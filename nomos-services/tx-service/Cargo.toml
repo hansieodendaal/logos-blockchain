@@ -19,6 +19,7 @@ async-trait       = "0.1"
 futures           = { default-features = false, version = "0.3" }
 nomos-core        = { workspace = true }
 nomos-da-sampling = { workspace = true }
+nomos-banning     = { workspace = true }
 nomos-network     = { workspace = true }
 nomos-storage     = { workspace = true }
 overwatch         = { workspace = true }

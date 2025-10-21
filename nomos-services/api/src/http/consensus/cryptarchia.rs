@@ -4,6 +4,7 @@ use chain_service::{
     ConsensusMsg, CryptarchiaConsensus, CryptarchiaInfo,
     network::adapters::libp2p::LibP2pAdapter as ConsensusNetworkAdapter,
 };
+use nomos_banning::BanningService;
 use nomos_core::{
     da::BlobId,
     header::HeaderId,
@@ -87,8 +88,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<Cryptarchia<
+            SamplingBackend,
+            SamplingNetworkAdapter,
+            SamplingStorage,
+            StorageAdapter,
+            TimeBackend,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(ConsensusMsg::Info { tx: sender })
@@ -141,8 +152,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<Cryptarchia<
+            SamplingBackend,
+            SamplingNetworkAdapter,
+            SamplingStorage,
+            StorageAdapter,
+            TimeBackend,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(ConsensusMsg::GetHeaders {

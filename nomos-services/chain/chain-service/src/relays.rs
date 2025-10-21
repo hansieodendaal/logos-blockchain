@@ -5,6 +5,7 @@ use std::{
 
 use broadcast_service::{BlockBroadcastMsg, BlockBroadcastService};
 use bytes::Bytes;
+use nomos_banning::BanningService;
 use nomos_core::{
     block::Block,
     da,
@@ -179,6 +180,7 @@ where
             >
             + AsServiceId<StorageService<Storage, RuntimeServiceId>>
             + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>,
+        RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
     {
         let network_relay = service_resources_handle
             .overwatch_handle

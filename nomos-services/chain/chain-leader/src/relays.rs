@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 
 use chain_service::api::CryptarchiaServiceData;
+use nomos_banning::BanningService;
 use nomos_core::{
     da,
     header::HeaderId,
@@ -143,6 +144,7 @@ where
             + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>
             + AsServiceId<CryptarchiaService>,
         CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item>,
+        RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
     {
         let blend_relay = service_resources_handle
             .overwatch_handle

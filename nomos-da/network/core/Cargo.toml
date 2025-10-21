@@ -17,9 +17,11 @@ kzgrs-backend            = { workspace = true }
 libp2p                   = { features = ["macros", "quic", "tokio"], workspace = true }
 libp2p-stream            = "0.3.0-alpha"
 log                      = "0.4"
+nomos-banning            = { workspace = true }
 nomos-core               = { workspace = true }
 nomos-da-messages        = { workspace = true }
 nomos-utils              = { workspace = true }
+overwatch                = { workspace = true }
 rand                     = { default-features = false, version = "0.9" }
 serde                    = { default-features = false, version = "1.0" }
 serde_with               = { workspace = true }

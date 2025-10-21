@@ -6,6 +6,7 @@ use std::{
 };
 
 use kzgrs_backend::common::share::DaSharesCommitments;
+use nomos_banning::BanningService;
 use nomos_core::{
     block::SessionNumber,
     da::{DaVerifier as CoreDaVerifier, blob::Share},
@@ -112,8 +113,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<DaVerifier<
+            DaShare,
+            VerifierNetwork,
+            ShareVerifier,
+            DaStorageConverter,
+            VerifierMempoolAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(DaVerifierMsg::AddShare {
@@ -143,8 +154,9 @@ where
         + AsServiceId<
             DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle.relay::<DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>>().await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(DaSamplingServiceMsg::GetCommitments {
@@ -179,8 +191,11 @@ where
         + Sync
         + Display
         + AsServiceId<DaDispersal<Backend, NetworkAdapter, Membership, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<DaDispersal<Backend, NetworkAdapter, Membership, RuntimeServiceId>>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(DaDispersalMsg::Disperse {
@@ -228,8 +243,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<NetworkService<
+            Backend,
+            Membership,
+            MembershipAdapter,
+            StorageAdapter,
+            ApiAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     let message = Backend::Message::create_block_message(peer_id, sender);
     relay
@@ -274,8 +299,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<NetworkService<
+            Backend,
+            Membership,
+            MembershipAdapter,
+            StorageAdapter,
+            ApiAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     let message = Backend::Message::create_unblock_message(peer_id, sender);
     relay
@@ -319,8 +354,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<NetworkService<
+            Backend,
+            Membership,
+            MembershipAdapter,
+            StorageAdapter,
+            ApiAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     let message = Backend::Message::create_blacklisted_message(sender);
     relay
@@ -364,8 +409,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<NetworkService<
+            Backend,
+            Membership,
+            MembershipAdapter,
+            StorageAdapter,
+            ApiAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
     let message = DaNetworkMsg::GetMembership { session_id, sender };
     relay.send(message).await.map_err(|(e, _)| e)?;
@@ -397,8 +452,9 @@ where
         + AsServiceId<
             DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
-    let relay = handle.relay().await?;
+    let relay = handle.relay::<DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>>().await?;
     let (sender, receiver) = oneshot::channel();
     let blob_ids: HashSet<SamplingBackend::BlobId> = blob_ids.into_iter().collect();
 

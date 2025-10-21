@@ -12,6 +12,7 @@ async-trait              = "0.1"
 futures                  = { default-features = false, version = "0.3" }
 kzgrs-backend            = { workspace = true }
 libp2p                   = { workspace = true }
+nomos-banning            = { workspace = true }
 nomos-core               = { workspace = true }
 nomos-da-network-core    = { workspace = true }
 nomos-da-network-service = { workspace = true }

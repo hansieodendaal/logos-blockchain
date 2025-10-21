@@ -17,6 +17,7 @@ use backend::{
 };
 use mempool::{DaMempoolAdapter, MempoolAdapterError};
 use network::NetworkAdapter;
+use nomos_banning::BanningService;
 use nomos_core::da::blob::Share;
 use nomos_da_network_core::swarm::DispersalValidationError;
 use nomos_da_network_service::{
@@ -97,6 +98,7 @@ pub struct GenericDaVerifierService<
     Network::Settings: Clone,
     MempoolAdapter: DaMempoolAdapter,
     Storage: DaStorageAdapter<RuntimeServiceId>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
     share_verifier: ShareVerifier,
@@ -135,6 +137,7 @@ where
         + Send
         + Sync
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     #[instrument(skip_all)]
     async fn handle_new_share(
@@ -228,6 +231,7 @@ where
     DaStorage: DaStorageAdapter<RuntimeServiceId>,
     DaStorage::Settings: Clone,
     MempoolAdapter: DaMempoolAdapter,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type Settings = DaVerifierServiceSettings<
         ShareVerifier::Settings,
@@ -307,6 +311,7 @@ where
         >
         + AsServiceId<MempoolAdapter::MempoolService>
         + AsServiceId<StorageService<DaStorage::Backend, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,

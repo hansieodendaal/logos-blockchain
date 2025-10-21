@@ -20,6 +20,7 @@ use nomos_libp2p::{
     behaviour::BehaviourEvent,
     libp2p::{kad::QueryId, swarm::ConnectionId},
 };
+use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::StreamExt as _;
@@ -39,6 +40,7 @@ mod kademlia;
 pub use chainsync::ChainSyncCommand;
 pub use gossipsub::PubSubCommand;
 pub use kademlia::DiscoveryCommand;
+use nomos_banning::BanningRequest;
 
 use crate::message::ChainSyncEvent;
 
@@ -66,8 +68,9 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         pubsub_events_tx: broadcast::Sender<Message>,
         chainsync_events_tx: broadcast::Sender<ChainSyncEvent>,
         rng: R,
+        banning_relay: Option<OutboundRelay<BanningRequest>>,
     ) -> Self {
-        let swarm = Swarm::build(config.inner, rng).unwrap();
+        let swarm = Swarm::build(config.inner, rng, banning_relay).unwrap();
 
         // Keep the dialing history since swarm.connect doesn't return the result
         // synchronously
@@ -362,6 +365,7 @@ mod tests {
             pubsub_events_tx,
             chainsync_events_tx,
             OsRng,
+            None,
         );
 
         let bootstrap_node_peer_id = *bootstrap_node.swarm.swarm().local_peer_id();
@@ -419,6 +423,7 @@ mod tests {
                 pubsub_events_tx,
                 chainsync_events_tx,
                 OsRng,
+                None,
             );
 
             let peer_id = *handler.swarm.swarm().local_peer_id();

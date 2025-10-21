@@ -14,6 +14,7 @@ use backend::{DaSamplingServiceBackend, SamplingState};
 use futures::{FutureExt as _, Stream, future::BoxFuture, stream::FuturesUnordered};
 use kzgrs_backend::common::share::{DaLightShare, DaShare, DaSharesCommitments};
 use network::NetworkAdapter;
+use nomos_banning::BanningService;
 use nomos_core::{block::SessionNumber, da::BlobId, header::HeaderId};
 use nomos_da_network_core::protocols::sampling::errors::SamplingError;
 use nomos_da_network_service::{
@@ -96,6 +97,7 @@ pub struct GenericDaSamplingService<
     SamplingNetwork: NetworkAdapter<RuntimeServiceId>,
     SamplingStorage: DaStorageAdapter<RuntimeServiceId>,
     ShareVerifier: VerifierBackend,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
     _phantom: PhantomData<(
@@ -119,6 +121,7 @@ where
     SamplingNetwork: NetworkAdapter<RuntimeServiceId>,
     SamplingStorage: DaStorageAdapter<RuntimeServiceId>,
     ShareVerifier: VerifierBackend,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     #[must_use]
     pub const fn new(
@@ -149,6 +152,7 @@ where
     SamplingNetwork: NetworkAdapter<RuntimeServiceId> + Send + Sync + 'static,
     SamplingStorage: DaStorageAdapter<RuntimeServiceId, Share = DaShare> + Send + Sync,
     ShareVerifier: VerifierBackend<DaShare = DaShare> + Send + Sync + Clone + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     #[instrument(skip_all)]
     async fn handle_service_message(
@@ -545,6 +549,7 @@ where
     SamplingNetwork: NetworkAdapter<RuntimeServiceId>,
     SamplingStorage: DaStorageAdapter<RuntimeServiceId>,
     ShareVerifier: VerifierBackend,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type Settings = DaSamplingServiceSettings<SamplingBackend::Settings, ShareVerifier::Settings>;
     type State = NoState<Self::Settings>;
@@ -591,6 +596,7 @@ where
         + Sync
         + Send
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,

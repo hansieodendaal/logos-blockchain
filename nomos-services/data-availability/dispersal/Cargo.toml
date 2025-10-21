@@ -13,6 +13,7 @@ ed25519                  = { default-features = false, version = "2.2.3" }
 ed25519-dalek            = { default-features = false, version = "2.2.0" }
 futures                  = { default-features = false, version = "0.3" }
 kzgrs-backend            = { workspace = true }
+nomos-banning            = { workspace = true }
 nomos-core               = { workspace = true }
 nomos-da-network-core    = { workspace = true }
 nomos-da-network-service = { workspace = true }

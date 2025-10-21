@@ -3,6 +3,7 @@ pub mod config;
 
 use api::backend::AxumBackend;
 use kzgrs_backend::common::share::DaShare;
+use nomos_banning::BanningService;
 use nomos_core::mantle::{SignedMantleTx, TxHash};
 use nomos_da_dispersal::{
     DispersalService,
@@ -207,6 +208,7 @@ pub struct NomosExecutor {
     storage: StorageService,
     system_sig: SystemSigService,
     wallet: WalletService,
+    banning: BanningService<RuntimeServiceId>,
     #[cfg(feature = "testing")]
     testing_http: TestingApiService<RuntimeServiceId>,
 }

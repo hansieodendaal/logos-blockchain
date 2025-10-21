@@ -1,11 +1,15 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{
+    fmt::{Debug, Display},
+    marker::PhantomData,
+};
 
+use nomos_banning::BanningService;
 use nomos_core::{
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction as _, TxHash},
 };
 use nomos_da_sampling::backend::DaSamplingServiceBackend;
-use overwatch::services::{ServiceData, relay::OutboundRelay};
+use overwatch::services::{AsServiceId, ServiceData, relay::OutboundRelay};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tx_service::{
@@ -77,6 +81,7 @@ where
         nomos_da_sampling::network::NetworkAdapter<RuntimeServiceId> + Send + Sync,
     SamplingStorage: nomos_da_sampling::storage::DaStorageAdapter<RuntimeServiceId> + Send + Sync,
     RuntimeServiceId: Send + Sync,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type MempoolService = TxMempoolService<
         MempoolNetAdapter,

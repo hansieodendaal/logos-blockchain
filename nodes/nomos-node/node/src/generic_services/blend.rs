@@ -9,6 +9,7 @@ use core::{
 use async_trait::async_trait;
 use chain_leader::LeaderMsg;
 use futures::{Stream, StreamExt as _};
+use nomos_banning::BanningService;
 use nomos_blend_message::crypto::{
     keys::Ed25519PrivateKey,
     proofs::{
@@ -193,6 +194,7 @@ where
         + Send
         + Sync
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     type Stream = Box<dyn Stream<Item = PolEpochInfo> + Send + Unpin>;
 

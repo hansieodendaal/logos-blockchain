@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fmt::Debug, marker::PhantomData, pin::Pin};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+    marker::PhantomData,
+    pin::Pin,
+};
 
 use futures::{
     Stream, StreamExt as _,
@@ -7,6 +12,7 @@ use futures::{
 use kzgrs_backend::common::share::DaShare;
 use libp2p::PeerId;
 use log::error;
+use nomos_banning::BanningService;
 use nomos_core::{
     block::SessionNumber, da::BlobId, header::HeaderId, mantle::SignedMantleTx, sdp::ProviderId,
 };
@@ -24,7 +30,10 @@ use nomos_da_network_core::{
 };
 use nomos_libp2p::ed25519;
 use nomos_tracing::info_with_id;
-use overwatch::{overwatch::handle::OverwatchHandle, services::state::NoState};
+use overwatch::{
+    overwatch::handle::OverwatchHandle,
+    services::{AsServiceId, state::NoState},
+};
 use serde::{Deserialize, Serialize};
 use subnetworks_assignations::MembershipHandler;
 use tokio::sync::{broadcast, mpsc::UnboundedSender, oneshot};
@@ -140,6 +149,7 @@ where
         + Sync
         + 'static,
     BalancerStats: Debug + Serialize + Send + Sync + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type Settings = DaNetworkExecutorBackendSettings;
     type State = NoState<Self::Settings>;
@@ -164,6 +174,10 @@ where
             .expect("Valid Ed25519 public key from keypair");
         let keypair = libp2p::identity::Keypair::from(ed_keypair);
 
+        let banning_relay = overwatch_handle
+            .runtime()
+            .block_on(overwatch_handle.relay::<BanningService<_>>())
+            .expect("Banning service must be available");
         let (mut executor_swarm, executor_events_stream) = ExecutorSwarm::new(
             keypair,
             membership,
@@ -178,6 +192,7 @@ where
             },
             subnet_refresh_signal,
             balancer_stats_sender,
+            Some(banning_relay),
         );
 
         let local_peer_id = *executor_swarm.local_peer_id();

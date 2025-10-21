@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
             sdp: (),
             membership: config.membership,
             wallet: config.wallet,
+            banning: config.banning,
             #[cfg(feature = "testing")]
             testing_http: config.testing_http,
         },

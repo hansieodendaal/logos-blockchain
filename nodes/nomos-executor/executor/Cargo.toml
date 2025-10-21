@@ -25,6 +25,7 @@ color-eyre               = { default-features = false, version = "0.6.0" }
 futures                  = { default-features = false, version = "0.3" }
 kzgrs-backend            = { workspace = true }
 nomos-api                = { workspace = true }
+nomos-banning            = { workspace = true }
 nomos-core               = { workspace = true }
 nomos-da-dispersal       = { workspace = true }
 nomos-da-network-core    = { workspace = true }

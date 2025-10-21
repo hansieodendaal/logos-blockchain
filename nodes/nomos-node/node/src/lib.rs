@@ -6,6 +6,7 @@ use color_eyre::eyre::{Result, eyre};
 use generic_services::VerifierMempoolAdapter;
 use kzgrs_backend::common::share::DaShare;
 pub use kzgrs_backend::dispersal::BlobInfo;
+use nomos_banning::BanningService;
 pub use nomos_blend_service::{
     core::{
         backends::libp2p::Libp2pBlendBackend as BlendBackend,
@@ -215,6 +216,7 @@ pub struct Nomos {
     storage: StorageService,
     system_sig: SystemSigService,
     wallet: WalletService,
+    banning: BanningService<RuntimeServiceId>,
     #[cfg(feature = "testing")]
     testing_http: TestingApiService<RuntimeServiceId>,
 }
@@ -254,6 +256,7 @@ pub fn run_node_from_config(config: Config) -> Result<Overwatch<RuntimeServiceId
             sdp: (),
             membership: config.membership,
             wallet: config.wallet,
+            banning: config.banning,
             #[cfg(feature = "testing")]
             testing_http: config.testing_http,
         },

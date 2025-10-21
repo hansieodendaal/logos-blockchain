@@ -3,6 +3,7 @@ use std::fmt::Display;
 
 use broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use futures::{Stream, StreamExt as _};
+use nomos_banning::BanningService;
 use nomos_core::{
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction},
@@ -67,8 +68,17 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay =
+        handle
+            .relay::<MempoolService<
+                SamplingNetworkAdapter,
+                SamplingStorage,
+                StorageAdapter,
+                RuntimeServiceId,
+            >>()
+            .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(MempoolMsg::Metrics {
@@ -112,8 +122,17 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay =
+        handle
+            .relay::<MempoolService<
+                SamplingNetworkAdapter,
+                SamplingStorage,
+                StorageAdapter,
+                RuntimeServiceId,
+            >>()
+            .await?;
     let (sender, receiver) = oneshot::channel();
     relay
         .send(MempoolMsg::Status {

@@ -1,6 +1,7 @@
 use core::{fmt::Debug, hash::Hash};
 use std::fmt::Display;
 
+use nomos_banning::BanningService;
 use nomos_core::header::HeaderId;
 use nomos_da_sampling::network::NetworkAdapter as DaSamplingNetworkAdapter;
 use nomos_network::backends::NetworkBackend;
@@ -52,8 +53,18 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<TxMempoolService<
+            MempoolNetworkAdapter,
+            SamplingNetworkAdapter,
+            SamplingStorage,
+            Mempool<HeaderId, Item, Key, StorageAdapter, RuntimeServiceId>,
+            StorageAdapter,
+            RuntimeServiceId,
+        >>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
 
     relay

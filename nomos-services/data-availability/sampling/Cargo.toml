@@ -14,6 +14,7 @@ futures                  = { default-features = false, version = "0.3" }
 hex                      = { default-features = false, version = "0.4.3" }
 kzgrs-backend            = { workspace = true }
 libp2p-identity          = { version = "0.2" }
+nomos-banning            = { workspace = true }
 nomos-core               = { workspace = true }
 nomos-da-network-core    = { workspace = true }
 nomos-da-network-service = { workspace = true }

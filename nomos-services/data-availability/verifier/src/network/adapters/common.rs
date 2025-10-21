@@ -15,6 +15,8 @@ macro_rules! adapter_for {
                 + 'static,
             MembershipServiceAdapter: MembershipAdapter,
             ApiAdapter: ApiAdapterTrait,
+            RuntimeServiceId:
+                AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
         {
             network_relay: OutboundRelay<
                 <NetworkService<
@@ -56,6 +58,8 @@ macro_rules! adapter_for {
                 + Send
                 + Sync
                 + 'static,
+            RuntimeServiceId:
+                AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
         {
             type Backend = $DaNetworkBackend<Membership>;
             type Settings = ();

@@ -3,6 +3,7 @@ use std::fmt::{Debug, Display};
 use axum::{Json, extract::State, response::Response};
 use kzgrs_backend::dispersal::Metadata;
 use nomos_api::http::da::{self, DaDispersal};
+use nomos_banning::BanningService;
 use nomos_da_dispersal::{adapters::network::DispersalNetworkAdapter, backend::DispersalBackend};
 use nomos_da_network_core::SubnetworkId;
 use nomos_http_api_common::{paths, types::DispersalRequest};
@@ -39,6 +40,7 @@ where
         + Sync
         + Display
         + AsServiceId<DaDispersal<Backend, NetworkAdapter, Membership, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::disperse_data::<
         Backend,

@@ -13,6 +13,7 @@ use axum::{
 };
 use kzgrs_backend::common::share::DaShare;
 use nomos_api::Backend;
+use nomos_banning::BanningService;
 use nomos_da_network_service::backends::libp2p::executor::DaNetworkExecutorBackend;
 use nomos_da_sampling::{
     backend::kzgrs::KzgrsSamplingBackend,
@@ -84,6 +85,7 @@ where
         + AsServiceId<MembershipService<RuntimeServiceId>>
         + AsServiceId<TestDaNetworkService<RuntimeServiceId>>
         + AsServiceId<TestDaSamplingService<RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     type Error = std::io::Error;
     type Settings = AxumBackendSettings;

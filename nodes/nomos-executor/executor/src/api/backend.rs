@@ -23,6 +23,7 @@ use nomos_api::{
         storage,
     },
 };
+use nomos_banning::BanningService;
 use nomos_core::{
     da::{
         DaVerifier as CoreDaVerifier,
@@ -363,6 +364,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     type Error = std::io::Error;
     type Settings = AxumBackendSettings;

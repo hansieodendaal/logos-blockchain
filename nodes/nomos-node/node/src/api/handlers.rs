@@ -20,6 +20,7 @@ use nomos_api::http::{
     libp2p, mantle, mempool,
     storage::StorageAdapter,
 };
+use nomos_banning::BanningService;
 use nomos_core::{
     da::{BlobId, DaVerifier as CoreDaVerifier, blob::Share},
     header::HeaderId,
@@ -117,6 +118,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::mantle_mempool_metrics::<
         SamplingNetworkAdapter,
@@ -181,6 +183,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::mantle_mempool_status::<
         SamplingNetworkAdapter,
@@ -248,6 +251,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(consensus::cryptarchia_info::<
         SamplingBackend,
@@ -313,6 +317,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     let CryptarchiaInfoQuery { from, to } = query;
     make_request_and_return_response!(consensus::cryptarchia_headers::<
@@ -395,6 +400,7 @@ where
         + AsServiceId<
             DaVerifier<S, N, VB, StorageConverter, VerifierMempoolAdapter, RuntimeServiceId>,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::add_share::<
         S,
@@ -446,6 +452,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::block_peer::<
         Backend,
@@ -498,6 +505,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::unblock_peer::<
         Backend,
@@ -548,6 +556,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::blacklisted_peers::<
         Backend,
@@ -581,6 +590,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(libp2p::libp2p_info::<RuntimeServiceId>(&handle))
 }
@@ -601,8 +611,12 @@ where
     HttpStorageAdapter: StorageAdapter<RuntimeServiceId> + Send + Sync + 'static,
     RuntimeServiceId:
         AsServiceId<StorageService<RocksBackend, RuntimeServiceId>> + Debug + Sync + Display,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = match handle.relay().await {
+    let relay = match handle
+        .relay::<StorageService<RocksBackend, RuntimeServiceId>>()
+        .await
+    {
         Ok(relay) => relay,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -638,6 +652,7 @@ where
         + AsServiceId<
             DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::get_commitments::<
         SamplingBackend,
@@ -675,8 +690,12 @@ where
         + Sync
         + Display
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = match handle.relay().await {
+    let relay = match handle
+        .relay::<StorageService<DaStorageBackend, RuntimeServiceId>>()
+        .await
+    {
         Ok(relay) => relay,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -710,8 +729,12 @@ where
         + Sync
         + Display
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = match handle.relay().await {
+    let relay = match handle
+        .relay::<StorageService<RocksBackend, RuntimeServiceId>>()
+        .await
+    {
         Ok(relay) => relay,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -745,8 +768,12 @@ where
         + Display
         + 'static
         + AsServiceId<StorageService<RocksBackend, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = match handle.relay().await {
+    let relay = match handle
+        .relay::<StorageService<RocksBackend, RuntimeServiceId>>()
+        .await
+    {
         Ok(relay) => relay,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -813,6 +840,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::balancer_stats::<
         Backend,
@@ -863,6 +891,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::monitor_stats::<
         Backend,
@@ -925,6 +954,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mempool::add_tx::<
         Libp2pNetworkBackend,

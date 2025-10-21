@@ -11,6 +11,7 @@ use chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
 use cryptarchia_engine::{Epoch, Slot};
 use futures::StreamExt as _;
 pub use leadership::LeaderConfig;
+use nomos_banning::BanningService;
 use nomos_core::{
     block::Block,
     da,
@@ -119,6 +120,7 @@ pub struct CryptarchiaLeader<
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData,
     Wallet: nomos_wallet::api::WalletServiceData,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
     winning_pol_epoch_slots_sender: broadcast::Sender<(LeaderPrivate, SecretKey, Epoch)>,
@@ -171,6 +173,7 @@ where
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData,
     Wallet: nomos_wallet::api::WalletServiceData,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type Settings = LeaderSettings<TxS::Settings, BlendService::BroadcastSettings>;
     type State = overwatch::services::state::NoState<Self::Settings>;
@@ -274,6 +277,7 @@ where
         + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>
         + AsServiceId<CryptarchiaService>
         + AsServiceId<Wallet>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
@@ -524,7 +528,8 @@ where
     TimeBackend::Settings: Clone + Send + Sync,
     CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item>,
     Wallet: nomos_wallet::api::WalletServiceData,
-    RuntimeServiceId: Sync + Send + 'static,
+    RuntimeServiceId:
+        Sync + Send + 'static + AsServiceId<BanningService<RuntimeServiceId>> + Display + Debug,
 {
     #[expect(clippy::allow_attributes_without_reason)]
     #[instrument(level = "debug", skip(tx_selector, relays))]

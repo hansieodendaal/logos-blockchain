@@ -1,4 +1,5 @@
 use std::{
+    fmt::{Debug, Display},
     net::{IpAddr, SocketAddr, ToSocketAddrs as _},
     path::{Path, PathBuf},
 };
@@ -7,12 +8,13 @@ use blend::BlendConfig;
 use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
 use hex::FromHex as _;
+use nomos_banning::BanningService;
 use nomos_libp2p::{Multiaddr, ed25519::SecretKey};
 use nomos_network::backends::libp2p::Libp2p as NetworkBackend;
 use nomos_tracing::logging::{gelf::GelfConfig, local::FileConfig};
 use nomos_tracing_service::{LoggerLayer, Tracing};
 use num_bigint::BigUint;
-use overwatch::services::ServiceData;
+use overwatch::services::{AsServiceId, ServiceData};
 use serde::{Deserialize, Serialize};
 use tracing::Level;
 
@@ -219,6 +221,7 @@ pub struct Config {
     pub storage: <StorageService as ServiceData>::Settings,
     pub mempool: MempoolConfig,
     pub wallet: <WalletService<CryptarchiaService, RuntimeServiceId> as ServiceData>::Settings,
+    pub banning: <BanningService<RuntimeServiceId> as ServiceData>::Settings,
 
     #[cfg(feature = "testing")]
     pub testing_http: <ApiService as ServiceData>::Settings,
@@ -289,7 +292,10 @@ pub fn update_tracing(
 pub fn update_network<RuntimeServiceId>(
     network: &mut <nomos_network::NetworkService<NetworkBackend, RuntimeServiceId> as ServiceData>::Settings,
     network_args: NetworkArgs,
-) -> Result<()> {
+) -> Result<()>
+where
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+{
     let NetworkArgs {
         host,
         port,

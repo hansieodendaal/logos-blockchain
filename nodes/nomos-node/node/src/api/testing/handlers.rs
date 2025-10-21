@@ -8,6 +8,7 @@ use nomos_api::http::{
     da::{self},
     membership::{self, MembershipUpdateRequest},
 };
+use nomos_banning::BanningService;
 use nomos_core::{block::SessionNumber, header::HeaderId};
 use nomos_da_network_service::{
     NetworkService, api::ApiAdapter as ApiAdapterTrait, backends::NetworkBackend,
@@ -36,6 +37,7 @@ where
         + Display
         + 'static
         + AsServiceId<MembershipService<Backend, Sdp, StorageAdapter, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(membership::update_membership_handler::<
         Backend,
@@ -76,6 +78,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::da_get_membership::<
         Backend,
@@ -114,6 +117,7 @@ where
         + AsServiceId<
             DaSamplingService<SamplingBackend, SamplingNetwork, SamplingStorage, RuntimeServiceId>,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(da::da_historic_sampling::<
         SamplingBackend,

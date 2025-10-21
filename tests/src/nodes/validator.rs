@@ -18,6 +18,7 @@ use cryptarchia_engine::time::SlotConfig;
 use futures::Stream;
 use kzgrs_backend::common::share::{DaLightShare, DaShare, DaSharesCommitments};
 use nomos_api::http::membership::MembershipUpdateRequest;
+use nomos_banning::BanningConfig;
 use nomos_blend_scheduling::message_blend::SessionCryptographicProcessorSettings;
 use nomos_blend_service::{
     core::settings::{CoverTrafficSettingsExt, MessageDelayerSettingsExt, SchedulerSettingsExt},
@@ -590,6 +591,7 @@ pub fn create_validator_config(config: GeneralConfig) -> Config {
         wallet: WalletServiceSettings {
             known_keys: HashSet::from_iter([config.consensus_config.leader_config.pk]),
         },
+        banning: BanningConfig::default(),
         testing_http: nomos_api::ApiServiceSettings {
             backend_settings: AxumBackendSettings {
                 address: testing_http_address,

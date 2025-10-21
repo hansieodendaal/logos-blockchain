@@ -1,4 +1,5 @@
 use color_eyre::eyre::Result;
+use nomos_banning::BanningService;
 use nomos_node::{
     CryptarchiaLeaderArgs, HttpArgs, LogArgs, NetworkArgs,
     config::{
@@ -35,6 +36,7 @@ pub struct Config {
     pub storage: <StorageService as ServiceData>::Settings,
     pub mempool: MempoolConfig,
     pub wallet: <WalletService as ServiceData>::Settings,
+    pub banning: <BanningService<nomos_node::RuntimeServiceId> as ServiceData>::Settings,
 
     #[cfg(feature = "testing")]
     pub testing_http: <ApiService as ServiceData>::Settings,

@@ -1,8 +1,13 @@
 pub mod adapters;
 
-use std::{collections::HashSet, pin::Pin};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+    pin::Pin,
+};
 
 use futures::Stream;
+use nomos_banning::BanningService;
 use nomos_core::{block::SessionNumber, da::BlobId, header::HeaderId};
 use nomos_da_network_service::{
     NetworkService,
@@ -14,12 +19,15 @@ use nomos_da_network_service::{
 };
 use overwatch::{
     DynError,
-    services::{ServiceData, relay::OutboundRelay},
+    services::{AsServiceId, ServiceData, relay::OutboundRelay},
 };
 use subnetworks_assignations::MembershipHandler;
 
 #[async_trait::async_trait]
-pub trait NetworkAdapter<RuntimeServiceId> {
+pub trait NetworkAdapter<RuntimeServiceId>
+where
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
+{
     type Backend: NetworkBackend<RuntimeServiceId> + Send + 'static;
     type Settings: Clone;
     type Membership: MembershipHandler;

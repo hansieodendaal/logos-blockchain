@@ -11,6 +11,7 @@ workspace = true
 async-trait      = "0.1"
 cryptarchia-sync = { workspace = true }
 futures          = { default-features = false, version = "0.3" }
+nomos-banning    = { workspace = true }
 nomos-core       = { workspace = true }
 nomos-libp2p     = { optional = true, workspace = true }
 overwatch        = { workspace = true }

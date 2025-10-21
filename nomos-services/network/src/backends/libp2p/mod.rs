@@ -2,11 +2,14 @@ mod command;
 mod config;
 pub(crate) mod swarm;
 
+use std::fmt::{Debug, Display};
+
+use nomos_banning::BanningService;
 pub use nomos_libp2p::{
     PeerId,
     libp2p::gossipsub::{Message, TopicHash},
 };
-use overwatch::overwatch::handle::OverwatchHandle;
+use overwatch::{overwatch::handle::OverwatchHandle, services::AsServiceId};
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, broadcast::Sender, mpsc};
@@ -31,7 +34,10 @@ pub struct Libp2p {
 const BUFFER_SIZE: usize = 64;
 
 #[async_trait::async_trait]
-impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p {
+impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p
+where
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
+{
     type Settings = Libp2pConfig;
     type Message = Command;
     type PubSubEvent = Message;
@@ -46,6 +52,10 @@ impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p {
 
         let initial_peers = config.initial_peers.clone();
 
+        let banning_relay = overwatch_handle
+            .runtime()
+            .block_on(overwatch_handle.relay::<BanningService<_>>())
+            .expect("Banning service must be available");
         let mut swarm_handler = SwarmHandler::new(
             config,
             commands_tx.clone(),
@@ -53,6 +63,7 @@ impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p {
             pubsub_events_tx.clone(),
             chainsync_events_tx.clone(),
             rng,
+            Some(banning_relay),
         );
 
         overwatch_handle.runtime().spawn(async move {

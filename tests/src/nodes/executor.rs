@@ -18,6 +18,7 @@ use cryptarchia_engine::time::SlotConfig;
 use futures::Stream;
 use kzgrs_backend::common::share::{DaLightShare, DaShare, DaSharesCommitments};
 use nomos_api::http::membership::MembershipUpdateRequest;
+use nomos_banning::BanningConfig;
 use nomos_blend_scheduling::message_blend::SessionCryptographicProcessorSettings;
 use nomos_blend_service::{
     core::settings::{CoverTrafficSettingsExt, MessageDelayerSettingsExt, SchedulerSettingsExt},
@@ -387,7 +388,12 @@ fn generate_config_keys() {
     let my_key_pair = ed25519::Keypair::from(my_node_key.clone());
     let my_peer_id = PeerId::from_public_key(&my_key_pair.public().into());
     let my_signing_key = Ed25519PrivateKey::generate();
-    println!("peer_id: {}, signing_key: {:?}, node_key: {}", my_peer_id, hex::encode(my_signing_key.as_bytes()), hex::encode(my_node_key.as_ref()));
+    println!(
+        "peer_id: {}, signing_key: {:?}, node_key: {}",
+        my_peer_id,
+        hex::encode(my_signing_key.as_bytes()),
+        hex::encode(my_node_key.as_ref())
+    );
 }
 
 #[must_use]
@@ -585,6 +591,7 @@ pub fn create_executor_config(config: GeneralConfig) -> Config {
             known_keys: HashSet::from_iter([config.consensus_config.leader_config.pk]),
         },
 
+        banning: BanningConfig::default(),
         testing_http: nomos_api::ApiServiceSettings {
             backend_settings: AxumBackendSettings {
                 address: testing_http_address,

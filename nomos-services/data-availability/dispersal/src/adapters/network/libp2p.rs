@@ -1,7 +1,14 @@
-use std::{collections::HashSet, fmt::Debug, marker::PhantomData, pin::Pin, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+    marker::PhantomData,
+    pin::Pin,
+    time::Duration,
+};
 
 use futures::{Stream, StreamExt as _, stream::BoxStream};
 use kzgrs_backend::common::share::{DaShare, DaSharesCommitments};
+use nomos_banning::BanningService;
 use nomos_core::{da::BlobId, mantle::SignedMantleTx};
 use nomos_da_network_core::{
     PeerId, SubnetworkId,
@@ -22,7 +29,7 @@ use nomos_da_network_service::{
 };
 use overwatch::{
     DynError,
-    services::{ServiceData, relay::OutboundRelay},
+    services::{AsServiceId, ServiceData, relay::OutboundRelay},
 };
 use subnetworks_assignations::MembershipHandler;
 use tokio::sync::oneshot;
@@ -44,6 +51,7 @@ pub struct Libp2pNetworkAdapter<
         + 'static,
     MembershipServiceAdapter: MembershipAdapter,
     ApiAdapter: ApiAdapterTrait,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     outbound_relay: OutboundRelay<
         DaNetworkMsg<DaNetworkExecutorBackend<Membership>, DaSharesCommitments, RuntimeServiceId>,
@@ -75,6 +83,7 @@ where
     ApiAdapter: ApiAdapterTrait + Sync,
     StorageAdapter: Sync,
     RuntimeServiceId: Sync,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     async fn start_sampling(&self, blob_id: BlobId) -> Result<(), DynError> {
         self.outbound_relay
@@ -108,6 +117,7 @@ where
     ApiAdapter: ApiAdapterTrait + Sync,
     StorageAdapter: Sync,
     RuntimeServiceId: Sync,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
 {
     type NetworkService = NetworkService<
         DaNetworkExecutorBackend<Membership>,

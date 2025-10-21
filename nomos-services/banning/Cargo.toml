@@ -1,0 +1,18 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "nomos-banning"
+version = "0.1.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+libp2p      = { workspace = true, features = ["serde"] }
+nomos-utils = { workspace = true, features = ["time"] }
+overwatch   = { workspace = true }
+serde       = { version = "1.0.228", features = ["derive"] }
+serde_with  = { workspace = true }
+tokio       = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tracing     = { workspace = true }

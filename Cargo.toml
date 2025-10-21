@@ -23,8 +23,9 @@ members = [
   "nomos-da/network/messages",
   "nomos-da/network/subnetworks-assignations",
   "nomos-libp2p",
-  "nomos-services/api",
+  "nomos-services/api", "nomos-services/banning",
   "nomos-services/blend",
+  "nomos-services/banning",
   "nomos-services/chain/broadcast-service",
   "nomos-services/chain/chain-common",
   "nomos-services/chain/chain-leader",
@@ -86,6 +87,7 @@ kzgrs                        = { default-features = false, path = "./nomos-da/kz
 kzgrs-backend                = { default-features = false, path = "./nomos-da/kzgrs-backend" }
 mmr                          = { default-features = false, path = "./mmr" }
 nomos-api                    = { default-features = false, path = "./nomos-services/api" }
+nomos-banning                = { default-features = false, path = "./nomos-services/banning" }
 nomos-blend-message          = { default-features = false, path = "./nomos-blend/message" }
 nomos-blend-network          = { default-features = false, path = "./nomos-blend/network" }
 nomos-blend-scheduling       = { default-features = false, path = "./nomos-blend/scheduling" }

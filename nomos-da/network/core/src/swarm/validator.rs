@@ -8,10 +8,12 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, TransportError,
     core::transport::ListenerId,
     identity::Keypair,
-    swarm::{DialError, SwarmEvent},
+    swarm::{DialError, SwarmEvent, dial_opts::DialOpts},
 };
+use nomos_banning::{BanningRequest, is_banned};
 use nomos_core::{da::BlobId, header::HeaderId};
 use nomos_da_messages::replication::ReplicationRequest;
+use overwatch::services::relay::OutboundRelay;
 use subnetworks_assignations::MembershipHandler;
 use tokio::{
     sync::mpsc::{UnboundedSender, unbounded_channel},
@@ -92,6 +94,7 @@ where
     validation_events_sender: UnboundedSender<DispersalValidatorEvent>,
     membership: Membership,
     phantom: PhantomData<HistoricMembership>,
+    banning_relay: Option<OutboundRelay<BanningRequest>>,
 }
 
 impl<Membership, HistoricMembership, Addressbook>
@@ -116,6 +119,7 @@ where
         }: SwarmSettings,
         refresh_signal: impl futures::Stream<Item = ()> + Send + 'static,
         balancer_stats_sender: UnboundedSender<<ConnectionBalancer<Membership> as Balancer>::Stats>,
+        banning_relay: Option<OutboundRelay<BanningRequest>>,
     ) -> (Self, ValidatorEventsStream) {
         let (sampling_events_sender, sampling_events_receiver) = unbounded_channel();
         let (validation_events_sender, validation_events_receiver) = unbounded_channel();
@@ -160,6 +164,7 @@ where
                 validation_events_sender,
                 membership,
                 phantom: PhantomData,
+                banning_relay,
             },
             ValidatorEventsStream {
                 sampling_events_receiver,
@@ -204,6 +209,13 @@ where
     }
 
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), DialError> {
+        let opt = DialOpts::from(addr.clone());
+        if is_banned(&self.banning_relay, opt.get_peer_id()) {
+            return Err(DialError::Transport(vec![(
+                addr,
+                TransportError::Other(io::Error::other("Attempted to dial a banned peer")),
+            )]));
+        }
         self.swarm.dial(addr)?;
         Ok(())
     }

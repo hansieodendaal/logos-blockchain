@@ -1,8 +1,12 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{
+    fmt::{Debug, Display},
+    marker::PhantomData,
+};
 
 use futures::Stream;
 use kzgrs_backend::common::share::{DaShare, DaSharesCommitments};
 use libp2p::PeerId;
+use nomos_banning::BanningService;
 use nomos_core::{da::BlobId, mantle::SignedMantleTx};
 use nomos_da_network_core::SubnetworkId;
 use nomos_da_network_service::{
@@ -14,7 +18,7 @@ use nomos_da_network_service::{
     },
     membership::{MembershipAdapter, handler::DaMembershipHandler},
 };
-use overwatch::services::{ServiceData, relay::OutboundRelay};
+use overwatch::services::{AsServiceId, ServiceData, relay::OutboundRelay};
 use subnetworks_assignations::MembershipHandler;
 use tokio_stream::StreamExt as _;
 

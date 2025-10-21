@@ -24,6 +24,7 @@ pub use cryptarchia_engine::{Epoch, Slot};
 use cryptarchia_sync::{GetTipResponse, ProviderResponse};
 use futures::{FutureExt as _, StreamExt as _};
 use network::NetworkAdapter;
+use nomos_banning::BanningService;
 use nomos_core::{
     block::Block,
     da,
@@ -396,6 +397,7 @@ pub struct CryptarchiaConsensus<
     SamplingStorage: nomos_da_sampling::storage::DaStorageAdapter<RuntimeServiceId>,
     TimeBackend: nomos_time::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
 {
     service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
     new_block_subscription_sender: broadcast::Sender<HeaderId>,
@@ -446,6 +448,7 @@ where
     SamplingStorage: nomos_da_sampling::storage::DaStorageAdapter<RuntimeServiceId>,
     TimeBackend: nomos_time::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
 {
     type Settings = CryptarchiaSettings<NetAdapter::PeerId, NetAdapter::Settings>;
     type State = CryptarchiaConsensusState<NetAdapter::PeerId, NetAdapter::Settings>;
@@ -544,6 +547,7 @@ where
         >
         + AsServiceId<StorageService<Storage, RuntimeServiceId>>
         + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
@@ -935,7 +939,8 @@ where
     SamplingStorage: nomos_da_sampling::storage::DaStorageAdapter<RuntimeServiceId>,
     TimeBackend: nomos_time::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync,
-    RuntimeServiceId: Display + AsServiceId<Self>,
+    RuntimeServiceId:
+        Display + AsServiceId<Self> + AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug,
 {
     fn notify_service_ready(&self) {
         self.service_resources_handle.status_updater.notify_ready();
