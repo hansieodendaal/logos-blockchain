@@ -5,7 +5,6 @@ use std::{
     str::FromStr as _,
     time::Duration,
 };
-
 use broadcast_service::BlockInfo;
 use chain_service::CryptarchiaInfo;
 use common_http_client::CommonHttpClient;
@@ -18,6 +17,7 @@ use nomos_da_dispersal::{
     DispersalServiceSettings,
     backend::kzgrs::{DispersalKZGRSBackendSettings, EncoderSettings},
 };
+use nomos_banning::BanningConfig;
 use nomos_da_network_core::{
     protocols::sampling::SubnetsConfig,
     swarm::{BalancerStats, MonitorStats},
@@ -354,6 +354,26 @@ impl Executor {
     }
 }
 
+#[ignore = "This test creates config keys for system-level testing purposes"]
+#[test]
+fn generate_config_keys() {
+    use libp2p::identity::ed25519;
+    use nomos_da_network_core::PeerId;
+    use ed25519_dalek::SigningKey;
+    use ark_std::UniformRand as _;
+
+    let my_node_key = ed25519::SecretKey::generate();
+    let my_key_pair = ed25519::Keypair::from(my_node_key.clone());
+    let my_peer_id = PeerId::from_public_key(&my_key_pair.public().into());
+    let my_signing_key = SigningKey::from_bytes(&[u8::rand(&mut rand::thread_rng()); 32]);
+    println!(
+        "peer_id: {}, signing_key: {:?}, node_key: {}",
+        my_peer_id,
+        hex::encode(my_signing_key.as_bytes()),
+        hex::encode(my_node_key.as_ref())
+    );
+}
+
 #[must_use]
 #[expect(clippy::too_many_lines, reason = "TODO: Address this at some point.")]
 pub fn create_executor_config(config: GeneralConfig) -> Config {
@@ -467,7 +487,7 @@ pub fn create_executor_config(config: GeneralConfig) -> Config {
                 .pk]),
         },
         key_management: config.kms_config,
-
+        banning: BanningConfig::default(),
         testing_http: nomos_api::ApiServiceSettings {
             backend_settings: AxumBackendSettings {
                 address: testing_http_address,

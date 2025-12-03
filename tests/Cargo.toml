@@ -32,6 +32,7 @@ hex                           = { default-features = false, version = "0.4.3" }
 key-management-system-service = { workspace = true }
 kzgrs-backend                 = { workspace = true }
 nomos-api                     = { workspace = true }
+nomos-banning                 = { workspace = true }
 nomos-blend                   = { workspace = true }
 nomos-blend-service           = { features = ["libp2p"], workspace = true }
 nomos-core                    = { workspace = true }
@@ -64,6 +65,10 @@ tokio                         = "1"
 tracing                       = { workspace = true }
 tx-service                    = { features = ["libp2p", "mock"], workspace = true }
 zksign                        = { workspace = true }
+
+[dev-dependencies]
+libp2p                        = { workspace = true }
+ark-std = "0.4.0"
 
 [[test]]
 name = "test_cryptarchia_happy_path"

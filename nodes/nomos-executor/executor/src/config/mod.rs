@@ -1,4 +1,5 @@
 use color_eyre::eyre::Result;
+use nomos_banning::BanningService;
 use nomos_node::{
     CryptarchiaLeaderArgs, HttpArgs, LogArgs, NetworkArgs,
     config::{
@@ -37,6 +38,7 @@ pub struct Config {
     pub storage: <StorageService as ServiceData>::Settings,
     pub wallet: <WalletService as ServiceData>::Settings,
     pub key_management: <KeyManagementService as ServiceData>::Settings,
+    pub banning: <BanningService<nomos_node::RuntimeServiceId> as ServiceData>::Settings,
 
     #[cfg(feature = "tracing")]
     pub tracing: <nomos_node::Tracing<RuntimeServiceId> as ServiceData>::Settings,

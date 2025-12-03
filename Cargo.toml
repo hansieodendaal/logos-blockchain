@@ -38,7 +38,8 @@ members = [
   "nomos-kms/keys",
   "nomos-kms/macros",
   "nomos-libp2p",
-  "nomos-services/api",
+  "nomos-services/api", 
+  "nomos-services/banning",
   "nomos-services/blend",
   "nomos-services/chain/broadcast-service",
   "nomos-services/chain/chain-common",
@@ -102,6 +103,7 @@ kzgrs                         = { default-features = false, path = "./nomos-da/k
 kzgrs-backend                 = { default-features = false, path = "./nomos-da/kzgrs-backend" }
 mmr                           = { default-features = false, path = "./mmr" }
 nomos-api                     = { default-features = false, path = "./nomos-services/api" }
+nomos-banning                 = { default-features = false, path = "./nomos-services/banning" }
 nomos-blend                   = { default-features = false, path = "./nomos-blend/core" }
 nomos-blend-crypto            = { default-features = false, path = "./nomos-blend/crypto" }
 nomos-blend-message           = { default-features = false, path = "./nomos-blend/message" }
