@@ -5,11 +5,13 @@ use std::{
     str::FromStr as _,
     time::Duration,
 };
+
 use broadcast_service::BlockInfo;
 use chain_service::CryptarchiaInfo;
 use common_http_client::CommonHttpClient;
 use futures::Stream;
 use kzgrs_backend::common::share::{DaLightShare, DaShare, DaSharesCommitments};
+use nomos_banning::BanningConfig;
 use nomos_core::{
     block::Block, da::BlobId, header::HeaderId, mantle::SignedMantleTx, sdp::SessionNumber,
 };
@@ -17,7 +19,6 @@ use nomos_da_dispersal::{
     DispersalServiceSettings,
     backend::kzgrs::{DispersalKZGRSBackendSettings, EncoderSettings},
 };
-use nomos_banning::BanningConfig;
 use nomos_da_network_core::{
     protocols::sampling::SubnetsConfig,
     swarm::{BalancerStats, MonitorStats},
@@ -357,10 +358,10 @@ impl Executor {
 #[ignore = "This test creates config keys for system-level testing purposes"]
 #[test]
 fn generate_config_keys() {
+    use ark_std::UniformRand as _;
+    use ed25519_dalek::SigningKey;
     use libp2p::identity::ed25519;
     use nomos_da_network_core::PeerId;
-    use ed25519_dalek::SigningKey;
-    use ark_std::UniformRand as _;
 
     let my_node_key = ed25519::SecretKey::generate();
     let my_key_pair = ed25519::Keypair::from(my_node_key.clone());

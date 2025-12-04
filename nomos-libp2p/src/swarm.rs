@@ -18,6 +18,8 @@ use libp2p::{
     swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
 };
 use multiaddr::multiaddr;
+use nomos_banning::{BanningRequest, is_banned};
+use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
 
 use crate::behaviour::BehaviourConfig;
@@ -33,12 +35,17 @@ const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct Swarm<R: Clone + Send + RngCore + 'static> {
     // A core libp2p swarm
     pub(crate) swarm: libp2p::Swarm<Behaviour<R>>,
+    pub(crate) banning_relay: Option<OutboundRelay<BanningRequest>>,
 }
 
 impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     /// Builds a [`Swarm`] configured for use with Nomos on top of a tokio
     /// executor.
-    pub fn build(config: SwarmConfig, rng: R) -> Result<Self, Box<dyn Error>> {
+    pub fn build(
+        config: SwarmConfig,
+        rng: R,
+        banning_relay: Option<OutboundRelay<BanningRequest>>,
+    ) -> Result<Self, Box<dyn Error>> {
         let keypair =
             libp2p::identity::Keypair::from(ed25519::Keypair::from(config.node_key.clone()));
         let peer_id = PeerId::from(keypair.public());
@@ -82,7 +89,10 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 
         let nomos_swarm = {
             let listen_addr = multiaddr(host, port);
-            let mut s = Self { swarm };
+            let mut s = Self {
+                swarm,
+                banning_relay,
+            };
             // We start listening on the provided address, which triggers the Identify flow,
             // which in turn triggers our NAT traversal state machine.
             s.start_listening_on(listen_addr.clone())
@@ -96,6 +106,12 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     /// Initiates a connection attempt to a peer
     pub fn connect(&mut self, peer_addr: &Multiaddr) -> Result<ConnectionId, DialError> {
         let opt = DialOpts::from(peer_addr.clone());
+        if is_banned(&self.banning_relay, opt.get_peer_id()) {
+            return Err(DialError::Transport(vec![(
+                peer_addr.clone(),
+                TransportError::Other(io::Error::other("Attempted to dial a banned peer")),
+            )]));
+        }
         let connection_id = opt.connection_id();
 
         tracing::debug!("attempting to dial {peer_addr}. connection_id:{connection_id:?}",);

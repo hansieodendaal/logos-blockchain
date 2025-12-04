@@ -11,6 +11,7 @@ use chain_service::CryptarchiaInfo;
 use common_http_client::CommonHttpClient;
 use futures::Stream;
 use kzgrs_backend::common::share::{DaLightShare, DaShare, DaSharesCommitments};
+use nomos_banning::BanningConfig;
 use nomos_core::{
     block::Block,
     da::BlobId,
@@ -551,6 +552,11 @@ pub fn create_validator_config(config: GeneralConfig) -> Config {
                 max_concurrent_requests: 1000,
                 ..Default::default()
             },
+        },
+        banning: BanningConfig {
+            whitelist: vec![],
+            blacklist: vec![],
+            ..Default::default()
         },
     }
 }

@@ -36,8 +36,10 @@ libp2p = { features = [
 multiaddr = { default-features = false, version = "0.18" }
 natpmp = { features = ["tokio"], version = "0.5" }
 netdev = { default-features = false, version = "0.31" }
+nomos-banning = { workspace = true }
 nomos-utils = { features = ["serde", "time"], workspace = true }
 num_enum = { default-features = false, version = "0.7.4" }
+overwatch = { workspace = true }
 rand = { default-features = false, version = "0.8" }
 serde = { workspace = true, features = ["derive"] }
 serde_with = { workspace = true }

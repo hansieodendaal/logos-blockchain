@@ -19,6 +19,7 @@ chain-service      = { workspace = true }
 cryptarchia-engine = { features = ["serde"], workspace = true }
 cryptarchia-sync   = { workspace = true }
 futures            = { default-features = false, version = "0.3" }
+nomos-banning      = { workspace = true }
 nomos-core         = { workspace = true }
 nomos-da-sampling  = { workspace = true }
 nomos-ledger       = { features = ["serde"], workspace = true }

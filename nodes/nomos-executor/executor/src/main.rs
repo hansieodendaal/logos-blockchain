@@ -124,6 +124,7 @@ async fn main() -> Result<()> {
             sdp: SdpSettings { declaration: None },
             wallet: config.wallet,
             key_management: config.key_management,
+            banning: config.banning,
             #[cfg(feature = "testing")]
             testing_http: config.testing_http,
         },

@@ -20,6 +20,7 @@ use nomos_api::{
     Backend,
     http::{consensus::Cryptarchia, da::DaVerifier},
 };
+use nomos_banning::BanningService;
 use nomos_core::{
     da::{
         BlobId, DaVerifier as CoreDaVerifier,
@@ -298,6 +299,7 @@ where
             >,
         >
         + AsServiceId<nomos_sdp::SdpService<SdpMempool, RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     type Error = std::io::Error;
     type Settings = AxumBackendSettings;

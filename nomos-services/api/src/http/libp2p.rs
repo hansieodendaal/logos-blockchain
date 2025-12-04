@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 
+use nomos_banning::BanningService;
 use nomos_network::{
     NetworkService,
     backends::libp2p::{Command, Libp2p, Libp2pInfo, NetworkCommand::Info},
@@ -14,8 +15,11 @@ pub async fn libp2p_info<RuntimeServiceId>(
 where
     RuntimeServiceId:
         AsServiceId<NetworkService<Libp2p, RuntimeServiceId>> + Debug + Sync + Display + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = handle.relay().await?;
+    let relay = handle
+        .relay::<NetworkService<Libp2p, RuntimeServiceId>>()
+        .await?;
     let (sender, receiver) = oneshot::channel();
 
     relay

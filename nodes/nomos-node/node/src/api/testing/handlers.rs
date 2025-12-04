@@ -5,6 +5,7 @@ use std::{
 
 use axum::{Json, extract::State, response::Response};
 use nomos_api::http::{da, mantle};
+use nomos_banning::BanningService;
 use nomos_core::{header::HeaderId, sdp::SessionNumber};
 use nomos_da_network_service::{
     NetworkService, api::ApiAdapter as ApiAdapterTrait, backends::NetworkBackend,
@@ -132,6 +133,7 @@ where
         + AsServiceId<TestHttpCryptarchiaService<RuntimeServiceId>>
         + AsServiceId<SdpService<RuntimeServiceId>>
         + AsServiceId<TxMempoolService<RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::get_sdp_declarations::<RuntimeServiceId>(&handle))
 }
