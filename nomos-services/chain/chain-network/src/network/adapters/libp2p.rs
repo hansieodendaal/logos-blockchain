@@ -44,7 +44,8 @@ type Relay<T, RuntimeServiceId> =
 pub struct LibP2pAdapter<Tx, RuntimeServiceId>
 where
     Tx: Clone + Eq,
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display + Send + 'static,
 {
     network_relay:
         OutboundRelay<<NetworkService<Libp2p, RuntimeServiceId> as ServiceData>::Message>,
@@ -59,7 +60,8 @@ pub struct LibP2pAdapterSettings {
 impl<Tx, RuntimeServiceId> LibP2pAdapter<Tx, RuntimeServiceId>
 where
     Tx: Clone + Eq + Serialize,
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display + Send + 'static,
 {
     async fn subscribe(relay: &Relay<Libp2p, RuntimeServiceId>, topic: &str) {
         if let Err((e, _)) = relay
@@ -116,7 +118,8 @@ where
 impl<Tx, RuntimeServiceId> NetworkAdapter<RuntimeServiceId> for LibP2pAdapter<Tx, RuntimeServiceId>
 where
     Tx: AuthenticatedMantleTx + Serialize + DeserializeOwned + Clone + Eq + Send + Sync + 'static,
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display + Send + 'static,
 {
     type Backend = Libp2p;
     type Settings = LibP2pAdapterSettings;

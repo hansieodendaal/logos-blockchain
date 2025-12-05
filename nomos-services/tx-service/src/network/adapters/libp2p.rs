@@ -16,7 +16,8 @@ use crate::network::NetworkAdapter;
 
 pub struct Libp2pAdapter<Item, Key, RuntimeServiceId>
 where
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug + Send + 'static,
 {
     network_relay:
         OutboundRelay<<NetworkService<Libp2p, RuntimeServiceId> as ServiceData>::Message>,
@@ -29,7 +30,8 @@ impl<Item, Key, RuntimeServiceId> NetworkAdapter<RuntimeServiceId>
 where
     Item: DeserializeOwned + Serialize + Send + Sync + 'static + Clone,
     Key: Clone + Send + Sync + 'static,
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug + Send + 'static,
 {
     type Backend = Libp2p;
     type Settings = Settings<Key, Item>;

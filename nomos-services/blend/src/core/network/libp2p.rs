@@ -15,7 +15,8 @@ use super::NetworkAdapter;
 #[derive(Clone)]
 pub struct Libp2pAdapter<RuntimeServiceId>
 where
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display + Send + 'static,
 {
     network_relay:
         OutboundRelay<<NetworkService<Libp2p, RuntimeServiceId> as ServiceData>::Message>,
@@ -31,7 +32,8 @@ pub struct Libp2pBroadcastSettings {
 #[async_trait::async_trait]
 impl<RuntimeServiceId> NetworkAdapter<RuntimeServiceId> for Libp2pAdapter<RuntimeServiceId>
 where
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Sync + Debug + Display + Send + 'static,
 {
     type Backend = Libp2p;
     type BroadcastSettings = Libp2pBroadcastSettings;
