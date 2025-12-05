@@ -6,4 +6,4 @@ mod store;
 mod types;
 mod utils;
 pub use types::{BanStatus, BanningRequest};
-pub use utils::is_banned;
+pub use utils::{is_banned,block_on_now};

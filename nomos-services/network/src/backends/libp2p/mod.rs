@@ -3,8 +3,8 @@ pub mod config;
 pub(crate) mod swarm;
 
 use std::fmt::{Debug, Display};
-
-use nomos_banning::BanningService;
+use std::time::Duration;
+use nomos_banning::{block_on_now, BanStatus, BanningRequest, BanningService};
 pub use nomos_libp2p::{
     PeerId,
     libp2p::gossipsub::{Message, TopicHash},
@@ -13,6 +13,7 @@ use overwatch::{overwatch::handle::OverwatchHandle, services::AsServiceId};
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, broadcast::Sender, mpsc};
+use tokio::time::timeout;
 use tokio_stream::wrappers::BroadcastStream;
 
 use self::swarm::SwarmHandler;
@@ -52,10 +53,17 @@ where
 
         let initial_peers = config.initial_peers.clone();
 
-        let banning_relay = overwatch_handle
-            .runtime()
-            .block_on(overwatch_handle.relay::<BanningService<_>>())
-            .expect("Banning service must be available");
+        // Option A - runtime panic - tokio does not allow block_on inside an active runtime.
+        // let banning_relay = overwatch_handle
+        //     .runtime()
+        //     .block_on(overwatch_handle.relay::<BanningService<_>>())
+        //     .expect("Banning service must be available");
+
+        // Option B
+        let banning_relay = block_on_now(async {
+            overwatch_handle.relay::<BanningService<_>>().await
+        }).expect("Banning service must be available");
+
         let mut swarm_handler = SwarmHandler::new(
             config,
             commands_tx.clone(),

@@ -37,10 +37,10 @@ pub fn is_banned(
     false
 }
 
-// A helper function to block on a future, handling the case where we might
-// already be inside a Tokio runtime (the default in most cases), and ensuring
-// we don't deadlock or panic.
-fn block_on_now<T>(fut: impl Future<Output = T>) -> T {
+/// A helper function to block on a future, handling the case where we might
+/// already be inside a Tokio runtime (the default in most cases), and ensuring
+/// we don't deadlock or panic.
+pub fn block_on_now<T>(fut: impl Future<Output = T>) -> T {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
             // Current runtime is multi-threaded, we can block in place
