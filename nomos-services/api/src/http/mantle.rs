@@ -66,7 +66,8 @@ where
         + Sync
         + Send
         + Display
-        + AsServiceId<MempoolService<StorageAdapter, RuntimeServiceId>>,
+        + AsServiceId<MempoolService<StorageAdapter, RuntimeServiceId>>
+        + 'static,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     let relay = handle
@@ -99,7 +100,8 @@ where
         + Sync
         + Send
         + Display
-        + AsServiceId<MempoolService<StorageAdapter, RuntimeServiceId>>,
+        + AsServiceId<MempoolService<StorageAdapter, RuntimeServiceId>>
+        + 'static,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     let relay = handle

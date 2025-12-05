@@ -489,6 +489,7 @@ pub async fn libp2p_info<RuntimeServiceId>(
 where
     RuntimeServiceId: Debug
         + Sync
+        + Send
         + Display
         + 'static
         + AsServiceId<
