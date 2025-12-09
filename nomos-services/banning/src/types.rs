@@ -40,9 +40,9 @@ pub enum BanStatus {
     },
 }
 
-/// Reported an offense by a peer
+/// Report a ban-able offense/violation by a peer
 #[derive(Clone, Debug)]
-pub struct ReportOffense {
+pub struct Violation {
     /// The peer who committed the offense
     pub peer_id: PeerId,
     /// The subsystem reporting the offense
@@ -56,16 +56,17 @@ pub struct ReportOffense {
 /// Requests that can be made to the banning subsystem
 #[derive(Debug)]
 pub enum BanningRequest {
-    ReportViolation {
-        violation: ReportOffense,
+    BanPeer {
+        violation: Violation,
         reply: Option<oneshot::Sender<BanStatus>>,
     },
     GetBanState {
         peer_id: PeerId,
         reply: oneshot::Sender<BanStatus>,
     },
-    Unban {
+    UnbanPeer {
         peer_id: PeerId,
+        reply: oneshot::Sender<bool>,
     },
     ListActiveBans {
         reply: oneshot::Sender<Vec<(PeerId, BanStatus)>>,

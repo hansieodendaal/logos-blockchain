@@ -3,6 +3,22 @@
     reason = "We split the `Swarm` impls into different modules for better code modularity."
 )]
 
+use crate::behaviour::BehaviourConfig;
+pub use crate::{
+    SwarmConfig,
+    behaviour::{Behaviour, BehaviourEvent},
+};
+use libp2p::{
+    Multiaddr, PeerId, TransportError,
+    identity::ed25519,
+    swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
+};
+use multiaddr::multiaddr;
+use nomos_banning::{BanningRequest, banning_subscribe};
+use overwatch::services::relay::OutboundRelay;
+use rand::RngCore;
+use std::collections::HashSet;
+use std::time::Instant;
 use std::{
     error::Error,
     io,
@@ -11,31 +27,19 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use tokio::sync::broadcast;
 
-use libp2p::{
-    Multiaddr, PeerId, TransportError,
-    identity::ed25519,
-    swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
-};
-use multiaddr::multiaddr;
-use nomos_banning::{BanningRequest, is_banned};
-use overwatch::services::relay::OutboundRelay;
-use rand::RngCore;
-
-use crate::behaviour::BehaviourConfig;
-pub use crate::{
-    SwarmConfig,
-    behaviour::{Behaviour, BehaviourEvent},
-};
-
-/// How long to keep a connection alive once it is idling.
+// How long to keep a connection alive once it is idling.
 const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(300);
+// The maximum amount of time to spent draining banning events per poll to avoid starvation.
+const BAN_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(10);
 
 /// Wraps [`libp2p::Swarm`], and config it for use within Nomos.
 pub struct Swarm<R: Clone + Send + RngCore + 'static> {
     // A core libp2p swarm
     pub(crate) swarm: libp2p::Swarm<Behaviour<R>>,
-    pub(crate) banning_relay: Option<OutboundRelay<BanningRequest>>,
+    pub(crate) banning_events_rx: Option<broadcast::Receiver<nomos_banning::BanningEvent>>,
+    pub(crate) banned_peers: HashSet<PeerId>,
 }
 
 impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
@@ -89,9 +93,13 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 
         let nomos_swarm = {
             let listen_addr = multiaddr(host, port);
+            let banning_events_rx = banning_subscribe(&banning_relay)
+                .inspect_err(|e| tracing::warn!("Could not subscribe to banning events: {e}"))
+                .unwrap_or_default();
             let mut s = Self {
                 swarm,
-                banning_relay,
+                banning_events_rx,
+                banned_peers: Default::default(),
             };
             // We start listening on the provided address, which triggers the Identify flow,
             // which in turn triggers our NAT traversal state machine.
@@ -106,15 +114,18 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     /// Initiates a connection attempt to a peer
     pub fn connect(&mut self, peer_addr: &Multiaddr) -> Result<ConnectionId, DialError> {
         let opt = DialOpts::from(peer_addr.clone());
-        if is_banned(&self.banning_relay, opt.get_peer_id()) {
-            return Err(DialError::Transport(vec![(
-                peer_addr.clone(),
-                TransportError::Other(io::Error::other("Attempted to dial a banned peer")),
-            )]));
+        if let Some(peer_id) = opt.get_peer_id().as_ref() {
+            self.poll_banning_events(None);
+            if self.banned_peers.contains(peer_id) {
+                return Err(DialError::Transport(vec![(
+                    peer_addr.clone(),
+                    TransportError::Other(io::Error::other("Attempted to dial a banned peer")),
+                )]));
+            }
         }
         let connection_id = opt.connection_id();
 
-        tracing::debug!("attempting to dial {peer_addr}. connection_id:{connection_id:?}",);
+        tracing::debug!("attempting to dial {peer_addr}. connection_id:{connection_id:?}");
         self.swarm.dial(opt)?;
         Ok(connection_id)
     }
@@ -128,13 +139,97 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     pub const fn swarm(&self) -> &libp2p::Swarm<Behaviour<R>> {
         &self.swarm
     }
+
+    // A light-weight version of poll_banning_events that limits the time spent processing
+    // banning events to avoid starving the swarm event polling. Ban and unban events only change
+    // the internal state of the swarm wrapper, so that targeted disconnects can be processed when
+    // needed.
+    fn poll_banning_events(&mut self, cx: Option<&Context<'_>>) {
+        let Some(rx) = &mut self.banning_events_rx else {
+            return;
+        };
+
+        let start = Instant::now();
+        loop {
+            if start.elapsed() >= BAN_DRAIN_TIME_BUDGET {
+                // Re-schedule to continue processing remaining events later
+                if let Some(context) = cx {
+                    context.waker().wake_by_ref();
+                }
+                break;
+            }
+
+            match rx.try_recv() {
+                Ok(event) => {
+                    use nomos_banning::BanningEvent;
+                    match event {
+                        BanningEvent::Banned {
+                            peer_id,
+                            banned_until,
+                            offense,
+                            context,
+                        } => {
+                            tracing::debug!(
+                                "Peer {peer_id} banned until {banned_until:?} for offense {offense:?} with context \
+                                {context:?}"
+                            );
+                            self.banned_peers.insert(peer_id.clone());
+                        }
+                        BanningEvent::Unbanned { peer_id, .. } => {
+                            tracing::debug!("Peer {peer_id} unbanned (event)");
+                            self.banned_peers.remove(&peer_id);
+                        }
+                    }
+                    // loop continues until time budget exhausted
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.banning_events_rx = None;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
     type Item = SwarmEvent<BehaviourEvent<R>>;
 
+    // This polls the inner swarm, inspects connection events and disconnects peers flagged by
+    // `is_banned`. Banned connection events are dropped and polling continues until a non-banned event
+    // is returned or Pending.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.swarm).poll_next(cx)
+        loop {
+            self.poll_banning_events(Some(cx));
+
+            match Pin::new(&mut self.swarm).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(event)) => {
+                    // Inspect connection/peer-related events and drop banned peers. Pattern matches
+                    // are intentionally broad to handle common variants.
+                    match &event {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. }
+                        | SwarmEvent::Dialing {
+                            peer_id: Some(peer_id),
+                            ..
+                        } => {
+                            if self.banned_peers.contains(peer_id) {
+                                // Disconnect the peer and drop this event.
+                                let _ = self.swarm.disconnect_peer_id(peer_id.clone());
+                                // Continue the loop to poll for the next event
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Not banned (or not a connection event we care about) — forward it.
+                    return Poll::Ready(Some(event));
+                }
+            }
+        }
     }
 }
 
