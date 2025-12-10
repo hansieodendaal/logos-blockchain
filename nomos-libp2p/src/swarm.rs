@@ -284,7 +284,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                 }
             };
             let _ = tokio::time::timeout(timeout, wait_future).await;
-            in_progress.load(Ordering::SeqCst)
+            !in_progress.load(Ordering::SeqCst)
         })
     }
 }
