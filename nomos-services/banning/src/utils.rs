@@ -1,45 +1,165 @@
+//! Utility functions for the banning subsystem, providing a bridge/interface between synchronous
+//!callers and the asynchronous banning service.
+
 use std::time::Duration;
 
+use crate::types::{BanningEvent, Violation};
+use crate::{BanStatus, BanningRequest};
 use libp2p::PeerId;
 use overwatch::services::relay::OutboundRelay;
+use tokio::sync::{broadcast, oneshot};
 use tokio::{runtime::RuntimeFlavor, time::timeout};
 
-use crate::{BanStatus, BanningRequest};
+const TIMEOUT_WAITING_FOR_SERVICE: Duration = Duration::from_secs(2);
 
-/// Checks if a peer is currently banned by querying the banning subsystem via
-/// the provided `banning_relay`. If `peer_id` is `None`, returns `false`.
-#[must_use]
-pub fn is_banned(
+// /// Checks if a peer is currently banned by querying the banning subsystem via the provided
+// /// `banning_relay`. If `peer_id` is `None`, returns `false`.
+// #[allow(clippy::must_use_candidate)]
+// pub fn banning_is_banned(
+//     banning_relay: &Option<OutboundRelay<BanningRequest>>,
+//     peer_id: Option<&PeerId>,
+// ) -> bool {
+//     if let Some(banning_relay) = banning_relay
+//         && let Some(peer_id) = peer_id
+//     {
+//         return block_on_now(async {
+//             let (tx, rx) = oneshot::channel();
+//             // Treat failures as "not banned" (service is going down or relay closed)
+//             if banning_relay
+//                 .send(BanningRequest::GetBanState {
+//                     peer_id: *peer_id,
+//                     reply: tx,
+//                 })
+//                 .await
+//                 .is_err()
+//             {
+//                 return false;
+//             }
+//             let ban_status = timeout(TIMEOUT_WAITING_FOR_SERVICE, rx)
+//                 .await
+//                 .ok() // timeout -> None
+//                 .and_then(Result::ok) // channel closed -> None
+//                 .unwrap_or(BanStatus::NotBanned);
+//             matches!(ban_status, BanStatus::Banned { .. })
+//         });
+//     }
+//     false
+// }
+
+/// Report a banning violation to get a peer banned using the banning subsystem via the provided
+/// `banning_relay`. If `peer_id` is `None`, returns `false`.
+pub fn banning_ban_peer(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
-    peer_id: Option<PeerId>,
-) -> bool {
-    if let Some(banning_relay) = banning_relay
-        && let Some(peer_id) = peer_id
-    {
+    violation: Violation,
+) -> Result<bool, overwatch::DynError> {
+    if let Some(banning_relay) = banning_relay {
         return block_on_now(async {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            // Treat failures as "not banned" (service is going down or relay closed)
-            if banning_relay
-                .send(BanningRequest::GetBanState { peer_id, reply: tx })
+            let (tx, rx) = oneshot::channel();
+            if let Err(err) = banning_relay
+                .send(BanningRequest::BanPeer {
+                    violation,
+                    reply: Some(tx),
+                })
                 .await
-                .is_err()
             {
-                return false;
+                return Err(format!("[Banning] 'ban_peer' oneshot error: {err:?}").into());
             }
-            let ban_status = timeout(Duration::from_secs(2), rx)
+            let ban_status = timeout(TIMEOUT_WAITING_FOR_SERVICE, rx)
                 .await
                 .ok() // timeout -> None
                 .and_then(Result::ok) // channel closed -> None
                 .unwrap_or(BanStatus::NotBanned);
-            matches!(ban_status, BanStatus::Banned { .. })
+            Ok(matches!(ban_status, BanStatus::Banned { .. }))
         });
     }
-    false
+    Ok(false)
 }
 
-/// A helper function to block on a future, handling the case where we might
-/// already be inside a Tokio runtime (the default in most cases), and ensuring
-/// we don't deadlock or panic.
+/// Unban a peer using the banning subsystem via the provided `banning_relay`. If `peer_id` is
+/// `None`, returns `false`.
+pub fn banning_unban_peer(
+    banning_relay: &Option<OutboundRelay<BanningRequest>>,
+    peer_id: &PeerId,
+) -> Result<bool, overwatch::DynError> {
+    if let Some(banning_relay) = banning_relay {
+        return block_on_now(async {
+            let (tx, rx) = oneshot::channel();
+            if let Err(err) = banning_relay
+                .send(BanningRequest::UnbanPeer {
+                    peer_id: *peer_id,
+                    reply: tx,
+                })
+                .await
+            {
+                return Err(format!("[Banning] 'unban_peer' oneshot error: {err:?}").into());
+            }
+            let unbanned = timeout(TIMEOUT_WAITING_FOR_SERVICE, rx)
+                .await
+                .ok() // timeout -> None
+                .and_then(Result::ok) // channel closed -> None
+                .unwrap_or_default();
+            Ok(unbanned)
+        });
+    }
+    Ok(false)
+}
+
+/// Subscribe to banning events using the banning subsystem via the provided `banning_relay`.
+pub fn banning_subscribe(
+    banning_relay: &Option<OutboundRelay<BanningRequest>>,
+) -> Result<Option<broadcast::Receiver<BanningEvent>>, overwatch::DynError> {
+    if let Some(banning_relay) = banning_relay {
+        return block_on_now(async {
+            let (tx, rx) = oneshot::channel();
+            match banning_relay
+                .send(BanningRequest::Subscribe { reply: tx })
+                .await
+            {
+                Ok(()) => match timeout(TIMEOUT_WAITING_FOR_SERVICE, rx).await {
+                    Ok(Ok(val)) => Ok(Some(val)),
+                    Ok(Err(err)) => {
+                        Err(format!("[Banning] 'subscribe' oneshot error: {err}").into())
+                    }
+                    Err(_) => Err("[Banning] Timeout 'subscribe'".into()),
+                },
+                Err(err) => Err(format!("[Banning] relay send error 'subscribe': {err:?}").into()),
+            }
+        });
+    }
+    Ok(None)
+}
+
+/// List all active bans using the banning subsystem via the provided `banning_relay`.
+pub fn banning_list_active_bans(
+    banning_relay: &Option<OutboundRelay<BanningRequest>>,
+) -> Result<Vec<(PeerId, BanStatus)>, overwatch::DynError> {
+    if let Some(banning_relay) = banning_relay {
+        return block_on_now(async {
+            let (tx, rx) = oneshot::channel();
+            match banning_relay
+                .send(BanningRequest::ListActiveBans { reply: tx })
+                .await
+            {
+                Ok(()) => match timeout(TIMEOUT_WAITING_FOR_SERVICE, rx).await {
+                    Ok(Ok(ban_list)) => Ok(ban_list),
+                    Ok(Err(err)) => {
+                        Err(format!("[Banning] 'list_active_bans' oneshot error: {err}").into())
+                    }
+                    Err(_) => Err("[Banning] Timeout 'list_active_bans'".into()),
+                },
+                Err(err) => {
+                    Err(format!("[Banning] Relay send error 'list_active_bans': {err:?}").into())
+                }
+            }
+        });
+    }
+    Ok(vec![])
+}
+
+/// A helper function to block on a future, handling the case where we might already be inside a
+/// Tokio runtime (the default in most cases), and ensuring we don't deadlock or panic. It uses
+/// 'tokio::task::block_in_place' on a multi-thread runtime, so it won't deadlock the runtime. If a
+/// suitable multi-thread runtime is not available, it creates a temporary one to run the future.
 pub fn block_on_now<T>(fut: impl Future<Output = T>) -> T {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {

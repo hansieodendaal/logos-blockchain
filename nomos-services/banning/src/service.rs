@@ -20,7 +20,9 @@ use crate::{
     types::{BanStatus, BanningEvent, BanningRequest},
 };
 
-const BROADCAST_CHANNEL_SIZE: usize = 128;
+// This is sufficiently large so no banning events are dropped in the subscribers for realistic
+// scenarios.
+const BROADCAST_CHANNEL_SIZE: usize = 2000;
 
 /// The banning service.
 pub struct BanningService<RuntimeServiceId> {
@@ -94,7 +96,7 @@ where
                 inbound = self.service_resources_handle.inbound_relay.recv() => {
                     if let Some(msg) = inbound {
                         match msg {
-                            BanningRequest::ReportViolation { violation, reply } => {
+                            BanningRequest::BanPeer { violation, reply } => {
                                 let ban_result = self.state.store.ban_peer(
                                     violation.peer_id,
                                     violation.offense_kind,
@@ -134,14 +136,16 @@ where
                                 let _unused = reply.send(state);
                             }
 
-                            BanningRequest::Unban { peer_id } => {
+                            BanningRequest::UnbanPeer { peer_id , reply} => {
                                 if self.state.store.unban_peer(&peer_id) {
-                                let _unused = self.state.events.send(BanningEvent::Unbanned { peer_id });
+                                    let _unused = self.state.events.send(BanningEvent::Unbanned { peer_id });
+                                    let _unused = reply.send(true);
                                     debug!(
                                         "[Banning service][Unban] Peer '{}' unbanned",
                                         peer_id,
                                     );
                                 } else {
+                                    let _unused = reply.send(false);
                                     debug!(
                                         "[Banning service][Unban] Peer '{}' was not banned",
                                         peer_id,

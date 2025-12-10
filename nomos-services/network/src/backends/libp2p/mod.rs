@@ -3,8 +3,8 @@ pub mod config;
 pub(crate) mod swarm;
 
 use std::fmt::{Debug, Display};
-use std::time::Duration;
-use nomos_banning::{block_on_now, BanStatus, BanningRequest, BanningService};
+
+use nomos_banning::BanningService;
 pub use nomos_libp2p::{
     PeerId,
     libp2p::gossipsub::{Message, TopicHash},
@@ -13,7 +13,6 @@ use overwatch::{overwatch::handle::OverwatchHandle, services::AsServiceId};
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, broadcast::Sender, mpsc};
-use tokio::time::timeout;
 use tokio_stream::wrappers::BroadcastStream;
 
 use self::swarm::SwarmHandler;
@@ -37,7 +36,8 @@ const BUFFER_SIZE: usize = 64;
 #[async_trait::async_trait]
 impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p
 where
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug,
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Display + Sync + Debug + Send + 'static,
 {
     type Settings = Libp2pConfig;
     type Message = Command;
@@ -45,7 +45,6 @@ where
     type ChainSyncEvent = ChainSyncEvent;
 
     fn new(config: Self::Settings, overwatch_handle: OverwatchHandle<RuntimeServiceId>) -> Self {
-        let rng = ChaCha20Rng::from_entropy();
         let (commands_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
 
         let (pubsub_events_tx, _) = broadcast::channel(BUFFER_SIZE);
@@ -53,28 +52,33 @@ where
 
         let initial_peers = config.initial_peers.clone();
 
-        // Option A - runtime panic - tokio does not allow block_on inside an active runtime.
-        // let banning_relay = overwatch_handle
-        //     .runtime()
-        //     .block_on(overwatch_handle.relay::<BanningService<_>>())
-        //     .expect("Banning service must be available");
+        // Clone the senders for the spawned task
+        let pubsub_events_tx_clone = pubsub_events_tx.clone();
+        let chainsync_events_tx_clone = chainsync_events_tx.clone();
+        let commands_tx_clone = commands_tx.clone();
 
-        // Option B
-        let banning_relay = block_on_now(async {
-            overwatch_handle.relay::<BanningService<_>>().await
-        }).expect("Banning service must be available");
+        // Get the runtime handle before moving overwatch_handle into the async block
+        let runtime = overwatch_handle.runtime().clone();
 
-        let mut swarm_handler = SwarmHandler::new(
-            config,
-            commands_tx.clone(),
-            commands_rx,
-            pubsub_events_tx.clone(),
-            chainsync_events_tx.clone(),
-            rng,
-            Some(banning_relay),
-        );
+        // Spawn the swarm handler task. The banning relay is acquired inside the async
+        // block to avoid blocking execution.
+        runtime.spawn(async move {
+            let banning_relay = overwatch_handle
+                .relay::<BanningService<_>>()
+                .await
+                .expect("Banning service must be available");
 
-        overwatch_handle.runtime().spawn(async move {
+            let rng = ChaCha20Rng::from_entropy();
+            let mut swarm_handler = SwarmHandler::new(
+                config,
+                commands_tx_clone,
+                commands_rx,
+                pubsub_events_tx_clone,
+                chainsync_events_tx_clone,
+                rng,
+                Some(banning_relay),
+            );
+
             swarm_handler.run(initial_peers).await;
         });
 

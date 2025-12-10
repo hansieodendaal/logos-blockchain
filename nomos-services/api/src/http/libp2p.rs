@@ -13,8 +13,12 @@ pub async fn libp2p_info<RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
 ) -> Result<Libp2pInfo, overwatch::DynError>
 where
-    RuntimeServiceId:
-        AsServiceId<NetworkService<Libp2p, RuntimeServiceId>> + Debug + Sync + Display + 'static,
+    RuntimeServiceId: AsServiceId<NetworkService<Libp2p, RuntimeServiceId>>
+        + Debug
+        + Sync
+        + Display
+        + Send
+        + 'static,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     let relay = handle
