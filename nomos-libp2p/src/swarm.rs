@@ -47,7 +47,7 @@ pub struct Swarm<R: Clone + Send + RngCore + 'static> {
     pub(crate) banning_relay: Option<OutboundRelay<BanningRequest>>,
     pub(crate) banning_events_rx: Arc<Mutex<Option<broadcast::Receiver<BanningEvent>>>>,
     pub(crate) banned_peers: Arc<RwLock<HashSet<PeerId>>>,
-    pub(crate) banned_peers_background_sync_in_progess: Arc<AtomicBool>,
+    pub(crate) banned_peers_background_sync_in_progress: Arc<AtomicBool>,
     pub(crate) banned_peers_background_sync_notify: Arc<Notify>,
 }
 
@@ -112,7 +112,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                 banning_relay,
                 banning_events_rx,
                 banned_peers: Arc::new(RwLock::new(HashSet::default())),
-                banned_peers_background_sync_in_progess: Arc::new(AtomicBool::new(false)),
+                banned_peers_background_sync_in_progress: Arc::new(AtomicBool::new(false)),
                 banned_peers_background_sync_notify: Arc::new(Notify::new()),
             };
             // We start listening on the provided address, which triggers the Identify flow,
@@ -242,7 +242,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     // the next time `update_banned_peer_list` is called.
     fn background_refresh_active_bans_from_relay(&self) {
         if self
-            .banned_peers_background_sync_in_progess
+            .banned_peers_background_sync_in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
@@ -251,7 +251,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 
         let banning_relay_clone = self.banning_relay.clone();
         let banned_peers_clone = Arc::clone(&self.banned_peers);
-        let in_progress = Arc::clone(&self.banned_peers_background_sync_in_progess);
+        let in_progress = Arc::clone(&self.banned_peers_background_sync_in_progress);
         let notify = Arc::clone(&self.banned_peers_background_sync_notify);
         tokio::spawn(async move {
             // This will tiemout internally if the banning service is unresponsive.
@@ -273,12 +273,12 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     }
 
     // Wait for any in-progress banned peer background sync to complete, up to the provided timeout.
-    // fn wait_for_banned_peers_background_sync(&self, timeout: Duration) -> bool {
+    // Returns 'true' if the sync completed, 'false' if timed out.
     fn wait_for_banned_peers_background_sync(&self, timeout: Duration) -> bool {
-        let in_progress = &self.banned_peers_background_sync_in_progess;
+        let in_progress = &self.banned_peers_background_sync_in_progress;
         block_on_now(async {
             let wait_future = async {
-                while self.banned_peers_background_sync_in_progess.load(Ordering::SeqCst)
+                while self.banned_peers_background_sync_in_progress.load(Ordering::SeqCst)
                 {
                     self.banned_peers_background_sync_notify.notified().await;
                 }
