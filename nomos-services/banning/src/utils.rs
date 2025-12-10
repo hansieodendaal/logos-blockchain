@@ -156,10 +156,10 @@ pub fn banning_list_active_bans(
     Ok(vec![])
 }
 
-// A helper function to block on a future, handling the case where we might already be inside a
-// Tokio runtime (the default in most cases), and ensuring we don't deadlock or panic. It uses
-// 'tokio::task::block_in_place' on a multi-thread runtime, so it won't deadlock the runtime. If a
-// suitable multi-thread runtime is not available, it creates a temporary one to run the future.
+/// A helper function to block on a future, handling the case where we might already be inside a
+/// Tokio runtime (the default in most cases), and ensuring we don't deadlock or panic. It uses
+/// 'tokio::task::block_in_place' on a multi-thread runtime, so it won't deadlock the runtime. If a
+/// suitable multi-thread runtime is not available, it creates a temporary one to run the future.
 pub fn block_on_now<T>(fut: impl Future<Output = T>) -> T {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
