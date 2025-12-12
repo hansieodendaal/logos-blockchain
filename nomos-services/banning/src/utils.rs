@@ -53,7 +53,7 @@ pub fn banning_ban_peer(
     violation: Violation,
 ) -> Result<bool, overwatch::DynError> {
     if let Some(banning_relay) = banning_relay {
-        return block_on_now(async {
+        return block_on_now_from_sync(async {
             let (tx, rx) = oneshot::channel();
             if let Err(err) = banning_relay
                 .send(BanningRequest::BanPeer {
@@ -82,7 +82,7 @@ pub fn banning_unban_peer(
     peer_id: &PeerId,
 ) -> Result<bool, overwatch::DynError> {
     if let Some(banning_relay) = banning_relay {
-        return block_on_now(async {
+        return block_on_now_from_sync(async {
             let (tx, rx) = oneshot::channel();
             if let Err(err) = banning_relay
                 .send(BanningRequest::UnbanPeer {
@@ -109,7 +109,7 @@ pub fn banning_subscribe(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
 ) -> Result<Option<broadcast::Receiver<BanningEvent>>, overwatch::DynError> {
     if let Some(banning_relay) = banning_relay {
-        return block_on_now(async {
+        return block_on_now_from_sync(async {
             let (tx, rx) = oneshot::channel();
             match banning_relay
                 .send(BanningRequest::Subscribe { reply: tx })
@@ -134,7 +134,7 @@ pub fn banning_list_active_bans(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
 ) -> Result<Vec<(PeerId, BanStatus)>, overwatch::DynError> {
     if let Some(banning_relay) = banning_relay {
-        return block_on_now(async {
+        return block_on_now_from_sync(async {
             let (tx, rx) = oneshot::channel();
             match banning_relay
                 .send(BanningRequest::ListActiveBans { reply: tx })
@@ -156,11 +156,22 @@ pub fn banning_list_active_bans(
     Ok(vec![])
 }
 
-/// A helper function to block on a future, handling the case where we might already be inside a
-/// Tokio runtime (the default in most cases), and ensuring we don't deadlock or panic. It uses
-/// 'tokio::task::block_in_place' on a multi-thread runtime, so it won't deadlock the runtime. If a
-/// suitable multi-thread runtime is not available, it creates a temporary one to run the future.
-pub fn block_on_now<T>(fut: impl Future<Output = T>) -> T {
+/// A synchronous helper that runs a future to completion from synchronous code, ensuring we don't
+/// deadlock or panic.
+///
+/// This helper function is intended for bridging sync APIs to async services. Behaviour:
+/// - When inside a Tokio multi-thread runtime, it uses `block_in_place(|| handle.block_on(fut))` to
+///   re-enter the async context but not deadlock the runtime.
+/// - If the current Tokio runtime is single-threaded, it creates a temporary multi-thread runtime
+///   to run the future.
+/// - If no Tokio runtime is available, it creates a temporary single-thread runtime to run the
+///   future.
+///
+/// Safety notes:
+/// - Creating a temporary runtime has non‑trivial cost and may affect timing in tests.
+/// - Callers should avoid calling this from latency‑sensitive async paths when inside a multi‑thread
+///   runtime.
+pub fn block_on_now_from_sync<T>(fut: impl Future<Output = T>) -> T {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
             // Current runtime is multi-threaded, we can block in place

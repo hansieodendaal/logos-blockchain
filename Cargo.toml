@@ -66,6 +66,7 @@ members = [
   "tests",
   "utxotree",
   "wallet",
+  "wallet-http-client",
   "zk/circuits/prover",
   "zk/circuits/utils",
   "zk/circuits/verifier",
@@ -144,6 +145,7 @@ tests                         = { default-features = false, path = "./tests" }
 tx-service                    = { default-features = false, path = "./nomos-services/tx-service" }
 utxotree                      = { default-features = false, path = "./utxotree" }
 wallet                        = { default-features = false, path = "./wallet" }
+wallet-http-client            = { default-features = false, path = "./wallet-http-client" }
 witness-generator             = { default-features = false, path = "zk/circuits/witness-generator" }
 zksign                        = { default-features = false, path = "./zk/proofs/zksign" }
 
@@ -152,6 +154,7 @@ blake2            = { default-features = false, version = "0.10" }
 bytes             = { default-features = false, version = "1.3" }
 cached            = { default-features = false, version = "0.55.1" }
 fork_stream       = { default-features = false, version = "0.1.0" }
+hex               = { default-features = false, version = "0.4" }
 libp2p            = { default-features = false, version = "0.55" }
 libp2p-stream     = { default-features = false, version = "0.3.0-alpha" }
 overwatch         = { default-features = false, git = "https://github.com/logos-co/Overwatch", rev = "f5a9902" }
@@ -160,6 +163,7 @@ rand              = { default-features = false, version = "0.8" }
 reqwest           = { default-features = false, version = "0.12" }
 serde             = { default-features = false, version = "1.0" }
 serde-big-array   = { default-features = false, version = "0.5" }
+serde_ignored     = { default-features = false, version = "0.1" }
 serde_json        = { default-features = false, version = "1.0" }
 serde_with        = { default-features = false, version = "3.14.0" }
 serde_yaml        = { default-features = false, version = "0.9.33" }

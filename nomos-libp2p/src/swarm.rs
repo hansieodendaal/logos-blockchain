@@ -15,7 +15,7 @@ use libp2p::{
 };
 use multiaddr::multiaddr;
 use nomos_banning::{
-    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe, block_on_now,
+    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe, block_on_now_from_sync,
 };
 use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
@@ -276,9 +276,11 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     // Returns 'true' if the sync completed, 'false' if timed out.
     fn wait_for_banned_peers_background_sync(&self, timeout: Duration) -> bool {
         let in_progress = &self.banned_peers_background_sync_in_progress;
-        block_on_now(async {
+        block_on_now_from_sync(async {
             let wait_future = async {
-                while self.banned_peers_background_sync_in_progress.load(Ordering::SeqCst)
+                while self
+                    .banned_peers_background_sync_in_progress
+                    .load(Ordering::SeqCst)
                 {
                     self.banned_peers_background_sync_notify.notified().await;
                 }
