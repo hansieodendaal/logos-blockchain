@@ -41,7 +41,8 @@ const TIMEOUT_WAITING_FOR_SERVICE: Duration = Duration::from_secs(2);
 //                 .and_then(Result::ok) // channel closed -> None
 //                 .unwrap_or(BanStatus::NotBanned);
 //             matches!(ban_status, BanStatus::Banned { .. })
-//         });
+//         })
+//         .unwrap_or_else(Err);
 //     }
 //     false
 // }
@@ -70,7 +71,8 @@ pub fn banning_ban_peer(
                 .and_then(Result::ok) // channel closed -> None
                 .unwrap_or(BanStatus::NotBanned);
             Ok(matches!(ban_status, BanStatus::Banned { .. }))
-        });
+        })
+        .unwrap_or_else(Err);
     }
     Ok(false)
 }
@@ -99,7 +101,8 @@ pub fn banning_unban_peer(
                 .and_then(Result::ok) // channel closed -> None
                 .unwrap_or_default();
             Ok(unbanned)
-        });
+        })
+        .unwrap_or_else(Err);
     }
     Ok(false)
 }
@@ -124,7 +127,8 @@ pub fn banning_subscribe(
                 },
                 Err(err) => Err(format!("[Banning] relay send error 'subscribe': {err:?}").into()),
             }
-        });
+        })
+        .unwrap_or_else(Err);
     }
     Ok(None)
 }
@@ -151,7 +155,8 @@ pub fn banning_list_active_bans(
                     Err(format!("[Banning] Relay send error 'list_active_bans': {err:?}").into())
                 }
             }
-        });
+        })
+        .unwrap_or_else(Err);
     }
     Ok(vec![])
 }
@@ -171,11 +176,11 @@ pub fn banning_list_active_bans(
 /// - Creating a temporary runtime has non‑trivial cost and may affect timing in tests.
 /// - Callers should avoid calling this from latency‑sensitive async paths when inside a multi‑thread
 ///   runtime.
-pub fn block_on_now_from_sync<T>(fut: impl Future<Output = T>) -> T {
+pub fn block_on_now_from_sync<T>(fut: impl Future<Output = T>) -> Result<T, overwatch::DynError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
             // Current runtime is multi-threaded, we can block in place
-            tokio::task::block_in_place(|| handle.block_on(fut))
+            Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
         } else {
             // Current runtime is not multi-threaded, create a temporary multi-threaded
             // runtime
@@ -183,15 +188,17 @@ pub fn block_on_now_from_sync<T>(fut: impl Future<Output = T>) -> T {
                 .worker_threads(2)
                 .enable_time()
                 .build()
-                .expect("temp runtime");
-            rt.block_on(fut)
+                .map_err(|e| {
+                    format!("[Banning] failed to create temp multi-thread runtime: {e}")
+                })?;
+            Ok(rt.block_on(fut))
         }
     } else {
         // We do not have a runtime available, create a new one
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
-            .expect("temp runtime");
-        rt.block_on(fut)
+            .map_err(|e| format!("[Banning] failed to create temp current-thread runtime: {e}"))?;
+        Ok(rt.block_on(fut))
     }
 }

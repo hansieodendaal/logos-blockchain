@@ -15,7 +15,8 @@ use libp2p::{
 };
 use multiaddr::multiaddr;
 use nomos_banning::{
-    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe, block_on_now_from_sync,
+    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe,
+    block_on_now_from_sync,
 };
 use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
@@ -187,7 +188,8 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                 }
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     tracing::warn!(
-                        "We missed {skipped} banning events, refreshing the banned peer list."
+                        "We missed {skipped} banning events, refreshing the banned peer list in \
+                        the background."
                     );
                     // Drop the mutex guard before doing the potentially-blocking work
                     drop(banning_events_rx);
@@ -199,6 +201,10 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                     break (self.snapshot_banned_peers(), true);
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
+                    tracing::warn!(
+                        "The banning events subscribe channel unexpectedly closed, no further \
+                        banning events will be received."
+                    );
                     *banning_events_rx = None;
                     drop(banning_events_rx);
                     break (self.snapshot_banned_peers(), false);
@@ -273,10 +279,10 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     }
 
     // Wait for any in-progress banned peer background sync to complete, up to the provided timeout.
-    // Returns 'true' if the sync completed, 'false' if timed out.
+    // Returns 'true' if the sync completed in time, 'false' if timed out or errored.
     fn wait_for_banned_peers_background_sync(&self, timeout: Duration) -> bool {
         let in_progress = &self.banned_peers_background_sync_in_progress;
-        block_on_now_from_sync(async {
+        let res = block_on_now_from_sync(async {
             let wait_future = async {
                 while self
                     .banned_peers_background_sync_in_progress
@@ -287,7 +293,18 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             };
             let _ = tokio::time::timeout(timeout, wait_future).await;
             !in_progress.load(Ordering::SeqCst)
-        })
+        });
+        match res {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!("Could not complete banned peer background sync in {timeout:.2?}");
+                false
+            }
+            Err(err) => {
+                tracing::warn!("Error waiting for banned peer background sync: {err}");
+                false
+            }
+        }
     }
 }
 
