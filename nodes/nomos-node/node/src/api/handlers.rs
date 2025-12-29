@@ -54,7 +54,6 @@ use tx_service::{
     TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
 };
-use zksign::PublicKey;
 #[cfg(feature = "block-explorer")]
 use {
     crate::api::{queries::BlockRangeQuery, serializers::blocks::ApiBlock},
@@ -1057,6 +1056,8 @@ where
 }
 
 pub mod wallet {
+    use key_management_system_service::keys::ZkPublicKey;
+
     use super::*;
 
     #[derive(Deserialize)]
@@ -1082,7 +1083,7 @@ pub mod wallet {
         RuntimeServiceId,
     >(
         State(handle): State<OverwatchHandle<RuntimeServiceId>>,
-        Path(address): Path<PublicKey>,
+        Path(address): Path<ZkPublicKey>,
         Query(query): Query<TipQuery>,
     ) -> Response
     where

@@ -85,9 +85,9 @@ dependencies = [
 
 [[package]]
 name = "aligned"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "377e4c0ba83e4431b10df45c1d4666f178ea9c552cac93e60c3a88bf32785923"
+checksum = "ee4508988c62edf04abd8d92897fca0c2995d907ce1dfeaf369dac3716a40685"
 dependencies = [
  "as-slice",
 ]
@@ -1709,7 +1709,7 @@ dependencies = [
  "nomos-tracing-service",
  "nomos-utils",
  "rand 0.8.5",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -1736,8 +1736,8 @@ dependencies = [
  "chain-common",
  "chain-service",
  "cryptarchia-engine",
- "ed25519-dalek",
  "futures",
+ "key-management-system-keys",
  "nomos-blend-service",
  "nomos-core",
  "nomos-da-sampling",
@@ -1752,7 +1752,6 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "tx-service",
- "zksign",
 ]
 
 [[package]]
@@ -1794,9 +1793,9 @@ dependencies = [
  "bytes",
  "cryptarchia-engine",
  "cryptarchia-sync",
- "ed25519-dalek",
  "futures",
  "groth16",
+ "key-management-system-keys",
  "nomos-core",
  "nomos-ledger",
  "nomos-network",
@@ -1996,7 +1995,7 @@ dependencies = [
  "nomos-core",
  "nomos-da-messages",
  "nomos-http-api-common",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3184,7 +3183,7 @@ dependencies = [
  "futures",
  "nomos-core",
  "nomos-http-api-common",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
 ]
 
@@ -4348,7 +4347,7 @@ dependencies = [
  "rgb",
  "tiff",
  "zune-core 0.5.0",
- "zune-jpeg 0.5.6",
+ "zune-jpeg 0.5.7",
 ]
 
 [[package]]
@@ -4677,10 +4676,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "ed25519-dalek",
+ "generic-array 1.3.5",
  "groth16",
  "key-management-system-macros",
  "nomos-blend-proofs",
  "nomos-utils",
+ "num-bigint",
+ "poseidon2",
+ "rand_core 0.6.4",
  "serde",
  "subtle",
  "thiserror 2.0.17",
@@ -4705,7 +4708,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "ed25519-dalek",
  "key-management-system-keys",
  "log",
  "num-bigint",
@@ -4716,7 +4718,6 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -5285,13 +5286,13 @@ dependencies = [
 
 [[package]]
 name = "libredox"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "416f7e718bdb06000964960ffa43b4335ad4012ae8b99060261aa4a8088d5ccb"
+checksum = "df15f6eac291ed1cf25865b1ee60399f57e7c227e7f51bdbd4c5270396a9ed50"
 dependencies = [
  "bitflags 2.10.0",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.6.0",
 ]
 
 [[package]]
@@ -5309,9 +5310,9 @@ dependencies = [
 
 [[package]]
 name = "libz-rs-sys"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b484ba8d4f775eeca644c452a56650e544bf7e617f1d170fe7298122ead5222"
+checksum = "15413ef615ad868d4d65dce091cb233b229419c7c0c4bcaa746c0901c49ff39c"
 dependencies = [
  "zlib-rs",
 ]
@@ -5605,9 +5606,9 @@ dependencies = [
 
 [[package]]
 name = "moxcms"
-version = "0.7.10"
+version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80986bbbcf925ebd3be54c26613d861255284584501595cf418320c078945608"
+checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -5933,7 +5934,7 @@ dependencies = [
  "nomos-sdp",
  "nomos-storage",
  "overwatch",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
  "serde_json",
  "subnetworks-assignations",
@@ -5975,7 +5976,6 @@ name = "nomos-blend-crypto"
 version = "0.1.0"
 dependencies = [
  "blake2",
- "ed25519-dalek",
  "groth16",
  "nomos-utils",
  "num-bigint",
@@ -5987,7 +5987,6 @@ dependencies = [
  "thiserror 1.0.69",
  "x25519-dalek",
  "zeroize",
- "zksign",
 ]
 
 [[package]]
@@ -5996,9 +5995,7 @@ version = "0.1.0"
 dependencies = [
  "blake2",
  "derivative",
- "ed25519-dalek",
  "groth16",
- "hex",
  "itertools 0.14.0",
  "key-management-system-keys",
  "nomos-blend-crypto",
@@ -6027,7 +6024,6 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "libp2p-swarm-test",
- "nomos-blend-crypto",
  "nomos-blend-message",
  "nomos-blend-proofs",
  "nomos-blend-scheduling",
@@ -6044,15 +6040,16 @@ name = "nomos-blend-proofs"
 version = "0.1.0"
 dependencies = [
  "const-hex",
+ "ed25519-dalek",
  "generic-array 1.3.5",
  "groth16",
+ "key-management-system-keys",
  "nomos-blend-crypto",
  "nomos-core",
  "num-bigint",
  "poq",
  "serde",
  "thiserror 1.0.69",
- "zksign",
 ]
 
 [[package]]
@@ -6089,7 +6086,6 @@ dependencies = [
  "broadcast-service",
  "chain-service",
  "cryptarchia-engine",
- "ed25519-dalek",
  "fork_stream",
  "futures",
  "groth16",
@@ -6118,7 +6114,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -6126,7 +6121,14 @@ name = "nomos-c"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "chain-service",
+ "cryptarchia-engine",
+ "key-management-system-keys",
+ "nomos-api",
+ "nomos-core",
  "nomos-node",
+ "nomos-wallet",
+ "num-bigint",
  "overwatch",
  "serde_yaml",
  "tokio",
@@ -6142,7 +6144,7 @@ dependencies = [
  "kzgrs-backend",
  "nomos-core",
  "nomos-tracing",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde_json",
  "tokio",
  "tracing",
@@ -6160,15 +6162,13 @@ dependencies = [
  "bytes",
  "const-hex",
  "cryptarchia-engine",
- "ed25519",
- "ed25519-dalek",
  "futures",
  "generic-array 1.3.5",
  "groth16",
  "hex",
+ "key-management-system-keys",
  "multiaddr",
  "nom 8.0.0",
- "nomos-blend-crypto",
  "nomos-blend-proofs",
  "nomos-utils",
  "num-bigint",
@@ -6177,11 +6177,9 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
- "serde_with",
  "strum",
  "thiserror 1.0.69",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -6190,9 +6188,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "broadcast-service",
- "ed25519",
- "ed25519-dalek",
  "futures",
+ "key-management-system-keys",
  "kzgrs-backend",
  "nomos-core",
  "nomos-da-network-core",
@@ -6208,7 +6205,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -6229,11 +6225,10 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "cached",
- "ed25519-dalek",
- "either",
  "fixed",
  "futures",
  "indexmap 2.12.1",
+ "key-management-system-keys",
  "kzgrs",
  "kzgrs-backend",
  "libp2p",
@@ -6253,7 +6248,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber 0.3.22",
- "zksign",
 ]
 
 [[package]]
@@ -6266,8 +6260,8 @@ dependencies = [
  "blake2",
  "broadcast-service",
  "common-http-client",
- "ed25519-dalek",
  "futures",
+ "key-management-system-keys",
  "kzgrs-backend",
  "libp2p",
  "libp2p-identity",
@@ -6392,6 +6386,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "governor",
+ "key-management-system-keys",
  "nomos-core",
  "pprof",
  "serde",
@@ -6400,7 +6395,6 @@ dependencies = [
  "tokio",
  "tower_governor",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -6408,9 +6402,8 @@ name = "nomos-ledger"
 version = "0.1.0"
 dependencies = [
  "cryptarchia-engine",
- "ed25519",
- "ed25519-dalek",
  "groth16",
+ "key-management-system-keys",
  "mmr",
  "nomos-blend-crypto",
  "nomos-blend-message",
@@ -6424,7 +6417,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "utxotree",
- "zksign",
 ]
 
 [[package]]
@@ -6547,7 +6539,6 @@ dependencies = [
  "tx-service",
  "utoipa",
  "utoipa-swagger-ui",
- "zksign",
 ]
 
 [[package]]
@@ -6555,8 +6546,8 @@ name = "nomos-sdp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ed25519-dalek",
  "futures",
+ "key-management-system-keys",
  "nomos-core",
  "overwatch",
  "serde",
@@ -6565,7 +6556,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tx-service",
- "zksign",
 ]
 
 [[package]]
@@ -6629,7 +6619,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "rand 0.8.5",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
  "tokio",
  "tracing",
@@ -6695,7 +6685,6 @@ dependencies = [
  "tokio",
  "tracing",
  "wallet",
- "zksign",
 ]
 
 [[package]]
@@ -7022,7 +7011,7 @@ dependencies = [
  "bytes",
  "http 1.4.0",
  "opentelemetry",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
 ]
 
 [[package]]
@@ -7210,7 +7199,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -8378,6 +8367,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec96166dafa0886eb81fe1c0a388bece180fbef2135f97c1e2cf8302e74b43b5"
+dependencies = [
+ "bitflags 2.10.0",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8504,9 +8502,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.25"
+version = "0.12.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6eff9328d40131d43bd911d42d79eb6a47312002a4daefc9e37f17e74a7701a"
+checksum = "3b4c14b2d9afca6a60277086b0cc6a6ae0b568f6f7916c943a8cdc79f8be240f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -9451,9 +9449,9 @@ dependencies = [
 
 [[package]]
 name = "shell-words"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24188a676b6ae68c3b2cb3a01be17fbf7240ce009799bb56d5b1409051e78fde"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
@@ -10073,7 +10071,6 @@ dependencies = [
  "common-http-client",
  "cryptarchia-engine",
  "cryptarchia-sync",
- "ed25519-dalek",
  "executor-http-client",
  "futures",
  "futures-util",
@@ -10105,7 +10102,7 @@ dependencies = [
  "nomos-wallet",
  "num-bigint",
  "rand 0.8.5",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde_json",
  "serde_yaml",
  "serial_test",
@@ -10115,7 +10112,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tx-service",
- "zksign",
 ]
 
 [[package]]
@@ -10653,7 +10649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba3beec919fbdf99d719de8eda6adae3281f8a5b71ae40431f44dc7423053d34"
 dependencies = [
  "loki-api",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "serde",
  "serde_json",
  "snap",
@@ -11090,7 +11086,7 @@ dependencies = [
  "axum",
  "mime_guess",
  "regex",
- "reqwest 0.12.25",
+ "reqwest 0.12.26",
  "rust-embed",
  "serde",
  "serde_json",
@@ -11184,6 +11180,7 @@ name = "wallet"
 version = "0.1.0"
 dependencies = [
  "cryptarchia-engine",
+ "key-management-system-keys",
  "nomos-core",
  "nomos-ledger",
  "nomos-utils",
@@ -11191,7 +11188,6 @@ dependencies = [
  "rpds",
  "thiserror 2.0.17",
  "tracing",
- "zksign",
 ]
 
 [[package]]
@@ -11200,10 +11196,10 @@ version = "0.1.0"
 dependencies = [
  "common-http-client",
  "hex",
+ "key-management-system-keys",
  "nomos-core",
  "nomos-http-api-common",
  "url",
- "zksign",
 ]
 
 [[package]]
@@ -12257,10 +12253,8 @@ dependencies = [
 name = "zksign"
 version = "0.1.0"
 dependencies = [
- "ark-ff 0.4.2",
  "circuits-prover",
  "circuits-utils",
- "generic-array 1.3.5",
  "groth16",
  "num-bigint",
  "poseidon2",
@@ -12268,16 +12262,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
- "tracing",
  "witness-generator",
- "zeroize",
 ]
 
 [[package]]
 name = "zlib-rs"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36134c44663532e6519d7a6dfdbbe06f6f8192bde8ae9ed076e9b213f0e31df7"
+checksum = "51f936044d677be1a1168fae1d03b583a285a5dd9d8cbf7b24c23aa1fc775235"
 
 [[package]]
 name = "zopfli"
@@ -12351,9 +12343,9 @@ dependencies = [
 
 [[package]]
 name = "zune-jpeg"
-version = "0.5.6"
+version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f520eebad972262a1dde0ec455bce4f8b298b1e5154513de58c114c4c54303e8"
+checksum = "51d915729b0e7d5fe35c2f294c5dc10b30207cc637920e5b59077bfa3da63f28"
 dependencies = [
  "zune-core 0.5.0",
 ]

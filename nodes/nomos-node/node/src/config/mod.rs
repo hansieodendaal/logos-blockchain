@@ -9,6 +9,7 @@ use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
 use hex::FromHex as _;
 use nomos_banning::BanningService;
+use key_management_system_service::keys::UnsecuredZkKey;
 use nomos_libp2p::{Multiaddr, ed25519::SecretKey};
 use nomos_tracing::logging::{gelf::GelfConfig, local::FileConfig};
 use nomos_tracing_service::{LoggerLayer, Tracing};
@@ -362,7 +363,7 @@ pub fn update_cryptarchia_leader_consensus(
         return Ok(());
     };
 
-    let sk = zksign::SecretKey::from(BigUint::from_bytes_le(&<[u8; 16]>::from_hex(secret_key)?));
+    let sk = UnsecuredZkKey::from(BigUint::from_bytes_le(&<[u8; 16]>::from_hex(secret_key)?));
     let pk = sk.to_public_key();
 
     leader.sk = sk;
