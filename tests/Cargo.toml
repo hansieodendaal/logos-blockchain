@@ -23,6 +23,7 @@ chain-service                 = { workspace = true }
 common-http-client            = { workspace = true }
 cryptarchia-engine            = { features = ["serde"], workspace = true }
 cryptarchia-sync              = { workspace = true }
+ed25519-dalek                 = { workspace = true }
 executor-http-client          = { workspace = true }
 futures                       = { default-features = false, version = "0.3" }
 futures-util                  = { default-features = false, version = "0.3.31" }

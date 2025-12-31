@@ -1,11 +1,11 @@
 use std::{collections::HashSet, fmt::Debug};
 
+use crate::backends::NetworkBackend;
+use crate::backends::libp2p::PeerId;
 use cryptarchia_sync::{BlocksResponse, TipResponse};
 use nomos_core::header::HeaderId;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
-
-use crate::backends::NetworkBackend;
 
 #[derive(Debug)]
 pub enum NetworkMsg<Payload, PubSubEvent, ChainSyncEvent> {
@@ -37,9 +37,13 @@ pub enum ChainSyncEvent {
         additional_blocks: HashSet<HeaderId>,
         /// Channel to send blocks to network.
         reply_sender: Sender<BlocksResponse>,
+        /// The peer ID of the requester.
+        peer_id: PeerId,
     },
     ProvideTipRequest {
         /// Channel to send the latest tip to the network.
         reply_sender: Sender<TipResponse>,
+        /// The peer ID of the requester.
+        peer_id: PeerId,
     },
 }

@@ -8,6 +8,10 @@ pub use crate::{
     SwarmConfig,
     behaviour::{Behaviour, BehaviourEvent},
 };
+use cryptarchia_sync::Event as CryptarchiaSyncEvent;
+use libp2p::gossipsub::Event as GossibsubEvent;
+use libp2p::identify::Event as IdentifyEvent;
+use libp2p::kad::Event as KademliaEvent;
 use libp2p::{
     Multiaddr, PeerId, TransportError,
     identity::ed25519,
@@ -22,7 +26,7 @@ use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
 use std::collections::HashSet;
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
@@ -132,7 +136,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         if let Some(peer_id) = opt.get_peer_id().as_ref() {
             let (mut banned_peers, lagged) = self.update_banned_peer_list(None);
             if lagged && self.wait_for_banned_peers_background_sync(Duration::from_millis(100)) {
-                banned_peers = self.banned_peers.read().unwrap().iter().copied().collect();
+                banned_peers = self.snapshot_banned_peers();
             }
             if banned_peers.contains(peer_id) {
                 return Err(DialError::Transport(vec![(
@@ -166,7 +170,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     // a 'Vec<PeerId>', also indicating if the subscriber events channel lagged. In normal operation
     // we expect this list to be small or empty, so copying into a Vec is a cheap overhead.
     fn update_banned_peer_list(&self, cx: Option<&Context<'_>>) -> (Vec<PeerId>, bool) {
-        let mut banning_events_rx = self.banning_events_rx.lock().unwrap();
+        let mut banning_events_rx = get_mutex_guard(&self.banning_events_rx, "banning_events_rx");
         let Some(rx) = banning_events_rx.as_mut() else {
             return (Vec::default(), false);
         };
@@ -215,7 +219,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 
     // Take a snapshot of the current banned peer list.
     fn snapshot_banned_peers(&self) -> Vec<PeerId> {
-        let banned_peers = self.banned_peers.read().unwrap();
+        let banned_peers = get_read_lock(&self.banned_peers, "banned_peers");
         banned_peers.iter().copied().collect()
     }
 
@@ -232,19 +236,19 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                     "Peer {peer_id} banned until {banned_until:?} for offense {offense:?} with \
                     context {context:?}"
                 );
-                let mut banned_peers = self.banned_peers.write().unwrap();
+                let mut banned_peers = get_write_lock(&self.banned_peers, "banned_peers (a)");
                 banned_peers.insert(peer_id);
             }
             BanningEvent::Unbanned { peer_id, .. } => {
                 tracing::debug!("Peer {peer_id} unbanned (event)");
-                let mut banned_peers = self.banned_peers.write().unwrap();
+                let mut banned_peers = get_write_lock(&self.banned_peers, "banned_peers (b)");
                 banned_peers.remove(&peer_id);
             }
         }
     }
 
     // This will spawn a background task to refresh the active bans from the banning relay, and
-    // should only be called if reading banning events lagged. The authoritive state will be seen
+    // should only be called if reading banning events lagged. The authoritative state will be seen
     // the next time `update_banned_peer_list` is called.
     fn background_refresh_active_bans_from_relay(&self) {
         if self
@@ -259,11 +263,28 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         let banned_peers_clone = Arc::clone(&self.banned_peers);
         let in_progress = Arc::clone(&self.banned_peers_background_sync_in_progress);
         let notify = Arc::clone(&self.banned_peers_background_sync_notify);
-        tokio::spawn(async move {
-            // This will tiemout internally if the banning service is unresponsive.
+
+        tokio::task::spawn_blocking(move || {
+            struct ResetGuard {
+                in_progress: Arc<AtomicBool>,
+                notify: Arc<Notify>,
+            }
+            impl Drop for ResetGuard {
+                fn drop(&mut self) {
+                    self.in_progress.store(false, Ordering::SeqCst);
+                    self.notify.notify_waiters();
+                }
+            }
+            // Ensure we reset the in-progress flag and notify waiters on exit, whether the
+            // operation succeeds, fails, or panics.
+            let _guard = ResetGuard {
+                in_progress,
+                notify,
+            };
+
             match banning_list_active_bans(&banning_relay_clone) {
                 Ok(authoritative_banned_peer_list) => {
-                    let mut banned_peers = banned_peers_clone.write().unwrap();
+                    let mut banned_peers = get_write_lock(&banned_peers_clone, "banned_peers (c)");
                     banned_peers.clear();
                     for (peer_id, _) in authoritative_banned_peer_list {
                         banned_peers.insert(peer_id);
@@ -273,8 +294,6 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                     tracing::warn!("Error retrieving banned peer list: {err}");
                 }
             }
-            in_progress.store(false, Ordering::SeqCst);
-            notify.notify_waiters();
         });
     }
 
@@ -306,6 +325,132 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             }
         }
     }
+
+    // Disconnects the given peer if it is banned. Returns 'true' if disconnected.
+    fn disconnect_if_banned(&mut self, peer_id: &PeerId, banned_peers: &[PeerId]) -> bool {
+        if banned_peers.contains(peer_id) {
+            let _ = self.swarm.disconnect_peer_id(*peer_id);
+            return true;
+        }
+        false
+    }
+
+    // Inspect connection/peer-related events and drop banned peers. Pattern matches are
+    // intentionally broad to handle common variants.
+    fn process_banned_for_event(
+        &mut self,
+        event: &SwarmEvent<BehaviourEvent<R>>,
+        banned_peers: &[PeerId],
+    ) -> bool {
+        match &event {
+            SwarmEvent::ConnectionEstablished { peer_id, .. }
+            | SwarmEvent::NewExternalAddrOfPeer { peer_id, .. }
+            | SwarmEvent::Dialing {
+                peer_id: Some(peer_id),
+                ..
+            } => self.disconnect_if_banned(peer_id, banned_peers),
+            SwarmEvent::IncomingConnection { send_back_addr, .. } => {
+                let opt = DialOpts::from(send_back_addr.clone());
+                if let Some(peer_id) = opt.get_peer_id().as_ref() {
+                    return self.disconnect_if_banned(peer_id, banned_peers);
+                }
+                false
+            }
+            SwarmEvent::Behaviour(behaviour) => match behaviour {
+                BehaviourEvent::Identify(event) => match event {
+                    IdentifyEvent::Received { peer_id, .. }
+                    | IdentifyEvent::Sent { peer_id, .. }
+                    | IdentifyEvent::Pushed { peer_id, .. }
+                    | IdentifyEvent::Error { peer_id, .. } => {
+                        self.disconnect_if_banned(peer_id, banned_peers)
+                    }
+                },
+                BehaviourEvent::AutonatServer(event) => {
+                    self.disconnect_if_banned(&event.client, banned_peers)
+                }
+                BehaviourEvent::Gossipsub(event) => match event {
+                    GossibsubEvent::Message {
+                        propagation_source, ..
+                    } => self.disconnect_if_banned(propagation_source, banned_peers),
+                    GossibsubEvent::Subscribed { peer_id, .. }
+                    | GossibsubEvent::Unsubscribed { peer_id, .. }
+                    | GossibsubEvent::GossipsubNotSupported { peer_id, .. }
+                    | GossibsubEvent::SlowPeer { peer_id, .. } => {
+                        self.disconnect_if_banned(peer_id, banned_peers)
+                    }
+                },
+                BehaviourEvent::Kademlia(event) => {
+                    match event {
+                        KademliaEvent::InboundRequest { request, .. } => {
+                            match request {
+                                libp2p_kad::InboundRequest::AddProvider { record, .. } => {
+                                    if let Some(source) = record {
+                                        return self
+                                            .disconnect_if_banned(&source.provider, banned_peers);
+                                    }
+                                    false
+                                }
+                                libp2p_kad::InboundRequest::PutRecord { source, .. } => {
+                                    self.disconnect_if_banned(source, banned_peers)
+                                }
+                                // These are no-op
+                                libp2p_kad::InboundRequest::FindNode { .. }
+                                | libp2p_kad::InboundRequest::GetProvider { .. }
+                                | libp2p_kad::InboundRequest::GetRecord { .. } => false,
+                            }
+                        }
+                        KademliaEvent::RoutingUpdated { peer, .. }
+                        | KademliaEvent::UnroutablePeer { peer }
+                        | KademliaEvent::RoutablePeer { peer, .. }
+                        | KademliaEvent::PendingRoutablePeer { peer, .. } => {
+                            self.disconnect_if_banned(peer, banned_peers)
+                        }
+                        KademliaEvent::OutboundQueryProgressed { .. }
+                        | KademliaEvent::ModeChanged { .. } => false,
+                    }
+                }
+                BehaviourEvent::Nat(event) => {
+                    if let Some(left) = event.as_ref().left() {
+                        return self.disconnect_if_banned(&left.server, banned_peers);
+                    }
+                    false
+                    // Either right is no-op
+                }
+                BehaviourEvent::ChainSync(event) => match event {
+                    CryptarchiaSyncEvent::ProvideBlocksRequest { peer_id, .. }
+                    | CryptarchiaSyncEvent::ProvideTipsRequest { peer_id, .. } => {
+                        self.disconnect_if_banned(peer_id, banned_peers)
+                    }
+                },
+            },
+            // These are no-op
+            SwarmEvent::ConnectionClosed { .. }
+            | SwarmEvent::IncomingConnectionError { .. }
+            | SwarmEvent::OutgoingConnectionError { .. }
+            | SwarmEvent::NewListenAddr { .. }
+            | SwarmEvent::ExpiredListenAddr { .. }
+            | SwarmEvent::ListenerClosed { .. }
+            | SwarmEvent::ListenerError { .. }
+            | SwarmEvent::NewExternalAddrCandidate { .. }
+            | SwarmEvent::ExternalAddrConfirmed { .. }
+            | SwarmEvent::ExternalAddrExpired { .. } => false,
+            #[expect(
+                clippy::match_same_arms,
+                reason = "Required catch-all because `SwarmEvent` is `#[non_exhaustive]`"
+            )]
+            _ => false,
+        }
+    }
+
+    /// Process a banned peer in an authoritive manner, updating the banned peer list if needed, and \
+    /// disconnecting the peer if it is banned. Returns 'true' if the peer was disconnected.
+    pub fn process_banned_authoritative(&mut self, peer_id: &PeerId) -> bool {
+        let (mut banned_peers, lagged) = self.update_banned_peer_list(None);
+        if lagged && self.wait_for_banned_peers_background_sync(Duration::from_millis(100)) {
+            banned_peers = self.snapshot_banned_peers();
+        }
+        self.disconnect_if_banned(peer_id, &banned_peers)
+    }
 }
 
 impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
@@ -320,44 +465,18 @@ impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
             // refresh will update the list soon enough.
             let (banned_peers, _) = self.update_banned_peer_list(Some(cx));
 
-            match Pin::new(&mut self.swarm).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
+            return match Pin::new(&mut self.swarm).poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => Poll::Ready(None),
                 Poll::Ready(Some(event)) => {
-                    // Inspect connection/peer-related events and drop banned peers. Pattern matches
-                    // are intentionally broad to handle common variants.
-                    match &event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. }
-                        | SwarmEvent::NewExternalAddrOfPeer { peer_id, .. }
-                        | SwarmEvent::Dialing {
-                            peer_id: Some(peer_id),
-                            ..
-                        } => {
-                            if banned_peers.contains(peer_id) {
-                                // Disconnect the peer and drop this event.
-                                let _ = self.swarm.disconnect_peer_id(*peer_id);
-                                // Continue the loop to poll for the next event
-                                continue;
-                            }
-                        }
-                        SwarmEvent::IncomingConnection { send_back_addr, .. } => {
-                            let opt = DialOpts::from(send_back_addr.clone());
-                            if let Some(peer_id) = opt.get_peer_id().as_ref()
-                                && banned_peers.contains(peer_id)
-                            {
-                                // Disconnect the peer and drop this event.
-                                let _ = self.swarm.disconnect_peer_id(*peer_id);
-                                // Continue the loop to poll for the next event
-                                continue;
-                            }
-                        }
-                        _ => {}
+                    if self.process_banned_for_event(&event, &banned_peers) {
+                        // Drop this event and continue the loop to poll for the next event
+                        continue;
                     }
-
                     // Not banned (or not a connection event we care about) — forward it.
-                    return Poll::Ready(Some(event));
+                    Poll::Ready(Some(event))
                 }
-            }
+            };
         }
     }
 }
@@ -365,4 +484,43 @@ impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
 #[must_use]
 pub fn multiaddr(ip: Ipv4Addr, port: u16) -> Multiaddr {
     multiaddr!(Ip4(ip), Udp(port), QuicV1)
+}
+
+// Get a mutex guard, while safely recovering the inner guard on poisoned locks instead of panicking
+fn get_mutex_guard<'a, T>(mutex: &'a Mutex<T>, name: &'a str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|e| {
+        tracing::warn!(
+            "Mutex '{}' was poisoned; recovering guard, shared data may be in an inconsistent \
+                state: ({}).",
+            name,
+            e
+        );
+        e.into_inner()
+    })
+}
+
+// Get a read lock, while safely recovering the inner guard on poisoned locks instead of panicking
+fn get_read_lock<'a, T>(rwlock: &'a RwLock<T>, name: &'a str) -> RwLockReadGuard<'a, T> {
+    rwlock.read().unwrap_or_else(|e| {
+        tracing::warn!(
+            "RwLock '{}' was poisoned; recovering guard, reading shared data may be in an \
+            inconsistent state: ({}).",
+            name,
+            e
+        );
+        e.into_inner()
+    })
+}
+
+// Get a write lock, while safely recovering the inner guard on poisoned locks instead of panicking
+fn get_write_lock<'a, T>(rwlock: &'a RwLock<T>, name: &'a str) -> RwLockWriteGuard<'a, T> {
+    rwlock.write().unwrap_or_else(|e| {
+        tracing::warn!(
+            "RwLock '{}' was poisoned; recovering guard, writing shared data may be in an \
+            inconsistent state: ({}).",
+            name,
+            e
+        );
+        e.into_inner()
+    })
 }

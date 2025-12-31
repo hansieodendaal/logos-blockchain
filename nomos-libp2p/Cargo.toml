@@ -33,6 +33,7 @@ libp2p = { features = [
   "secp256k1",
   "tokio",
 ], workspace = true }
+libp2p-kad = "0.47.0"
 multiaddr = { default-features = false, version = "0.18" }
 natpmp = { features = ["tokio"], version = "0.5" }
 netdev = { default-features = false, version = "0.31" }
