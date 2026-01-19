@@ -1,11 +1,11 @@
 use std::{collections::HashSet, fmt::Debug};
 
-use crate::backends::NetworkBackend;
-use crate::backends::libp2p::PeerId;
 use cryptarchia_sync::{BlocksResponse, TipResponse};
 use nomos_core::header::HeaderId;
 use tokio::sync::{mpsc::Sender, oneshot};
 use tokio_stream::wrappers::BroadcastStream;
+
+use crate::backends::{NetworkBackend, libp2p::PeerId};
 
 #[derive(Debug)]
 pub enum NetworkMsg<Payload, PubSubEvent, ChainSyncEvent> {

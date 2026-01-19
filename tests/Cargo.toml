@@ -33,6 +33,7 @@ hex                            = { default-features = false, version = "0.4.3" }
 key-management-system-service  = { workspace = true }
 kzgrs-backend                  = { workspace = true }
 nomos-api                      = { workspace = true }
+nomos-banning                  = { workspace = true }
 nomos-blend-service            = { features = ["libp2p"], workspace = true }
 nomos-core                     = { workspace = true }
 nomos-da-dispersal             = { workspace = true }
@@ -67,6 +68,11 @@ tokio                          = "1"
 tracing                        = { workspace = true }
 tracing-subscriber             = { version = "0.3", features = ["env-filter", "fmt"] }
 tx-service                     = { features = ["libp2p", "mock"], workspace = true }
+
+[dev-dependencies]
+ark-std       = "0.4.0"
+ed25519-dalek = { workspace = true }
+libp2p        = { workspace = true }
 
 [[test]]
 name = "test_cryptarchia_happy_path"

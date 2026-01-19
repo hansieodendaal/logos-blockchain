@@ -22,7 +22,7 @@ workspace = true
 [dependencies]
 async-trait    = "0.1"
 futures        = { default-features = false, version = "0.3" }
-nomos-banning     = { workspace = true }
+nomos-banning  = { workspace = true }
 nomos-core     = { workspace = true }
 nomos-network  = { workspace = true }
 nomos-storage  = { workspace = true }

@@ -207,10 +207,10 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         }
     }
 
-    // Decide whether to drop the command based on banned peer IDs - any banned peer ID
-    // found in the command will cause the peer to be disconnected in the swarm. Returns
-    // true if the command should be dropped (i.e., if the peer is banned and disconnected),
-    // false otherwise.
+    // Decide whether to drop the command based on banned peer IDs - any banned peer
+    // ID found in the command will cause the peer to be disconnected in the
+    // swarm. Returns true if the command should be dropped (i.e., if the peer
+    // is banned and disconnected), false otherwise.
     fn should_drop_command(&mut self, command: &Command) -> (bool, Option<PeerId>) {
         let peer_id = match command {
             Command::Network(network_cmd) => match network_cmd {

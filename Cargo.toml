@@ -38,7 +38,7 @@ members = [
   "nomos-kms/keys",
   "nomos-kms/macros",
   "nomos-libp2p",
-  "nomos-services/api", 
+  "nomos-services/api",
   "nomos-services/banning",
   "nomos-services/blend",
   "nomos-services/chain/broadcast-service",

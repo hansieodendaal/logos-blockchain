@@ -1906,6 +1906,7 @@ dependencies = [
  "cryptarchia-engine 0.1.0",
  "cryptarchia-sync 0.1.0",
  "futures",
+ "nomos-banning",
  "nomos-core 0.1.0",
  "nomos-da-sampling 0.1.0",
  "nomos-ledger 0.1.0",
@@ -5671,6 +5672,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.5",
  "regex",
+ "serde",
  "sha2",
  "tracing",
  "web-time",
@@ -5737,6 +5739,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "rand 0.8.5",
+ "serde",
  "sha2",
  "smallvec",
  "thiserror 2.0.17",
@@ -6388,6 +6391,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b430e7953c29dd6a09afc29ff0bb69c6e306329ee6794700aee27b76a1aea8d"
 dependencies = [
  "core2",
+ "serde",
  "unsigned-varint 0.8.0",
 ]
 
@@ -6685,6 +6689,7 @@ dependencies = [
  "futures",
  "hyper 1.8.1",
  "kzgrs-backend 0.1.0",
+ "nomos-banning",
  "nomos-core 0.1.0",
  "nomos-da-dispersal 0.1.0",
  "nomos-da-network-core 0.1.0",
@@ -6739,6 +6744,20 @@ dependencies = [
  "tx-service 0.1.0 (git+https://github.com/logos-co/nomos-node.git?rev=1fce2dc3f482c16361316eb2a1b6ccd1206aa917)",
  "utoipa",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "nomos-banning"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libp2p",
+ "nomos-utils 0.1.0",
+ "overwatch",
+ "serde",
+ "serde_with",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6983,6 +7002,7 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "libp2p-swarm-test",
+ "nomos-banning",
  "nomos-blend 0.1.0",
  "nomos-core 0.1.0",
  "nomos-ledger 0.1.0",
@@ -7465,6 +7485,7 @@ dependencies = [
  "futures",
  "kzgrs-backend 0.1.0",
  "nomos-api 0.1.0",
+ "nomos-banning",
  "nomos-core 0.1.0",
  "nomos-da-dispersal 0.1.0",
  "nomos-da-network-core 0.1.0",
@@ -7622,12 +7643,15 @@ dependencies = [
  "hex",
  "igd-next 0.16.2",
  "libp2p",
+ "libp2p-kad",
  "libp2p-swarm-test",
  "multiaddr",
  "natpmp",
  "netdev",
+ "nomos-banning",
  "nomos-utils 0.1.0",
  "num_enum",
+ "overwatch",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -7676,6 +7700,7 @@ dependencies = [
  "chrono",
  "cryptarchia-sync 0.1.0",
  "futures",
+ "nomos-banning",
  "nomos-core 0.1.0",
  "nomos-libp2p 0.1.0",
  "nomos-utils 0.1.0",
@@ -7730,6 +7755,7 @@ dependencies = [
  "key-management-system-service 0.1.0",
  "kzgrs-backend 0.1.0",
  "nomos-api 0.1.0",
+ "nomos-banning",
  "nomos-blend 0.1.0",
  "nomos-blend-service 0.1.0",
  "nomos-core 0.1.0",
@@ -11967,6 +11993,7 @@ dependencies = [
 name = "tests"
 version = "0.1.0"
 dependencies = [
+ "ark-std 0.4.0",
  "async-trait",
  "blst",
  "broadcast-service 0.1.0",
@@ -11978,6 +12005,7 @@ dependencies = [
  "cryptarchia-sync 0.1.0",
  "cucumber",
  "cucumber_ext",
+ "ed25519-dalek",
  "executor-http-client 0.1.0",
  "futures",
  "futures-util",
@@ -11985,7 +12013,9 @@ dependencies = [
  "hex",
  "key-management-system-service 0.1.0",
  "kzgrs-backend 0.1.0",
+ "libp2p",
  "nomos-api 0.1.0",
+ "nomos-banning",
  "nomos-blend-service 0.1.0",
  "nomos-core 0.1.0",
  "nomos-da-dispersal 0.1.0",
@@ -12715,6 +12745,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "nomos-banning",
  "nomos-core 0.1.0",
  "nomos-network 0.1.0",
  "nomos-storage 0.1.0",

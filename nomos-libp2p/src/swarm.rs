@@ -3,18 +3,27 @@
     reason = "We split the `Swarm` impls into different modules for better code modularity."
 )]
 
-use crate::behaviour::BehaviourConfig;
-pub use crate::{
-    SwarmConfig,
-    behaviour::{Behaviour, BehaviourEvent},
+use std::{
+    collections::HashSet,
+    error::Error,
+    io,
+    net::Ipv4Addr,
+    pin::Pin,
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
+
 use cryptarchia_sync::Event as CryptarchiaSyncEvent;
-use libp2p::gossipsub::Event as GossibsubEvent;
-use libp2p::identify::Event as IdentifyEvent;
-use libp2p::kad::Event as KademliaEvent;
 use libp2p::{
     Multiaddr, PeerId, TransportError,
+    gossipsub::Event as GossibsubEvent,
+    identify::Event as IdentifyEvent,
     identity::ed25519,
+    kad::Event as KademliaEvent,
     swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
 };
 use multiaddr::multiaddr;
@@ -24,25 +33,18 @@ use nomos_banning::{
 };
 use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
-use std::collections::HashSet;
-use std::sync::{
-    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Instant;
-use std::{
-    error::Error,
-    io,
-    net::Ipv4Addr,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
 use tokio::sync::{Notify, broadcast};
+
+use crate::behaviour::BehaviourConfig;
+pub use crate::{
+    SwarmConfig,
+    behaviour::{Behaviour, BehaviourEvent},
+};
 
 // How long to keep a connection alive once it is idling.
 const IDLE_CONN_TIMEOUT: Duration = Duration::from_secs(300);
-// The maximum amount of time to spent draining banning events per poll to avoid starvation.
+// The maximum amount of time to spent draining banning events per poll to avoid
+// starvation.
 const BAN_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(10);
 
 /// Wraps [`libp2p::Swarm`], and config it for use within Nomos.
@@ -162,13 +164,15 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         &self.swarm
     }
 
-    // This is a light-weight banned event polling implementation that limits time spent processing
-    // banning events to avoid starving the swarm event polling. Acting on ban and unban events only
-    // change the internal state of the swarm wrapper, so that targeted disconnects can be processed
+    // This is a light-weight banned event polling implementation that limits time
+    // spent processing banning events to avoid starving the swarm event
+    // polling. Acting on ban and unban events only change the internal state of
+    // the swarm wrapper, so that targeted disconnects can be processed
     // when needed.
-    // This function returns the current list of banned peers after processing available events as
-    // a 'Vec<PeerId>', also indicating if the subscriber events channel lagged. In normal operation
-    // we expect this list to be small or empty, so copying into a Vec is a cheap overhead.
+    // This function returns the current list of banned peers after processing
+    // available events as a 'Vec<PeerId>', also indicating if the subscriber
+    // events channel lagged. In normal operation we expect this list to be
+    // small or empty, so copying into a Vec is a cheap overhead.
     fn update_banned_peer_list(&self, cx: Option<&Context<'_>>) -> (Vec<PeerId>, bool) {
         let mut banning_events_rx = get_mutex_guard(&self.banning_events_rx, "banning_events_rx");
         let Some(rx) = banning_events_rx.as_mut() else {
@@ -223,7 +227,8 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         banned_peers.iter().copied().collect()
     }
 
-    // Process a single banning event, updating the internal banned peer list accordingly.
+    // Process a single banning event, updating the internal banned peer list
+    // accordingly.
     fn process_banning_event(&self, event: BanningEvent) {
         match event {
             BanningEvent::Banned {
@@ -247,9 +252,10 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         }
     }
 
-    // This will spawn a background task to refresh the active bans from the banning relay, and
-    // should only be called if reading banning events lagged. The authoritative state will be seen
-    // the next time `update_banned_peer_list` is called.
+    // This will spawn a background task to refresh the active bans from the banning
+    // relay, and should only be called if reading banning events lagged. The
+    // authoritative state will be seen the next time `update_banned_peer_list`
+    // is called.
     fn background_refresh_active_bans_from_relay(&self) {
         if self
             .banned_peers_background_sync_in_progress
@@ -297,8 +303,9 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         });
     }
 
-    // Wait for any in-progress banned peer background sync to complete, up to the provided timeout.
-    // Returns 'true' if the sync completed in time, 'false' if timed out or errored.
+    // Wait for any in-progress banned peer background sync to complete, up to the
+    // provided timeout. Returns 'true' if the sync completed in time, 'false'
+    // if timed out or errored.
     fn wait_for_banned_peers_background_sync(&self, timeout: Duration) -> bool {
         let in_progress = &self.banned_peers_background_sync_in_progress;
         let res = block_on_now_from_sync(async {
@@ -335,8 +342,8 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         false
     }
 
-    // Inspect connection/peer-related events and drop banned peers. Pattern matches are
-    // intentionally broad to handle common variants.
+    // Inspect connection/peer-related events and drop banned peers. Pattern matches
+    // are intentionally broad to handle common variants.
     fn process_banned_for_event(
         &mut self,
         event: &SwarmEvent<BehaviourEvent<R>>,
@@ -442,8 +449,9 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         }
     }
 
-    /// Process a banned peer in an authoritive manner, updating the banned peer list if needed, and \
-    /// disconnecting the peer if it is banned. Returns 'true' if the peer was disconnected.
+    /// Process a banned peer in an authoritive manner, updating the banned peer
+    /// list if needed, and \ disconnecting the peer if it is banned.
+    /// Returns 'true' if the peer was disconnected.
     pub fn process_banned_authoritative(&mut self, peer_id: &PeerId) -> bool {
         let (mut banned_peers, lagged) = self.update_banned_peer_list(None);
         if lagged && self.wait_for_banned_peers_background_sync(Duration::from_millis(100)) {
@@ -456,13 +464,13 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
     type Item = SwarmEvent<BehaviourEvent<R>>;
 
-    // This polls the inner swarm, inspects connection events and disconnects peers flagged by
-    // `is_banned`. Banned connection events are dropped and polling continues until a non-banned event
-    // is returned or Pending.
+    // This polls the inner swarm, inspects connection events and disconnects peers
+    // flagged by `is_banned`. Banned connection events are dropped and polling
+    // continues until a non-banned event is returned or Pending.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            // If getting the banned peer list lagged, we ignore that for this poll, as the background
-            // refresh will update the list soon enough.
+            // If getting the banned peer list lagged, we ignore that for this poll, as the
+            // background refresh will update the list soon enough.
             let (banned_peers, _) = self.update_banned_peer_list(Some(cx));
 
             return match Pin::new(&mut self.swarm).poll_next(cx) {
@@ -486,7 +494,8 @@ pub fn multiaddr(ip: Ipv4Addr, port: u16) -> Multiaddr {
     multiaddr!(Ip4(ip), Udp(port), QuicV1)
 }
 
-// Get a mutex guard, while safely recovering the inner guard on poisoned locks instead of panicking
+// Get a mutex guard, while safely recovering the inner guard on poisoned locks
+// instead of panicking
 fn get_mutex_guard<'a, T>(mutex: &'a Mutex<T>, name: &'a str) -> MutexGuard<'a, T> {
     mutex.lock().unwrap_or_else(|e| {
         tracing::warn!(
@@ -499,7 +508,8 @@ fn get_mutex_guard<'a, T>(mutex: &'a Mutex<T>, name: &'a str) -> MutexGuard<'a, 
     })
 }
 
-// Get a read lock, while safely recovering the inner guard on poisoned locks instead of panicking
+// Get a read lock, while safely recovering the inner guard on poisoned locks
+// instead of panicking
 fn get_read_lock<'a, T>(rwlock: &'a RwLock<T>, name: &'a str) -> RwLockReadGuard<'a, T> {
     rwlock.read().unwrap_or_else(|e| {
         tracing::warn!(
@@ -512,7 +522,8 @@ fn get_read_lock<'a, T>(rwlock: &'a RwLock<T>, name: &'a str) -> RwLockReadGuard
     })
 }
 
-// Get a write lock, while safely recovering the inner guard on poisoned locks instead of panicking
+// Get a write lock, while safely recovering the inner guard on poisoned locks
+// instead of panicking
 fn get_write_lock<'a, T>(rwlock: &'a RwLock<T>, name: &'a str) -> RwLockWriteGuard<'a, T> {
     rwlock.write().unwrap_or_else(|e| {
         tracing::warn!(

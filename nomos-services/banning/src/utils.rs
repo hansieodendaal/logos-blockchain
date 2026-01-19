@@ -1,20 +1,26 @@
-//! Utility functions for the banning subsystem, providing a bridge/interface between synchronous
-//!callers and the asynchronous banning service.
+//! Utility functions for the banning subsystem, providing a bridge/interface
+//! between synchronous callers and the asynchronous banning service.
 
 use std::time::Duration;
 
-use crate::types::{BanningEvent, Violation};
-use crate::{BanStatus, BanningRequest};
 use libp2p::PeerId;
 use overwatch::services::relay::OutboundRelay;
-use tokio::sync::{broadcast, oneshot};
-use tokio::{runtime::RuntimeFlavor, time::timeout};
+use tokio::{
+    runtime::RuntimeFlavor,
+    sync::{broadcast, oneshot},
+    time::timeout,
+};
+
+use crate::{
+    BanStatus, BanningRequest,
+    types::{BanningEvent, Violation},
+};
 
 const TIMEOUT_WAITING_FOR_SERVICE: Duration = Duration::from_secs(2);
 
-// /// Checks if a peer is currently banned by querying the banning subsystem via the provided
-// /// `banning_relay`. If `peer_id` is `None`, returns `false`.
-// #[allow(clippy::must_use_candidate)]
+// /// Checks if a peer is currently banned by querying the banning subsystem
+// via the provided /// `banning_relay`. If `peer_id` is `None`, returns
+// `false`. #[allow(clippy::must_use_candidate)]
 // pub fn banning_is_banned(
 //     banning_relay: &Option<OutboundRelay<BanningRequest>>,
 //     peer_id: Option<&PeerId>,
@@ -24,7 +30,8 @@ const TIMEOUT_WAITING_FOR_SERVICE: Duration = Duration::from_secs(2);
 //     {
 //         return block_on_now(async {
 //             let (tx, rx) = oneshot::channel();
-//             // Treat failures as "not banned" (service is going down or relay closed)
+//             // Treat failures as "not banned" (service is going down or relay
+//             // closed)
 //             if banning_relay
 //                 .send(BanningRequest::GetBanState {
 //                     peer_id: *peer_id,
@@ -47,8 +54,8 @@ const TIMEOUT_WAITING_FOR_SERVICE: Duration = Duration::from_secs(2);
 //     false
 // }
 
-/// Report a banning violation to get a peer banned using the banning subsystem via the provided
-/// `banning_relay`. If `peer_id` is `None`, returns `false`.
+/// Report a banning violation to get a peer banned using the banning subsystem
+/// via the provided `banning_relay`. If `peer_id` is `None`, returns `false`.
 pub fn banning_ban_peer(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
     violation: Violation,
@@ -77,8 +84,8 @@ pub fn banning_ban_peer(
     Ok(false)
 }
 
-/// Unban a peer using the banning subsystem via the provided `banning_relay`. If `peer_id` is
-/// `None`, returns `false`.
+/// Unban a peer using the banning subsystem via the provided `banning_relay`.
+/// If `peer_id` is `None`, returns `false`.
 pub fn banning_unban_peer(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
     peer_id: &PeerId,
@@ -107,7 +114,8 @@ pub fn banning_unban_peer(
     Ok(false)
 }
 
-/// Subscribe to banning events using the banning subsystem via the provided `banning_relay`.
+/// Subscribe to banning events using the banning subsystem via the provided
+/// `banning_relay`.
 pub fn banning_subscribe(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
 ) -> Result<Option<broadcast::Receiver<BanningEvent>>, overwatch::DynError> {
@@ -133,7 +141,8 @@ pub fn banning_subscribe(
     Ok(None)
 }
 
-/// List all active bans using the banning subsystem via the provided `banning_relay`.
+/// List all active bans using the banning subsystem via the provided
+/// `banning_relay`.
 pub fn banning_list_active_bans(
     banning_relay: &Option<OutboundRelay<BanningRequest>>,
 ) -> Result<Vec<(PeerId, BanStatus)>, overwatch::DynError> {
@@ -161,21 +170,24 @@ pub fn banning_list_active_bans(
     Ok(vec![])
 }
 
-/// A synchronous helper that runs a future to completion from synchronous code, ensuring we don't
-/// deadlock or panic.
+/// A synchronous helper that runs a future to completion from synchronous code,
+/// ensuring we don't deadlock or panic.
 ///
-/// This helper function is intended for bridging sync APIs to async services. Behaviour:
-/// - When inside a Tokio multi-thread runtime, it uses `block_in_place(|| handle.block_on(fut))` to
-///   re-enter the async context but not deadlock the runtime.
-/// - If the current Tokio runtime is single-threaded, it creates a temporary multi-thread runtime
-///   to run the future.
-/// - If no Tokio runtime is available, it creates a temporary single-thread runtime to run the
-///   future.
+/// This helper function is intended for bridging sync APIs to async services.
+/// Behaviour:
+/// - When inside a Tokio multi-thread runtime, it uses `block_in_place(||
+///   handle.block_on(fut))` to re-enter the async context but not deadlock the
+///   runtime.
+/// - If the current Tokio runtime is single-threaded, it creates a temporary
+///   multi-thread runtime to run the future.
+/// - If no Tokio runtime is available, it creates a temporary single-thread
+///   runtime to run the future.
 ///
 /// Safety notes:
-/// - Creating a temporary runtime has non‑trivial cost and may affect timing in tests.
-/// - Callers should avoid calling this from latency‑sensitive async paths when inside a multi‑thread
-///   runtime.
+/// - Creating a temporary runtime has non‑trivial cost and may affect timing in
+///   tests.
+/// - Callers should avoid calling this from latency‑sensitive async paths when
+///   inside a multi‑thread runtime.
 pub fn block_on_now_from_sync<T>(fut: impl Future<Output = T>) -> Result<T, overwatch::DynError> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         if handle.runtime_flavor() == RuntimeFlavor::MultiThread {

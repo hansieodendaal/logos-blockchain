@@ -20,8 +20,8 @@ use crate::{
     types::{BanStatus, BanningEvent, BanningRequest},
 };
 
-// This is sufficiently large so no banning events are dropped in the subscribers for realistic
-// scenarios.
+// This is sufficiently large so no banning events are dropped in the
+// subscribers for realistic scenarios.
 const BROADCAST_CHANNEL_SIZE: usize = 2000;
 
 /// The banning service.
