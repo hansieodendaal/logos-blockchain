@@ -580,7 +580,7 @@ where
                 routing::get(
                     blocks_stream::<
                         DaStorageBackend,
-                        CryptarchiaConsensus<_, _, _>,
+                        CryptarchiaConsensus<_, _, _, _>,
                         RuntimeServiceId,
                     >,
                 ),
