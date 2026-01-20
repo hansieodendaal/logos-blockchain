@@ -39,7 +39,7 @@ members = [
   "nodes/node/binary",
   "nodes/node/http-client",
   "services/api",
-  "nomos-services/banning",
+  "services/banning",
   "services/blend",
   "services/chain/broadcast-service",
   "services/chain/chain-common",
@@ -85,6 +85,7 @@ resolver = "2"
 [workspace.dependencies]
 # Internal
 lb-api-service                   = { default-features = false, path = "./services/api", package = "logos-blockchain-api-service" }
+lb-banning-service                   = { default-features = false, path = "./services/banning", package = "logos-blockchain-banning-service" }
 lb-blend                         = { default-features = false, path = "./blend/core", package = "logos-blockchain-blend" }
 lb-blend-crypto                  = { default-features = false, path = "./blend/crypto", package = "logos-blockchain-blend-crypto" }
 lb-blend-message                 = { default-features = false, path = "./blend/message", package = "logos-blockchain-blend-message" }

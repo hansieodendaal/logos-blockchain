@@ -4,7 +4,7 @@ description = { workspace = true }
 edition     = { workspace = true }
 keywords    = { workspace = true }
 license     = { workspace = true }
-name        = "nomos-banning"
+name        = "logos-blockchain-banning-service"
 readme      = { workspace = true }
 repository  = { workspace = true }
 version     = { workspace = true }
@@ -14,10 +14,10 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-libp2p      = { workspace = true, features = ["serde"] }
-nomos-utils = { workspace = true, features = ["time"] }
+lb-libp2p      = { workspace = true }
+lb-utils = { workspace = true, features = ["time"] }
 overwatch   = { workspace = true }
-serde       = { version = "1.0.228", features = ["derive"] }
+serde       = { workspace = true, features = ["derive"] }
 serde_with  = { workspace = true }
 tokio       = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing     = { workspace = true }

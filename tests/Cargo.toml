@@ -37,7 +37,7 @@ lb-da-dispersal-service          = { workspace = true }
 lb-da-network-core               = { workspace = true }
 lb-da-network-service            = { workspace = true }
 lb-da-sampling-service           = { workspace = true }
-nomos-banning                  = { workspace = true }
+lb-banning-service                  = { workspace = true }
 lb-da-verifier-service           = { workspace = true }
 lb-executor                      = { default-features = false, features = ["testing", "tracing"], workspace = true }
 lb-executor-http-client          = { workspace = true }
