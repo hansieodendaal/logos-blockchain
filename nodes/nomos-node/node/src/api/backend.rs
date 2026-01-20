@@ -125,7 +125,7 @@ pub struct AxumBackend<
     paths(
     ),
     components(
-        schemas(Status<HeaderId>, MempoolMetrics)
+        schemas(Status, MempoolMetrics)
     ),
     tags(
         (name = "da", description = "data availibility related APIs")
