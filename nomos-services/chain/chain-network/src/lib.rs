@@ -710,9 +710,6 @@ where
 {
     debug!("received proposal {:?}", block);
 
-    let header = block.header();
-    let id = header.id();
-
     if let Some(blob_validation) = blob_validation {
         blob_validation.validate(&block).await?;
     }
@@ -721,12 +718,11 @@ where
 
     // remove included content from mempool
     mempool_adapter
-        .mark_transactions_in_block(
+        .remove_transactions(
             &block
                 .transactions()
                 .map(Transaction::hash)
                 .collect::<Vec<_>>(),
-            id,
         )
         .await
         .unwrap_or_else(|e| error!("Could not mark transactions in block: {e}"));
