@@ -7,8 +7,8 @@ use std::{
 };
 
 use futures::Stream;
+use lb_banning_service::BanningConfig;
 use lb_chain_broadcast_service::BlockInfo;
-use nomos_banning::BanningConfig;
 use lb_chain_service::CryptarchiaInfo;
 use lb_common_http_client::CommonHttpClient;
 use lb_core::{

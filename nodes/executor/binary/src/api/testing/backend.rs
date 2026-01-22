@@ -9,8 +9,8 @@ use axum::{
     routing::post,
 };
 use lb_api_service::Backend;
+use lb_banning_service::BanningService;
 use lb_da_network_service::backends::libp2p::executor::DaNetworkExecutorBackend;
-use nomos_banning::BanningService;
 use lb_da_sampling_service::{
     backend::kzgrs::KzgrsSamplingBackend,
     network::adapters::executor::Libp2pAdapter as SamplingLibp2pAdapter,

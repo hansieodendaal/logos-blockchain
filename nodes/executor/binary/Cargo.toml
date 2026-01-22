@@ -28,6 +28,7 @@ clap                        = { default-features = false, features = ["derive"],
 color-eyre                  = { default-features = false, version = "0.6.0" }
 futures                     = { default-features = false, version = "0.3" }
 lb-api-service              = { workspace = true }
+lb-banning-service          = { workspace = true }
 lb-chain-broadcast-service  = { workspace = true }
 lb-core                     = { workspace = true }
 lb-da-dispersal-service     = { workspace = true }

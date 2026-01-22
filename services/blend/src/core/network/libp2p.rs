@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_network_service::{
     NetworkService,
     backends::libp2p::{Command, Libp2p, PubSubCommand},

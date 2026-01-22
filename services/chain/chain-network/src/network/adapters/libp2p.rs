@@ -1,8 +1,12 @@
-use std::{collections::HashSet, fmt::{Debug, Display}, hash::Hash, marker::PhantomData};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+    hash::Hash,
+    marker::PhantomData,
+};
 
-use cryptarchia_sync::GetTipResponse;
 use futures::{FutureExt as _, TryStreamExt as _, future::select_ok};
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_chain_service_common::NetworkMessage;
 use lb_core::{
     block::{Block, Proposal},

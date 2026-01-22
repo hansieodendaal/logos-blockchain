@@ -5,7 +5,7 @@ use std::{
 
 use axum::{Json, extract::State, response::Response};
 use lb_api_service::http::{da, mantle};
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_core::{header::HeaderId, sdp::SessionNumber};
 use lb_da_network_service::{
     NetworkService, api::ApiAdapter as ApiAdapterTrait, backends::NetworkBackend,

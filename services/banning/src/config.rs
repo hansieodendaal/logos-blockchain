@@ -1,7 +1,7 @@
 use std::time::Duration;
 
+use lb_utils::bounded_duration::{MinimalBoundedDuration, SECOND};
 use libp2p::PeerId;
-use nomos_utils::bounded_duration::{MinimalBoundedDuration, SECOND};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 

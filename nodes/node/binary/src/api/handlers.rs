@@ -17,7 +17,7 @@ use lb_api_service::http::{
     libp2p, mantle, mempool,
     storage::StorageAdapter,
 };
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_core::{
     da::{BlobId, DaVerifier as CoreDaVerifier, blob::Share},

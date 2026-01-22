@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 
 use futures::Stream;
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_core::codec::{DeserializeOp as _, SerializeOp as _};
 use lb_network_service::{
     NetworkService,

@@ -7,7 +7,7 @@ use core::{
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_blend::proofs::quota::inputs::prove::private::ProofOfLeadershipQuotaInputs;
 use lb_blend_service::{
     core::kms::PreloadKMSBackendCorePoQGenerator,

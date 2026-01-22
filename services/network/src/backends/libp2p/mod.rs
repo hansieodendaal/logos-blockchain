@@ -4,7 +4,7 @@ pub(crate) mod swarm;
 
 use std::fmt::{Debug, Display};
 
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 pub use lb_libp2p::{
     PeerId,
     libp2p::gossipsub::{Message, TopicHash},
@@ -45,7 +45,6 @@ where
     type ChainSyncEvent = ChainSyncEvent;
 
     fn new(config: Self::Settings, overwatch_handle: OverwatchHandle<RuntimeServiceId>) -> Self {
-        let rng = ChaCha20Rng::from_entropy();
         let (commands_tx, commands_rx) = mpsc::channel(BUFFER_SIZE);
 
         let (pubsub_events_tx, _) = broadcast::channel(BUFFER_SIZE);

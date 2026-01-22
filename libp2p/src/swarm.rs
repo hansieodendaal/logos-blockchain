@@ -17,7 +17,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cryptarchia_sync::Event as CryptarchiaSyncEvent;
+use lb_banning_service::{
+    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe,
+    block_on_now_from_sync,
+};
+use lb_cryptarchia_sync::Event as CryptarchiaSyncEvent;
 use libp2p::{
     Multiaddr, PeerId, TransportError,
     gossipsub::Event as GossibsubEvent,
@@ -27,10 +31,6 @@ use libp2p::{
     swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
 };
 use multiaddr::multiaddr;
-use nomos_banning::{
-    BanningEvent, BanningRequest, banning_list_active_bans, banning_subscribe,
-    block_on_now_from_sync,
-};
 use overwatch::services::relay::OutboundRelay;
 use rand::RngCore;
 use tokio::sync::{Notify, broadcast};
@@ -483,7 +483,7 @@ impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {
                         // Drop this event and continue the loop to poll for the next event
                         continue;
                     }
-                    // Not banned (or not a connection event we care about) — forward it.
+                    // Not banned (or not a connection event we care about) - forward it.
                     Poll::Ready(Some(event))
                 }
             };

@@ -7,7 +7,7 @@ use ::time::OffsetDateTime;
 use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
 use hex::FromHex as _;
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_chain_leader_service::LeaderConfig;
 use lb_key_management_system_service::keys::UnsecuredZkKey;
 use lb_libp2p::{Multiaddr, ed25519::SecretKey};

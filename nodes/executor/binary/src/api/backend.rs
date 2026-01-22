@@ -23,7 +23,7 @@ use lb_api_service::{
         storage,
     },
 };
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_core::{
     da::{
         DaVerifier as CoreDaVerifier,

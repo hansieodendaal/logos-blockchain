@@ -24,6 +24,7 @@ futures                          = { default-features = false, version = "0.3" }
 futures-util                     = { default-features = false, version = "0.3.31" }
 hex                              = { default-features = false, version = "0.4.3" }
 lb-api-service                   = { workspace = true }
+lb-banning-service               = { workspace = true }
 lb-blend-service                 = { features = ["libp2p"], workspace = true }
 lb-chain-broadcast-service       = { workspace = true }
 lb-chain-leader-service          = { workspace = true }
@@ -37,7 +38,6 @@ lb-da-dispersal-service          = { workspace = true }
 lb-da-network-core               = { workspace = true }
 lb-da-network-service            = { workspace = true }
 lb-da-sampling-service           = { workspace = true }
-lb-banning-service                  = { workspace = true }
 lb-da-verifier-service           = { workspace = true }
 lb-executor                      = { default-features = false, features = ["testing", "tracing"], workspace = true }
 lb-executor-http-client          = { workspace = true }

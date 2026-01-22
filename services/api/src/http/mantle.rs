@@ -2,7 +2,7 @@ use core::fmt::Debug;
 use std::fmt::Display;
 
 use futures::{Stream, StreamExt as _};
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use lb_chain_service::ConsensusMsg;
 use lb_core::{

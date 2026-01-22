@@ -4,7 +4,7 @@ pub mod generic_services;
 
 use color_eyre::eyre::{Result, eyre};
 use generic_services::{SamplingMempoolAdapter, VerifierMempoolAdapter};
-use nomos_banning::BanningService;
+use lb_banning_service::BanningService;
 pub use lb_blend_service::{
     core::{
         backends::libp2p::Libp2pBlendBackend as BlendBackend,

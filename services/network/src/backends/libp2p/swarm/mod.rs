@@ -40,7 +40,7 @@ mod kademlia;
 pub use chainsync::ChainSyncCommand;
 pub use gossipsub::PubSubCommand;
 pub use kademlia::DiscoveryCommand;
-use nomos_banning::BanningRequest;
+use lb_banning_service::BanningRequest;
 
 use crate::message::ChainSyncEvent;
 

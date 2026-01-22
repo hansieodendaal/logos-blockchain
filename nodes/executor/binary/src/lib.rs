@@ -2,8 +2,8 @@ pub mod api;
 pub mod config;
 
 use api::backend::AxumBackend;
+use lb_banning_service::BanningService;
 use lb_core::mantle::{SignedMantleTx, TxHash};
-use nomos_banning::BanningService;
 use lb_da_dispersal_service::{
     DispersalService,
     adapters::{
