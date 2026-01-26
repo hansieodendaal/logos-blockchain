@@ -27,11 +27,16 @@ lb-time-service               = { workspace = true }
 lb-tx-service                 = { workspace = true }
 lb-wallet-service             = { workspace = true }
 overwatch                     = { workspace = true }
+rand                          = { workspace = true }
 serde                         = { workspace = true }
 thiserror                     = "1.0"
 tokio                         = { default-features = false, version = "1" }
 tracing                       = { workspace = true }
 tracing-futures               = { default-features = false, version = "0.2" }
+
+[dev-dependencies]
+lb-groth16 = { workspace = true }
+lb-utils   = { workspace = true }
 
 [features]
 default      = []
