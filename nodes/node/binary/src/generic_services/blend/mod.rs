@@ -1,7 +1,6 @@
 use core::{
     fmt::{Debug, Display},
     future::ready,
-    marker::PhantomData,
     time::Duration,
 };
 
@@ -17,7 +16,6 @@ use lb_blend_service::{
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::LeaderMsg;
 use lb_core::crypto::ZkHash;
-use lb_da_sampling_service::network::NetworkAdapter;
 use lb_libp2p::PeerId;
 use lb_pol::{PolChainInputsData, PolWalletInputsData, PolWitnessInputsData};
 use lb_poq::AGED_NOTE_MERKLE_TREE_HEIGHT;
@@ -36,7 +34,7 @@ mod proofs;
 
 pub type BlendMembershipAdapter<RuntimeServiceId> =
     Adapter<BlockBroadcastService<RuntimeServiceId>, PeerId>;
-pub type BlendCoreService<SamplingAdapter, RuntimeServiceId> = lb_blend_service::core::BlendService<
+pub type BlendCoreService<RuntimeServiceId> = lb_blend_service::core::BlendService<
     lb_blend_service::core::backends::libp2p::Libp2pBlendBackend,
     PeerId,
     lb_blend_service::core::network::libp2p::Libp2pAdapter<RuntimeServiceId>,
@@ -46,10 +44,10 @@ pub type BlendCoreService<SamplingAdapter, RuntimeServiceId> = lb_blend_service:
     BlendProofsVerifier,
     NtpTimeBackend,
     CryptarchiaService<RuntimeServiceId>,
-    PolInfoProvider<SamplingAdapter>,
+    PolInfoProvider,
     RuntimeServiceId,
 >;
-pub type BlendEdgeService<SamplingAdapter, RuntimeServiceId> = lb_blend_service::edge::BlendService<
+pub type BlendEdgeService<RuntimeServiceId> = lb_blend_service::edge::BlendService<
         lb_blend_service::edge::backends::libp2p::Libp2pBlendBackend,
         PeerId,
         <lb_blend_service::core::network::libp2p::Libp2pAdapter<RuntimeServiceId> as lb_blend_service::core::network::NetworkAdapter<RuntimeServiceId>>::BroadcastSettings,
@@ -57,29 +55,26 @@ pub type BlendEdgeService<SamplingAdapter, RuntimeServiceId> = lb_blend_service:
         EdgeProofsGenerator,
         NtpTimeBackend,
         CryptarchiaService<RuntimeServiceId>,
-        PolInfoProvider<SamplingAdapter>,
+        PolInfoProvider,
         RuntimeServiceId
     >;
-pub type BlendService<SamplingAdapter, RuntimeServiceId> = lb_blend_service::BlendService<
-    BlendCoreService<SamplingAdapter, RuntimeServiceId>,
-    BlendEdgeService<SamplingAdapter, RuntimeServiceId>,
+pub type BlendService<RuntimeServiceId> = lb_blend_service::BlendService<
+    BlendCoreService<RuntimeServiceId>,
+    BlendEdgeService<RuntimeServiceId>,
     RuntimeServiceId,
 >;
 
 /// The provider of a stream of winning `PoL` epoch slots for the Blend service,
 /// without introducing a cyclic dependency from Blend service to chain service.
-pub struct PolInfoProvider<SamplingAdapter>(PhantomData<SamplingAdapter>);
+pub struct PolInfoProvider;
 
 #[async_trait]
-impl<SamplingAdapter, RuntimeServiceId> PolInfoProviderTrait<RuntimeServiceId>
-    for PolInfoProvider<SamplingAdapter>
+impl<RuntimeServiceId> PolInfoProviderTrait<RuntimeServiceId> for PolInfoProvider
 where
-    SamplingAdapter: NetworkAdapter<RuntimeServiceId> + 'static,
     RuntimeServiceId: AsServiceId<
             CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
-                SamplingAdapter,
                 RuntimeServiceId,
             >,
         > + Debug
@@ -102,7 +97,6 @@ where
             CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
-                SamplingAdapter,
                 RuntimeServiceId,
             >
         )
@@ -112,7 +106,6 @@ where
             .relay::<CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
-                SamplingAdapter,
                 RuntimeServiceId,
             >>()
             .await
