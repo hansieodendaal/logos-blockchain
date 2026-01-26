@@ -9,8 +9,8 @@ use axum::{
     routing::get,
 };
 use lb_api_service::Backend;
-use lb_http_api_common::{paths::MANTLE_SDP_DECLARATIONS, utils::create_rate_limit_layer};
 use lb_banning_service::BanningService;
+use lb_http_api_common::{paths::MANTLE_SDP_DECLARATIONS, utils::create_rate_limit_layer};
 pub use lb_network_service::backends::libp2p::Libp2p as NetworkBackend;
 use overwatch::{DynError, overwatch::handle::OverwatchHandle, services::AsServiceId};
 use tokio::net::TcpListener;

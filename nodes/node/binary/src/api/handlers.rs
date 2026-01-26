@@ -298,7 +298,9 @@ where
         AsServiceId<StorageService<RocksBackend, RuntimeServiceId>> + Debug + Sync + Display,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let relay = match get_relay_or_500(&handle).await {
+    let relay = match get_relay_or_500::<StorageService<RocksBackend, RuntimeServiceId>, _>(&handle)
+        .await
+    {
         Ok(relay) => relay,
         Err(error_response) => return error_response,
     };
