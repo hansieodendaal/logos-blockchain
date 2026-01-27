@@ -3,6 +3,7 @@ pub mod config;
 pub mod generic_services;
 
 use color_eyre::eyre::{Result, eyre};
+use lb_banning_service::BanningService;
 pub use lb_blend_service::{
     core::{
         backends::libp2p::Libp2pBlendBackend as BlendBackend,
@@ -121,6 +122,7 @@ pub struct LogosBlockchain {
     system_sig: SystemSigService,
     key_management: KeyManagementService,
     wallet: WalletService,
+    banning: BanningService<RuntimeServiceId>,
     #[cfg(feature = "testing")]
     testing_http: TestingApiService<RuntimeServiceId>,
 }
@@ -174,6 +176,7 @@ pub fn run_node_from_config(config: RunConfig) -> Result<Overwatch<RuntimeServic
             key_management: config.user.key_management,
             sdp: SdpSettings { declaration: None },
             wallet: config.user.wallet,
+            banning: config.user.banning,
             #[cfg(feature = "testing")]
             testing_http: config.user.testing_http,
         },

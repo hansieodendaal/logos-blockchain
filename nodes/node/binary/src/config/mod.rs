@@ -8,6 +8,7 @@ use ::time::OffsetDateTime;
 use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
 use hex::FromHex as _;
+use lb_banning_service::BanningService;
 use lb_chain_leader_service::LeaderConfig;
 use lb_key_management_system_service::keys::UnsecuredZkKey;
 use lb_libp2p::{Multiaddr, ed25519::SecretKey};
@@ -283,6 +284,7 @@ pub struct UserConfig {
     pub storage: <StorageService as ServiceData>::Settings,
     pub key_management: <KeyManagementService as ServiceData>::Settings,
     pub wallet: <WalletService<CryptarchiaService, RuntimeServiceId> as ServiceData>::Settings,
+    pub banning: <BanningService<RuntimeServiceId> as ServiceData>::Settings,
 
     #[cfg(feature = "testing")]
     pub testing_http: <ApiService as ServiceData>::Settings,

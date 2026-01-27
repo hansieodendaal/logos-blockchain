@@ -5660,6 +5660,7 @@ dependencies = [
  "bytes",
  "futures",
  "hyper 1.8.1",
+ "logos-blockchain-banning-service",
  "logos-blockchain-chain-broadcast-service",
  "logos-blockchain-chain-service",
  "logos-blockchain-core",
@@ -5677,6 +5678,20 @@ dependencies = [
  "tracing",
  "utoipa",
  "utoipa-swagger-ui",
+]
+
+[[package]]
+name = "logos-blockchain-banning-service"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "libp2p",
+ "logos-blockchain-utils",
+ "overwatch",
+ "serde",
+ "serde_with",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5802,6 +5817,7 @@ dependencies = [
  "libp2p",
  "libp2p-stream",
  "libp2p-swarm-test",
+ "logos-blockchain-banning-service",
  "logos-blockchain-blend",
  "logos-blockchain-chain-broadcast-service",
  "logos-blockchain-chain-service",
@@ -5930,6 +5946,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "logos-blockchain-banning-service",
  "logos-blockchain-chain-service",
  "logos-blockchain-chain-service-common",
  "logos-blockchain-core",
@@ -6266,13 +6283,16 @@ dependencies = [
  "hex",
  "igd-next 0.16.2",
  "libp2p",
+ "libp2p-kad",
  "libp2p-swarm-test",
+ "logos-blockchain-banning-service",
  "logos-blockchain-cryptarchia-sync",
  "logos-blockchain-utils",
  "multiaddr",
  "natpmp",
  "netdev",
  "num_enum",
+ "overwatch",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -6304,6 +6324,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "logos-blockchain-banning-service",
  "logos-blockchain-core",
  "logos-blockchain-cryptarchia-sync",
  "logos-blockchain-libp2p",
@@ -6331,6 +6352,7 @@ dependencies = [
  "hex",
  "http 1.4.0",
  "logos-blockchain-api-service",
+ "logos-blockchain-banning-service",
  "logos-blockchain-blend",
  "logos-blockchain-blend-service",
  "logos-blockchain-chain-broadcast-service",
@@ -6501,6 +6523,7 @@ dependencies = [
  "futures-util",
  "hex",
  "logos-blockchain-api-service",
+ "logos-blockchain-banning-service",
  "logos-blockchain-blend-proofs",
  "logos-blockchain-blend-service",
  "logos-blockchain-chain-broadcast-service",
@@ -6605,6 +6628,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "logos-blockchain-banning-service",
  "logos-blockchain-core",
  "logos-blockchain-network-service",
  "logos-blockchain-services-utils",
