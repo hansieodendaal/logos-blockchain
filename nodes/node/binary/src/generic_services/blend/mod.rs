@@ -6,6 +6,7 @@ use core::{
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
+use lb_banning_service::BanningService;
 use lb_blend::proofs::quota::inputs::prove::private::ProofOfLeadershipQuotaInputs;
 use lb_blend_service::{
     core::kms::PreloadKMSBackendCorePoQGenerator,
@@ -81,6 +82,7 @@ where
         + Send
         + Sync
         + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     type Stream = Box<dyn Stream<Item = PolEpochInfo> + Send + Unpin>;
 
