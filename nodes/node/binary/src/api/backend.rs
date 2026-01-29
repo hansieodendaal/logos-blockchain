@@ -15,6 +15,7 @@ use axum::{
 };
 use lb_api_service::{Backend, http::consensus::Cryptarchia};
 use lb_chain_broadcast_service::BlockBroadcastService;
+use lb_chain_service::CryptarchiaConsensus;
 use lb_core::{
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction},
@@ -38,15 +39,10 @@ use tower_http::{
 };
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-#[cfg(feature = "block-explorer")]
-use {
-    super::handlers::{blocks, blocks_stream},
-    lb_chain_service::CryptarchiaConsensus,
-};
 
 use super::handlers::{
-    add_tx, block, cryptarchia_headers, cryptarchia_info, cryptarchia_lib_stream, libp2p_info,
-    mantle_metrics, mantle_status, wallet,
+    add_tx, block, blocks, blocks_stream, cryptarchia_headers, cryptarchia_info,
+    cryptarchia_lib_stream, libp2p_info, mantle_metrics, mantle_status, wallet,
 };
 use crate::{
     WalletService,
@@ -235,22 +231,21 @@ where
                 routing::post(wallet::post_transactions_transfer_funds::<WalletService, _>),
             );
 
-        #[cfg(feature = "block-explorer")]
-        let app = app
-            .route(
-                paths::BLOCKS,
-                routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
-            )
-            .route(
-                paths::BLOCKS_STREAM,
-                routing::get(
-                    blocks_stream::<
-                        BlockStorageBackend,
-                        CryptarchiaConsensus<_, _, _, _>,
-                        RuntimeServiceId,
-                    >,
-                ),
-            );
+        let app = app.route(
+            paths::BLOCKS_STREAM,
+            routing::get(
+                blocks_stream::<
+                    BlockStorageBackend,
+                    CryptarchiaConsensus<_, _, _, _>,
+                    RuntimeServiceId,
+                >,
+            ),
+        );
+
+        let app = app.route(
+            paths::BLOCKS,
+            routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
+        );
 
         let app = app
             .with_state(handle.clone())

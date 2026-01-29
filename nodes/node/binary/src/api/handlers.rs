@@ -6,13 +6,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse as _, Response},
 };
+use futures::FutureExt as _;
 use lb_api_service::http::{
+    DynError,
     consensus::{self, Cryptarchia},
     libp2p, mantle, mempool,
     storage::StorageAdapter,
 };
 use lb_chain_broadcast_service::BlockBroadcastService;
+use lb_chain_service::ConsensusMsg;
 use lb_core::{
+    block::Block,
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction},
 };
@@ -23,31 +27,30 @@ use lb_http_api_common::{
     },
     paths,
 };
+use lb_libp2p::libp2p::bytes::Bytes;
 use lb_network_service::backends::libp2p::Libp2p as Libp2pNetworkBackend;
 use lb_sdp_service::{mempool::SdpMempoolAdapter, wallet::SdpWalletAdapter};
-use lb_storage_service::{StorageService, backends::rocksdb::RocksBackend};
+use lb_storage_service::{
+    StorageService, api::chain::StorageChainApi, backends::rocksdb::RocksBackend,
+};
 use lb_tx_service::{
     TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
 };
 use lb_wallet_service::api::{WalletApi, WalletServiceData};
-use overwatch::{overwatch::handle::OverwatchHandle, services::AsServiceId};
-use serde::Deserialize;
-#[cfg(feature = "block-explorer")]
-use {
-    crate::api::{queries::BlockRangeQuery, serializers::blocks::ApiBlock},
-    futures::FutureExt as _,
-    lb_api_service::http::DynError,
-    lb_chain_service::ConsensusMsg,
-    lb_core::block::Block,
-    lb_libp2p::libp2p::bytes::Bytes,
-    lb_storage_service::api::chain::StorageChainApi,
-    overwatch::services::ServiceData,
-    serde::Serialize,
-    tokio_stream::StreamExt as _,
+use overwatch::{
+    overwatch::handle::OverwatchHandle,
+    services::{AsServiceId, ServiceData},
 };
+use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt as _;
 
-use crate::api::{responses, responses::overwatch::get_relay_or_500};
+use crate::api::{
+    queries::BlockRangeQuery,
+    responses,
+    responses::overwatch::get_relay_or_500,
+    serializers::blocks::{ApiBlock, ApiProcessedBlockEvent},
+};
 
 #[macro_export]
 macro_rules! make_request_and_return_response {
@@ -443,7 +446,6 @@ where
     >(handle, declaration_id))
 }
 
-#[cfg(feature = "block-explorer")]
 #[utoipa::path(
     get,
     path = paths::BLOCKS,
@@ -476,12 +478,11 @@ where
     make_request_and_return_response!(api_blocks)
 }
 
-#[cfg(feature = "block-explorer")]
 #[utoipa::path(
     get,
     path = paths::BLOCKS_STREAM,
     responses(
-        (status = 200, description = "Get blocks"),
+        (status = 200, description = "Stream of processed blocks with chain state"),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
@@ -504,7 +505,7 @@ where
 {
     let stream = mantle::get_new_blocks_stream::<_, _, ConsensusService, _>(&handle)
         .await
-        .map(|stream| stream.map(ApiBlock::from));
+        .map(|stream| stream.map(ApiProcessedBlockEvent::from));
     match stream {
         Ok(stream) => responses::ndjson::from_stream(stream),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),

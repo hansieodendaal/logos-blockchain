@@ -290,8 +290,8 @@ where
                 Some(msg) = service_resources_handle.inbound_relay.recv() => {
                     Self::handle_wallet_message(msg, &mut wallet, &storage_adapter, &cryptarchia_api, &kms).await;
                 }
-                Ok(header_id) = new_block_receiver.recv() => {
-                    Self::handle_new_block(header_id, &mut wallet, &storage_adapter, &cryptarchia_api).await;
+                Ok(event) = new_block_receiver.recv() => {
+                    Self::handle_new_block(event.block_id, &mut wallet, &storage_adapter, &cryptarchia_api).await;
                 }
                 Ok(lib_update) = lib_receiver.recv() => {
                     Self::handle_lib_update(&lib_update, &mut wallet);
