@@ -313,6 +313,54 @@ impl LedgerState {
         &self.epoch_state.utxos
     }
 
+    /// Computes the epoch state for a given slot.
+    ///
+    /// This handles the case where epochs have been skipped (no blocks
+    /// produced). When the requested epoch is ahead of the stored epoch
+    /// states, it synthesizes an epoch state with adjusted total stake
+    /// using 0 block density for each skipped epoch.
+    ///
+    /// Returns `None` if the requested epoch is in the past (before current
+    /// `epoch_state`).
+    #[must_use]
+    pub fn epoch_state_for_slot(&self, slot: Slot, config: &Config) -> Option<EpochState> {
+        let requested_epoch = config.epoch(slot);
+
+        if self.epoch_state.epoch() == requested_epoch {
+            Some(self.epoch_state.clone())
+        } else if self.next_epoch_state.epoch() == requested_epoch {
+            Some(self.next_epoch_state.clone())
+        } else if requested_epoch > self.next_epoch_state.epoch() {
+            // Epochs were skipped - synthesize epoch state with adjusted total stake.
+            // Use 0 density since no blocks were produced in the skipped epochs.
+            let mut total_stake = self.epoch_state.total_stake;
+
+            for _ in u32::from(self.next_epoch_state.epoch())..u32::from(requested_epoch) {
+                total_stake = self
+                    .stake_inference
+                    .total_stake_inference::<PRECISION>(total_stake, 0);
+            }
+
+            tracing::warn!(
+                "EpochState skipping epochs {}..{}, adjusting total stake: {} -> {}",
+                u32::from(self.next_epoch_state.epoch()),
+                u32::from(requested_epoch),
+                self.epoch_state.total_stake,
+                total_stake
+            );
+
+            Some(EpochState {
+                epoch: requested_epoch,
+                nonce: self.nonce,
+                utxos: self.utxos.clone(),
+                total_stake,
+            })
+        } else {
+            // Requested epoch is in the past
+            None
+        }
+    }
+
     pub fn from_genesis_tx<Id>(
         tx: impl GenesisTx,
         config: &Config,
@@ -1015,5 +1063,62 @@ pub mod tests {
 
         let result = ledger_state.try_apply_tx::<(), MainnetGasConstants>(&locked_notes, tx);
         assert!(matches!(result, Err(LedgerError::ZeroValueNote)));
+    }
+
+    #[test]
+    fn test_epoch_state_for_slot_with_empty_epochs() {
+        let utxo = utxo();
+        let config = config();
+        let ledger_state = genesis_state(&[utxo]);
+
+        // Genesis state is at epoch 0, with epoch_state for epoch 0 and
+        // next_epoch_state for epoch 1
+        assert_eq!(ledger_state.epoch_state.epoch, 0.into());
+        assert_eq!(ledger_state.next_epoch_state.epoch, 1.into());
+        let initial_total_stake = ledger_state.epoch_state.total_stake;
+
+        // Query for epoch 0 (current epoch) - should return epoch_state
+        let epoch_0_slot: Slot = 5.into();
+        let epoch_0_state = ledger_state
+            .epoch_state_for_slot(epoch_0_slot, &config)
+            .expect("Should return epoch state for current epoch");
+        assert_eq!(epoch_0_state.epoch, 0.into());
+        assert_eq!(epoch_0_state.total_stake, initial_total_stake);
+
+        // Query for epoch 1 (next epoch) - should return next_epoch_state
+        let epoch_1_slot: Slot = 15.into(); // epoch length is 10
+        let epoch_1_state = ledger_state
+            .epoch_state_for_slot(epoch_1_slot, &config)
+            .expect("Should return epoch state for next epoch");
+        assert_eq!(epoch_1_state.epoch, 1.into());
+        assert_eq!(epoch_1_state.total_stake, initial_total_stake);
+
+        // Query for epoch 2 (skipped epoch) - should synthesize with reduced total
+        // stake
+        let epoch_2_slot: Slot = 25.into();
+        let epoch_2_state = ledger_state
+            .epoch_state_for_slot(epoch_2_slot, &config)
+            .expect("Should synthesize epoch state for skipped epoch");
+        assert_eq!(epoch_2_state.epoch, 2.into());
+        // With 0 density and LEARNING_RATE=1, total stake drops to minimum (1)
+        assert_eq!(
+            epoch_2_state.total_stake, 1,
+            "Total stake should drop to minimum for empty epochs"
+        );
+
+        // Query for epoch 3 (multiple skipped epochs) - stake stays at minimum
+        let epoch_3_slot: Slot = 35.into();
+        let epoch_3_state = ledger_state
+            .epoch_state_for_slot(epoch_3_slot, &config)
+            .expect("Should synthesize epoch state for multiple skipped epochs");
+        assert_eq!(epoch_3_state.epoch, 3.into());
+        assert_eq!(
+            epoch_3_state.total_stake, 1,
+            "Total stake should remain at minimum"
+        );
+
+        // Verify nonce and utxos are preserved from current state
+        assert_eq!(epoch_3_state.nonce, ledger_state.nonce);
+        assert_eq!(epoch_3_state.utxos, ledger_state.utxos);
     }
 }
