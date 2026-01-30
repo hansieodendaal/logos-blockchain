@@ -1,0 +1,170 @@
+name: Prepare release draft with built binaries
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}@${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  configure-version:
+    name: Configure release version
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.define-version.outputs.version }}
+
+    steps:
+      # Take the version of the tag from which the workflow is dispatched, or use `0.0.0` for test runs with the `release-ci-test` tag.
+      - name: Define version
+        id: define-version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$TAG_NAME" == "release-ci-test" ]]; then
+            echo "Test workflow run. Setting version to 0.0.0 for testing."
+            VERSION=0.0.0
+          elif [[ "$TAG_NAME" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Release workflow run for tag '$TAG_NAME'. Setting version to '$TAG_NAME'."
+            VERSION="$TAG_NAME"
+          else
+            echo "Tag name '$TAG_NAME' is not valid. It must either be 'release-ci-test' or follow the format 'X.Y.Z'."
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build:
+    name: "Build binaries for ${{ matrix.platform.os-display }} (${{ matrix.platform.arch }})"
+    needs: configure-version
+    runs-on: ${{ matrix.platform.builder }}
+    env:
+      VERSION: ${{ needs.configure-version.outputs.version }}
+    strategy:
+      matrix:
+        platform:
+          - os: linux
+            os-display: Linux
+            arch: x86_64
+            builder: ubuntu-24.04
+            target_triple: x86_64-unknown-linux-gnu
+          - os: linux
+            os-display: Linux
+            arch: aarch64
+            builder: ubuntu-24.04-arm
+            target_triple: aarch64-unknown-linux-gnu
+          - os: macos
+            os-display: MacOS
+            arch: aarch64
+            builder: macos-14
+            target_triple: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2  # Version 4.2.2
+
+      - name: Add the target triple
+        run: rustup target add ${{ matrix.platform.target_triple }}
+
+      - name: Setup Circuits
+        uses: ./.github/actions/setup-circuits
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build node binary
+        run: cargo build -p logos-blockchain-node --release --target ${{ matrix.platform.target_triple }}
+
+      - name: Upload binary (${{ matrix.platform.arch }})
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47 # Version 4.6.2
+        with:
+          name: logos-blockchain-node-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ needs.configure-version.outputs.version }}
+          path: target/${{ matrix.platform.target_triple }}/release/logos-blockchain-node
+          if-no-files-found: error
+
+  create-draft-release:
+    name: Create draft release
+    needs:
+      - configure-version
+      - build
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.configure-version.outputs.version }}
+    outputs:
+      upload_url: ${{ steps.create-draft-release.outputs.upload_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2  # Version 4.2.2
+
+      - name: Create Draft Release
+        uses: actions/create-release@4c11c9fe1dcd9636620a16455165783b20fc7ea0  # Version 1.1.4
+        id: create-draft-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.VERSION }}
+          release_name: Logos Blockchain Node ${{ env.VERSION }}
+          body_path: .github/release/release-content.md
+          draft: true
+          prerelease: true
+
+  upload-artifacts:
+    name: Upload artifacts to release
+    needs:
+      - configure-version
+      - create-draft-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - os: linux
+            arch: x86_64
+          - os: linux
+            arch: aarch64
+          - os: macos
+            arch: aarch64
+    env:
+      UPLOAD_URL: ${{ needs.create-draft-release.outputs.upload_url }}
+      BINARY_NAME: logos-blockchain-node-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-${{ needs.configure-version.outputs.version }}
+      DOWNLOAD_DIRECTORY: artifacts
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # Version 4.2.1
+        with:
+          name: ${{ env.BINARY_NAME }}
+          path: ${{ env.DOWNLOAD_DIRECTORY }}
+          merge-multiple: true
+
+      - name: Upload ${{ matrix.platform.os }} (${{ matrix.platform.arch }}) to release
+        uses: actions/upload-release-asset@ef2adfe8cb8ebfa540930c452c576b3819990faa  # Version 1.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: ${{ env.DOWNLOAD_DIRECTORY }}/logos-blockchain-node
+          asset_name: ${{ env.BINARY_NAME }}
+          asset_content_type: application/octet-stream
+
+  upload-node-config:
+    name: Upload example node config to release
+    needs:
+      - create-draft-release
+    runs-on: ubuntu-latest
+    env:
+      UPLOAD_URL: ${{ needs.create-draft-release.outputs.upload_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2  # Version 4.2.2
+
+      - name: Upload node-config.yaml
+        uses: actions/upload-release-asset@ef2adfe8cb8ebfa540930c452c576b3819990faa  # Version 1.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: nodes/node/config.yaml
+          asset_name: node-config.yaml
+          asset_content_type: text/yaml
