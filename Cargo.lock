@@ -3943,6 +3943,7 @@ dependencies = [
  "futures",
  "hyper",
  "logos-blockchain-chain-broadcast-service 0.1.0",
+ "logos-blockchain-chain-leader-service 0.1.0",
  "logos-blockchain-chain-service 0.1.0",
  "logos-blockchain-core 0.1.0",
  "logos-blockchain-network-service 0.1.0",
