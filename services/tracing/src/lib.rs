@@ -24,7 +24,7 @@ use overwatch::{
     },
 };
 use serde::{Deserialize, Serialize};
-use tracing::Level;
+use tracing::{Level, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _,
@@ -48,11 +48,23 @@ pub struct SharedWriter {
 
 impl Write for SharedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.lock().unwrap().write(buf)
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("Tracing writer mutex poisoned on write, recovering");
+                poisoned.into_inner()
+            })
+            .write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.lock().unwrap().flush()
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("Tracing writer mutex poisoned on flush, recovering");
+                poisoned.into_inner()
+            })
+            .flush()
     }
 }
 
