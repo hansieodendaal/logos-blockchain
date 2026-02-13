@@ -55,6 +55,7 @@ lb-tx-service                    = { features = ["rocksdb-backend"], workspace =
 lb-utils                         = { features = ["serde", "time"], workspace = true }
 lb-wallet-service                = { workspace = true }
 libp2p                           = { features = ["gossipsub", "identify", "kad"], workspace = true }
+logos-blockchain-tui-zone        = { path = "../../../testnet/tui-zone" }
 num-bigint                       = { default-features = false, version = "0.4" }
 overwatch                        = { workspace = true }
 rand                             = { workspace = true }

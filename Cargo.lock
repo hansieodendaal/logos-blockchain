@@ -5168,6 +5168,7 @@ dependencies = [
  "logos-blockchain-time-service 0.1.0",
  "logos-blockchain-tracing 0.1.0",
  "logos-blockchain-tracing-service 0.1.0",
+ "logos-blockchain-tui-zone",
  "logos-blockchain-tx-service 0.1.0",
  "logos-blockchain-utils 0.1.0",
  "logos-blockchain-wallet-service 0.1.0",
@@ -5643,6 +5644,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "logos-blockchain-tui-zone"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "logos-blockchain-core 0.1.0",
+ "logos-blockchain-key-management-system-service 0.1.0",
+ "logos-blockchain-zone-sdk",
+ "rand 0.8.5",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
 name = "logos-blockchain-tx-service"
 version = "0.1.0"
 dependencies = [
@@ -5906,6 +5923,7 @@ dependencies = [
  "logos-blockchain-key-management-system-service 0.1.0",
  "reqwest",
  "rpds",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
