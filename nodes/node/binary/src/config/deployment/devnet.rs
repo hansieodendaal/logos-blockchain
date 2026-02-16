@@ -34,6 +34,7 @@ cryptarchia:
     epoch_period_nonce_buffer: 3
     epoch_period_nonce_stabilization: 4
   security_param: 20
+  learning_rate: 0.1
   sdp_config:
     service_params:
       BN:

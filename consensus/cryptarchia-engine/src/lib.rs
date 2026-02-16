@@ -706,7 +706,11 @@ pub mod tests {
 
     #[must_use]
     pub fn config_with(security_param: u32) -> Config {
-        Config::new(NonZero::new(security_param).unwrap(), 1f64)
+        Config::new(
+            NonZero::new(security_param).unwrap(),
+            1f64,
+            1f64.try_into().expect("1 > 0"),
+        )
     }
 
     fn hash<T: Hash>(t: &T) -> [u8; 32] {
