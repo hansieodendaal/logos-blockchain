@@ -3,17 +3,15 @@ use std::{collections::HashMap, time::Duration};
 use cucumber::{given, then, when};
 use futures::future::try_join_all;
 use hex::ToHex as _;
-use testing_framework_core::{
-    scenario::{PeerSelection, StartNodeOptions},
-    topology::config::TopologyConfig,
-};
-use testing_framework_runner_local::LocalDeployer;
-use tokio::time::sleep;
+use lb_testing_framework::{DeploymentBuilder, LbcLocalDeployer, TopologyConfig};
+use testing_framework_core::scenario::{PeerSelection, StartNodeOptions};
+use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
 use crate::cucumber::{
     error::{StepError, StepResult},
     steps::TARGET,
+    utils::track_progress,
     world::{ChainInfoMap, CucumberWorld, NodeInfo},
 };
 
@@ -40,13 +38,21 @@ struct MaybeSnapshot {
 #[when(expr = "I have a cluster with capacity of {int} nodes")]
 fn manual_cluster(world: &mut CucumberWorld, nodes_count: usize) -> StepResult {
     let config = TopologyConfig::with_node_numbers(nodes_count);
-    let deployer = LocalDeployer::new();
-    let cluster = deployer.manual_cluster(config).inspect_err(|e| {
-        warn!(
-            target: TARGET,
-            "Step 'I have a we have a cluster with capacity of {nodes_count} nodes' error: {e}"
-        );
-    })?;
+    let deployment = match DeploymentBuilder::new(config).build() {
+        Ok(deployment) => deployment,
+        Err(source) => {
+            warn!(
+                target: TARGET,
+                "Step 'I have a we have a cluster with capacity of {nodes_count} nodes' error: \
+                 {source}"
+            );
+            return Err(StepError::LogicalError {
+                message: format!("failed to build manual cluster: {source}"),
+            });
+        }
+    };
+    let deployer = LbcLocalDeployer::new();
+    let cluster = deployer.manual_cluster_from_descriptors(deployment);
     world.local_cluster = Some(cluster);
 
     Ok(())
@@ -95,26 +101,28 @@ async fn start_node(world: &mut CucumberWorld, node_name: String, peers: &[Strin
             .collect::<Result<Vec<String>, StepError>>()?;
         PeerSelection::Named(named)
     };
-    let started_node = cluster
-        .start_node_with(
+    let started_node = Box::pin(
+        cluster.start_node_with(
             &node_name,
-            StartNodeOptions {
-                peers: peer_selection,
-                config_patch: None,
-                persist_dir: Some(world.scenario_base_dir.join(node_name.as_str())),
-            }
-            .create_patch(move |config| {
-                // Placeholder - Add any custom configuration changes here if needed.
-                Ok(config)
-            }),
-        )
-        .await
-        .inspect_err(|e| {
-            warn!(
-                target: TARGET,
-                "Step `I start node/peer node {node_name} (connected to {peers:?})` error: {e}"
-            );
-        })?;
+            StartNodeOptions::default()
+                .with_peers(peer_selection)
+                .with_persist_dir(world.scenario_base_dir.join(node_name.as_str()))
+                .create_patch(move |config| {
+                    // Placeholder - Add any custom configuration changes here if needed.
+                    Ok(config)
+                }),
+        ),
+    )
+    .await
+    .inspect_err(|e| {
+        warn!(
+            target: TARGET,
+            "Step `I start node/peer node {node_name} (connected to {peers:?})` error: {e}"
+        );
+    })?;
+
+    let started_node_name = started_node.name.clone();
+
     world.nodes_info.insert(
         node_name.clone(),
         NodeInfo {
@@ -124,6 +132,20 @@ async fn start_node(world: &mut CucumberWorld, node_name: String, peers: &[Strin
             chain_info: HashMap::default(),
         },
     );
+
+    let operation = format!("node '{started_node_name}' readiness");
+    track_progress(&operation, Duration::from_secs(5), async {
+        cluster
+            .wait_node_ready(&started_node_name)
+            .await
+            .map_err(|source| StepError::StepFail {
+                message: format!(
+                    "node '{started_node_name}' did not become ready after start: {source}"
+                ),
+            })
+    })
+    .await?;
+
     Ok(())
 }
 
@@ -135,7 +157,7 @@ async fn node_is_at_height(
     height: u64,
     time_out_seconds: u64,
 ) -> StepResult {
-    let start = tokio::time::Instant::now();
+    let start = Instant::now();
     let time_out = Duration::from_secs(time_out_seconds);
 
     let mut count = 0usize;
@@ -288,7 +310,7 @@ fn log_waiting_status(
     peer_heights: &[u64],
     peer_min: u64,
     anchor_hashes: &[MaybeSnapshot],
-    start: tokio::time::Instant,
+    start: Instant,
 ) {
     match status {
         AlignmentStatus::Aligned => {
@@ -333,7 +355,7 @@ async fn nodes_converged(
     time_out_seconds: u64,
 ) -> StepResult {
     let nodes_info = &world.nodes_info.values().collect::<Vec<&NodeInfo>>();
-    let start = tokio::time::Instant::now();
+    let start = Instant::now();
     let time_out = Duration::from_secs(time_out_seconds);
 
     // node_name -> (height -> header_id)  (overwrites on reorg)
@@ -414,7 +436,7 @@ async fn poll_all_nodes_and_update_consensus_cache(
     let info_futures = nodes.iter().map(async |node| {
         let node_name = node.name.clone();
         node.started_node
-            .api
+            .client
             .consensus_info()
             .await
             .map(|info| ConsensusSnapshot {
