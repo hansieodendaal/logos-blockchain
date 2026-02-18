@@ -38,7 +38,7 @@ use overwatch::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::oneshot;
-use tracing::{Level, debug, error, info, instrument, span};
+use tracing::{Level, debug, error, info, instrument, span, trace};
 use tracing_futures::Instrument as _;
 
 pub use crate::{
@@ -343,7 +343,7 @@ where
                             relays.mempool_adapter(),
                         ).await {
                             Ok(()) => {
-                                info!(counter.consensus_processed_blocks = 1);
+                                trace!(counter.consensus_processed_blocks = 1);
                             }
                             Err(e) => {
                                 error!(target: LOG_TARGET, "Error processing orphan downloader block: {e:?}");
@@ -510,7 +510,7 @@ where
         {
             Ok(()) => {
                 orphan_downloader.remove_orphan(&block_id);
-                info!(counter.consensus_processed_blocks = 1);
+                trace!(counter.consensus_processed_blocks = 1);
             }
             Err(err) => {
                 Self::handle_proposal_processing_error(err, block_id, orphan_downloader);
@@ -611,7 +611,7 @@ where
         RecoverableMempool<BlockId = HeaderId, Key = TxHash, Item = Cryptarchia::Tx> + Send + Sync,
     RuntimeServiceId: Send + Sync,
 {
-    debug!("received proposal {:?}", block);
+    debug!("Received proposal with ID: {:?}", block.header().id());
 
     let (tip, reorged_txs) = cryptarchia.apply_block(block.clone()).await?;
 

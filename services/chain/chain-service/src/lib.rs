@@ -904,8 +904,7 @@ where
         new_block_subscription_sender: &broadcast::Sender<ProcessedBlockEvent>,
         lib_broadcaster: &broadcast::Sender<LibUpdate>,
     ) -> Result<(Cryptarchia, PrunedBlocks<HeaderId>, Vec<Tx>), Error> {
-        debug!("received proposal {:?}", block);
-
+        debug!("Received proposal with ID: {:?}", block.header().id());
         let header = block.header();
         let prev_lib = cryptarchia.lib();
 
@@ -1264,7 +1263,7 @@ where
                     height: tip.length(),
                 });
 
-                info!("Sending tip response: {response:?}");
+                debug!("Sending tip response: {response:?}");
                 if let Err(e) = reply_sender.send(response).await {
                     error!("Failed to send tip header: {e}");
                 }
