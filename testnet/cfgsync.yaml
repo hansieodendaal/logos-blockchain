@@ -13,7 +13,9 @@ mode: Run
 
 # Tracing
 tracing_settings:
-  logger: Stdout
+  logger: !Otlp
+    endpoint: http://otel:4317
+    service_name: init_node
   tracing: None
   filter: None
   metrics: !Otlp

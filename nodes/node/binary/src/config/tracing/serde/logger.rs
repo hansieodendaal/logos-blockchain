@@ -10,6 +10,7 @@ pub enum Layer {
     Gelf(GelfConfig),
     File(FileConfig),
     Loki(LokiConfig),
+    Otlp(OtlpConfig),
     #[default]
     Stdout,
     Stderr,
@@ -30,6 +31,10 @@ impl From<Layer> for LoggerLayer {
             Layer::Loki(config) => Self::Loki(lb_tracing::logging::loki::LokiConfig {
                 endpoint: config.endpoint,
                 host_identifier: config.host_identifier,
+            }),
+            Layer::Otlp(config) => Self::Otlp(lb_tracing::logging::otlp::OtlpConfig {
+                endpoint: config.endpoint,
+                service_name: config.service_name,
             }),
             Layer::Stdout => Self::Stdout,
             Layer::Stderr => Self::Stderr,
@@ -72,4 +77,10 @@ impl Default for FileConfig {
 pub struct LokiConfig {
     pub endpoint: Url,
     pub host_identifier: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OtlpConfig {
+    pub endpoint: Url,
+    pub service_name: String,
 }
