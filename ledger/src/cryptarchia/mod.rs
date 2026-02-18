@@ -12,7 +12,6 @@ use lb_core::{
 use lb_cryptarchia_engine::{Epoch, Slot};
 use lb_groth16::{Fr, fr_from_bytes};
 use lb_key_management_system_keys::keys::ZkPublicKey;
-use lb_pol::slot_activation_coefficient;
 use lb_utxotree::MerklePath;
 
 use crate::cryptarchia::{
@@ -27,17 +26,22 @@ use crate::mantle::sdp::locked_notes::LockedNotes;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpochState {
-    // The epoch this snapshot is for
+    /// The epoch this snapshot is for
     pub epoch: Epoch,
-    // value of the ledger nonce after 'epoch_period_nonce_buffer' slots from the beginning of the
-    // epoch
+    /// value of the ledger nonce after `epoch_period_nonce_buffer` slots from
+    /// the beginning of the epoch
     #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
     pub nonce: Fr,
-    // stake distribution snapshot taken at the beginning of the epoch
-    // (in practice, this is equivalent to the utxos the are spendable at the beginning of the
-    // epoch)
+    /// stake distribution snapshot taken at the beginning of the epoch
+    /// (in practice, this is equivalent to the utxos the are spendable at the
+    /// beginning of the epoch)
     pub utxos: UtxoTree,
     pub total_stake: Value,
+    /// Lottery values computed based on `total_stake`
+    #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
+    pub lottery_0: Fr,
+    #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
+    pub lottery_1: Fr,
 }
 
 impl EpochState {
@@ -60,6 +64,8 @@ impl EpochState {
             nonce,
             utxos,
             total_stake: self.total_stake,
+            lottery_0: self.lottery_0,
+            lottery_1: self.lottery_1,
         }
     }
 
@@ -76,6 +82,11 @@ impl EpochState {
     #[must_use]
     pub const fn total_stake(&self) -> Value {
         self.total_stake
+    }
+
+    #[must_use]
+    pub const fn lottery_values(&self) -> (Fr, Fr) {
+        (self.lottery_0, self.lottery_1)
     }
 
     #[must_use]
@@ -131,6 +142,9 @@ impl LedgerState {
             self.epoch_state.total_stake,
             block_density_inference.current_block_density(),
         );
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let current_epoch = config.epoch(self.slot);
         let new_epoch = config.epoch(slot);
 
@@ -169,6 +183,8 @@ impl LedgerState {
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             Ok(Self {
                 slot,
@@ -193,12 +209,16 @@ impl LedgerState {
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             let next_epoch_state = EpochState {
                 epoch: new_epoch + 1,
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             Ok(Self {
                 slot,
@@ -225,7 +245,8 @@ impl LedgerState {
             self.latest_utxos().root(),
             self.epoch_state.nonce,
             slot.into(),
-            self.epoch_state.total_stake,
+            self.epoch_state.lottery_0,
+            self.epoch_state.lottery_1,
         );
         if !proof.verify(&public_inputs) {
             return Err(LedgerError::InvalidProof);
@@ -365,11 +386,17 @@ impl LedgerState {
                 total_stake
             );
 
+            let (lottery_0, lottery_1) = config
+                .lottery_constants()
+                .compute_lottery_values(total_stake);
+
             Some(EpochState {
                 epoch: requested_epoch,
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             })
         } else {
             // Requested epoch is in the past
@@ -404,11 +431,15 @@ impl LedgerState {
             .utxos()
             .iter()
             .map(|(_, (utxo, _))| utxo.note.value)
-            .sum::<Value>();
+            .sum::<Value>()
+            .max(1); // TODO: Change total_stake to NonZeroU64: https://github.com/logos-blockchain/logos-blockchain/issues/2166
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let slot: Slot = 0.into();
         let stake_inference = Arc::new(StakeInference::new(
             config.consensus_config.stake_inference_learning_rate(),
-            slot_activation_coefficient(),
+            config.consensus_config.slot_activation_coeff().as_f64(),
             config.consensus_config.security_param().get().into(),
         ));
         let block_density = BlockDensity::new(stake_inference.period(), slot);
@@ -421,12 +452,16 @@ impl LedgerState {
                 nonce,
                 utxos: utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             epoch_state: EpochState {
                 epoch: 0.into(),
                 nonce,
                 utxos,
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             block_density,
             stake_inference,
@@ -463,7 +498,7 @@ pub mod tests {
     use lb_cryptarchia_engine::EpochConfig;
     use lb_groth16::Field as _;
     use lb_key_management_system_keys::keys::{Ed25519PublicKey, ZkKey};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use num_bigint::BigUint;
     use rand::{RngCore as _, thread_rng};
 
@@ -579,7 +614,8 @@ pub mod tests {
                 },
                 ledger_state.epoch_state.nonce,
                 slot.into(),
-                ledger_state.epoch_state.total_stake,
+                ledger_state.epoch_state.lottery_0,
+                ledger_state.epoch_state.lottery_1,
             ),
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
@@ -608,7 +644,7 @@ pub mod tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(1).unwrap(),
-                0.1,
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: crate::mantle::sdp::Config {
@@ -635,13 +671,16 @@ pub mod tests {
     pub fn genesis_state(utxos: &[Utxo]) -> LedgerState {
         let config = config();
         let total_stake = utxos.iter().map(|u| u.note.value).sum();
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let utxos = utxos
             .iter()
             .map(|utxo| (utxo.id(), *utxo))
             .collect::<UtxoTree>();
         let stake_inference = Arc::new(StakeInference::new(
             config.consensus_config.stake_inference_learning_rate(),
-            slot_activation_coefficient(),
+            config.consensus_config.slot_activation_coeff().as_f64(),
             config.consensus_config.security_param().get().into(),
         ));
         let block_density_inference = BlockDensity::new(stake_inference.period(), 0.into());
@@ -654,12 +693,16 @@ pub mod tests {
                 nonce: Fr::ZERO,
                 utxos: utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             epoch_state: EpochState {
                 epoch: 0.into(),
                 nonce: Fr::ZERO,
                 utxos,
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             stake_inference,
             block_density: block_density_inference,
@@ -848,7 +891,8 @@ pub mod tests {
                 latest_root: ledger_state.latest_utxos().root(),
                 epoch_nonce: ledger_state.epoch_state.nonce,
                 slot: slot.into(),
-                total_stake: ledger_state.epoch_state.total_stake,
+                lottery_0: ledger_state.epoch_state.lottery_0,
+                lottery_1: ledger_state.epoch_state.lottery_1,
             },
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
@@ -872,7 +916,8 @@ pub mod tests {
                 latest_root: BigUint::from(1u8).into(), // Invalid latest root
                 epoch_nonce: ledger_state.epoch_state.nonce,
                 slot: slot.into(),
-                total_stake: ledger_state.epoch_state.total_stake,
+                lottery_0: ledger_state.epoch_state.lottery_0,
+                lottery_1: ledger_state.epoch_state.lottery_1,
             },
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),

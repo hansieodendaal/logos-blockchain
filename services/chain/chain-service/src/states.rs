@@ -113,7 +113,7 @@ mod tests {
     use lb_core::sdp::{MinStake, ServiceParameters, ServiceType};
     use lb_cryptarchia_engine::State::Bootstrapping;
     use lb_ledger::mantle::sdp::{ServiceRewardsParameters, rewards};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
 
     use super::*;
 
@@ -125,7 +125,7 @@ mod tests {
         let security_param: NonZero<u32> = 2.try_into().unwrap();
         let cryptarchia_engine_config = lb_cryptarchia_engine::Config::new(
             security_param,
-            0.1,
+            NonNegativeRatio::new(1, 10.try_into().unwrap()),
             1f64.try_into().expect("1 > 0"),
         );
         let ledger_config = lb_ledger::Config {
@@ -134,7 +134,7 @@ mod tests {
                 epoch_period_nonce_buffer: 1.try_into().unwrap(),
                 epoch_period_nonce_stabilization: 1.try_into().unwrap(),
             },
-            consensus_config: cryptarchia_engine_config,
+            consensus_config: cryptarchia_engine_config.clone(),
             sdp_config: lb_ledger::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -259,7 +259,7 @@ mod tests {
         let security_param: NonZero<u32> = 2.try_into().unwrap();
         let cryptarchia_engine_config = lb_cryptarchia_engine::Config::new(
             security_param,
-            0.1,
+            NonNegativeRatio::new(1, 10.try_into().unwrap()),
             1f64.try_into().expect("1 > 0"),
         );
         let ledger_config = lb_ledger::Config {
@@ -268,7 +268,7 @@ mod tests {
                 epoch_period_nonce_buffer: 1.try_into().unwrap(),
                 epoch_period_nonce_stabilization: 1.try_into().unwrap(),
             },
-            consensus_config: cryptarchia_engine_config,
+            consensus_config: cryptarchia_engine_config.clone(),
             sdp_config: lb_ledger::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(

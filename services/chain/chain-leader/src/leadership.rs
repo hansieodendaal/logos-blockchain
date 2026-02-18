@@ -156,7 +156,8 @@ fn public_inputs_for_slot(
         latest_tree.root(),
         epoch_state.nonce,
         slot.into(),
-        epoch_state.total_stake(),
+        epoch_state.lottery_0,
+        epoch_state.lottery_1,
     )
 }
 
@@ -342,7 +343,7 @@ mod pol_tests {
     use lb_ledger::mantle::sdp::{
         Config as SdpConfig, ServiceRewardsParameters, rewards::blend::RewardsParameters,
     };
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use lb_wallet_service::{WalletMsg, WalletServiceSettings, api::WalletServiceData};
     use overwatch::services::{
         ServiceData,
@@ -357,12 +358,13 @@ mod pol_tests {
     /// verified successfully.
     #[tokio::test]
     async fn test_build_proof_for() {
+        let config = test_config();
+
         // Create secret key and leader
         let kms = DummyKms;
         let key_id = KeyId::from("0");
         let sk = UnsecuredZkKey::new(Fr::from(0u64));
         let pk = sk.to_public_key();
-        let config = test_config();
 
         // Create a UTXO
         let utxo = Tx::new(vec![], vec![Note::new(1000u64, pk)])
@@ -374,11 +376,17 @@ mod pol_tests {
         let latest_tree = UtxoTree::new().insert(utxo.id(), utxo).0;
 
         // Create EpochState
+        let total_stake = utxo.note.value;
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let epoch_state = EpochState {
             epoch: 1.into(),
             nonce: Fr::from(999u64),
             utxos: aged_tree.clone(),
-            total_stake: utxo.note.value,
+            total_stake,
+            lottery_0,
+            lottery_1,
         };
 
         // Create notifier channel (not used in this test)
@@ -408,7 +416,8 @@ mod pol_tests {
             latest_tree.root(),
             epoch_state.nonce,
             winning_slot.into(),
-            utxo.note.value,
+            epoch_state.lottery_0,
+            epoch_state.lottery_1,
         );
         assert!(
             proof.verify(&public_inputs),
@@ -453,7 +462,7 @@ mod pol_tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(5).unwrap(),
-                0.05,
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: SdpConfig {

@@ -331,7 +331,7 @@ mod tests {
     };
     use lb_cryptarchia_engine::EpochConfig;
     use lb_ledger::mantle::sdp::{ServiceRewardsParameters, rewards};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use num_bigint::BigUint;
 
     use super::*;
@@ -682,7 +682,7 @@ mod tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(1).unwrap(),
-                0.1,
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: lb_ledger::mantle::sdp::Config {

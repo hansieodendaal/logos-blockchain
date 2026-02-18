@@ -423,7 +423,7 @@ mod tests {
         mantle::sdp::{ServiceRewardsParameters, rewards},
     };
     use lb_network_service::{NetworkService, backends::NetworkBackend, message::ChainSyncEvent};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use overwatch::{
         overwatch::OverwatchHandle,
         services::{ServiceData, relay::OutboundRelay},
@@ -1117,7 +1117,7 @@ mod tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(1).unwrap(),
-                0.1,
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: lb_ledger::mantle::sdp::Config {

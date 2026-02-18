@@ -7,14 +7,14 @@ use lb_core::{
     sdp::{MinStake, ServiceType},
 };
 use lb_cryptarchia_engine::Config as ConsensusConfig;
-use lb_pol::slot_activation_coefficient;
-use lb_utils::math::NonNegativeF64;
+use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Settings {
     pub epoch_config: EpochConfig,
     pub security_param: NonZeroU32,
+    pub slot_activation_coeff: NonNegativeRatio,
     pub learning_rate: NonNegativeF64,
     pub sdp_config: SdpConfig,
     pub gossipsub_protocol: String,
@@ -37,10 +37,10 @@ pub struct EpochConfig {
 
 impl Settings {
     #[must_use]
-    pub const fn consensus_config(&self) -> ConsensusConfig {
+    pub fn consensus_config(&self) -> ConsensusConfig {
         ConsensusConfig::new(
             self.security_param,
-            slot_activation_coefficient(),
+            self.slot_activation_coeff,
             self.learning_rate,
         )
     }

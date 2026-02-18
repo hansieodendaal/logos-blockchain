@@ -582,6 +582,10 @@ where
         let pruned_blocks = new.update_lib();
         (new, pruned_blocks)
     }
+
+    pub const fn config(&self) -> &Config {
+        &self.config
+    }
 }
 
 /// The output of applying a new block to [`Cryptarchia`]
@@ -699,6 +703,8 @@ pub mod tests {
         num::NonZero,
     };
 
+    use lb_utils::math::NonNegativeRatio;
+
     use super::{Cryptarchia, Error, Slot, maxvalid_bg};
     use crate::{Config, ReorgedBlocks, State, UpdatedCryptarchia};
 
@@ -711,7 +717,7 @@ pub mod tests {
     pub fn config_with(security_param: u32) -> Config {
         Config::new(
             NonZero::new(security_param).unwrap(),
-            0.1,
+            NonNegativeRatio::new(1, 10.try_into().unwrap()),
             1f64.try_into().expect("1 > 0"),
         )
     }

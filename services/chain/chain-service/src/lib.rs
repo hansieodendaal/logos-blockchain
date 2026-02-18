@@ -223,7 +223,7 @@ impl Cryptarchia {
         Self {
             consensus: <lb_cryptarchia_engine::Cryptarchia<_>>::from_lib(
                 lib_id,
-                ledger_config.consensus_config,
+                ledger_config.consensus_config.clone(),
                 state,
                 lib_slot,
                 lib_length,

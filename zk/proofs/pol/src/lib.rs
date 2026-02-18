@@ -46,9 +46,7 @@ use tracing::error;
 pub use wallet_inputs::{PolWalletInputs, PolWalletInputsData};
 pub use witness::Witness;
 
-pub use crate::lottery::{
-    P, T0_CONSTANT, T1_CONSTANT, compute_lottery_values, slot_activation_coefficient,
-};
+pub use crate::lottery::{LotteryConstants, P};
 use crate::{inputs::PolVerifierInputJson, proving_key::POL_PROVING_KEY_PATH};
 
 pub type PoLProof = CompressedGroth16Proof;
@@ -145,6 +143,7 @@ mod tests {
     use std::str::FromStr as _;
 
     use lb_groth16::Fr;
+    use lb_utils::math::NonNegativeRatio;
     use num_bigint::BigUint;
 
     use super::*;
@@ -152,10 +151,15 @@ mod tests {
     #[expect(clippy::too_many_lines, reason = "For the sake of the test let it be")]
     #[test]
     fn test_full_flow() {
+        let (lottery_0, lottery_1) =
+            LotteryConstants::new(NonNegativeRatio::new(1, 10.try_into().unwrap()))
+                .compute_lottery_values(5000);
+
         let chain_data = PolChainInputsData {
             slot_number: 135,
             epoch_nonce: Fr::from(510u64),
-            total_stake: 5000,
+            lottery_0,
+            lottery_1,
             aged_root: BigUint::from_str(
                 "16524395010779500501330992017298834046369952285388149958144954382059764408785",
             )

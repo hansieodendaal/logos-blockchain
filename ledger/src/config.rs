@@ -1,6 +1,7 @@
 use std::num::{NonZero, NonZeroU64};
 
 use lb_cryptarchia_engine::{Epoch, Slot};
+use lb_pol::LotteryConstants;
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
@@ -11,6 +12,11 @@ pub struct Config {
 }
 
 impl Config {
+    #[must_use]
+    pub const fn lottery_constants(&self) -> &LotteryConstants {
+        self.consensus_config.lottery_constants()
+    }
+
     #[must_use]
     pub const fn base_period_length(&self) -> NonZero<u64> {
         self.consensus_config.base_period_length()
@@ -58,7 +64,7 @@ mod tests {
 
     use lb_core::sdp::{MinStake, ServiceParameters, ServiceType};
     use lb_cryptarchia_engine::EpochConfig;
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
 
     use crate::mantle::sdp::{ServiceRewardsParameters, rewards::blend::RewardsParameters};
 
@@ -72,7 +78,7 @@ mod tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(5).unwrap(),
-                0.5,
+                NonNegativeRatio::new(1, 2.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: crate::mantle::sdp::Config {
@@ -122,7 +128,7 @@ mod tests {
             },
             consensus_config: lb_cryptarchia_engine::Config::new(
                 NonZero::new(5).unwrap(),
-                0.5,
+                NonNegativeRatio::new(1, 2.try_into().unwrap()),
                 1f64.try_into().expect("1 > 0"),
             ),
             sdp_config: crate::mantle::sdp::Config {
