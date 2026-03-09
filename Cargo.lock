@@ -4819,6 +4819,7 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+ "tracing-appender",
  "tracing-subscriber 0.3.22",
 ]
 
@@ -4964,6 +4965,7 @@ name = "logos-blockchain-zone-sdk"
 version = "0.2.1"
 dependencies = [
  "futures",
+ "hex",
  "logos-blockchain-common-http-client",
  "logos-blockchain-core",
  "logos-blockchain-key-management-system-service",

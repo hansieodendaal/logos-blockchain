@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 futures                          = { default-features = false, version = "0.3" }
+hex                              = { workspace = true }
 lb-common-http-client            = { workspace = true }
 lb-core                          = { workspace = true }
 lb-key-management-system-service = { workspace = true }

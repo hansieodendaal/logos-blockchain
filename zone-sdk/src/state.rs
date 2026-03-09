@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use lb_common_http_client::Slot;
 use lb_core::{
     header::HeaderId,
-    mantle::{SignedMantleTx, tx::TxHash},
+    mantle::{SignedMantleTx, ops::channel::MsgId, tx::TxHash},
 };
 use rpds::HashTrieSetSync;
 
@@ -19,6 +20,24 @@ pub enum TxStatus {
     Unknown,
 }
 
+impl TxStatus {
+    #[must_use]
+    pub const fn is_on_chain(&self) -> bool {
+        matches!(self, Self::Safe | Self::Finalized)
+    }
+}
+
+/// Result of resolving the latest inscription chain tip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainTipResolution {
+    /// A deterministic chain tip was found.
+    Determinate(MsgId),
+    /// No inscriptions are known yet.
+    NoInscriptions,
+    /// Competing branches are present with no deterministic winner yet.
+    Ambiguous,
+}
+
 /// Transaction state tracker.
 pub struct TxState {
     /// All transactions being tracked, kept until finalized.
@@ -31,6 +50,71 @@ pub struct TxState {
     finalized: HashSet<TxHash>,
     /// Current LIB for pruning.
     current_lib: HeaderId,
+    /// Inscriptions tracked per block header (allows multiple inscriptions per
+    /// block)
+    parent_msg_id_map: HashMap<HeaderId, Vec<MsgIdState>>,
+    /// Last finalized inscription state retained when older blocks are pruned.
+    /// This preserves enough lineage to continue building the correct chain.
+    last_finalized_msg_state: Option<MsgIdState>,
+}
+
+/// Relationship between `HeaderId`, `TxHash` and `MsgId`
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MsgIdState {
+    /// The header ID of the block containing this inscription
+    header_id: HeaderId,
+    /// The slot of the block containing this inscription
+    slot: Slot,
+    /// The `TxHash` of the transaction that was included in the block
+    tx_hash: TxHash,
+    /// The `MsgId` of the parent message
+    parent_id: MsgId,
+    /// The `MsgId` of this message
+    this_id: MsgId,
+}
+
+impl MsgIdState {
+    #[must_use]
+    pub const fn new(
+        header_id: HeaderId,
+        slot: Slot,
+        tx_hash: TxHash,
+        parent_id: MsgId,
+        this_id: MsgId,
+    ) -> Self {
+        Self {
+            header_id,
+            slot,
+            tx_hash,
+            parent_id,
+            this_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn header_id(&self) -> HeaderId {
+        self.header_id
+    }
+
+    #[must_use]
+    pub const fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn tx_hash(&self) -> TxHash {
+        self.tx_hash
+    }
+
+    #[must_use]
+    pub const fn parent_id(&self) -> MsgId {
+        self.parent_id
+    }
+
+    #[must_use]
+    pub const fn this_id(&self) -> MsgId {
+        self.this_id
+    }
 }
 
 impl TxState {
@@ -44,6 +128,8 @@ impl TxState {
             parent_map: HashMap::new(),
             finalized: HashSet::new(),
             current_lib: lib,
+            parent_msg_id_map: HashMap::new(),
+            last_finalized_msg_state: None,
         }
     }
 
@@ -52,13 +138,75 @@ impl TxState {
         self.pending.insert(tx_hash, signed_tx);
     }
 
+    // Order MsgIdState values into parent-linked chain(s).
+    // A chain starts at a root inscription (parent_id == MsgId::root())
+    // or at an orphan relative to this batch (its parent_id does not appear
+    // as any this_id in the provided states).
+    fn order_msg_id_states(states: &[MsgIdState]) -> Vec<Vec<MsgIdState>> {
+        const fn all_assigned(all: usize, assigned: &[MsgIdState]) -> bool {
+            assigned.len() >= all
+        }
+
+        let mut ordered = Vec::new();
+        let mut roots = Vec::new();
+        let mut assigned = Vec::new();
+
+        // First find the root inscription(s), those that have parent_id ==
+        // MsgId::root() or whose parent_id is not referenced as a this_id in
+        // any other inscription (orphans).
+        for state in states {
+            if state.parent_id() == MsgId::root()
+                || !states.iter().any(|s| s.this_id() == state.parent_id())
+            {
+                roots.push(*state);
+            }
+        }
+
+        for root in roots {
+            ordered.push(vec![root]);
+            assigned.push(root);
+        }
+
+        let mut cyclic = 0;
+        while !all_assigned(states.len(), &assigned) && cyclic < states.len() {
+            let mut progress = false;
+
+            for chain in &mut ordered {
+                let Some(mut last) = chain.last().copied() else {
+                    continue;
+                };
+
+                for state in states {
+                    if assigned.contains(state) {
+                        continue; // Already ordered
+                    }
+
+                    if state.parent_id() == last.this_id() {
+                        chain.push(*state);
+                        assigned.push(*state);
+                        last = *state;
+                        progress = true;
+                    }
+                }
+            }
+
+            if progress {
+                cyclic = 0;
+            } else {
+                cyclic += 1;
+            }
+        }
+
+        ordered
+    }
+
     /// Process a new block.
     pub fn process_block(
         &mut self,
         block_id: HeaderId,
         parent_id: HeaderId,
         lib: HeaderId,
-        our_txs: impl IntoIterator<Item = TxHash>,
+        our_txs: &[MsgIdState],
     ) {
         // Store parent relationship for pruning
         self.parent_map.insert(block_id, parent_id);
@@ -74,11 +222,26 @@ impl TxState {
             .cloned()
             .unwrap_or_default();
 
-        for tx in our_txs {
-            if self.pending.contains_key(&tx) {
-                safe_set = safe_set.insert(tx);
+        for msg_state in our_txs {
+            if self.pending.contains_key(&msg_state.tx_hash) {
+                safe_set = safe_set.insert(msg_state.tx_hash);
             }
         }
+
+        // Store inscriptions for this block
+        if !our_txs.is_empty() {
+            let ordered = Self::order_msg_id_states(our_txs);
+            debug_assert!(
+                ordered.len() <= 1,
+                "expected at most one inscription chain per block, got {}",
+                ordered.len()
+            );
+
+            if let Some(chain) = ordered.into_iter().next() {
+                self.parent_msg_id_map.insert(block_id, chain);
+            }
+        }
+
         self.block_states.insert(block_id, safe_set);
 
         // When lib advances: finalize txs and prune
@@ -103,19 +266,56 @@ impl TxState {
                 block_opt = self.parent_map.get(&block).copied();
             }
 
-            // Prune ancestors of new lib (but not lib itself)
+            // Prune finalized ancestors of new lib (but not lib itself)
+            // Keep parent/inscription lineage so we can reconstruct chain ancestry
+            // after clean restarts and around shallow reorg windows.
             let mut prune_cursor = self.parent_map.get(&lib).copied();
+            let mut pruned_headers = Vec::new();
+
             while let Some(b) = prune_cursor {
+                pruned_headers.push(b);
                 self.block_states.remove(&b);
-                prune_cursor = self.parent_map.remove(&b);
+                prune_cursor = self.parent_map.get(&b).copied();
             }
+
+            let pruned_msg_id_set = pruned_headers
+                .iter()
+                .filter_map(|header_id| self.parent_msg_id_map.get(header_id))
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+
+            let ordered_msg_id_states = Self::order_msg_id_states(&pruned_msg_id_set);
+
+            // Determine which header(s) to keep below LIB: the last block in each chain.
+            let kept_headers = ordered_msg_id_states
+                .iter()
+                .filter_map(|chain| chain.last().map(MsgIdState::header_id))
+                .collect::<HashSet<_>>();
+
+            // Remove all other pruned below-LIB headers from parent_msg_id_map.
+            for header_id in &pruned_headers {
+                if !kept_headers.contains(header_id) {
+                    self.parent_msg_id_map.remove(header_id);
+                }
+            }
+
+            // Refresh the finalized fallback from the retained below-LIB blocks.
+            self.last_finalized_msg_state = kept_headers
+                .iter()
+                .filter_map(|header_id| self.parent_msg_id_map.get(header_id))
+                .flatten()
+                .copied()
+                .last();
 
             self.prune_orphans(lib);
             self.current_lib = lib;
         }
     }
 
-    /// Remove orphaned blocks whose parent was pruned.
+    /// Remove orphaned block-state snapshots whose parent snapshot was pruned.
+    /// Keep block/inscription lineage maps for deterministic parent
+    /// reconstruction.
     fn prune_orphans(&mut self, lib: HeaderId) {
         loop {
             let orphans: Vec<_> = self
@@ -126,8 +326,8 @@ impl TxState {
                         return None; // lib is root
                     }
                     let parent_is_lib = *parent == lib;
-                    let parent_exists = self.parent_map.contains_key(parent);
-                    (!parent_is_lib && !parent_exists).then_some(*id)
+                    let parent_snapshot_exists = self.block_states.contains_key(parent);
+                    (!parent_is_lib && !parent_snapshot_exists).then_some(*id)
                 })
                 .collect();
 
@@ -137,6 +337,7 @@ impl TxState {
 
             for orphan in orphans {
                 self.block_states.remove(&orphan);
+                // Keep parent_msg_id_map lineage, but remove orphan edges so pruning converges.
                 self.parent_map.remove(&orphan);
             }
         }
@@ -201,6 +402,84 @@ impl TxState {
     pub fn all_pending_txs(&self) -> impl Iterator<Item = (&TxHash, &SignedMantleTx)> {
         self.pending.iter()
     }
+
+    fn all_known_inscriptions(&self) -> Vec<MsgIdState> {
+        let mut all = Vec::new();
+        for states in self.parent_msg_id_map.values() {
+            all.extend(states.iter().copied());
+        }
+        if let Some(finalized) = self.last_finalized_msg_state
+            && !all.contains(&finalized)
+        {
+            all.push(finalized);
+        }
+        all
+    }
+
+    /// Resolve the latest known inscription chain tip.
+    ///
+    /// If two competing branches have equal best length, the tip is ambiguous
+    /// until a subsequent inscription extends one branch.
+    #[must_use]
+    pub fn resolve_inscription_chain_tip(&self) -> ChainTipResolution {
+        let all = self.all_known_inscriptions();
+
+        if all.is_empty() {
+            return ChainTipResolution::NoInscriptions;
+        }
+
+        let chains = Self::order_msg_id_states(&all);
+
+        if chains.is_empty() {
+            return ChainTipResolution::NoInscriptions;
+        }
+
+        let max_len = chains.iter().map(Vec::len).max().unwrap_or(0);
+
+        let best: Vec<&Vec<MsgIdState>> = chains.iter().filter(|c| c.len() == max_len).collect();
+
+        if best.len() > 1 {
+            return ChainTipResolution::Ambiguous;
+        }
+
+        best[0]
+            .last()
+            .map_or(ChainTipResolution::NoInscriptions, |state| {
+                ChainTipResolution::Determinate(state.this_id())
+            })
+    }
+
+    /// Get the latest confirmed parent message ID from blocks that have been
+    /// processed. Returns `None` if there are no inscriptions or the latest
+    /// tip is ambiguous.
+    #[must_use]
+    pub fn latest_confirmed_parent_id(&self) -> Option<MsgId> {
+        match self.resolve_inscription_chain_tip() {
+            ChainTipResolution::Determinate(this_id) => self
+                .all_known_inscriptions()
+                .into_iter()
+                .find(|s| s.this_id() == this_id)
+                .map(|s| s.parent_id()),
+            ChainTipResolution::NoInscriptions | ChainTipResolution::Ambiguous => None,
+        }
+    }
+
+    /// Get the latest chain tip message ID from processed blocks.
+    /// Returns `None` when no inscriptions are known or the tip is ambiguous.
+    #[must_use]
+    pub fn latest_inscriptions_tip_id(&self) -> Option<MsgId> {
+        match self.resolve_inscription_chain_tip() {
+            ChainTipResolution::Determinate(this_id) => Some(this_id),
+            ChainTipResolution::NoInscriptions | ChainTipResolution::Ambiguous => None,
+        }
+    }
+
+    /// Get the mapping of block headers to their included inscriptions
+    /// (`MsgIdState`).
+    #[must_use]
+    pub fn parent_msg_id_map(&self) -> HashMap<HeaderId, Vec<MsgIdState>> {
+        self.parent_msg_id_map.clone()
+    }
 }
 
 #[cfg(test)]
@@ -234,6 +513,24 @@ mod tests {
         }
     }
 
+    fn empty_our_txs() -> Vec<MsgIdState> {
+        Vec::new()
+    }
+
+    fn our_txs_with_hash(header_id: HeaderId, slot: Slot, hash: TxHash) -> Vec<MsgIdState> {
+        // Derive a distinct this_id from the tx_hash bytes so parent_id != this_id,
+        // preventing a self-loop in the inscription children map.
+        let bytes: [u8; 32] = hash.into();
+        let this_id = MsgId::from(bytes);
+        vec![MsgIdState::new(
+            header_id,
+            slot,
+            hash,
+            MsgId::root(),
+            this_id,
+        )]
+    }
+
     #[test]
     fn submit_and_query_pending() {
         let genesis = header_id(0);
@@ -257,7 +554,12 @@ mod tests {
         state.submit(hash, tx);
 
         // Process block containing our tx, lib stays at genesis
-        state.process_block(b1, genesis, genesis, vec![hash]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(header_id(1), Slot::new(123), hash),
+        );
 
         assert_eq!(state.status(&hash, b1), TxStatus::Safe);
         assert_eq!(state.status(&hash, genesis), TxStatus::Pending);
@@ -275,11 +577,16 @@ mod tests {
         state.submit(hash, tx);
 
         // b1 with our tx
-        state.process_block(b1, genesis, genesis, vec![hash]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(header_id(1), Slot::new(123), hash),
+        );
         assert_eq!(state.status(&hash, b1), TxStatus::Safe);
 
         // b2, lib advances to b1
-        state.process_block(b2, b1, b1, vec![]);
+        state.process_block(b2, b1, b1, &empty_our_txs());
         assert_eq!(state.status(&hash, b2), TxStatus::Finalized);
         assert_eq!(state.finalized_count(), 1);
     }
@@ -299,7 +606,12 @@ mod tests {
         state.submit(hash2, tx2);
 
         // b1 contains only tx1
-        state.process_block(b1, genesis, genesis, vec![hash1]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(header_id(1), Slot::new(123), hash1),
+        );
 
         // pending_txs at b1 should only return tx2
         let pending: Vec<_> = state.pending_txs(b1).map(|(h, _)| *h).collect();
@@ -321,11 +633,16 @@ mod tests {
         state.submit(hash, tx);
 
         // b1 has our tx
-        state.process_block(b1, genesis, genesis, vec![hash]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(header_id(1), Slot::new(123), hash),
+        );
         assert_eq!(state.status(&hash, b1), TxStatus::Safe);
 
         // b2 forks from genesis, no tx
-        state.process_block(b2, genesis, genesis, vec![]);
+        state.process_block(b2, genesis, genesis, &empty_our_txs());
 
         // At b2 tip, tx is not safe (different branch)
         assert_eq!(state.status(&hash, b2), TxStatus::Pending);
@@ -351,19 +668,19 @@ mod tests {
         let mut state = TxState::new(genesis);
 
         // Build main chain up to a1
-        state.process_block(a1, genesis, genesis, vec![]);
+        state.process_block(a1, genesis, genesis, &empty_our_txs());
 
         // Build fork from a1 (before lib advances past a1)
-        state.process_block(b1, a1, genesis, vec![]);
-        state.process_block(b2, b1, genesis, vec![]);
+        state.process_block(b1, a1, genesis, &empty_our_txs());
+        state.process_block(b2, b1, genesis, &empty_our_txs());
 
         // Verify fork blocks exist before lib advances
         assert!(state.block_states.contains_key(&b1));
         assert!(state.block_states.contains_key(&b2));
 
         // Continue main chain, lib advances to a3
-        state.process_block(a2, a1, genesis, vec![]);
-        state.process_block(a3, a2, a3, vec![]); // lib advances to a3
+        state.process_block(a2, a1, genesis, &empty_our_txs());
+        state.process_block(a3, a2, a3, &empty_our_txs()); // lib advances to a3
 
         // After lib advances to a3:
         // - genesis, a1, a2 should be pruned (ancestors up to and including old lib)
@@ -388,9 +705,9 @@ mod tests {
         assert!(state.block_states.contains_key(&a3), "lib should exist");
 
         // Continue and verify pruning continues working
-        state.process_block(a4, a3, a3, vec![]);
-        state.process_block(a5, a4, a5, vec![]); // lib advances to a5
-        state.process_block(a6, a5, a5, vec![]);
+        state.process_block(a4, a3, a3, &empty_our_txs());
+        state.process_block(a5, a4, a5, &empty_our_txs()); // lib advances to a5
+        state.process_block(a6, a5, a5, &empty_our_txs());
 
         assert!(
             !state.block_states.contains_key(&a3),
@@ -422,15 +739,121 @@ mod tests {
         state.submit(hash2, tx2);
 
         // b1 has tx1
-        state.process_block(b1, genesis, genesis, vec![hash1]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(header_id(1), Slot::new(123), hash1),
+        );
         // b2 has tx2
-        state.process_block(b2, b1, genesis, vec![hash2]);
+        state.process_block(
+            b2,
+            b1,
+            genesis,
+            &our_txs_with_hash(header_id(2), Slot::new(234), hash2),
+        );
         // b3, lib jumps from genesis to b2 (skipping b1)
-        state.process_block(b3, b2, b2, vec![]);
+        state.process_block(b3, b2, b2, &empty_our_txs());
 
         // Both tx1 (in b1) and tx2 (in b2) should be finalized
         assert_eq!(state.status(&hash1, b3), TxStatus::Finalized);
         assert_eq!(state.status(&hash2, b3), TxStatus::Finalized);
         assert_eq!(state.finalized_count(), 2);
+    }
+
+    #[test]
+    fn keeps_finalized_history_when_pruned_below_lib() {
+        // Ensure we keep enough inscription history below LIB to keep building
+        // correct parent relationships even when no inscriptions are above LIB.
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let b2 = header_id(2);
+        let mut state = TxState::new(genesis);
+
+        let tx1 = make_dummy_tx(1);
+        let hash1 = tx1.mantle_tx.hash();
+        state.submit(hash1, tx1);
+
+        let parent_1 = MsgId::root();
+        let this_1 = MsgId::from([9u8; 32]);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(b1, Slot::new(123), hash1, parent_1, this_1)],
+        );
+
+        // Advance LIB to b2 with no inscriptions. This prunes b1 from maps.
+        state.process_block(b2, b1, b2, &empty_our_txs());
+
+        // We still retain finalized inscription lineage for future parent selection.
+        assert_eq!(state.latest_inscriptions_tip_id(), Some(this_1));
+        assert_eq!(state.latest_confirmed_parent_id(), Some(parent_1));
+    }
+
+    #[test]
+    fn competing_children_are_ambiguous_until_one_branch_extends() {
+        let genesis = header_id(0);
+        let block_1 = header_id(1);
+        let block_2 = header_id(2);
+        let block_3 = header_id(3);
+        let mut state = TxState::new(genesis);
+
+        let this_pid_a = MsgId::from([21u8; 32]);
+        let this_pid_b = MsgId::from([22u8; 32]);
+
+        let tx_a = make_dummy_tx(21);
+        let tx_b = make_dummy_tx(22);
+
+        state.process_block(
+            block_1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                header_id(1),
+                Slot::new(123),
+                tx_a.mantle_tx.hash(),
+                MsgId::root(),
+                this_pid_a,
+            )],
+        );
+        state.process_block(
+            block_2,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                header_id(1),
+                Slot::new(123),
+                tx_b.mantle_tx.hash(),
+                MsgId::root(),
+                this_pid_b,
+            )],
+        );
+
+        assert_eq!(
+            state.resolve_inscription_chain_tip(),
+            ChainTipResolution::Ambiguous,
+            "two children of the same parent are ambiguous without a tie-break"
+        );
+
+        let this_pid_b_child = MsgId::from([23u8; 32]);
+        let tx_b_child = make_dummy_tx(23);
+        state.process_block(
+            block_3,
+            block_2,
+            genesis,
+            &[MsgIdState::new(
+                header_id(2),
+                Slot::new(234),
+                tx_b_child.mantle_tx.hash(),
+                this_pid_b,
+                this_pid_b_child,
+            )],
+        );
+
+        assert_eq!(
+            state.resolve_inscription_chain_tip(),
+            ChainTipResolution::Determinate(this_pid_b_child)
+        );
     }
 }

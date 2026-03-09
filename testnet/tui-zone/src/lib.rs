@@ -1,10 +1,22 @@
-use std::{fs, io::Write as _, path::Path};
+use std::{
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use clap::Parser;
 use lb_core::mantle::ops::channel::ChannelId;
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key};
-use lb_zone_sdk::sequencer::{SequencerCheckpoint, ZoneSequencer};
+use lb_zone_sdk::sequencer::{InscriptionId, SequencerCheckpoint, ZoneSequencer};
 use reqwest::Url;
+use tracing_subscriber::{
+    Layer as _, filter::LevelFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
+
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const STATUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1200); // 20 minutes
 
 #[derive(Parser, Debug)]
 #[command(about = "Terminal UI zone sequencer - publish text inscriptions")]
@@ -55,12 +67,83 @@ fn load_or_create_signing_key(path: &Path) -> Ed25519Key {
     }
 }
 
+async fn wait_for_on_chain_status(
+    sequencer: Arc<ZoneSequencer>,
+    inscription_id: InscriptionId,
+) -> Result<bool, lb_zone_sdk::sequencer::Error> {
+    let deadline = tokio::time::Instant::now() + STATUS_CHECK_TIMEOUT;
+
+    loop {
+        if sequencer.status(inscription_id).await?.is_on_chain() {
+            return Ok(true);
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+
+        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
+    }
+}
+
+async fn persist_checkpoint_when_on_chain(
+    msg: &str,
+    sequencer: Arc<ZoneSequencer>,
+    checkpoint_path: PathBuf,
+    inscription_id: InscriptionId,
+) {
+    let start = tokio::time::Instant::now();
+    let tx_hash = hex::encode(<[u8; 32]>::from(inscription_id));
+    let msg = capped_msg(msg, 20);
+    match wait_for_on_chain_status(Arc::<ZoneSequencer>::clone(&sequencer), inscription_id).await {
+        Ok(true) => {
+            println!(
+                "\n    mined tx: {tx_hash}/'{msg}' after {:.2?}\n> ",
+                start.elapsed()
+            );
+            match sequencer.checkpoint().await {
+                Ok(checkpoint) => {
+                    save_checkpoint(&checkpoint_path, &checkpoint);
+                }
+                Err(e) => {
+                    println!(
+                        "\n    error tx: {tx_hash}/'{msg}' failed to fetch & save checkpoint: {e}"
+                    );
+                }
+            }
+        }
+        Ok(false) => {
+            println!(
+                "\n    warning tx: {tx_hash}/'{msg}' not on-chain after {:?}\n> ",
+                start.elapsed()
+            );
+        }
+        Err(e) => {
+            println!(
+                "\n    error tx: {tx_hash}/'{msg}' status check failed after {:?}: {e}\n> ",
+                start.elapsed()
+            );
+        }
+    }
+}
+
 pub async fn run(args: InscribeArgs) {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+    let file_appender = tracing_appender::rolling::daily("logs", "tui-zone.log");
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(file_appender);
+
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_ansi(true)
+        .with_filter(LevelFilter::WARN);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(log_writer)
+        .with_ansi(false)
+        .with_filter(LevelFilter::DEBUG);
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
         .init();
 
     let node_url: Url = args.node_url.parse().expect("invalid node URL");
@@ -79,7 +162,13 @@ pub async fn run(args: InscribeArgs) {
         println!("  Restored checkpoint from {}", args.checkpoint_path);
     }
 
-    let sequencer = ZoneSequencer::init(channel_id, signing_key, node_url, None, checkpoint);
+    let sequencer = Arc::new(ZoneSequencer::init(
+        channel_id,
+        signing_key,
+        node_url,
+        None,
+        checkpoint,
+    ));
 
     println!();
     println!("Type a message and press Enter to publish it as a zone block.");
@@ -97,21 +186,34 @@ pub async fn run(args: InscribeArgs) {
         let bytes_read = stdin.read_line(&mut line).expect("failed to read line");
 
         if bytes_read == 0 {
-            // EOF
             println!();
             break;
         }
 
-        let msg = line.trim_end();
+        let msg = line.trim_end().to_owned();
         if msg.is_empty() {
             break;
         }
 
         match sequencer.publish(msg.as_bytes().to_vec()).await {
             Ok(result) => {
-                let tx_hash: [u8; 32] = result.inscription_id.into();
-                println!("  published: {}", hex::encode(tx_hash));
-                save_checkpoint(checkpoint_path, &result.checkpoint);
+                let tx_hash = hex::encode(<[u8; 32]>::from(result.inscription_id));
+                println!("    published: {tx_hash}/'{}'", capped_msg(&msg, 20));
+
+                let sequencer = Arc::clone(&sequencer);
+                let checkpoint_path = checkpoint_path.to_path_buf();
+                let inscription_id = result.inscription_id;
+                let msg_for_task = msg.clone();
+
+                tokio::spawn(async move {
+                    persist_checkpoint_when_on_chain(
+                        &msg_for_task,
+                        sequencer,
+                        checkpoint_path,
+                        inscription_id,
+                    )
+                    .await;
+                });
             }
             Err(e) => {
                 println!("  error: {e}");
@@ -120,4 +222,12 @@ pub async fn run(args: InscribeArgs) {
     }
 
     println!("Goodbye!");
+}
+
+fn capped_msg(msg: &str, len: usize) -> String {
+    if msg.len() > len {
+        format!("{}...", &msg.get(0..20).unwrap_or(msg))
+    } else {
+        msg.to_owned()
+    }
 }
