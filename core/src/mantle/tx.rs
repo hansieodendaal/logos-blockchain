@@ -11,6 +11,7 @@ use num_bigint::BigUint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
+    codec::SerializeOp as _,
     crypto::ZkHasher,
     mantle::{
         AuthenticatedMantleTx, Transaction, TransactionHasher,
@@ -75,6 +76,11 @@ impl TxHash {
     #[must_use]
     pub fn as_signing_bytes(&self) -> Bytes {
         self.0.0.0.iter().flat_map(|b| b.to_le_bytes()).collect()
+    }
+
+    #[must_use]
+    pub fn as_hex(&self) -> String {
+        hex::encode(self.to_bytes().unwrap_or_default())
     }
 }
 

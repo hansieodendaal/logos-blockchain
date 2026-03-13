@@ -19,6 +19,11 @@ impl MsgId {
     pub const fn root() -> Self {
         Self([0; 32])
     }
+
+    #[must_use]
+    pub fn as_hex(&self) -> String {
+        hex::encode(self.as_ref())
+    }
 }
 
 impl From<[u8; 32]> for MsgId {
@@ -53,5 +58,12 @@ impl AsRef<[u8; 32]> for ChannelId {
 impl From<ChannelId> for [u8; 32] {
     fn from(channel_id: ChannelId) -> Self {
         channel_id.0
+    }
+}
+
+impl ChannelId {
+    #[must_use]
+    pub fn as_hex(&self) -> String {
+        hex::encode(self.as_ref())
     }
 }

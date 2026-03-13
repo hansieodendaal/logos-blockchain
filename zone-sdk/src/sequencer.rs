@@ -6,7 +6,6 @@ use std::{
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use lb_common_http_client::{BasicAuthCredentials, CommonHttpClient, ProcessedBlockEvent, Slot};
 use lb_core::{
-    codec::SerializeOp as _,
     header::HeaderId,
     mantle::{
         MantleTx, SignedMantleTx, Transaction as _,
@@ -176,6 +175,7 @@ impl ZoneSequencer {
     /// Returns the inscription ID and a checkpoint for persistence.
     pub async fn publish(&self, data: Vec<u8>) -> Result<PublishResult, Error> {
         let (reply_tx, reply_rx) = oneshot::channel();
+        let msg = String::from_utf8_lossy(&data).into_owned();
         let request = ActorRequest::Publish {
             data,
             reply: reply_tx,
@@ -193,10 +193,10 @@ impl ZoneSequencer {
         })??;
 
         info!(
-            "Created inscription - hash: {}, this msg_id: {}, parent msg_id: {}",
-            hex::encode(result.inscription_id.to_bytes().unwrap_or_default()),
-            hex::encode(result.checkpoint.last_msg_id.as_ref()),
-            hex::encode(result.parent_msg_id.as_ref()),
+            "Created inscription - msg: {msg}, hash: '{}', this msg_id: '{}', parent msg_id: '{}'",
+            result.inscription_id.as_hex(),
+            result.checkpoint.last_msg_id.as_hex(),
+            result.parent_msg_id.as_hex(),
         );
 
         // Post to network (best effort, will be resubmitted/recreated if needed)
@@ -426,16 +426,13 @@ async fn run_loop(
         match s.resolve_inscription_chain_tip() {
             ChainTipResolution::Determinate(msg_id) => {
                 last_msg_id = msg_id;
-                info!(
-                    "Startup lineage tip resolved to '{}'",
-                    hex::encode(msg_id.as_ref())
-                );
+                info!("Startup lineage tip resolved to '{}'", msg_id.as_hex());
             }
             ChainTipResolution::NoInscriptions => {
                 if restored_from_checkpoint {
                     info!(
-                        "No on-chain inscriptions found on startup; keeping checkpoint parent {:?}",
-                        hex::encode(last_msg_id.as_ref())
+                        "No on-chain inscriptions found on startup; keeping checkpoint parent '{}'",
+                        last_msg_id.as_hex()
                     );
                 }
             }
@@ -573,20 +570,27 @@ fn handle_request(
         ActorRequest::Publish { data, reply } => {
             // If we already have unpublished/pending inscriptions, keep extending that
             // local chain tip so multiple publishes before the next block remain ordered.
-            let has_local_pending_chain = tx_state.pending_count() > 0;
             let parent_to_use = match current_tip {
-                Some(_) if has_local_pending_chain => *last_msg_id,
-                Some(_) => match tx_state.resolve_inscription_chain_tip() {
-                    ChainTipResolution::Determinate(this_id) => this_id,
-                    ChainTipResolution::NoInscriptions => *last_msg_id,
-                    ChainTipResolution::Ambiguous => {
-                        drop(reply.send(Err(Error::Unavailable {
-                            reason: "inscription fork is ambiguous",
-                        })));
-                        return;
+                Some(_) => {
+                    if let Some(active_pending_tip) =
+                        active_pending_chain_tip(tx_state, pending_publications, publish_order)
+                    {
+                        active_pending_tip
+                    } else {
+                        match tx_state.resolve_inscription_chain_tip() {
+                            ChainTipResolution::Determinate(this_id) => this_id,
+                            ChainTipResolution::NoInscriptions => *last_msg_id,
+                            ChainTipResolution::Ambiguous => {
+                                drop(reply.send(Err(Error::Unavailable {
+                                    reason: "inscription fork is ambiguous",
+                                })));
+                                return;
+                            }
+                        }
                     }
-                },
-                None => *last_msg_id,
+                }
+                None => active_pending_chain_tip(tx_state, pending_publications, publish_order)
+                    .unwrap_or(*last_msg_id),
             };
 
             let (signed_tx, new_msg_id) =
@@ -745,13 +749,44 @@ async fn handle_block_event(
         channel_id,
     );
 
+    // Refresh pending publications from newly observed on-chain lineage:
+    // - if a local current tx hash is now observed on-chain, it is no longer an
+    //   active unpublished local attempt
+    // - if a local current msg id has already been used as a parent on-chain, it is
+    //   no longer eligible to drive local chaining
+    let observed_tx_hashes = our_txs
+        .iter()
+        .map(MsgIdState::tx_hash)
+        .collect::<HashSet<_>>();
+    let observed_parent_ids = our_txs
+        .iter()
+        .map(MsgIdState::parent_id)
+        .collect::<HashSet<_>>();
+
+    for publication in pending_publications.values_mut() {
+        let current_tx_observed = publication
+            .current_tx_hash
+            .is_some_and(|tx_hash| observed_tx_hashes.contains(&tx_hash));
+
+        let current_msg_id_used_as_parent = publication
+            .current_msg_id
+            .is_some_and(|msg_id| observed_parent_ids.contains(&msg_id));
+
+        if current_tx_observed || current_msg_id_used_as_parent {
+            publication.parent_msg_id = None;
+            publication.current_msg_id = None;
+        }
+    }
+
     // Process the actual event block with real lib (triggers finalization if lib
     // advanced)
     s.process_block(block_id, parent_id, lib, &our_txs);
     *current_tip = Some(tip);
 
-    // Detect foreign inscriptions that claimed a parent used by a pending local
-    // inscription.
+    sync_last_msg_id_from_chain(s, last_msg_id, pending_publications, publish_order);
+
+    // Detect foreign newly minted inscriptions that claimed a parent used by a
+    // pending local inscription.
     let conflicted = detect_conflicting_publications(s, tip, &our_txs, pending_publications);
     suspend_publications(s, &conflicted, pending_publications);
 
@@ -815,12 +850,53 @@ fn publication_status(
 ) -> TxStatus {
     if let Some(pending) = pending_publications.get(id) {
         if let Some(current_tx_hash) = pending.current_tx_hash {
-            return state.status(&current_tx_hash, tip);
+            let status = state.status(&current_tx_hash, tip);
+            if matches!(status, TxStatus::Pending)
+                && state.is_tx_observed_on_chain(&current_tx_hash)
+            {
+                return TxStatus::Safe;
+            }
+            return status;
         }
         return TxStatus::Pending;
     }
 
     state.status(id, tip)
+}
+
+fn active_pending_chain_tip(
+    state: &TxState,
+    pending_publications: &HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
+) -> Option<MsgId> {
+    publish_order.iter().rev().find_map(|logical_id| {
+        let publication = pending_publications.get(logical_id)?;
+        let current_tx_hash = publication.current_tx_hash?;
+        let current_msg_id = publication.current_msg_id?;
+
+        (state.is_tx_pending(&current_tx_hash)
+            && !state.is_tx_observed_on_chain(&current_tx_hash)
+            && !state.is_msg_id_used_as_parent_on_chain(current_msg_id))
+        .then_some(current_msg_id)
+    })
+}
+
+fn sync_last_msg_id_from_chain(
+    state: &TxState,
+    last_msg_id: &mut MsgId,
+    pending_publications: &HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
+) {
+    if let Some(active_pending_tip) =
+        active_pending_chain_tip(state, pending_publications, publish_order)
+    {
+        *last_msg_id = active_pending_tip;
+        return;
+    }
+
+    if let ChainTipResolution::Determinate(msg_id) = state.resolve_inscription_chain_tip() {
+        *last_msg_id = msg_id;
+    }
 }
 
 /// Backfill finalized blocks from current `lib_slot` to new `lib_slot`.
@@ -874,6 +950,13 @@ async fn backfill_to_lib(
                 let current_lib = state.lib();
                 state.process_block(block_id, parent_id, current_lib, &our_txs);
 
+                sync_last_msg_id_from_chain(
+                    state,
+                    last_msg_id,
+                    pending_publications,
+                    publish_order,
+                );
+
                 let conflicted = detect_conflicting_publications(
                     state,
                     block_id,
@@ -881,19 +964,20 @@ async fn backfill_to_lib(
                     pending_publications,
                 );
                 suspend_publications(state, &conflicted, pending_publications);
-
-                try_recreate_suspended_publications(
-                    state,
-                    channel_id,
-                    signing_key,
-                    node_url,
-                    http_client,
-                    last_msg_id,
-                    pending_publications,
-                    publish_order,
-                )
-                .await;
             }
+
+            try_recreate_suspended_publications(
+                state,
+                channel_id,
+                signing_key,
+                node_url,
+                http_client,
+                last_msg_id,
+                pending_publications,
+                publish_order,
+            )
+            .await;
+
             debug!("Backfilled {} finalized blocks", to - from);
         }
         Err(e) => {
@@ -966,22 +1050,24 @@ async fn backfill_canonical(
         // Use current state lib to avoid premature finalization
         state.process_block(block_id, parent_id, lib, &our_txs);
 
+        sync_last_msg_id_from_chain(state, last_msg_id, pending_publications, publish_order);
+
         let conflicted =
             detect_conflicting_publications(state, block_id, &our_txs, pending_publications);
         suspend_publications(state, &conflicted, pending_publications);
-
-        try_recreate_suspended_publications(
-            state,
-            channel_id,
-            signing_key,
-            node_url,
-            http_client,
-            last_msg_id,
-            pending_publications,
-            publish_order,
-        )
-        .await;
     }
+
+    try_recreate_suspended_publications(
+        state,
+        channel_id,
+        signing_key,
+        node_url,
+        http_client,
+        last_msg_id,
+        pending_publications,
+        publish_order,
+    )
+    .await;
 
     debug!("Canonical backfill complete");
 }
@@ -1027,7 +1113,7 @@ fn enqueue_resubmit(
         "Resubmitting inscriptions: {}",
         pending_msg_ids
             .iter()
-            .map(|id| hex::encode(id.as_ref()))
+            .map(MsgId::as_hex)
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -1145,20 +1231,18 @@ async fn try_recreate_suspended_publications(
         return;
     }
 
-    let has_active_pending_chain = pending_publications
-        .values()
-        .any(|publication| publication.current_tx_hash.is_some());
-
-    let mut parent_to_use = if has_active_pending_chain {
-        *last_msg_id
+    let mut parent_to_use = if let Some(active_pending_tip) =
+        active_pending_chain_tip(state, pending_publications, publish_order)
+    {
+        active_pending_tip
     } else {
         match state.resolve_inscription_chain_tip() {
             ChainTipResolution::Determinate(msg_id) => msg_id,
-            ChainTipResolution::NoInscriptions => MsgId::root(),
+            ChainTipResolution::NoInscriptions => *last_msg_id,
             ChainTipResolution::Ambiguous => {
                 warn!(
                     "Inscription lineage is ambiguous; delaying recreation of {} pending \
-                     inscription(s) until the chain tip becomes determinate",
+                         inscription(s) until the chain tip becomes determinate",
                     suspended.len()
                 );
                 return;
@@ -1166,16 +1250,23 @@ async fn try_recreate_suspended_publications(
         }
     };
 
+    debug!(
+        "Recreating {} suspended inscription(s) from parent msg id {}",
+        suspended.len(),
+        parent_to_use.as_hex(),
+    );
+
     for logical_id in suspended {
         let Some(publication) = pending_publications.get(&logical_id).cloned() else {
             continue;
         };
 
+        let parent_used = parent_to_use;
         let (signed_tx, new_msg_id) = create_inscribe_tx(
             channel_id,
             signing_key,
             publication.data.clone(),
-            parent_to_use,
+            parent_used,
         );
         let tx_hash = signed_tx.mantle_tx.hash();
 
@@ -1183,7 +1274,7 @@ async fn try_recreate_suspended_publications(
 
         if let Some(publication) = pending_publications.get_mut(&logical_id) {
             publication.current_tx_hash = Some(tx_hash);
-            publication.parent_msg_id = Some(parent_to_use);
+            publication.parent_msg_id = Some(parent_used);
             publication.current_msg_id = Some(new_msg_id);
         }
 
@@ -1191,10 +1282,13 @@ async fn try_recreate_suspended_publications(
         parent_to_use = new_msg_id;
 
         info!(
-            "Recreated conflicting inscription - logical: {}, new hash: {}, parent msg id: {}",
-            hex::encode(logical_id.to_bytes().unwrap_or_default()),
-            hex::encode(tx_hash.to_bytes().unwrap_or_default()),
-            hex::encode(parent_to_use.as_ref()),
+            "Recreated conflicting inscription - msg: '{}', logical: '{}', new hash: '{}', parent \
+            msg id: '{}', this msg id: '{}'",
+            String::from_utf8_lossy(&publication.data).into_owned(),
+            logical_id.as_hex(),
+            tx_hash.as_hex(),
+            parent_used.as_hex(),
+            new_msg_id.as_hex(),
         );
 
         if let Err(e) = http_client
@@ -1223,12 +1317,13 @@ fn collect_msg_id_state_from_block<'a>(
             extract_msg_id_state(header_id, slot, tx, channel_id)
         {
             info!(
-                "Found inscription - block: '{}', slot: {}, msg: '{}', parent_id: {}, this_id: {}",
+                "Found inscription - block: '{}', slot: {}, msg: '{}', parent_id: '{}', this_id: \
+                '{}'",
                 msg_state.header_id(),
                 msg_state.slot().into_inner(),
                 inscription_msg,
-                hex::encode(msg_state.parent_id().as_ref()),
-                hex::encode(msg_state.this_id().as_ref())
+                msg_state.parent_id().as_hex(),
+                msg_state.this_id().as_hex(),
             );
             inscriptions.push(msg_state);
         }
@@ -1631,5 +1726,468 @@ mod tests {
             .expect("publish reply dropped")
             .expect("second publish should succeed");
         assert_eq!(publish_parent_id(&tx_2), msg_1);
+    }
+
+    fn make_signed_inscribe_tx(seed: u8, parent: MsgId) -> SignedMantleTx {
+        let channel_id = ChannelId::from([seed; 32]);
+        let signing_key = Ed25519Key::from_bytes(&[seed; 32]);
+        let (tx, _) = create_inscribe_tx(channel_id, &signing_key, vec![seed], parent);
+        tx
+    }
+
+    fn pending_publication(
+        data: &[u8],
+        current_tx_hash: Option<TxHash>,
+        parent_msg_id: Option<MsgId>,
+        current_msg_id: Option<MsgId>,
+    ) -> PendingPublication {
+        PendingPublication {
+            data: data.to_vec(),
+            current_tx_hash,
+            parent_msg_id,
+            current_msg_id,
+        }
+    }
+
+    #[test]
+    fn active_pending_chain_tip_returns_latest_active_in_publish_order() {
+        let genesis = header_id(0);
+        let mut tx_state = TxState::new(genesis);
+
+        let tx1 = make_signed_inscribe_tx(1, MsgId::root());
+        let tx2 = make_signed_inscribe_tx(2, publish_this_id(&tx1));
+        let tx3 = make_signed_inscribe_tx(3, publish_this_id(&tx2));
+
+        let hash1 = tx1.mantle_tx.hash();
+        let hash2 = tx2.mantle_tx.hash();
+        let hash3 = tx3.mantle_tx.hash();
+
+        let msg1 = publish_this_id(&tx1);
+        let msg2 = publish_this_id(&tx2);
+        let msg3 = publish_this_id(&tx3);
+
+        tx_state.submit(hash1, tx1);
+        tx_state.submit(hash2, tx2);
+        tx_state.submit(hash3, tx3);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            hash1,
+            pending_publication(b"a1", Some(hash1), Some(MsgId::root()), Some(msg1)),
+        );
+        pending_publications.insert(
+            hash2,
+            pending_publication(b"a2", Some(hash2), Some(msg1), Some(msg2)),
+        );
+        pending_publications.insert(
+            hash3,
+            pending_publication(b"a3", Some(hash3), Some(msg2), Some(msg3)),
+        );
+
+        let publish_order = vec![hash1, hash2, hash3];
+
+        assert_eq!(
+            active_pending_chain_tip(&tx_state, &pending_publications, &publish_order),
+            Some(msg3)
+        );
+    }
+
+    #[test]
+    fn sync_last_msg_id_from_chain_prefers_active_pending_tip() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let mut tx_state = TxState::new(genesis);
+
+        let on_chain_tip = MsgId::from([31u8; 32]);
+        tx_state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                b1,
+                Slot::new(100),
+                test_tx_hash(31),
+                MsgId::root(),
+                on_chain_tip,
+            )],
+        );
+
+        let pending_tx = make_signed_inscribe_tx(32, on_chain_tip);
+        let pending_hash = pending_tx.mantle_tx.hash();
+        let pending_tip = publish_this_id(&pending_tx);
+        tx_state.submit(pending_hash, pending_tx);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            pending_hash,
+            pending_publication(
+                b"pending",
+                Some(pending_hash),
+                Some(on_chain_tip),
+                Some(pending_tip),
+            ),
+        );
+
+        let publish_order = vec![pending_hash];
+        let mut last_msg_id = MsgId::root();
+
+        sync_last_msg_id_from_chain(
+            &tx_state,
+            &mut last_msg_id,
+            &pending_publications,
+            &publish_order,
+        );
+
+        assert_eq!(last_msg_id, pending_tip);
+    }
+
+    #[test]
+    fn detect_conflicting_publications_marks_direct_and_transitive_dependents() {
+        let genesis = header_id(0);
+        let tip = header_id(1);
+        let mut tx_state = TxState::new(genesis);
+
+        let tx1 = make_signed_inscribe_tx(61, MsgId::root());
+        let msg1 = publish_this_id(&tx1);
+        let hash1 = tx1.mantle_tx.hash();
+
+        let tx2 = make_signed_inscribe_tx(62, msg1);
+        let msg2 = publish_this_id(&tx2);
+        let hash2 = tx2.mantle_tx.hash();
+
+        let tx3 = make_signed_inscribe_tx(63, msg2);
+        let msg3 = publish_this_id(&tx3);
+        let hash3 = tx3.mantle_tx.hash();
+
+        tx_state.submit(hash1, tx1);
+        tx_state.submit(hash2, tx2);
+        tx_state.submit(hash3, tx3);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            hash1,
+            pending_publication(b"b1", Some(hash1), Some(MsgId::root()), Some(msg1)),
+        );
+        pending_publications.insert(
+            hash2,
+            pending_publication(b"b2", Some(hash2), Some(msg1), Some(msg2)),
+        );
+        pending_publications.insert(
+            hash3,
+            pending_publication(b"b3", Some(hash3), Some(msg2), Some(msg3)),
+        );
+
+        let foreign = MsgIdState::new(
+            tip,
+            Slot::new(111),
+            test_tx_hash(64),
+            MsgId::root(),
+            MsgId::from([64u8; 32]),
+        );
+
+        let conflicted =
+            detect_conflicting_publications(&tx_state, tip, &[foreign], &pending_publications);
+
+        assert!(conflicted.contains(&hash1));
+        assert!(conflicted.contains(&hash2));
+        assert!(conflicted.contains(&hash3));
+        assert_eq!(conflicted.len(), 3);
+    }
+
+    #[test]
+    fn suspend_publications_clears_tracking_and_removes_pending_tx() {
+        let genesis = header_id(0);
+        let mut tx_state = TxState::new(genesis);
+
+        let tx = make_signed_inscribe_tx(81, MsgId::root());
+        let hash = tx.mantle_tx.hash();
+        let msg = publish_this_id(&tx);
+
+        tx_state.submit(hash, tx);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            hash,
+            pending_publication(b"b1", Some(hash), Some(MsgId::root()), Some(msg)),
+        );
+
+        let conflicted = HashSet::from([hash]);
+        suspend_publications(&mut tx_state, &conflicted, &mut pending_publications);
+
+        let publication = pending_publications
+            .get(&hash)
+            .expect("publication should still exist logically");
+        assert_eq!(publication.current_tx_hash, None);
+        assert_eq!(publication.parent_msg_id, None);
+        assert_eq!(publication.current_msg_id, None);
+        assert!(!tx_state.is_tx_pending(&hash));
+    }
+
+    #[tokio::test]
+    async fn wait_inclusion_registers_waiter_for_pending_publication() {
+        let genesis = header_id(0);
+        let tip = header_id(1);
+        let channel_id = ChannelId::from([93u8; 32]);
+        let signing_key = Ed25519Key::from_bytes(&[93u8; 32]);
+
+        let mut tx_state = TxState::new(genesis);
+
+        let tx = make_signed_inscribe_tx(94, MsgId::root());
+        let current_hash = tx.mantle_tx.hash();
+        let this_id = publish_this_id(&tx);
+        tx_state.submit(current_hash, tx);
+
+        let logical_id = test_tx_hash(93);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            logical_id,
+            pending_publication(b"x", Some(current_hash), Some(MsgId::root()), Some(this_id)),
+        );
+
+        let mut state = Some(tx_state);
+        let mut last_msg_id = this_id;
+        let mut publish_order = vec![logical_id];
+        let mut inclusion_waiters = HashMap::new();
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        handle_request(
+            ActorRequest::WaitInclusion {
+                id: logical_id,
+                reply: reply_tx,
+            },
+            &mut state,
+            Some(tip),
+            Slot::genesis(),
+            channel_id,
+            &signing_key,
+            &mut last_msg_id,
+            &mut pending_publications,
+            &mut publish_order,
+            &mut inclusion_waiters,
+        );
+
+        assert_eq!(inclusion_waiters.len(), 1);
+        assert_eq!(
+            inclusion_waiters
+                .get(&logical_id)
+                .expect("waiter should be registered")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "This test covers multiple related conditions around active_pending_chain_tip() and \
+        requires a lot of setup to properly cover the scenarios"
+    )]
+    fn active_pending_chain_tip_ignores_locally_pending_txs_once_they_are_seen_on_chain() {
+        // This test covers both suppression conditions for active_pending_chain_tip():
+        //
+        // 1. a locally pending tx must stop driving the local tip once that exact tx
+        //    has already been observed on-chain
+        // 2. a locally pending tx must also stop driving the local tip once its
+        //    current_msg_id has already been used as a parent on-chain
+
+        let genesis = header_id(0);
+        let block_1 = header_id(1);
+        let block_2 = header_id(2);
+        let channel_id = ChannelId::from([42u8; 32]);
+        let signing_key = Ed25519Key::from_bytes(&[9u8; 32]);
+
+        // -------------------------------------------------------------------------
+        // Case 1: current_tx_hash is already observed on-chain
+        // -------------------------------------------------------------------------
+        let mut state = TxState::new(genesis);
+
+        let (tx_1, msg_1) =
+            create_inscribe_tx(channel_id, &signing_key, b"aa1".to_vec(), MsgId::root());
+        let (tx_2, msg_2) = create_inscribe_tx(channel_id, &signing_key, b"aa2".to_vec(), msg_1);
+        let (tx_3, msg_3) = create_inscribe_tx(channel_id, &signing_key, b"aa3".to_vec(), msg_2);
+
+        let hash_1 = tx_1.mantle_tx.hash();
+        let hash_2 = tx_2.mantle_tx.hash();
+        let hash_3 = tx_3.mantle_tx.hash();
+
+        state.submit(hash_1, tx_1);
+        state.submit(hash_2, tx_2);
+        state.submit(hash_3, tx_3);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            hash_1,
+            PendingPublication {
+                data: b"aa1".to_vec(),
+                current_tx_hash: Some(hash_1),
+                parent_msg_id: Some(MsgId::root()),
+                current_msg_id: Some(msg_1),
+            },
+        );
+        pending_publications.insert(
+            hash_2,
+            PendingPublication {
+                data: b"aa2".to_vec(),
+                current_tx_hash: Some(hash_2),
+                parent_msg_id: Some(msg_1),
+                current_msg_id: Some(msg_2),
+            },
+        );
+        pending_publications.insert(
+            hash_3,
+            PendingPublication {
+                data: b"aa3".to_vec(),
+                current_tx_hash: Some(hash_3),
+                parent_msg_id: Some(msg_2),
+                current_msg_id: Some(msg_3),
+            },
+        );
+
+        let publish_order = vec![hash_1, hash_2, hash_3];
+
+        // The chain later shows aa1 -> aa2 -> aa3 on-chain in a block.
+        state.process_block(
+            block_1,
+            genesis,
+            genesis,
+            &[
+                MsgIdState::new(block_1, Slot::new(100), hash_1, MsgId::root(), msg_1),
+                MsgIdState::new(block_1, Slot::new(100), hash_2, msg_1, msg_2),
+                MsgIdState::new(block_1, Slot::new(100), hash_3, msg_2, msg_3),
+            ],
+        );
+
+        assert_eq!(
+            active_pending_chain_tip(&state, &pending_publications, &publish_order),
+            None,
+            "once the local txs have been seen on-chain, they must no longer drive the active pending chain tip"
+        );
+
+        // -------------------------------------------------------------------------
+        // Case 2: current_msg_id has already been used as a parent on-chain
+        // -------------------------------------------------------------------------
+        let mut state = TxState::new(genesis);
+
+        let (tx_c, msg_c) =
+            create_inscribe_tx(channel_id, &signing_key, b"bb3".to_vec(), MsgId::root());
+        let hash_c = tx_c.mantle_tx.hash();
+
+        state.submit(hash_c, tx_c);
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            hash_c,
+            PendingPublication {
+                data: b"bb3".to_vec(),
+                current_tx_hash: Some(hash_c),
+                parent_msg_id: Some(MsgId::root()),
+                current_msg_id: Some(msg_c),
+            },
+        );
+
+        let publish_order = vec![hash_c];
+
+        // A foreign on-chain inscription already used msg_c as its parent.
+        // That means msg_c has been consumed on-chain and cannot remain the local
+        // active unpublished chain tip, even though hash_c itself was not observed.
+        let foreign_hash = test_tx_hash(99);
+        let foreign_child = MsgId::from([99u8; 32]);
+
+        state.process_block(
+            block_2,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                block_2,
+                Slot::new(200),
+                foreign_hash,
+                msg_c,
+                foreign_child,
+            )],
+        );
+
+        assert!(
+            !state.is_tx_observed_on_chain(&hash_c),
+            "this case requires the local tx hash itself to remain unobserved on-chain"
+        );
+        assert!(
+            state.is_msg_id_used_as_parent_on_chain(msg_c),
+            "this case requires msg_c to have been used as a parent on-chain"
+        );
+
+        assert_eq!(
+            active_pending_chain_tip(&state, &pending_publications, &publish_order),
+            None,
+            "once the local msg id has already been used as a parent on-chain, it must no longer drive the active pending chain tip"
+        );
+    }
+    #[test]
+    fn publication_status_reports_safe_when_current_hash_was_seen_on_chain_during_backfill() {
+        // This mimics the real stall:
+        // - current tip block is processed before its missing parent
+        // - later, backfill processes the missing parent block containing our tx
+        // - the tx is now definitely seen on-chain
+        // - but TxState::status(hash, current_tip) can still say Pending because the
+        //   tip's cumulative safe set was built before the parent was known
+        //
+        // Desired behavior:
+        // publication_status() should still treat the current hash as on-chain.
+
+        let genesis = header_id(0);
+        let block_1 = header_id(1);
+        let block_2 = header_id(2);
+        let channel_id = ChannelId::from([33u8; 32]);
+        let signing_key = Ed25519Key::from_bytes(&[7u8; 32]);
+
+        let mut state = TxState::new(genesis);
+
+        let (tx, this_id) =
+            create_inscribe_tx(channel_id, &signing_key, b"aa4".to_vec(), MsgId::root());
+        let tx_hash = tx.mantle_tx.hash();
+
+        state.submit(tx_hash, tx);
+
+        // Simulate receiving the tip block first, before its parent is known.
+        state.process_block(block_2, block_1, genesis, &[]);
+
+        // Later backfill finds the missing parent containing our inscription.
+        state.process_block(
+            block_1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                block_1,
+                Slot::new(123),
+                tx_hash,
+                MsgId::root(),
+                this_id,
+            )],
+        );
+
+        // Sanity check: the raw TxState status at the already-built tip is still
+        // Pending.
+        assert_eq!(
+            state.status(&tx_hash, block_2),
+            TxStatus::Pending,
+            "this test requires the tx to be seen on-chain but not reflected as safe at the current tip"
+        );
+
+        let mut pending_publications = HashMap::new();
+        pending_publications.insert(
+            tx_hash,
+            PendingPublication {
+                data: b"aa4".to_vec(),
+                current_tx_hash: Some(tx_hash),
+                parent_msg_id: Some(MsgId::root()),
+                current_msg_id: Some(this_id),
+            },
+        );
+
+        assert_eq!(
+            publication_status(&state, block_2, &tx_hash, &pending_publications),
+            TxStatus::Safe,
+            "if the current recreated hash has been seen on-chain, publication_status must resolve it as on-chain instead of leaving it Pending forever"
+        );
     }
 }

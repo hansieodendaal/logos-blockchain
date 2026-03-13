@@ -12,9 +12,12 @@ use lb_core::mantle::ops::channel::ChannelId;
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key};
 use lb_zone_sdk::sequencer::{Error, InscriptionId, SequencerCheckpoint, ZoneSequencer};
 use reqwest::Url;
+use tokio::sync::Mutex;
 use tracing_subscriber::{
     Layer as _, filter::LevelFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
+
+type TermLock = Arc<Mutex<()>>;
 
 const STATUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1200); // 20 minutes
 
@@ -95,40 +98,69 @@ async fn persist_checkpoint_when_on_chain(
     sequencer: Arc<ZoneSequencer>,
     checkpoint_path: PathBuf,
     inscription_id: InscriptionId,
+    term_lock: &TermLock,
 ) {
     let start = tokio::time::Instant::now();
-    let tx_hash = hex::encode(<[u8; 32]>::from(inscription_id));
+    let tx_hash = inscription_id.as_hex();
     let msg = capped_msg(msg, 20);
     match wait_for_on_chain_status(Arc::<ZoneSequencer>::clone(&sequencer), inscription_id).await {
         Ok(true) => {
-            println!(
-                "\n    mined tx: {tx_hash}/'{msg}' after {:.2?}\n> ",
-                start.elapsed()
-            );
+            print_flush_prompt(
+                term_lock,
+                &format!(
+                    "\n    mined tx: {tx_hash}/'{msg}' after {:.2?}",
+                    start.elapsed()
+                ),
+            )
+            .await;
             match sequencer.checkpoint().await {
                 Ok(checkpoint) => {
                     save_checkpoint(&checkpoint_path, &checkpoint);
                 }
                 Err(e) => {
-                    println!(
-                        "\n    error tx: {tx_hash}/'{msg}' failed to fetch & save checkpoint: {e}"
-                    );
+                    print_flush_prompt(term_lock,
+                                       &format!(
+                                           "\n    error tx: {tx_hash}/'{msg}' failed to fetch & save checkpoint: {e}"
+
+                                       )
+                    ).await;
                 }
             }
         }
         Ok(false) => {
-            println!(
-                "\n    warning tx: {tx_hash}/'{msg}' not on-chain after {:?}\n> ",
-                start.elapsed()
-            );
+            print_flush_prompt(
+                term_lock,
+                &format!(
+                    "\n    warning tx: {tx_hash}/'{msg}' not on-chain after {:?}",
+                    start.elapsed()
+                ),
+            )
+            .await;
         }
         Err(e) => {
-            println!(
-                "\n    error tx: {tx_hash}/'{msg}' inclusion wait failed after {:?}: {e}\n> ",
-                start.elapsed()
-            );
+            print_flush_prompt(
+                term_lock,
+                &format!(
+                    "\n    error tx: {tx_hash}/'{msg}' inclusion wait failed after {:?}: {e}",
+                    start.elapsed()
+                ),
+            )
+            .await;
         }
     }
+}
+
+async fn print_prompt(term_lock: &TermLock) {
+    let _guard = term_lock.lock().await;
+    print!("> ");
+    std::io::stdout().flush().expect("failed to flush stdout");
+}
+
+async fn print_flush_prompt(term_lock: &TermLock, msg: &str) {
+    let _guard = term_lock.lock().await;
+    println!("{msg}");
+    print!("> ");
+    std::io::stdout().flush().expect("failed to flush stdout");
 }
 
 pub async fn run(args: InscribeArgs) {
@@ -157,7 +189,7 @@ pub async fn run(args: InscribeArgs) {
     println!("TUI Zone Sequencer");
     println!("  Node:       {node_url}");
     println!("  Key:        {}", args.key_path);
-    println!("  Channel ID: {}", hex::encode(channel_id.as_ref()));
+    println!("  Channel ID: {}", channel_id.as_hex());
     println!();
 
     let checkpoint_path = Path::new(&args.checkpoint_path);
@@ -183,10 +215,9 @@ pub async fn run(args: InscribeArgs) {
     let stdin = std::io::stdin();
     let mut line = String::new();
 
+    let term_lock = TermLock::new(Mutex::default());
+    print_prompt(&term_lock).await;
     loop {
-        print!("> ");
-        std::io::stdout().flush().expect("failed to flush stdout");
-
         line.clear();
         let bytes_read = stdin.read_line(&mut line).expect("failed to read line");
 
@@ -202,26 +233,36 @@ pub async fn run(args: InscribeArgs) {
 
         match sequencer.publish(msg.as_bytes().to_vec()).await {
             Ok(result) => {
-                let tx_hash = hex::encode(<[u8; 32]>::from(result.inscription_id));
-                println!("    published: {tx_hash}/'{}'", capped_msg(&msg, 20));
+                let tx_hash = result.inscription_id.as_hex();
+                print_flush_prompt(
+                    &term_lock,
+                    &format!("    published: {tx_hash}/'{}'", capped_msg(&msg, 20)),
+                )
+                .await;
 
                 let sequencer = Arc::clone(&sequencer);
                 let checkpoint_path = checkpoint_path.to_path_buf();
                 let inscription_id = result.inscription_id;
                 let msg_for_task = msg.clone();
 
+                let term_lock_clone = Arc::clone(&term_lock);
                 tokio::spawn(async move {
                     persist_checkpoint_when_on_chain(
                         &msg_for_task,
                         sequencer,
                         checkpoint_path,
                         inscription_id,
+                        &term_lock_clone,
                     )
                     .await;
                 });
             }
             Err(e) => {
-                println!("  error: {e}");
+                print_flush_prompt(
+                    &term_lock,
+                    &format!("  error: {e}"),
+                )
+                    .await;
             }
         }
     }

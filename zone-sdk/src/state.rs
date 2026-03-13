@@ -420,6 +420,40 @@ impl TxState {
         self.pending.contains_key(tx_hash)
     }
 
+    /// Returns true if the transaction hash has been observed in any on-chain
+    /// inscription that this state has processed, even if the current tip's
+    /// cumulative safe set has not yet been rebuilt to include it.
+    #[must_use]
+    pub fn is_tx_observed_on_chain(&self, tx_hash: &TxHash) -> bool {
+        if self.finalized.contains(tx_hash) {
+            return true;
+        }
+
+        if self
+            .block_states
+            .values()
+            .any(|safe_set| safe_set.contains(tx_hash))
+        {
+            return true;
+        }
+
+        self.parent_msg_id_map
+            .values()
+            .flatten()
+            .any(|msg_state| msg_state.tx_hash() == *tx_hash)
+    }
+
+    #[must_use]
+    pub fn is_msg_id_used_as_parent_on_chain(&self, msg_id: MsgId) -> bool {
+        self.parent_msg_id_map
+            .values()
+            .flatten()
+            .any(|msg_state| msg_state.parent_id() == msg_id)
+            || self
+                .last_finalized_msg_state
+                .is_some_and(|s| s.parent_id() == msg_id)
+    }
+
     fn all_known_inscriptions(&self) -> Vec<MsgIdState> {
         let mut all = Vec::new();
         for states in self.parent_msg_id_map.values() {
@@ -871,6 +905,234 @@ mod tests {
         assert_eq!(
             state.resolve_inscription_chain_tip(),
             ChainTipResolution::Determinate(this_pid_b_child)
+        );
+    }
+
+    #[test]
+    fn remove_pending_scrubs_safe_sets_and_status_becomes_unknown() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let mut state = TxState::new(genesis);
+
+        let tx = make_dummy_tx(1);
+        let hash = tx.mantle_tx.hash();
+        state.submit(hash, tx);
+
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &our_txs_with_hash(b1, Slot::new(123), hash),
+        );
+        assert_eq!(state.status(&hash, b1), TxStatus::Safe);
+
+        let removed = state.remove_pending(&hash);
+        assert!(removed.is_some());
+        assert_eq!(state.status(&hash, b1), TxStatus::Unknown);
+        assert!(!state.is_tx_pending(&hash));
+    }
+
+    #[test]
+    fn process_block_keeps_multiple_inscriptions_from_same_block_in_order() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let mut state = TxState::new(genesis);
+
+        let tx1 = make_dummy_tx(41);
+        let tx2 = make_dummy_tx(42);
+        let tx3 = make_dummy_tx(43);
+
+        let this_1 = MsgId::from([41u8; 32]);
+        let this_2 = MsgId::from([42u8; 32]);
+        let this_3 = MsgId::from([43u8; 32]);
+
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &[
+                MsgIdState::new(
+                    b1,
+                    Slot::new(100),
+                    tx1.mantle_tx.hash(),
+                    MsgId::root(),
+                    this_1,
+                ),
+                MsgIdState::new(b1, Slot::new(100), tx2.mantle_tx.hash(), this_1, this_2),
+                MsgIdState::new(b1, Slot::new(100), tx3.mantle_tx.hash(), this_2, this_3),
+            ],
+        );
+
+        let map = state.parent_msg_id_map();
+        let chain = map.get(&b1).expect("block chain should be stored");
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].this_id(), this_1);
+        assert_eq!(chain[1].this_id(), this_2);
+        assert_eq!(chain[2].this_id(), this_3);
+        assert_eq!(state.latest_inscriptions_tip_id(), Some(this_3));
+    }
+
+    #[test]
+    fn latest_tip_and_parent_are_none_when_no_inscriptions_exist() {
+        let genesis = header_id(0);
+        let state = TxState::new(genesis);
+
+        assert_eq!(state.latest_inscriptions_tip_id(), None);
+        assert_eq!(state.latest_confirmed_parent_id(), None);
+        assert_eq!(
+            state.resolve_inscription_chain_tip(),
+            ChainTipResolution::NoInscriptions
+        );
+    }
+
+    #[test]
+    fn latest_tip_and_parent_follow_linear_chain() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let b2 = header_id(2);
+        let mut state = TxState::new(genesis);
+
+        let this_1 = MsgId::from([31u8; 32]);
+        let this_2 = MsgId::from([32u8; 32]);
+
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                b1,
+                Slot::new(101),
+                make_dummy_tx(31).mantle_tx.hash(),
+                MsgId::root(),
+                this_1,
+            )],
+        );
+        state.process_block(
+            b2,
+            b1,
+            genesis,
+            &[MsgIdState::new(
+                b2,
+                Slot::new(102),
+                make_dummy_tx(32).mantle_tx.hash(),
+                this_1,
+                this_2,
+            )],
+        );
+
+        assert_eq!(
+            state.resolve_inscription_chain_tip(),
+            ChainTipResolution::Determinate(this_2)
+        );
+        assert_eq!(state.latest_inscriptions_tip_id(), Some(this_2));
+        assert_eq!(state.latest_confirmed_parent_id(), Some(this_1));
+    }
+
+    #[test]
+    fn process_block_keeps_only_tail_below_lib_for_each_chain() {
+        let genesis = header_id(0);
+        let a1 = header_id(1);
+        let a2 = header_id(2);
+        let a3 = header_id(3);
+        let mut state = TxState::new(genesis);
+
+        let tx1 = make_dummy_tx(51);
+        let tx2 = make_dummy_tx(52);
+
+        let this_1 = MsgId::from([51u8; 32]);
+        let this_2 = MsgId::from([52u8; 32]);
+
+        state.process_block(
+            a1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                a1,
+                Slot::new(100),
+                tx1.mantle_tx.hash(),
+                MsgId::root(),
+                this_1,
+            )],
+        );
+        state.process_block(
+            a2,
+            a1,
+            genesis,
+            &[MsgIdState::new(
+                a2,
+                Slot::new(101),
+                tx2.mantle_tx.hash(),
+                this_1,
+                this_2,
+            )],
+        );
+
+        state.process_block(a3, a2, a3, &empty_our_txs());
+
+        let map = state.parent_msg_id_map();
+        assert!(
+            !map.contains_key(&a1),
+            "older below-lib lineage should be dropped when superseded"
+        );
+        assert!(
+            map.contains_key(&a2),
+            "tail below-lib lineage should be retained"
+        );
+        assert_eq!(state.latest_inscriptions_tip_id(), Some(this_2));
+    }
+
+    #[test]
+    fn resolve_chain_tip_prefers_longest_chain() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let b2 = header_id(2);
+        let b3 = header_id(3);
+        let mut state = TxState::new(genesis);
+
+        let a1 = MsgId::from([61u8; 32]);
+        let a2 = MsgId::from([62u8; 32]);
+        let b1_msg = MsgId::from([63u8; 32]);
+
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                b1,
+                Slot::new(100),
+                make_dummy_tx(61).mantle_tx.hash(),
+                MsgId::root(),
+                a1,
+            )],
+        );
+        state.process_block(
+            b2,
+            b1,
+            genesis,
+            &[MsgIdState::new(
+                b2,
+                Slot::new(101),
+                make_dummy_tx(62).mantle_tx.hash(),
+                a1,
+                a2,
+            )],
+        );
+        state.process_block(
+            b3,
+            genesis,
+            genesis,
+            &[MsgIdState::new(
+                b3,
+                Slot::new(102),
+                make_dummy_tx(63).mantle_tx.hash(),
+                MsgId::root(),
+                b1_msg,
+            )],
+        );
+
+        assert_eq!(
+            state.resolve_inscription_chain_tip(),
+            ChainTipResolution::Determinate(a2)
         );
     }
 }
