@@ -398,9 +398,26 @@ impl TxState {
         self.current_lib
     }
 
+    /// Remove a pending transaction, returning it if it existed.
+    ///
+    /// Also scrubs the tx hash from every block safe set so that
+    /// [`status`](Self::status) immediately reflects the removal.
+    pub fn remove_pending(&mut self, tx_hash: &TxHash) -> Option<SignedMantleTx> {
+        let tx = self.pending.remove(tx_hash)?;
+        for safe_set in self.block_states.values_mut() {
+            *safe_set = safe_set.remove(tx_hash);
+        }
+        Some(tx)
+    }
+
     /// All pending transactions (for checkpoint serialization).
     pub fn all_pending_txs(&self) -> impl Iterator<Item = (&TxHash, &SignedMantleTx)> {
         self.pending.iter()
+    }
+
+    #[must_use]
+    pub fn is_tx_pending(&self, tx_hash: &TxHash) -> bool {
+        self.pending.contains_key(tx_hash)
     }
 
     fn all_known_inscriptions(&self) -> Vec<MsgIdState> {
@@ -822,7 +839,7 @@ mod tests {
             genesis,
             genesis,
             &[MsgIdState::new(
-                header_id(1),
+                header_id(2),
                 Slot::new(123),
                 tx_b.mantle_tx.hash(),
                 MsgId::root(),
@@ -843,7 +860,7 @@ mod tests {
             block_2,
             genesis,
             &[MsgIdState::new(
-                header_id(2),
+                header_id(3),
                 Slot::new(234),
                 tx_b_child.mantle_tx.hash(),
                 this_pid_b,

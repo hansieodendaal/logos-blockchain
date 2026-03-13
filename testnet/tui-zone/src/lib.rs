@@ -7,15 +7,15 @@ use std::{
 };
 
 use clap::Parser;
+use lb_common_http_client::BasicAuthCredentials;
 use lb_core::mantle::ops::channel::ChannelId;
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key};
-use lb_zone_sdk::sequencer::{InscriptionId, SequencerCheckpoint, ZoneSequencer};
+use lb_zone_sdk::sequencer::{Error, InscriptionId, SequencerCheckpoint, ZoneSequencer};
 use reqwest::Url;
 use tracing_subscriber::{
     Layer as _, filter::LevelFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
 
-const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_CHECK_TIMEOUT: Duration = Duration::from_secs(1200); // 20 minutes
 
 #[derive(Parser, Debug)]
@@ -32,6 +32,12 @@ pub struct InscribeArgs {
     /// Path to the checkpoint file for crash recovery
     #[arg(long, default_value = "sequencer.checkpoint", env = "CHECKPOINT_PATH")]
     checkpoint_path: String,
+
+    #[arg(long, env = "USERNAME")]
+    username: Option<String>,
+
+    #[arg(long, env = "PASSWORD")]
+    password: Option<String>,
 }
 
 fn save_checkpoint(path: &Path, checkpoint: &SequencerCheckpoint) {
@@ -50,8 +56,9 @@ fn load_checkpoint(path: &Path) -> Option<SequencerCheckpoint> {
 fn load_or_create_signing_key(path: &Path) -> Ed25519Key {
     if path.exists() {
         let key_bytes = fs::read(path).expect("failed to read key file");
-        assert!(
-            key_bytes.len() == ED25519_SECRET_KEY_SIZE,
+        assert_eq!(
+            key_bytes.len(),
+            ED25519_SECRET_KEY_SIZE,
             "invalid key file: expected {} bytes, got {}",
             ED25519_SECRET_KEY_SIZE,
             key_bytes.len()
@@ -70,19 +77,16 @@ fn load_or_create_signing_key(path: &Path) -> Ed25519Key {
 async fn wait_for_on_chain_status(
     sequencer: Arc<ZoneSequencer>,
     inscription_id: InscriptionId,
-) -> Result<bool, lb_zone_sdk::sequencer::Error> {
-    let deadline = tokio::time::Instant::now() + STATUS_CHECK_TIMEOUT;
-
-    loop {
-        if sequencer.status(inscription_id).await?.is_on_chain() {
-            return Ok(true);
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-
-        tokio::time::sleep(STATUS_POLL_INTERVAL).await;
+) -> Result<bool, Error> {
+    match tokio::time::timeout(
+        STATUS_CHECK_TIMEOUT,
+        sequencer.wait_for_inclusion(inscription_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(false),
     }
 }
 
@@ -120,7 +124,7 @@ async fn persist_checkpoint_when_on_chain(
         }
         Err(e) => {
             println!(
-                "\n    error tx: {tx_hash}/'{msg}' status check failed after {:?}: {e}\n> ",
+                "\n    error tx: {tx_hash}/'{msg}' inclusion wait failed after {:?}: {e}\n> ",
                 start.elapsed()
             );
         }
@@ -166,7 +170,8 @@ pub async fn run(args: InscribeArgs) {
         channel_id,
         signing_key,
         node_url,
-        None,
+        args.username
+            .map(|username| BasicAuthCredentials::new(username, args.password.clone())),
         checkpoint,
     ));
 

@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use lb_common_http_client::{BasicAuthCredentials, CommonHttpClient, ProcessedBlockEvent, Slot};
@@ -93,12 +96,24 @@ enum ActorRequest {
     Checkpoint {
         reply: oneshot::Sender<Result<SequencerCheckpoint, Error>>,
     },
+    WaitInclusion {
+        id: InscriptionId,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 enum InFlight {
     ResubmittedBatch {
         results: Vec<(InscriptionId, Result<(), String>)>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct PendingPublication {
+    data: Vec<u8>,
+    current_tx_hash: Option<TxHash>,
+    parent_msg_id: Option<MsgId>,
+    current_msg_id: Option<MsgId>,
 }
 
 /// Zone sequencer client.
@@ -184,7 +199,7 @@ impl ZoneSequencer {
             hex::encode(result.parent_msg_id.as_ref()),
         );
 
-        // Post to network (best effort, will be resubmitted if needed)
+        // Post to network (best effort, will be resubmitted/recreated if needed)
         if let Err(e) = self
             .http_client
             .post_transaction(self.node_url.clone(), signed_tx)
@@ -194,6 +209,30 @@ impl ZoneSequencer {
         }
 
         Ok(result)
+    }
+
+    /// Wait until the logical inscription publish is on-chain.
+    ///
+    /// This follows automatic local recreation after collisions, so callers can
+    /// wait on the original inscription ID returned by
+    /// [`publish`](Self::publish).
+    pub async fn wait_for_inclusion(&self, id: InscriptionId) -> Result<(), Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = ActorRequest::WaitInclusion {
+            id,
+            reply: reply_tx,
+        };
+
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| Error::Unavailable {
+                reason: "actor channel closed",
+            })?;
+
+        reply_rx.await.map_err(|_| Error::Unavailable {
+            reason: "actor dropped reply",
+        })?
     }
 
     /// Get the status of an inscription.
@@ -360,6 +399,10 @@ async fn connect_blocks_stream(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "The main loop owns the core logic and state management of the sequencer, so it's natural for it to be long"
+)]
 async fn run_loop(
     mut request_rx: mpsc::Receiver<ActorRequest>,
     channel_id: ChannelId,
@@ -408,6 +451,10 @@ async fn run_loop(
     let mut resubmit_interval = tokio::time::interval(config.resubmit_interval);
     let mut resubmit_active = false;
     let mut in_flight: FuturesUnordered<BoxFuture<'static, InFlight>> = FuturesUnordered::new();
+    let mut pending_publications: HashMap<InscriptionId, PendingPublication> = HashMap::new();
+    let mut publish_order = Vec::<InscriptionId>::new();
+    let mut inclusion_waiters: HashMap<InscriptionId, Vec<oneshot::Sender<Result<(), Error>>>> =
+        HashMap::new();
 
     loop {
         let blocks_stream =
@@ -425,6 +472,9 @@ async fn run_loop(
                         channel_id,
                         &signing_key,
                         &mut last_msg_id,
+                        &mut pending_publications,
+                        &mut publish_order,
+                        &mut inclusion_waiters,
                     );
                 }
                 maybe_event = blocks_stream.next() => {
@@ -435,10 +485,21 @@ async fn run_loop(
                             &mut current_tip,
                             &mut lib_slot,
                             channel_id,
+                            &signing_key,
                             &http_client,
                             &node_url,
+                            &mut last_msg_id,
+                            &mut pending_publications,
+                            &publish_order,
                         )
                         .await;
+
+                        notify_inclusion_waiters(
+                            state.as_ref(),
+                            current_tip,
+                            &pending_publications,
+                            &mut inclusion_waiters,
+                        );
                     } else {
                         warn!("Blocks stream disconnected, reconnecting...");
                         break;
@@ -462,6 +523,14 @@ async fn run_loop(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stateful actor request handling keeps merge impact localized"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Handling different request types in one place helps keep the logic consistent and maintainable"
+)]
 fn handle_request(
     request: ActorRequest,
     state: &mut Option<TxState>,
@@ -470,6 +539,9 @@ fn handle_request(
     channel_id: ChannelId,
     signing_key: &Ed25519Key,
     last_msg_id: &mut MsgId,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+    publish_order: &mut Vec<InscriptionId>,
+    inclusion_waiters: &mut HashMap<InscriptionId, Vec<oneshot::Sender<Result<(), Error>>>>,
 ) {
     let Some(tx_state) = state else {
         match request {
@@ -488,6 +560,11 @@ fn handle_request(
                     reason: "not initialized",
                 })));
             }
+            ActorRequest::WaitInclusion { reply, .. } => {
+                drop(reply.send(Err(Error::Unavailable {
+                    reason: "not initialized",
+                })));
+            }
         }
         return;
     };
@@ -498,9 +575,6 @@ fn handle_request(
             // local chain tip so multiple publishes before the next block remain ordered.
             let has_local_pending_chain = tx_state.pending_count() > 0;
             let parent_to_use = match current_tip {
-                // TODO: This will be fixed in PR#2375 as there is no proof another sequencer
-                // TODO: did not publish in the meantime and newly found inscriptions currently do
-                // TODO: not invalidate invalid pending inscriptions
                 Some(_) if has_local_pending_chain => *last_msg_id,
                 Some(_) => match tx_state.resolve_inscription_chain_tip() {
                     ChainTipResolution::Determinate(this_id) => this_id,
@@ -516,11 +590,22 @@ fn handle_request(
             };
 
             let (signed_tx, new_msg_id) =
-                create_inscribe_tx(channel_id, signing_key, data, parent_to_use);
+                create_inscribe_tx(channel_id, signing_key, data.clone(), parent_to_use);
             let tx_hash = signed_tx.mantle_tx.hash();
 
             tx_state.submit(tx_hash, signed_tx.clone());
             *last_msg_id = new_msg_id;
+
+            pending_publications.insert(
+                tx_hash,
+                PendingPublication {
+                    data,
+                    current_tx_hash: Some(tx_hash),
+                    parent_msg_id: Some(parent_to_use),
+                    current_msg_id: Some(new_msg_id),
+                },
+            );
+            publish_order.push(tx_hash);
 
             let checkpoint = build_checkpoint(tx_state, *last_msg_id, lib_slot);
             let result = PublishResult {
@@ -535,13 +620,38 @@ fn handle_request(
                 Err(Error::Unavailable {
                     reason: "not synced (no tip yet)",
                 }),
-                |tip| Ok(tx_state.status(&id, tip)),
+                |tip| Ok(publication_status(tx_state, tip, &id, pending_publications)),
             );
             drop(reply.send(result));
         }
         ActorRequest::Checkpoint { reply } => {
             let checkpoint = build_checkpoint(tx_state, *last_msg_id, lib_slot);
             drop(reply.send(Ok(checkpoint)));
+        }
+        ActorRequest::WaitInclusion { id, reply } => {
+            let result = current_tip.map_or(
+                Err(Error::Unavailable {
+                    reason: "not synced (no tip yet)",
+                }),
+                |tip| Ok(publication_status(tx_state, tip, &id, pending_publications)),
+            );
+
+            match result {
+                Ok(TxStatus::Safe | TxStatus::Finalized) => {
+                    drop(reply.send(Ok(())));
+                }
+                Ok(TxStatus::Pending) => {
+                    inclusion_waiters.entry(id).or_default().push(reply);
+                }
+                Ok(TxStatus::Unknown) => {
+                    drop(reply.send(Err(Error::Unavailable {
+                        reason: "unknown inscription",
+                    })));
+                }
+                Err(err) => {
+                    drop(reply.send(Err(err)));
+                }
+            }
         }
     }
 }
@@ -558,14 +668,22 @@ fn build_checkpoint(state: &TxState, last_msg_id: MsgId, lib_slot: Slot) -> Sequ
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "block event processing owns the chain observation and local rebase logic"
+)]
 async fn handle_block_event(
     event: &ProcessedBlockEvent,
     state: &mut Option<TxState>,
     current_tip: &mut Option<HeaderId>,
     lib_slot: &mut Slot,
     channel_id: ChannelId,
+    signing_key: &Ed25519Key,
     http_client: &CommonHttpClient,
     node_url: &Url,
+    last_msg_id: &mut MsgId,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
 ) {
     let block_id = event.block.header.id;
     let parent_id = event.block.header.parent_block;
@@ -591,8 +709,12 @@ async fn handle_block_event(
                 *lib_slot,
                 new_lib_slot,
                 channel_id,
+                signing_key,
                 http_client,
                 node_url,
+                last_msg_id,
+                pending_publications,
+                publish_order,
             )
             .await;
         }
@@ -601,7 +723,18 @@ async fn handle_block_event(
 
     // 2. Backfill canonical chain if parent is missing
     if !s.has_block(&parent_id) && parent_id != s.lib() {
-        backfill_canonical(s, parent_id, channel_id, http_client, node_url).await;
+        backfill_canonical(
+            s,
+            parent_id,
+            channel_id,
+            signing_key,
+            http_client,
+            node_url,
+            last_msg_id,
+            pending_publications,
+            publish_order,
+        )
+        .await;
     }
 
     // Extract channel tx lineage keyed by block header id.
@@ -616,6 +749,23 @@ async fn handle_block_event(
     // advanced)
     s.process_block(block_id, parent_id, lib, &our_txs);
     *current_tip = Some(tip);
+
+    // Detect foreign inscriptions that claimed a parent used by a pending local
+    // inscription.
+    let conflicted = detect_conflicting_publications(s, tip, &our_txs, pending_publications);
+    suspend_publications(s, &conflicted, pending_publications);
+
+    try_recreate_suspended_publications(
+        s,
+        channel_id,
+        signing_key,
+        node_url,
+        http_client,
+        last_msg_id,
+        pending_publications,
+        publish_order,
+    )
+    .await;
 }
 
 fn handle_inflight(event: InFlight, resubmit_active: &mut bool) {
@@ -632,18 +782,67 @@ fn handle_inflight(event: InFlight, resubmit_active: &mut bool) {
     }
 }
 
+fn notify_inclusion_waiters(
+    state: Option<&TxState>,
+    current_tip: Option<HeaderId>,
+    pending_publications: &HashMap<InscriptionId, PendingPublication>,
+    inclusion_waiters: &mut HashMap<InscriptionId, Vec<oneshot::Sender<Result<(), Error>>>>,
+) {
+    let (Some(s), Some(tip)) = (state, current_tip) else {
+        return;
+    };
+
+    let resolved = inclusion_waiters
+        .keys()
+        .filter(|id| publication_status(s, tip, id, pending_publications).is_on_chain())
+        .copied()
+        .collect::<Vec<_>>();
+
+    for logical_id in resolved {
+        if let Some(waiters) = inclusion_waiters.remove(&logical_id) {
+            for waiter in waiters {
+                drop(waiter.send(Ok(())));
+            }
+        }
+    }
+}
+
+fn publication_status(
+    state: &TxState,
+    tip: HeaderId,
+    id: &InscriptionId,
+    pending_publications: &HashMap<InscriptionId, PendingPublication>,
+) -> TxStatus {
+    if let Some(pending) = pending_publications.get(id) {
+        if let Some(current_tx_hash) = pending.current_tx_hash {
+            return state.status(&current_tx_hash, tip);
+        }
+        return TxStatus::Pending;
+    }
+
+    state.status(id, tip)
+}
+
 /// Backfill finalized blocks from current `lib_slot` to new `lib_slot`.
 ///
 /// Uses `state.lib()` during replay to avoid premature finalization.
 /// The caller is responsible for triggering finalization after backfill
 /// completes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "backfill needs access to both chain state and publication rebase state"
+)]
 async fn backfill_to_lib(
     state: &mut TxState,
     from_slot: Slot,
     to_slot: Slot,
     channel_id: ChannelId,
+    signing_key: &Ed25519Key,
     http_client: &CommonHttpClient,
     node_url: &Url,
+    last_msg_id: &mut MsgId,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
 ) {
     let from: u64 = from_slot.into();
     let to: u64 = to_slot.into();
@@ -674,6 +873,26 @@ async fn backfill_to_lib(
                 // Use current state lib to avoid premature finalization
                 let current_lib = state.lib();
                 state.process_block(block_id, parent_id, current_lib, &our_txs);
+
+                let conflicted = detect_conflicting_publications(
+                    state,
+                    block_id,
+                    &our_txs,
+                    pending_publications,
+                );
+                suspend_publications(state, &conflicted, pending_publications);
+
+                try_recreate_suspended_publications(
+                    state,
+                    channel_id,
+                    signing_key,
+                    node_url,
+                    http_client,
+                    last_msg_id,
+                    pending_publications,
+                    publish_order,
+                )
+                .await;
             }
             debug!("Backfilled {} finalized blocks", to - from);
         }
@@ -688,12 +907,20 @@ async fn backfill_to_lib(
 /// Uses `state.lib()` during replay to avoid premature finalization.
 /// The caller is responsible for triggering finalization after backfill
 /// completes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "backfill needs access to both chain state and publication rebase state"
+)]
 async fn backfill_canonical(
     state: &mut TxState,
     missing_parent: HeaderId,
     channel_id: ChannelId,
+    signing_key: &Ed25519Key,
     http_client: &CommonHttpClient,
     node_url: &Url,
+    last_msg_id: &mut MsgId,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
 ) {
     debug!("Backfilling canonical chain from {:?}", missing_parent);
 
@@ -738,6 +965,22 @@ async fn backfill_canonical(
 
         // Use current state lib to avoid premature finalization
         state.process_block(block_id, parent_id, lib, &our_txs);
+
+        let conflicted =
+            detect_conflicting_publications(state, block_id, &our_txs, pending_publications);
+        suspend_publications(state, &conflicted, pending_publications);
+
+        try_recreate_suspended_publications(
+            state,
+            channel_id,
+            signing_key,
+            node_url,
+            http_client,
+            last_msg_id,
+            pending_publications,
+            publish_order,
+        )
+        .await;
     }
 
     debug!("Canonical backfill complete");
@@ -804,6 +1047,163 @@ fn enqueue_resubmit(
         }
         InFlight::ResubmittedBatch { results }
     }));
+}
+
+fn detect_conflicting_publications(
+    state: &TxState,
+    tip: HeaderId,
+    inscriptions: &[MsgIdState],
+    pending_publications: &HashMap<InscriptionId, PendingPublication>,
+) -> HashSet<InscriptionId> {
+    let active_current_hashes = pending_publications
+        .values()
+        .filter_map(|publication| publication.current_tx_hash)
+        .collect::<HashSet<_>>();
+
+    let mut conflicted = HashSet::new();
+
+    for inscription in inscriptions {
+        // Only foreign newly minted inscriptions can invalidate pending local attempts.
+        if active_current_hashes.contains(&inscription.tx_hash()) {
+            continue;
+        }
+
+        let mut claimed_parents = vec![inscription.parent_id()];
+        let mut seen_msg_ids = HashSet::new();
+
+        while let Some(parent_id) = claimed_parents.pop() {
+            for (logical_id, publication) in pending_publications {
+                let Some(current_parent) = publication.parent_msg_id else {
+                    continue;
+                };
+                let Some(current_msg_id) = publication.current_msg_id else {
+                    continue;
+                };
+                let Some(current_tx_hash) = publication.current_tx_hash else {
+                    continue;
+                };
+
+                if current_parent != parent_id {
+                    continue;
+                }
+
+                if !matches!(state.status(&current_tx_hash, tip), TxStatus::Pending) {
+                    continue;
+                }
+
+                if conflicted.insert(*logical_id) && seen_msg_ids.insert(current_msg_id) {
+                    claimed_parents.push(current_msg_id);
+                }
+            }
+        }
+    }
+
+    conflicted
+}
+
+fn suspend_publications(
+    state: &mut TxState,
+    conflicted: &HashSet<InscriptionId>,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+) {
+    for logical_id in conflicted {
+        if let Some(publication) = pending_publications.get_mut(logical_id) {
+            if let Some(current_tx_hash) = publication.current_tx_hash.take() {
+                let _unused = state.remove_pending(&current_tx_hash);
+            }
+            publication.parent_msg_id = None;
+            publication.current_msg_id = None;
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Publication recreation needs access to both chain state and publication rebase state"
+)]
+async fn try_recreate_suspended_publications(
+    state: &mut TxState,
+    channel_id: ChannelId,
+    signing_key: &Ed25519Key,
+    node_url: &Url,
+    http_client: &CommonHttpClient,
+    last_msg_id: &mut MsgId,
+    pending_publications: &mut HashMap<InscriptionId, PendingPublication>,
+    publish_order: &[InscriptionId],
+) {
+    let suspended = publish_order
+        .iter()
+        .copied()
+        .filter(|logical_id| {
+            pending_publications
+                .get(logical_id)
+                .is_some_and(|publication| publication.current_tx_hash.is_none())
+        })
+        .collect::<Vec<_>>();
+
+    if suspended.is_empty() {
+        return;
+    }
+
+    let has_active_pending_chain = pending_publications
+        .values()
+        .any(|publication| publication.current_tx_hash.is_some());
+
+    let mut parent_to_use = if has_active_pending_chain {
+        *last_msg_id
+    } else {
+        match state.resolve_inscription_chain_tip() {
+            ChainTipResolution::Determinate(msg_id) => msg_id,
+            ChainTipResolution::NoInscriptions => MsgId::root(),
+            ChainTipResolution::Ambiguous => {
+                warn!(
+                    "Inscription lineage is ambiguous; delaying recreation of {} pending \
+                     inscription(s) until the chain tip becomes determinate",
+                    suspended.len()
+                );
+                return;
+            }
+        }
+    };
+
+    for logical_id in suspended {
+        let Some(publication) = pending_publications.get(&logical_id).cloned() else {
+            continue;
+        };
+
+        let (signed_tx, new_msg_id) = create_inscribe_tx(
+            channel_id,
+            signing_key,
+            publication.data.clone(),
+            parent_to_use,
+        );
+        let tx_hash = signed_tx.mantle_tx.hash();
+
+        state.submit(tx_hash, signed_tx.clone());
+
+        if let Some(publication) = pending_publications.get_mut(&logical_id) {
+            publication.current_tx_hash = Some(tx_hash);
+            publication.parent_msg_id = Some(parent_to_use);
+            publication.current_msg_id = Some(new_msg_id);
+        }
+
+        *last_msg_id = new_msg_id;
+        parent_to_use = new_msg_id;
+
+        info!(
+            "Recreated conflicting inscription - logical: {}, new hash: {}, parent msg id: {}",
+            hex::encode(logical_id.to_bytes().unwrap_or_default()),
+            hex::encode(tx_hash.to_bytes().unwrap_or_default()),
+            hex::encode(parent_to_use.as_ref()),
+        );
+
+        if let Err(e) = http_client
+            .post_transaction(node_url.clone(), signed_tx)
+            .await
+        {
+            warn!("Failed to post recreated transaction: {e}");
+        }
+    }
 }
 
 #[expect(
@@ -1057,6 +1457,10 @@ mod tests {
 
         let mut state = Some(tx_state);
         let mut stale_last_msg_id = MsgId::root();
+        let mut pending_publications = HashMap::new();
+        let mut publish_order = Vec::new();
+        let mut inclusion_waiters = HashMap::new();
+
         let (reply_tx, reply_rx) = oneshot::channel();
         handle_request(
             ActorRequest::Publish {
@@ -1069,6 +1473,9 @@ mod tests {
             channel_id,
             &signing_key,
             &mut stale_last_msg_id,
+            &mut pending_publications,
+            &mut publish_order,
+            &mut inclusion_waiters,
         );
 
         let (signed_tx, _result) = reply_rx
@@ -1115,6 +1522,10 @@ mod tests {
 
         let mut state = Some(tx_state);
         let mut last_msg_id = MsgId::root();
+        let mut pending_publications = HashMap::new();
+        let mut publish_order = Vec::new();
+        let mut inclusion_waiters = HashMap::new();
+
         let (reply_tx, reply_rx) = oneshot::channel();
         handle_request(
             ActorRequest::Publish {
@@ -1127,6 +1538,9 @@ mod tests {
             channel_id,
             &signing_key,
             &mut last_msg_id,
+            &mut pending_publications,
+            &mut publish_order,
+            &mut inclusion_waiters,
         );
 
         let err = reply_rx
@@ -1166,6 +1580,9 @@ mod tests {
 
         let mut state = Some(tx_state);
         let mut last_msg_id = chain_tip;
+        let mut pending_publications = HashMap::new();
+        let mut publish_order = Vec::new();
+        let mut inclusion_waiters = HashMap::new();
 
         // First publish should build on chain tip.
         let (reply_tx_1, reply_rx_1) = oneshot::channel();
@@ -1180,6 +1597,9 @@ mod tests {
             channel_id,
             &signing_key,
             &mut last_msg_id,
+            &mut pending_publications,
+            &mut publish_order,
+            &mut inclusion_waiters,
         );
         let (tx_1, _) = reply_rx_1
             .await
@@ -1202,6 +1622,9 @@ mod tests {
             channel_id,
             &signing_key,
             &mut last_msg_id,
+            &mut pending_publications,
+            &mut publish_order,
+            &mut inclusion_waiters,
         );
         let (tx_2, _) = reply_rx_2
             .await
