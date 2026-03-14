@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-banning-service"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "libp2p",
