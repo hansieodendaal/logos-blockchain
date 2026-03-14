@@ -1,9 +1,11 @@
 pub mod error;
+mod voucher;
 
 use std::{
     borrow::Borrow,
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap},
+    fmt::Debug,
 };
 
 pub use error::WalletError;
@@ -11,12 +13,16 @@ use lb_core::{
     block::Block,
     header::HeaderId,
     mantle::{
-        AuthenticatedMantleTx, GasConstants, NoteId, Utxo, Value, ledger::Tx as LedgerTx,
+        AuthenticatedMantleTx, GasConstants, NoteId, Utxo, Value,
+        ledger::Tx as LedgerTx,
+        ops::leader_claim::{VoucherCm, VoucherNullifier},
         tx_builder::MantleTxBuilder,
     },
 };
 use lb_key_management_system_keys::keys::ZkPublicKey;
 use lb_ledger::LedgerState;
+
+pub use crate::voucher::Vouchers;
 
 pub struct WalletBlock {
     pub id: HeaderId,
@@ -44,12 +50,15 @@ pub struct WalletState {
 }
 
 impl WalletState {
-    pub fn from_ledger(known_keys: &HashSet<ZkPublicKey>, ledger: &LedgerState) -> Self {
+    pub fn from_ledger<KeyId>(
+        known_keys: &HashMap<ZkPublicKey, KeyId>,
+        ledger: &LedgerState,
+    ) -> Self {
         let mut utxos = rpds::HashTrieMapSync::new_sync();
         let mut pk_index = rpds::HashTrieMapSync::new_sync();
 
         for (_, (utxo, _)) in ledger.latest_utxos().utxos().iter() {
-            if known_keys.contains(&utxo.note.pk) {
+            if known_keys.contains_key(&utxo.note.pk) {
                 let note_id = utxo.id();
                 utxos = utxos.insert(note_id, *utxo);
 
@@ -133,7 +142,11 @@ impl WalletState {
     }
 
     #[must_use]
-    pub fn apply_block(&self, known_keys: &HashSet<ZkPublicKey>, block: &WalletBlock) -> Self {
+    pub fn apply_block<KeyId>(
+        &self,
+        known_keys: &HashMap<ZkPublicKey, KeyId>,
+        block: &WalletBlock,
+    ) -> Self {
         let mut utxos = self.utxos.clone();
         let mut pk_index = self.pk_index.clone();
 
@@ -158,7 +171,7 @@ impl WalletState {
 
             // Add new UTXOs (outputs) - only if they belong to our known keys
             for utxo in ledger_tx.utxos() {
-                if known_keys.contains(&utxo.note.pk) {
+                if known_keys.contains_key(&utxo.note.pk) {
                     let note_id = utxo.id();
                     utxos = utxos.insert(note_id, utxo);
 
@@ -177,29 +190,55 @@ impl WalletState {
 }
 
 #[derive(Clone)]
-pub struct Wallet {
-    known_keys: HashSet<ZkPublicKey>,
+pub struct Wallet<KeyId, VoucherId> {
+    known_keys: HashMap<ZkPublicKey, KeyId>,
+    known_vouchers: Vouchers<VoucherId>,
     wallet_states: BTreeMap<HeaderId, WalletState>,
 }
 
-impl Wallet {
+impl<KeyId, VoucherId> Wallet<KeyId, VoucherId>
+where
+    VoucherId: Debug,
+{
     pub fn from_lib(
-        known_keys: impl IntoIterator<Item = ZkPublicKey>,
+        known_keys: impl IntoIterator<Item = (ZkPublicKey, KeyId)>,
+        known_vouchers: Vouchers<VoucherId>,
         lib: HeaderId,
         ledger: &LedgerState,
     ) -> Self {
-        let known_keys: HashSet<ZkPublicKey> = known_keys.into_iter().collect();
+        let known_keys = known_keys.into_iter().collect();
         let wallet_state = WalletState::from_ledger(&known_keys, ledger);
 
         Self {
             known_keys,
+            known_vouchers,
             wallet_states: [(lib, wallet_state)].into(),
         }
     }
 
     #[must_use]
-    pub const fn known_keys(&self) -> &HashSet<ZkPublicKey> {
+    pub const fn known_keys(&self) -> &HashMap<ZkPublicKey, KeyId> {
         &self.known_keys
+    }
+
+    pub fn add_known_voucher(&mut self, cm: VoucherCm, nf: VoucherNullifier, id: VoucherId) {
+        self.known_vouchers.insert(cm, nf, id);
+    }
+
+    #[must_use]
+    pub fn get_voucher_by_nullifier(&self, nf: &VoucherNullifier) -> Option<&VoucherId> {
+        self.known_vouchers.get_by_nullifier(nf)
+    }
+
+    pub fn voucher_commitments_and_nullifiers(
+        &self,
+    ) -> impl Iterator<Item = (&VoucherNullifier, &VoucherCm)> {
+        self.known_vouchers.commitments_and_nullifiers()
+    }
+
+    #[must_use]
+    pub const fn vouchers(&self) -> &Vouchers<VoucherId> {
+        &self.known_vouchers
     }
 
     #[must_use]
@@ -264,16 +303,29 @@ impl Wallet {
             );
         }
     }
+
+    pub fn prune_vouchers(
+        &mut self,
+        immutable_transactions: impl IntoIterator<Item = VoucherNullifier>,
+    ) {
+        for voucher_nullifier in immutable_transactions {
+            if let Some(id) = self.known_vouchers.remove_by_nullifier(&voucher_nullifier) {
+                tracing::debug!("Pruned voucher {:?} from wallet", id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        iter::empty,
         num::{NonZero, NonZeroU64},
         sync::Arc,
     };
 
     use lb_core::{
+        crypto::{ZkDigest as _, ZkHasher},
         mantle::{Note, TxHash, gas::MainnetGasConstants as Gas},
         sdp::{MinStake, ServiceParameters, ServiceType},
     };
@@ -292,10 +344,23 @@ mod tests {
         TxHash::from(BigUint::from(v))
     }
 
+    fn voucher(key_id: u64, idx: u64) -> (VoucherCm, VoucherNullifier) {
+        let secret =
+            ZkHasher::digest(&[BigUint::from(key_id).into(), BigUint::from(idx).into()]).into();
+        (
+            VoucherCm::from_secret(secret),
+            VoucherNullifier::from_secret(secret),
+        )
+    }
+
+    type TestVoucherId = (u64, u64);
+
     #[test]
     fn test_initialization() {
         let alice = pk(1);
         let bob = pk(2);
+        let (voucher_master_key, voucher_index) = (100, 0);
+        let (voucher_cm, voucher_nf) = voucher(voucher_master_key, voucher_index);
 
         let genesis = HeaderId::from([0; 32]);
 
@@ -308,19 +373,40 @@ mod tests {
             &ledger_config(),
         );
 
-        let wallet = Wallet::from_lib([], genesis, &ledger);
+        let wallet = Wallet::<_, TestVoucherId>::from_lib(
+            empty::<(ZkPublicKey, u64)>(),
+            Vouchers::default(),
+            genesis,
+            &ledger,
+        );
         assert_eq!(wallet.balance(genesis, alice).unwrap(), None);
         assert_eq!(wallet.balance(genesis, bob).unwrap(), None);
+        assert!(wallet.vouchers().get(&voucher_cm).is_none());
 
-        let wallet = Wallet::from_lib([alice], genesis, &ledger);
+        let wallet = Wallet::from_lib(
+            [(alice, 1)],
+            Vouchers::new([(voucher_cm, voucher_nf, (voucher_master_key, voucher_index))]),
+            genesis,
+            &ledger,
+        );
         assert_eq!(wallet.balance(genesis, alice).unwrap(), Some(104));
         assert_eq!(wallet.balance(genesis, bob).unwrap(), None);
+        assert_eq!(
+            wallet.vouchers().get(&voucher_cm),
+            Some(&(voucher_master_key, voucher_index))
+        );
 
-        let wallet = Wallet::from_lib([bob], genesis, &ledger);
+        let wallet =
+            Wallet::<_, TestVoucherId>::from_lib([(bob, 2)], Vouchers::default(), genesis, &ledger);
         assert_eq!(wallet.balance(genesis, alice).unwrap(), None);
         assert_eq!(wallet.balance(genesis, bob).unwrap(), Some(20));
 
-        let wallet = Wallet::from_lib([alice, bob], genesis, &ledger);
+        let wallet = Wallet::<_, TestVoucherId>::from_lib(
+            [(alice, 1), (bob, 2)],
+            Vouchers::default(),
+            genesis,
+            &ledger,
+        );
         assert_eq!(wallet.balance(genesis, alice).unwrap(), Some(104));
         assert_eq!(wallet.balance(genesis, bob).unwrap(), Some(20));
     }
@@ -334,7 +420,12 @@ mod tests {
 
         let genesis_ledger = LedgerState::from_utxos([], &ledger_config());
 
-        let mut wallet = Wallet::from_lib([alice, bob], genesis, &genesis_ledger);
+        let mut wallet = Wallet::<_, TestVoucherId>::from_lib(
+            [(alice, 1), (bob, 2)],
+            Vouchers::default(),
+            genesis,
+            &genesis_ledger,
+        );
 
         // Block 1
         // - alice is minted 104 NMO in two notes (100 NMO and 4 NMO)
@@ -382,7 +473,7 @@ mod tests {
         let alice_utxo = Utxo::new(tx_hash(0), 0, Note::new(5000, alice));
 
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice]),
+            &HashMap::from_iter([(alice, 1)]),
             &LedgerState::from_utxos([alice_utxo], &ledger_config()),
         );
 
@@ -418,7 +509,7 @@ mod tests {
         let alice = pk(1);
 
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice]),
+            &HashMap::from_iter([(alice, 1)]),
             &LedgerState::from_utxos(
                 [
                     Utxo::new(tx_hash(0), 0, Note::new(100, alice)),
@@ -448,7 +539,7 @@ mod tests {
         let alice = pk(1);
 
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice]),
+            &HashMap::from_iter([(alice, 1)]),
             &LedgerState::from_utxos([], &ledger_config()),
         );
 
@@ -470,7 +561,7 @@ mod tests {
         let bob = pk(2);
 
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice, bob]),
+            &HashMap::from_iter([(alice, 1), (bob, 2)]),
             &LedgerState::from_utxos(
                 [Utxo::new(tx_hash(0), 0, Note::new(1_000_000, bob))],
                 &ledger_config(),
@@ -515,7 +606,7 @@ mod tests {
         // We can fund the tx if the note value is exactly the gas cost without change
         // note
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice]),
+            &HashMap::from_iter([(alice, 1)]),
             &LedgerState::from_utxos(
                 [Utxo::new(tx_hash(0), 0, Note::new(2884, alice))],
                 &ledger_config(),
@@ -545,7 +636,7 @@ mod tests {
             // We can fund the tx if the note value is exactly the gas cost without change
             // note
             let wallet_state = WalletState::from_ledger(
-                &HashSet::from_iter([alice]),
+                &HashMap::from_iter([(alice, 1)]),
                 &LedgerState::from_utxos(
                     [Utxo::new(tx_hash(0), 0, Note::new(value, alice))],
                     &ledger_config(),
@@ -562,7 +653,7 @@ mod tests {
 
         // We can fund the tx if the note value exceeds gas cost with change note
         let wallet_state = WalletState::from_ledger(
-            &HashSet::from_iter([alice]),
+            &HashMap::from_iter([(alice, 1)]),
             &LedgerState::from_utxos(
                 [Utxo::new(tx_hash(0), 0, Note::new(2925, alice))],
                 &ledger_config(),
@@ -589,10 +680,7 @@ mod tests {
                 epoch_period_nonce_buffer: NonZero::new(1).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(1).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config {
-                security_param: NonZero::new(1).unwrap(),
-                active_slot_coeff: 1.0,
-            },
+            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(1).unwrap(), 1.0),
             sdp_config: lb_ledger::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -613,6 +701,8 @@ mod tests {
                         message_frequency_per_round: NonNegativeF64::try_from(1.0).unwrap(),
                         num_blend_layers: NonZeroU64::new(3).unwrap(),
                         minimum_network_size: NonZeroU64::new(1).unwrap(),
+                        data_replication_factor: 0,
+                        activity_threshold_sensitivity: 1,
                     },
                 },
                 min_stake: MinStake {

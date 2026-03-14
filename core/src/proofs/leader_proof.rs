@@ -1,58 +1,20 @@
 use std::sync::LazyLock;
 
 use ark_ff::{Field as _, PrimeField as _};
-#[cfg(feature = "pol-dev-mode")]
-use generic_array::GenericArray;
 use lb_groth16::{Fr, fr_from_bytes, serde::serde_fr};
+use lb_key_management_system_keys::keys::ZkPublicKey;
 use lb_poseidon2::{Digest as _, Poseidon2Bn254Hasher};
+use lb_utxotree::MerklePath;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-pub const POL_PROOF_DEV_MODE: &str = "POL_PROOF_DEV_MODE";
-
-/// Macro to conditionally execute code based on `PoL` dev mode.
-///
-/// This macro checks both the `pol-dev-mode` feature flag (compile-time) and
-/// the `POL_PROOF_DEV_MODE` environment variable (runtime). The dev code path
-/// is only taken when both conditions are met.
-///
-/// When the `pol-dev-mode` feature is disabled, the dev code is completely
-/// eliminated at compile time.
-///
-/// # Example
-/// ```ignore
-/// let result = if_pol_dev_mode!(
-///     // Dev mode code
-///     compute_dev_result(),
-///     // Normal mode code
-///     compute_normal_result()
-/// );
-/// ```
-#[macro_export]
-macro_rules! if_pol_dev_mode {
-    ($dev:expr, $normal:expr) => {{
-        #[cfg(feature = "pol-dev-mode")]
-        {
-            if std::env::var($crate::proofs::leader_proof::POL_PROOF_DEV_MODE).is_ok() {
-                $dev
-            } else {
-                $normal
-            }
-        }
-        #[cfg(not(feature = "pol-dev-mode"))]
-        {
-            $normal
-        }
-    }};
-}
 
 use crate::{
     mantle::{
         ledger::Utxo,
         ops::{channel::Ed25519PublicKey, leader_claim::VoucherCm},
     },
-    utils::merkle::{MerkleNode, MerklePath},
+    proofs::merkle::merkle_path_to_witness,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +25,6 @@ pub struct Groth16LeaderProof {
     entropy_contribution: Fr,
     leader_key: Ed25519PublicKey,
     voucher_cm: VoucherCm,
-    #[cfg(feature = "pol-dev-mode")]
-    public: LeaderPublic,
 }
 
 #[derive(Debug, Error)]
@@ -76,8 +36,6 @@ pub enum Error {
 impl Groth16LeaderProof {
     pub fn prove(witness: LeaderPrivate, voucher_cm: VoucherCm) -> Result<Self, Error> {
         let start_t = std::time::Instant::now();
-        #[cfg(feature = "pol-dev-mode")]
-        let public = witness.public;
         let leader_key = witness.pk;
         let (proof, entropy_contribution) = Self::generate_proof(witness)?;
         tracing::debug!("groth16 prover time: {:.2?}", start_t.elapsed(),);
@@ -87,8 +45,6 @@ impl Groth16LeaderProof {
             entropy_contribution,
             leader_key,
             voucher_cm,
-            #[cfg(feature = "pol-dev-mode")]
-            public,
         })
     }
 
@@ -99,30 +55,13 @@ impl Groth16LeaderProof {
             entropy_contribution: Fr::ZERO,
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
-            #[cfg(feature = "pol-dev-mode")]
-            public: LeaderPublic::new(Fr::ZERO, Fr::ZERO, Fr::ZERO, 0, 0),
         }
     }
 
     fn generate_proof(private: LeaderPrivate) -> Result<(lb_pol::PoLProof, Fr), Error> {
-        if_pol_dev_mode!(
-            {
-                tracing::warn!(
-                    "Proofs are being generated in dev mode. This should never be used in production."
-                );
-                let proof = lb_groth16::CompressedGroth16Proof::new(
-                    GenericArray::default(),
-                    GenericArray::default(),
-                    GenericArray::default(),
-                );
-                Ok((proof, Fr::ZERO))
-            },
-            {
-                let (proof, verif_inputs) =
-                    lb_pol::prove(&private.input.into()).map_err(Error::PoLProofFailed)?;
-                Ok((proof, verif_inputs.entropy_contribution.into_inner()))
-            }
-        )
+        let (proof, verif_inputs) =
+            lb_pol::prove(&private.input.into()).map_err(Error::PoLProofFailed)?;
+        Ok((proof, verif_inputs.entropy_contribution.into_inner()))
     }
 
     #[must_use]
@@ -147,37 +86,28 @@ pub trait LeaderProof {
 
 impl LeaderProof for Groth16LeaderProof {
     fn verify(&self, public_inputs: &LeaderPublic) -> bool {
-        if_pol_dev_mode!(
-            {
-                tracing::warn!(
-                    "Proofs are being verified in dev mode. This should never be used in production."
-                );
-                &self.public == public_inputs
-            },
-            {
-                let leader_pk = ed25519_pk_to_fr_tuple(self.leader_key());
-                lb_pol::verify(
-                    &self.proof,
-                    &lb_pol::PolVerifierInput::new(
-                        self.entropy(),
-                        public_inputs.slot,
-                        public_inputs.epoch_nonce,
-                        public_inputs.aged_root,
-                        public_inputs.latest_root,
-                        public_inputs.total_stake,
-                        leader_pk,
-                    ),
-                )
-                .is_ok()
-            }
+        let leader_pk = ed25519_pk_to_fr_tuple(self.leader_key());
+        lb_pol::verify(
+            &self.proof,
+            &lb_pol::PolVerifierInput::new(
+                self.entropy(),
+                public_inputs.slot,
+                public_inputs.epoch_nonce,
+                public_inputs.aged_root,
+                public_inputs.latest_root,
+                public_inputs.total_stake,
+                leader_pk,
+            ),
         )
+        .is_ok()
     }
 
     fn verify_genesis(&self) -> bool {
-        self.proof == lb_pol::PoLProof::from_bytes(&[0u8; 128])
-            && self.entropy_contribution == Fr::ZERO
-            && self.leader_key == Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap()
-            && self.voucher_cm == VoucherCm::default()
+        let expected_genesis = Self::genesis();
+        self.proof == expected_genesis.proof
+            && self.entropy_contribution == expected_genesis.entropy_contribution
+            && self.leader_key == expected_genesis.leader_key
+            && self.voucher_cm == expected_genesis.voucher_cm
     }
 
     fn entropy(&self) -> Fr {
@@ -203,6 +133,19 @@ pub struct LeaderPublic {
     pub aged_root: Fr,
     #[serde(with = "serde_fr")]
     pub latest_root: Fr,
+}
+
+/// Check if the given note is owned by the leader and wins the lottery with
+/// the given public inputs.
+#[must_use]
+pub fn check_winning(
+    utxo: Utxo,
+    public_inputs: LeaderPublic,
+    publib_key: &ZkPublicKey,
+    secret_key: Fr,
+) -> bool {
+    utxo.note.pk == *publib_key
+        && public_inputs.check_winning(utxo.note.value, utxo.id().0, secret_key)
 }
 
 impl LeaderPublic {
@@ -232,45 +175,11 @@ impl LeaderPublic {
         ticket < threshold
     }
 
-    #[must_use]
-    #[cfg(feature = "pol-dev-mode")]
-    pub fn check_winning_dev(
-        &self,
-        value: u64,
-        note_id: Fr,
-        sk: Fr,
-        active_slot_coeff: f64,
-    ) -> bool {
-        let (t0, t1) = self.scaled_phi_approx_dev(active_slot_coeff);
-        let threshold =
-            Self::phi_approx(&Fr::from(value), &(Fr::from(t0), Fr::from(t1))).into_bigint();
-        let ticket = Self::ticket(note_id, sk, self.epoch_nonce, Fr::from(self.slot)).into_bigint();
-        ticket < threshold
-    }
-
     fn scaled_phi_approx(&self) -> (BigUint, BigUint) {
         let t0 = &*lb_pol::T0_CONSTANT / &BigUint::from(self.total_stake);
         let total_stake_sq = &BigUint::from(self.total_stake) * &BigUint::from(self.total_stake);
         let t1 = &*lb_pol::P - (&*lb_pol::T1_CONSTANT / &total_stake_sq);
         (t0, t1)
-    }
-
-    #[cfg(feature = "pol-dev-mode")]
-    fn scaled_phi_approx_dev(&self, active_slot_coeff: f64) -> (BigUint, BigUint) {
-        let total_stake = BigUint::from(self.total_stake);
-        let total_stake_sq = &total_stake * &total_stake;
-        let double_total_stake_sq = &total_stake_sq * 2u64;
-
-        let precision = 1_000_000_000_000_000_000u128;
-        let order = lb_pol::P.clone();
-        let neg_f_ln =
-            BigUint::from((-(1.0 - active_slot_coeff).ln() * precision as f64).round() as u128);
-        let neg_f_ln_sq = &neg_f_ln * &neg_f_ln;
-
-        let t0 = (&order * &neg_f_ln) / (&total_stake * precision);
-        let t1 =
-            ((&order * &neg_f_ln_sq) / (&double_total_stake_sq * precision * precision)) % &order;
-        (t0, &order - t1)
     }
 
     fn phi_approx(stake: &Fr, approx: &(Fr, Fr)) -> Fr {
@@ -290,8 +199,6 @@ static LEAD_V1: LazyLock<Fr> =
 pub struct LeaderPrivate {
     input: lb_pol::PolWitnessInputsData,
     pk: Ed25519PublicKey,
-    #[cfg(feature = "pol-dev-mode")]
-    public: LeaderPublic,
 }
 
 impl LeaderPrivate {
@@ -330,8 +237,6 @@ impl LeaderPrivate {
         Self {
             input,
             pk: public_key,
-            #[cfg(feature = "pol-dev-mode")]
-            public,
         }
     }
 
@@ -378,21 +283,6 @@ fn ed25519_pk_to_fr_tuple(pk: &Ed25519PublicKey) -> (Fr, Fr) {
     )
 }
 
-/// Converts a [`MerklePath`] to the witness format expected by the circuit.
-fn merkle_path_to_witness<T: Copy>(path: &MerklePath<T>) -> (Vec<T>, Vec<bool>) {
-    path.iter()
-        // PoL circuit expects the reverse order for selectors
-        .zip(path.iter().rev())
-        .map(|(node, rev_node)| {
-            (
-                *node.item(),
-                // 1 if sibling is on the left
-                matches!(rev_node, MerkleNode::Left(_)),
-            )
-        })
-        .unzip()
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr as _;
@@ -423,18 +313,24 @@ mod tests {
     }
 
     fn check_prob(target: f64, f: impl Fn() -> bool) {
-        const EPS: f64 = 0.01; // tolerance band (±2 percentage points)
-        const ALPHA: f64 = 1e-6; // fails with probability at most ALPHA if the observed rate is within EPS of
-        // target
+        let eps = if target < 0.1 {
+            0.01 // tight tolerance for low target (±1%p)
+        } else {
+            0.08 // loose tolerance for high target (±8%p)
+        };
 
-        let n = hoeffding_sample_size(EPS, ALPHA);
+        let n = hoeffding_sample_size(
+            eps,
+            // fails with probability at most 1e-6 if the observed rate is within EPS of target
+            1e-6,
+        );
         println!("Sampling n = {n}");
 
         let observed = empirical_rate(n, f);
 
         assert!(
-            (observed - target).abs() <= EPS,
-            "Rate out of tolerance: observed={observed:.6}, target={target:.6}, eps={EPS:.6}, n={n}"
+            (observed - target).abs() <= eps,
+            "Rate out of tolerance: observed={observed:.6}, target={target:.6}, eps={eps:.6}, n={n}"
         );
     }
 
@@ -450,6 +346,12 @@ mod tests {
         let note = Fr::from(rng.next_u64()); // note value
         let sk = Fr::from(rng.next_u64()); // secret key
         (public, note, sk)
+    }
+
+    #[test]
+    fn test_genesis_verification() {
+        let genesis_proof = Groth16LeaderProof::genesis();
+        assert!(genesis_proof.verify_genesis());
     }
 
     /// Check that ticket is derived correctly with known values.
@@ -472,49 +374,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "pol-dev-mode")]
-    #[test]
-    fn test_check_winning_dev() {
-        // winning rate of all the stake should be ~ active slot coeff
-        check_prob(1.0 / 30.0, || {
-            let (public, note_id, sk) = rand_inputs();
-            public.check_winning_dev(1, note_id, sk, 1.0 / 30.0)
-        });
-        check_prob(0.05, || {
-            let (public, note_id, sk) = rand_inputs();
-            public.check_winning_dev(1, note_id, sk, 0.05)
-        });
-    }
-
     #[test]
     fn test_check_winning() {
         // winning rate of all the stake should be ~ active slot coeff
-        check_prob(1.0 / 30.0, || {
+        check_prob(lb_pol::slot_activation_coefficient(), || {
             let (public, note_id, sk) = rand_inputs();
             public.check_winning(1, note_id, sk)
         });
-    }
-
-    #[test]
-    fn test_merkle_path_to_witness() {
-        let path: Vec<MerkleNode<i32>> = vec![
-            MerkleNode::Left(1),
-            MerkleNode::Right(2),
-            MerkleNode::Left(3),
-            MerkleNode::Right(4),
-        ];
-        let (items, selectors) = merkle_path_to_witness(&path);
-        // Items should be in forward order.
-        assert_eq!(items, vec![1, 2, 3, 4]);
-        // Selectors should be in reverse order.
-        assert_eq!(selectors, vec![false, true, false, true]);
-    }
-
-    #[test]
-    fn test_merkle_path_to_witness_empty() {
-        let path: Vec<MerkleNode<i32>> = vec![];
-        let (items, selectors) = merkle_path_to_witness(&path);
-        assert!(items.is_empty());
-        assert!(selectors.is_empty());
     }
 }

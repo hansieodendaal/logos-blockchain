@@ -5,9 +5,13 @@ use std::{
 
 use futures::stream::{self, StreamExt as _};
 use lb_libp2p::PeerId;
+use lb_pol::slot_activation_coefficient;
 use logos_blockchain_tests::{
     adjust_timeout,
-    common::sync::{wait_for_validators_mode, wait_for_validators_mode_and_height},
+    common::{
+        sync::{wait_for_validators_mode, wait_for_validators_mode_and_height},
+        time::max_block_propagation_time,
+    },
     nodes::validator::{Validator, create_validator_config},
     secret_key_to_peer_id,
     topology::configs::{
@@ -53,8 +57,13 @@ async fn test_ibd_behind_nodes() {
     wait_for_validators_mode_and_height(
         &initial_validators,
         lb_cryptarchia_engine::State::Online,
-        minimum_height,
-        adjust_timeout(Duration::from_secs(300)),
+        minimum_height.into(),
+        adjust_timeout(max_block_propagation_time(
+            minimum_height,
+            initial_validators.len().try_into().unwrap(),
+            &initial_validators[0].config().deployment,
+            2.0,
+        )),
     )
     .await;
 
@@ -118,11 +127,7 @@ async fn test_ibd_behind_nodes() {
     // So, calculate an acceptable height margin for safe comparison.
     let height_margin = acceptable_height_margin(
         config.deployment.time.slot_duration,
-        config
-            .deployment
-            .cryptarchia
-            .consensus_config
-            .active_slot_coeff,
+        slot_activation_coefficient(),
         height_check_timestamp.elapsed(),
     );
 

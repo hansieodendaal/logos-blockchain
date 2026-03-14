@@ -4,7 +4,7 @@ use overwatch::services::{ServiceData, relay::OutboundRelay};
 use thiserror::Error;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::{ConsensusMsg, CryptarchiaInfo, LibUpdate};
+use crate::{ConsensusMsg, CryptarchiaInfo, LibUpdate, ProcessedBlockEvent};
 
 pub trait CryptarchiaServiceData:
     ServiceData<Message = ConsensusMsg<Self::Tx>> + Send + 'static
@@ -77,12 +77,14 @@ where
             })?;
 
         rx.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving GetInfo"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving GetInfo"))
         })
     }
 
     /// Subscribe to new blocks
-    pub async fn subscribe_new_blocks(&self) -> Result<broadcast::Receiver<HeaderId>, ApiError> {
+    pub async fn subscribe_new_blocks(
+        &self,
+    ) -> Result<broadcast::Receiver<ProcessedBlockEvent>, ApiError> {
         let (sender, receiver) = oneshot::channel();
 
         self.relay
@@ -93,7 +95,7 @@ where
             })?;
 
         receiver.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving NewBlockSubscribe"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving NewBlockSubscribe"))
         })
     }
 
@@ -109,7 +111,7 @@ where
             })?;
 
         receiver.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving LibSubscribe"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving LibSubscribe"))
         })
     }
 
@@ -131,7 +133,7 @@ where
             })?;
 
         rx.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving GetHeaders"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving GetHeaders"))
         })
     }
 
@@ -160,7 +162,7 @@ where
             })?;
 
         rx.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving GetLedgerState"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving GetLedgerState"))
         })
     }
 
@@ -179,7 +181,7 @@ where
             })?;
 
         rx.await.map_err(|relay_error| {
-            ApiError::CommsFailure(format!("{relay_error} while recving GetEpochState resp"))
+            ApiError::CommsFailure(format!("{relay_error} while receiving GetEpochState resp"))
         })
     }
 
@@ -204,7 +206,7 @@ where
 
         rx.await
             .map_err(|relay_error| {
-                ApiError::CommsFailure(format!("{relay_error} while recving ApplyBlock resp"))
+                ApiError::CommsFailure(format!("{relay_error} while receiving ApplyBlock resp"))
             })?
             .map_err(|err| match err {
                 crate::Error::ParentMissing { parent, info } => {
@@ -237,6 +239,35 @@ where
             .await
             .map_err(|(relay_error, _)| {
                 ApiError::CommsFailure(format!("{relay_error} while sending IbdCompleted"))
+            })?;
+
+        Ok(())
+    }
+
+    /// Wait until the chain becomes the Online mode.
+    /// For details, see [`ConsensusMsg::SubscribeChainOnline`].
+    pub async fn wait_until_chain_becomes_online(&self) -> Result<(), ApiError> {
+        let (sender, receiver) = oneshot::channel();
+
+        self.relay
+            .send(ConsensusMsg::SubscribeChainOnline { sender })
+            .await
+            .map_err(|(relay_error, _)| {
+                ApiError::CommsFailure(format!("{relay_error} while sending SubscribeChainOnline"))
+            })?;
+
+        let mut subscriber = receiver.await.map_err(|relay_error| {
+            ApiError::CommsFailure(format!(
+                "{relay_error} while receiving SubscribeChainOnline"
+            ))
+        })?;
+
+        // Wait until the channel returns `true`.
+        subscriber
+            .wait_for(|&is_online| is_online)
+            .await
+            .map_err(|e| {
+                ApiError::CommsFailure(format!("Failed to wait for chain to become online: {e}"))
             })?;
 
         Ok(())

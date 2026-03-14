@@ -1,42 +1,47 @@
 use core::fmt::Debug;
-use std::fmt::Display;
+use std::{fmt::Display, num::NonZeroUsize, ops::RangeInclusive};
 
-use futures::{Stream, StreamExt as _};
-use lb_banning_service::BanningService;
-use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
-use lb_chain_service::ConsensusMsg;
+use bytes::Bytes;
+use lb_banning_service::BanningService;use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
+use futures::{Stream, StreamExt as _, future::join_all};
+use lb_chain_service::{
+    ConsensusMsg, ProcessedBlockEvent, Slot,
+    storage::{StorageAdapter as _, adapters::StorageAdapter},
+};
 use lb_core::{
+    block::Block,
     header::HeaderId,
-    mantle::{SignedMantleTx, Transaction},
+    mantle::{SignedMantleTx, Transaction, TxHash},
     sdp::Declaration,
+};
+use lb_storage_service::{
+    StorageMsg, StorageService,
+    api::{
+        StorageApiRequest,
+        chain::{StorageChainApi, requests::ChainApiRequest},
+    },
 };
 use lb_tx_service::{
     MempoolMetrics, MempoolMsg, TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
     tx::service::openapi::Status,
 };
-use overwatch::services::AsServiceId;
+use overwatch::services::{AsServiceId, ServiceData};
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
-#[cfg(feature = "block-explorer")]
-use {
-    bytes::Bytes,
-    futures::future::join_all,
-    lb_chain_service::Slot,
-    lb_chain_service::storage::StorageAdapter as _,
-    lb_chain_service::storage::adapters::StorageAdapter,
-    lb_core::{block::Block, mantle::TxHash},
-    lb_storage_service::{
-        StorageMsg, StorageService,
-        api::{
-            StorageApiRequest,
-            chain::{StorageChainApi, requests::ChainApiRequest},
-        },
-    },
-    overwatch::services::ServiceData,
-    serde::{Serialize, de::DeserializeOwned},
-    std::{num::NonZeroUsize, ops::RangeInclusive},
-};
+
+/// A block along with the current chain state (tip and LIB) at the time it was
+/// processed. This allows clients to track the canonical chain without needing
+/// to poll /cryptarchia/info.
+pub struct BlockWithChainState<Tx> {
+    /// The processed block.
+    pub block: Block<Tx>,
+    /// The current canonical tip after processing this block.
+    pub tip: HeaderId,
+    /// The current Last Irreversible Block after processing this block.
+    pub lib: HeaderId,
+}
 
 pub type MempoolService<StorageAdapter, RuntimeServiceId> = TxMempoolService<
     MempoolNetworkAdapter<SignedMantleTx, <SignedMantleTx as Transaction>::Hash, RuntimeServiceId>,
@@ -147,11 +152,10 @@ where
     Ok(stream)
 }
 
-#[cfg(feature = "block-explorer")]
-pub async fn get_new_header_ids_stream<Transaction, Service, RuntimeServiceId>(
+pub async fn get_processed_blocks_event_stream<Transaction, Service, RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
 ) -> Result<
-    impl Stream<Item = Result<HeaderId, crate::http::DynError>>
+    impl Stream<Item = Result<ProcessedBlockEvent, crate::http::DynError>>
     + Send
     + Sync
     + use<Transaction, Service, RuntimeServiceId>,
@@ -175,13 +179,12 @@ where
         .await
         .map_err(|error| Box::new(error) as super::DynError)?;
 
-    let new_header_ids_stream = BroadcastStream::new(new_blocks_receiver)
+    let processed_blocks_stream = BroadcastStream::new(new_blocks_receiver)
         .map(|item| item.map_err(|error| Box::new(error) as crate::http::DynError));
 
-    Ok(new_header_ids_stream)
+    Ok(processed_blocks_stream)
 }
 
-#[cfg(feature = "block-explorer")]
 pub async fn get_new_blocks_stream<
     Transaction,
     StorageBackend,
@@ -190,7 +193,7 @@ pub async fn get_new_blocks_stream<
 >(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
 ) -> Result<
-    impl Stream<Item = Block<Transaction>>
+    impl Stream<Item = BlockWithChainState<Transaction>>
     + Send
     + use<Transaction, StorageBackend, ConsensusService, RuntimeServiceId>,
     super::DynError,
@@ -216,9 +219,11 @@ where
         + AsServiceId<ConsensusService>,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
-    let new_header_ids_stream =
-        get_new_header_ids_stream::<Transaction, ConsensusService, RuntimeServiceId>(handle)
-            .await?;
+    let processed_blocks_stream =
+        get_processed_blocks_event_stream::<Transaction, ConsensusService, RuntimeServiceId>(
+            handle,
+        )
+        .await?;
 
     let relay = handle
         .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
@@ -226,18 +231,22 @@ where
     let storage_adapter =
         StorageAdapter::<StorageBackend, Transaction, RuntimeServiceId>::new(relay).await;
 
-    let new_blocks_stream = new_header_ids_stream.filter_map(move |header_id| {
+    let new_blocks_stream = processed_blocks_stream.filter_map(move |event| {
         let storage_adapter = storage_adapter.clone();
         async move {
-            let header_id = header_id.ok()?;
-            storage_adapter.get_block(&header_id).await
+            let event = event.ok()?;
+            let block = storage_adapter.get_block(&event.block_id).await?;
+            Some(BlockWithChainState {
+                block,
+                tip: event.tip,
+                lib: event.lib,
+            })
         }
     });
 
     Ok(new_blocks_stream)
 }
 
-#[cfg(feature = "block-explorer")]
 /// Fetch block header ids in range.
 ///
 /// # Arguments
@@ -298,7 +307,6 @@ where
         .map_err(|error| Box::new(error) as super::DynError)
 }
 
-#[cfg(feature = "block-explorer")]
 /// Fetch blocks in range
 ///
 /// # Parameters

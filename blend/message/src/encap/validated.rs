@@ -1,8 +1,7 @@
+use derivative::Derivative;
 use lb_blend_crypto::random_sized_bytes;
 use lb_blend_proofs::{quota::VerifiedProofOfQuota, selection::inputs::VerifyInputs};
-use lb_key_management_system_keys::{
-    keys::UnsecuredEd25519Key, operators::ed25519::derive_x25519::X25519PrivateKey,
-};
+use lb_key_management_system_keys::keys::{UnsecuredEd25519Key, X25519PrivateKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -28,9 +27,11 @@ pub struct RequiredProofOfSelectionVerificationInputs {
 }
 
 /// An encapsulated message whose public header has been verified.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Derivative, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derivative(Debug)]
 pub struct EncapsulatedMessageWithVerifiedPublicHeader {
     validated_public_header: VerifiedPublicHeader,
+    #[derivative(Debug = "ignore")] // too long
     encapsulated_part: EncapsulatedPart,
 }
 

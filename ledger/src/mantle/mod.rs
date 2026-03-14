@@ -6,12 +6,17 @@ use std::collections::HashMap;
 
 use lb_core::{
     block::BlockNumber,
+    crypto::ZkHash,
     mantle::{
         AuthenticatedMantleTx, GasConstants, GenesisTx, NoteId, TxHash, Utxo,
-        ops::{Op, OpProof, leader_claim::VoucherCm},
+        ops::{
+            Op, OpProof,
+            leader_claim::{RewardsRoot, VoucherCm},
+        },
     },
     sdp::{Declaration, DeclarationId, ProviderId, ProviderInfo, ServiceType, SessionNumber},
 };
+use lb_utxotree::MerklePath;
 use sdp::{Error as SdpLedgerError, locked_notes::LockedNotes};
 
 use crate::{Balance, Config, EpochState, UtxoTree};
@@ -117,6 +122,21 @@ impl LedgerState {
     #[must_use]
     pub fn sdp_declarations(&self) -> Vec<(DeclarationId, Declaration)> {
         self.sdp.declarations()
+    }
+
+    #[must_use]
+    pub fn has_claimable_voucher(&self, voucher_cm: &VoucherCm) -> bool {
+        self.leaders.has_claimable_voucher(voucher_cm)
+    }
+
+    #[must_use]
+    pub const fn claimable_vouchers_root(&self) -> RewardsRoot {
+        self.leaders.claimable_vouchers_root()
+    }
+
+    #[must_use]
+    pub fn voucher_merkle_path(&self, voucher_cm: VoucherCm) -> Option<MerklePath<ZkHash>> {
+        self.leaders.voucher_merkle_path(voucher_cm)
     }
 
     pub fn try_apply_header(

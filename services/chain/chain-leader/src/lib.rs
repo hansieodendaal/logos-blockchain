@@ -1,24 +1,29 @@
+pub mod api;
 mod blend;
+mod kms;
 mod leadership;
 mod mempool;
 mod relays;
+mod wallet;
 
 use core::fmt::Debug;
 use std::{fmt::Display, iter, pin::Pin, time::Duration};
 
 use futures::{StreamExt as _, stream};
+use lb_chain_network_service::api::{ChainNetworkServiceApi, ChainNetworkServiceData};
 use lb_chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
 use lb_core::{
     block::{Block, Error as BlockError, MAX_TRANSACTIONS},
     header::HeaderId,
     mantle::{
-        AuthenticatedMantleTx, Transaction, TxHash, TxSelect, gas::MainnetGasConstants,
-        ops::leader_claim::VoucherCm,
+        AuthenticatedMantleTx, SignedMantleTx, Transaction, TxHash, TxSelect,
+        gas::MainnetGasConstants, ops::leader_claim::LeaderClaimOp,
     },
     proofs::leader_proof::{Groth16LeaderProof, LeaderPrivate},
 };
 use lb_cryptarchia_engine::{Epoch, Slot};
-use lb_key_management_system_keys::keys::Ed25519Key;
+use lb_key_management_system_service::{api::KmsServiceApi, keys::Ed25519Key};
+use lb_ledger::LedgerState;
 use lb_services_utils::wait_until_services_are_ready;
 use lb_time_service::{SlotTick, TimeService, TimeServiceMessage};
 use lb_tx_service::{
@@ -27,7 +32,7 @@ use lb_tx_service::{
     network::NetworkAdapter as MempoolNetworkAdapter,
     storage::MempoolStorageAdapter,
 };
-pub use leadership::LeaderConfig;
+use lb_wallet_service::api::{WalletApi, WalletApiError};
 use overwatch::{
     DynError, OpaqueServiceResourcesHandle,
     services::{AsServiceId, ServiceCore, ServiceData},
@@ -35,14 +40,17 @@ use overwatch::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::{oneshot, watch};
-use tracing::{Level, error, info, instrument, span};
+use tracing::{Level, debug, error, info, instrument, span};
 use tracing_futures::Instrument as _;
 
+pub use crate::wallet::LeaderWalletConfig;
 use crate::{
     blend::BlendAdapter,
-    leadership::{Leader, WinningPoLSlotNotifier},
-    mempool::MempoolAdapter as _,
+    kms::PreloadKmsService,
+    leadership::{PotentialWinningPoLSlotNotifier, build_proof_for},
+    mempool::{MempoolAdapter as _, adapter::MempoolAdapter},
     relays::CryptarchiaConsensusRelays,
+    wallet::{LeaderWalletError, fund_and_sign_leader_claim_tx},
 };
 
 pub(crate) type WinningPolInfo = (LeaderPrivate, Epoch);
@@ -63,6 +71,18 @@ pub enum Error {
     FetchBlockTransactions(#[source] DynError),
     #[error("Failed to create valid block during proposal: {0}")]
     BlockCreation(#[from] BlockError),
+    #[error("Wallet API error: {0}")]
+    Wallet(#[from] WalletApiError),
+    #[error("Leader wallet error: {0}")]
+    LeaderWallet(#[from] LeaderWalletError),
+    #[error("Mempool error: {0}")]
+    Mempool(#[source] DynError),
+    #[error("Chain service error: {0}")]
+    ChainService(#[from] lb_chain_service::api::ApiError),
+    #[error("No claimable voucher found")]
+    NoClaimableVoucher,
+    #[error("Ledger state not found for {0:?}")]
+    LedgerStateNotFound(HeaderId),
 }
 
 #[derive(Debug)]
@@ -70,17 +90,18 @@ pub enum LeaderMsg {
     /// Request a new receiver that yields PoL-winning slot information.
     ///
     /// The stream will yield items in one of the following cases:
-    /// * a new epoch starts -> immediately the first winning slot of the new
-    ///   epoch, if any
-    /// * this service is started mid-epoch -> immediately the first winning
-    ///   slot of the ongoing epoch (the slot can also be in the past compared
-    ///   to the current slot as returned by the time service), if any
-    /// * a new winning slot (other than the very first one in the ongoing
-    ///   epoch) is identified when proposing blocks
+    /// * a new epoch starts -> immediately the first potential winning slot of
+    ///   the new epoch, if any
+    /// * this service is started mid-epoch -> immediately the first potential
+    ///   winning slot of the ongoing epoch (the slot can also be in the past
+    ///   compared to the current slot as returned by the time service), if any
     /// * a new consumer subscribes -> the latest value that was sent to all the
     ///   other consumers, if any
-    WinningPolEpochSlotStreamSubscribe {
+    PotentialWinningPolEpochSlotStreamSubscribe {
         sender: oneshot::Sender<watch::Receiver<Option<WinningPolInfo>>>,
+    },
+    Claim {
+        sender: oneshot::Sender<Result<(), Error>>,
     },
 }
 
@@ -89,8 +110,8 @@ pub struct LeaderSettings<Ts, BlendBroadcastSettings> {
     #[serde(default)]
     pub transaction_selector_settings: Ts,
     pub config: lb_ledger::Config,
-    pub leader_config: LeaderConfig,
     pub blend_broadcast_settings: BlendBroadcastSettings,
+    pub wallet_config: LeaderWalletConfig,
 }
 
 #[expect(clippy::allow_attributes_without_reason)]
@@ -101,6 +122,7 @@ pub struct CryptarchiaLeader<
     TxS,
     TimeBackend,
     CryptarchiaService,
+    ChainNetwork,
     Wallet,
     RuntimeServiceId,
 > where
@@ -119,6 +141,7 @@ pub struct CryptarchiaLeader<
     TimeBackend: lb_time_service::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData,
+    ChainNetwork: ChainNetworkServiceData,
     Wallet: lb_wallet_service::api::WalletServiceData,
 {
     service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
@@ -132,6 +155,7 @@ impl<
     TxS,
     TimeBackend,
     CryptarchiaService,
+    ChainNetwork,
     Wallet,
     RuntimeServiceId,
 > ServiceData
@@ -142,6 +166,7 @@ impl<
         TxS,
         TimeBackend,
         CryptarchiaService,
+        ChainNetwork,
         Wallet,
         RuntimeServiceId,
     >
@@ -160,6 +185,7 @@ where
     TimeBackend: lb_time_service::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData,
+    ChainNetwork: ChainNetworkServiceData,
     Wallet: lb_wallet_service::api::WalletServiceData,
 {
     type Settings = LeaderSettings<TxS::Settings, BlendService::BroadcastSettings>;
@@ -176,6 +202,7 @@ impl<
     TxS,
     TimeBackend,
     CryptarchiaService,
+    ChainNetwork,
     Wallet,
     RuntimeServiceId,
 > ServiceCore<RuntimeServiceId>
@@ -186,6 +213,7 @@ impl<
         TxS,
         TimeBackend,
         CryptarchiaService,
+        ChainNetwork,
         Wallet,
         RuntimeServiceId,
     >
@@ -197,7 +225,11 @@ where
         + Sync
         + 'static,
     BlendService::BroadcastSettings: Clone + Send + Sync,
-    Mempool: RecoverableMempool<BlockId = HeaderId, Key = TxHash> + Send + Sync + 'static,
+    Mempool: MemPool<Item = SignedMantleTx>
+        + RecoverableMempool<BlockId = HeaderId, Key = TxHash>
+        + Send
+        + Sync
+        + 'static,
     Mempool::Storage: MempoolStorageAdapter<RuntimeServiceId> + Clone + Send + Sync,
     Mempool::RecoveryState: Serialize + DeserializeOwned,
     Mempool::Settings: Clone + Send + Sync + 'static,
@@ -222,6 +254,7 @@ where
     TimeBackend: lb_time_service::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item>,
+    ChainNetwork: ChainNetworkServiceData<Tx = Mempool::Item>,
     Wallet: lb_wallet_service::api::WalletServiceData,
     RuntimeServiceId: Debug
         + Send
@@ -235,7 +268,9 @@ where
         >
         + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>
         + AsServiceId<CryptarchiaService>
-        + AsServiceId<Wallet>,
+        + AsServiceId<ChainNetwork>
+        + AsServiceId<Wallet>
+        + AsServiceId<PreloadKmsService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
@@ -267,28 +302,43 @@ where
                 .expect("Failed to estabilish connection with Cryptarchia"),
         );
 
+        let chain_network_api = ChainNetworkServiceApi::<ChainNetwork, RuntimeServiceId>::new(
+            self.service_resources_handle
+                .overwatch_handle
+                .relay::<ChainNetwork>()
+                .await
+                .expect("Failed to estabilish connection with ChainNetwork"),
+        );
+
         let LeaderSettings {
             config: ledger_config,
             transaction_selector_settings,
-            leader_config,
             blend_broadcast_settings,
+            wallet_config,
         } = self
             .service_resources_handle
             .settings_handle
             .notifier()
             .get_updated_settings();
 
-        // TODO: check active slot coeff is exactly 1/30
+        let mut winning_pol_slot_notifier = PotentialWinningPoLSlotNotifier::new(
+            &ledger_config,
+            &self.winning_pol_epoch_slots_sender,
+        );
 
-        let leader = Leader::new(leader_config.sk, ledger_config.clone());
-        let mut winning_pol_slot_notifier =
-            WinningPoLSlotNotifier::new(&leader, &self.winning_pol_epoch_slots_sender);
-
-        let wallet_api = lb_wallet_service::api::WalletApi::<Wallet, RuntimeServiceId>::new(
+        let wallet_api = WalletApi::<Wallet, RuntimeServiceId>::new(
             self.service_resources_handle
                 .overwatch_handle
                 .relay::<Wallet>()
                 .await?,
+        );
+
+        let kms_api = KmsServiceApi::<PreloadKmsService<RuntimeServiceId>, RuntimeServiceId>::new(
+            self.service_resources_handle
+                .overwatch_handle
+                .relay::<PreloadKmsService<_>>()
+                .await
+                .expect("Relay with KMS service should be available."),
         );
 
         let tx_selector = TxS::new(transaction_selector_settings);
@@ -298,6 +348,7 @@ where
             blend_broadcast_settings.clone(),
         );
 
+        // Wait for other service (except ChainLeader) to become ready, with timeout.
         wait_until_services_are_ready!(
             &self.service_resources_handle.overwatch_handle,
             Some(Duration::from_secs(60)),
@@ -305,7 +356,17 @@ where
             TxMempoolService<_, _, _, _>,
             TimeService<_, _>,
             CryptarchiaService,
-            Wallet
+            ChainNetwork,
+            Wallet,
+            PreloadKmsService<_>
+        )
+        .await?;
+        // Wait for ChainLeader service to become ready.
+        // No timeout since it becomes ready only after IBD is complete.
+        wait_until_services_are_ready!(
+            &self.service_resources_handle.overwatch_handle,
+            None,
+            ChainNetwork
         )
         .await?;
 
@@ -319,6 +380,15 @@ where
             receiver.await?
         };
 
+        // Wait until the chain becomes Online mode.
+        // We should not propose blocks while the chain is in Bootstrapping mode.
+        info!("Waiting for chain to become Online mode");
+        cryptarchia_api
+            .wait_until_chain_becomes_online()
+            .await
+            .expect("Waiting for chain to be online should succeed");
+        info!("Chain is now Online. Starting block proposals.");
+
         self.service_resources_handle.status_updater.notify_ready();
         info!(
             "Service '{}' is ready.",
@@ -330,26 +400,14 @@ where
                 tokio::select! {
                     Some(SlotTick { slot, epoch }) = slot_timer.next() => {
                         info!("Received SlotTick for slot {}, ep {}", u64::from(slot), u32::from(epoch));
-                        let chain_info = match cryptarchia_api.info().await {
-                            Ok(info) => info,
+                        let (tip, tip_state) = match Self::get_tip_ledger_state(&cryptarchia_api).await {
+                            Ok(output) => output,
                             Err(e) => {
-                                error!("Failed to get chain info: {:?}", e);
+                                error!("Failed to get tip ledger state: {e:?}");
                                 continue;
                             }
                         };
-                        let parent = chain_info.tip;
-
-                        let tip_state = match cryptarchia_api.get_ledger_state(parent).await {
-                            Ok(Some(state)) => state,
-                            Ok(None) => {
-                                error!("No ledger state found for tip {:?}", parent);
-                                continue;
-                            }
-                            Err(e) => {
-                                error!("Failed to get ledger state: {:?}", e);
-                                continue;
-                            }
-                        };
+                        let parent = tip;
 
                         let latest_tree = tip_state.latest_utxos();
 
@@ -374,9 +432,9 @@ where
                         };
 
                         // If it's a new epoch or the service just started, pre-compute the first winning slot and notify consumers.
-                        winning_pol_slot_notifier.process_epoch(&eligible_utxos.response, &epoch_state);
+                        winning_pol_slot_notifier.process_epoch(&eligible_utxos.response, latest_tree, &epoch_state, &kms_api).await;
 
-                        if let Some((proof, signing_key)) = leader.build_proof_for(&eligible_utxos.response, latest_tree, &epoch_state, slot, &winning_pol_slot_notifier).await {
+                       if let Some((proof, signing_key)) = build_proof_for(&eligible_utxos.response, latest_tree, &epoch_state, slot, &winning_pol_slot_notifier, &wallet_api, &kms_api).await {
                             // TODO: spawn as a separate task?
                             match Self::propose_block(
                                 parent,
@@ -391,21 +449,7 @@ where
                             .await
                             {
                                 Ok(block) => {
-                                    // Process our own block first to ensure it's valid
-                                    match cryptarchia_api.apply_block(block.clone()).await {
-                                        Ok((tip, reorged_txs)) => {
-                                            // Block successfully processed, now remove included txs from mempool and publish it to the network.
-                                            // Assert that the proposed block is added to the honest chain.
-                                            assert!(tip == block.header().id());
-                                            assert!(reorged_txs.is_empty());
-                                            Self::remove_txs_in_block_from_mempool(&block, &relays).await;
-                                            let proposal = block.to_proposal();
-                                            blend_adapter.publish_proposal(proposal).await;
-                                        }
-                                        Err(e) => {
-                                            error!(target: LOG_TARGET, "Error processing local block: {:?}", e);
-                                        }
-                                    }
+                                    Self::apply_and_publish_block_proposal(block, &chain_network_api, &blend_adapter).await;
                                 }
                                 Err(e) => {
                                     error!(target: LOG_TARGET, "{e}");
@@ -415,7 +459,7 @@ where
                     }
 
                     Some(msg) = self.service_resources_handle.inbound_relay.next() => {
-                        handle_inbound_message(msg, &self.winning_pol_epoch_slots_sender);
+                        Self::handle_inbound_message(msg, &self.winning_pol_epoch_slots_sender, &cryptarchia_api, &wallet_api, &wallet_config, relays.mempool_adapter()).await;
                     }
                 }
             }
@@ -441,6 +485,7 @@ impl<
     TxS,
     TimeBackend,
     CryptarchiaService,
+    ChainNetwork,
     Wallet,
     RuntimeServiceId,
 >
@@ -451,6 +496,7 @@ impl<
         TxS,
         TimeBackend,
         CryptarchiaService,
+        ChainNetwork,
         Wallet,
         RuntimeServiceId,
     >
@@ -461,8 +507,12 @@ where
         + Send
         + Sync
         + 'static,
-    BlendService::BroadcastSettings: Send + Sync,
-    Mempool: RecoverableMempool<BlockId = HeaderId, Key = TxHash> + Send + Sync + 'static,
+    BlendService::BroadcastSettings: Clone + Send + Sync,
+    Mempool: MemPool<Item = SignedMantleTx>
+        + RecoverableMempool<BlockId = HeaderId, Key = TxHash>
+        + Send
+        + Sync
+        + 'static,
     Mempool::RecoveryState: Serialize + DeserializeOwned,
     Mempool::Settings: Clone + Send + Sync + 'static,
     Mempool::Item: AuthenticatedMantleTx<Hash = Mempool::Key>
@@ -474,7 +524,6 @@ where
         + Send
         + Sync
         + 'static,
-    Mempool::Item: AuthenticatedMantleTx,
     MempoolNetAdapter:
         MempoolNetworkAdapter<RuntimeServiceId, Payload = Mempool::Item, Key = Mempool::Key>,
     MempoolNetAdapter: MempoolNetworkAdapter<RuntimeServiceId, Payload = Mempool::Item, Key = Mempool::Key>
@@ -488,8 +537,9 @@ where
     TimeBackend: lb_time_service::backends::TimeBackend,
     TimeBackend::Settings: Clone + Send + Sync,
     CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item>,
+    ChainNetwork: ChainNetworkServiceData<Tx = Mempool::Item>,
     Wallet: lb_wallet_service::api::WalletServiceData,
-    RuntimeServiceId: Sync + Send + 'static,
+    RuntimeServiceId: Debug + Display + Sync + Send + 'static + AsServiceId<Wallet>,
 {
     #[expect(clippy::allow_attributes_without_reason)]
     #[expect(
@@ -512,7 +562,7 @@ where
             MempoolNetAdapter,
             RuntimeServiceId,
         >,
-        mut ledger_state: lb_ledger::LedgerState,
+        mut ledger_state: LedgerState,
         ledger_config: &lb_ledger::Config,
     ) -> Result<Block<Mempool::Item>, Error> {
         let txs_stream = relays
@@ -525,12 +575,7 @@ where
 
         ledger_state = ledger_state
             .clone()
-            .try_apply_header::<Groth16LeaderProof, HeaderId>(
-                slot,
-                &proof,
-                VoucherCm::default(),
-                ledger_config,
-            )?;
+            .try_apply_header::<Groth16LeaderProof, HeaderId>(slot, &proof, ledger_config)?;
 
         let mut valid_txs = Vec::new();
         let mut invalid_tx_hashes = Vec::new();
@@ -583,46 +628,97 @@ where
         Ok(block)
     }
 
-    /// A helper function to remove all transactions in the given block from the
-    /// mempool.
-    /// On error, logs the error instead of propagating it, to keep the caller
-    /// logic simple.
-    async fn remove_txs_in_block_from_mempool(
-        block: &Block<Mempool::Item>,
-        relays: &CryptarchiaConsensusRelays<
-            BlendService,
-            Mempool,
-            MempoolNetAdapter,
-            RuntimeServiceId,
-        >,
+    /// Apply our own proposed block to the chain and publish it to the blend
+    /// network.
+    async fn apply_and_publish_block_proposal(
+        block: Block<Mempool::Item>,
+        chain_network_api: &ChainNetworkServiceApi<ChainNetwork, RuntimeServiceId>,
+        blend_adapter: &BlendAdapter<BlendService>,
     ) {
-        if let Err(e) = relays
-            .mempool_adapter()
-            .remove_transactions(
-                &block
-                    .transactions()
-                    .map(Transaction::hash)
-                    .collect::<Vec<_>>(),
-            )
+        if let Err(e) = chain_network_api
+            .apply_block_and_reconcile_mempool(block.clone())
             .await
         {
-            error!(
-                "failed to remove txs included in block {:?} from mempool: {e:?}",
-                block.header().id()
-            );
+            error!(target: LOG_TARGET, "Failed to apply our own proposed block {:?}: {e:?}", block.header().id());
+            return;
+        }
+        debug!(target: LOG_TARGET, "Successfully applied our own proposed block. Publishing it to the blend network: {:?}", block.header().id());
+
+        blend_adapter.publish_proposal(block.to_proposal()).await;
+    }
+
+    async fn handle_inbound_message(
+        msg: LeaderMsg,
+        winning_pol_epoch_slots_sender: &watch::Sender<Option<WinningPolInfo>>,
+        cryptarchia: &CryptarchiaServiceApi<CryptarchiaService, RuntimeServiceId>,
+        wallet: &WalletApi<Wallet, RuntimeServiceId>,
+        config: &LeaderWalletConfig,
+        mempool: &MempoolAdapter<Mempool::Item>,
+    ) {
+        match msg {
+            LeaderMsg::PotentialWinningPolEpochSlotStreamSubscribe { sender } => {
+                sender
+                    .send(winning_pol_epoch_slots_sender.subscribe())
+                    .unwrap_or_else(|_| {
+                        error!("Could not subscribe to POL epoch winning slots channel.");
+                    });
+            }
+            LeaderMsg::Claim { sender } => {
+                Self::handle_claim_message(cryptarchia, wallet, config, mempool, sender).await;
+            }
         }
     }
-}
 
-fn handle_inbound_message(
-    msg: LeaderMsg,
-    winning_pol_epoch_slots_sender: &watch::Sender<Option<WinningPolInfo>>,
-) {
-    let LeaderMsg::WinningPolEpochSlotStreamSubscribe { sender } = msg;
+    async fn handle_claim_message(
+        cryptarchia: &CryptarchiaServiceApi<CryptarchiaService, RuntimeServiceId>,
+        wallet: &WalletApi<Wallet, RuntimeServiceId>,
+        config: &LeaderWalletConfig,
+        mempool: &MempoolAdapter<Mempool::Item>,
+        resp_tx: oneshot::Sender<Result<(), Error>>,
+    ) {
+        let result = Self::build_and_submit_claim_tx(cryptarchia, wallet, mempool, config).await;
+        if resp_tx.send(result).is_err() {
+            error!("Failed to send claim response");
+        }
+    }
 
-    sender
-        .send(winning_pol_epoch_slots_sender.subscribe())
-        .unwrap_or_else(|_| {
-            error!("Could not subscribe to POL epoch winning slots channel.");
-        });
+    async fn build_and_submit_claim_tx(
+        cryptarchia: &CryptarchiaServiceApi<CryptarchiaService, RuntimeServiceId>,
+        wallet: &WalletApi<Wallet, RuntimeServiceId>,
+        mempool: &MempoolAdapter<Mempool::Item>,
+        config: &LeaderWalletConfig,
+    ) -> Result<(), Error> {
+        let (tip, ledger_state) = Self::get_tip_ledger_state(cryptarchia).await?;
+
+        let voucher_nullifier = wallet
+            .get_claimable_voucher(Some(tip))
+            .await?
+            .response
+            .ok_or(Error::NoClaimableVoucher)?
+            .nullifier;
+
+        let signed_tx = fund_and_sign_leader_claim_tx(
+            LeaderClaimOp {
+                rewards_root: ledger_state.mantle_ledger().claimable_vouchers_root(),
+                voucher_nullifier,
+            },
+            tip,
+            wallet,
+            config,
+        )
+        .await?;
+
+        mempool.post_tx(signed_tx).await.map_err(Error::Mempool)
+    }
+
+    async fn get_tip_ledger_state(
+        cryptarchia: &CryptarchiaServiceApi<CryptarchiaService, RuntimeServiceId>,
+    ) -> Result<(HeaderId, LedgerState), Error> {
+        let tip = cryptarchia.info().await?.tip;
+        let ledger_state = cryptarchia
+            .get_ledger_state(tip)
+            .await?
+            .ok_or(Error::LedgerStateNotFound(tip))?;
+        Ok((tip, ledger_state))
+    }
 }

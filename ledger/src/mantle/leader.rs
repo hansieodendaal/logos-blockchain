@@ -1,11 +1,15 @@
 use std::cmp::Ordering;
 
-use lb_core::mantle::{
-    Value,
-    ops::leader_claim::{LeaderClaimOp, RewardsRoot, VoucherCm, VoucherNullifier},
+use lb_core::{
+    crypto::ZkHash,
+    mantle::{
+        Value,
+        ops::leader_claim::{LeaderClaimOp, RewardsRoot, VoucherCm, VoucherNullifier},
+    },
 };
 use lb_cryptarchia_engine::Epoch;
-use lb_mmr::MerkleMountainRange;
+use lb_utxotree::{DynamicMerkleTree, MerklePath};
+use rpds::HashTrieMapSync;
 
 use crate::Balance;
 
@@ -15,8 +19,7 @@ pub struct LeaderState {
     // current epoch
     epoch: Epoch,
     // vouchers that can be claimed in this epoch
-    // this is updated once at the start of each epoch from the root of
-    // the vouchers merkle tree
+    // this is updated once at the start of each epoch
     claimable_vouchers_root: RewardsRoot,
     n_claimable_vouchers: u64,
     // nullifiers of vouchers that have been claimed since genesis
@@ -26,9 +29,15 @@ pub struct LeaderState {
     // that have been collected in the previous epoch.
     // unclaimed rewards are carried over to the next epoch.
     claimable_rewards: Value,
-    // Merkle tree of vouchers, vouchers can only be claimed with a delay
-    // of one epoch.
-    vouchers: MerkleMountainRange<VoucherCm, lb_core::crypto::ZkHasher>,
+    // Merkle tree vouchers that can be claimed in this epoch
+    // this is updated once at the start of each epoch
+    // TODO: Replace this with MMR to save space by moving merkle path
+    //       maintenance to the wallet.
+    claimable_vouchers: DynamicMerkleTree<VoucherCm, lb_core::crypto::ZkHasher>,
+    claimable_voucher_indices: HashTrieMapSync<VoucherCm, usize>,
+    // List of vouchers that are waiting to be added at the start of
+    // the next epoch
+    pending_vouchers: Vec<VoucherCm>,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -56,12 +65,16 @@ impl LeaderState {
             n_claimable_vouchers: 0,
             nfs: rpds::HashTrieSetSync::new_sync(),
             claimable_rewards: 0,
-            vouchers: MerkleMountainRange::new(),
+            claimable_vouchers: DynamicMerkleTree::new(),
+            claimable_voucher_indices: HashTrieMapSync::new_sync(),
+            pending_vouchers: Vec::new(),
         }
     }
 
     pub fn try_apply_header(self, epoch: Epoch, voucher_cm: VoucherCm) -> Result<Self, Error> {
-        Ok(self.update_epoch_state(epoch)?.add_voucher(voucher_cm))
+        Ok(self
+            .update_epoch_state(epoch)?
+            .add_pending_voucher(voucher_cm))
     }
 
     fn update_epoch_state(mut self, epoch: Epoch) -> Result<Self, Error> {
@@ -72,20 +85,48 @@ impl LeaderState {
                 incoming: epoch,
             }),
             Ordering::Greater => {
+                self = self.update_claimable_vouchers();
                 self.epoch = epoch;
-                self.claimable_vouchers_root = self.vouchers.frontier_root().into();
-                self.n_claimable_vouchers = self.vouchers.len() as u64;
                 // TODO: increase rewards, what about epoch jumps?
                 Ok(self)
             }
         }
     }
 
-    fn add_voucher(self, voucher_cm: VoucherCm) -> Self {
-        Self {
-            vouchers: self.vouchers.push(voucher_cm),
-            ..self
+    /// Add a voucher to be included in the Merkle tree at the start of the
+    /// next epoch
+    fn add_pending_voucher(mut self, voucher_cm: VoucherCm) -> Self {
+        self.pending_vouchers.push(voucher_cm);
+        self
+    }
+
+    /// Insert all pending vouchers into the Merkle tree,
+    /// and update the Merkle root.
+    fn update_claimable_vouchers(mut self) -> Self {
+        for &voucher_cm in &self.pending_vouchers {
+            let (new_vouchers, index) = self.claimable_vouchers.insert(voucher_cm);
+            self.claimable_vouchers = new_vouchers;
+            self.claimable_voucher_indices =
+                self.claimable_voucher_indices.insert(voucher_cm, index);
         }
+        self.pending_vouchers = Vec::new();
+        self.claimable_vouchers_root = self.claimable_vouchers.root().into();
+        self.n_claimable_vouchers = self.claimable_vouchers.size() as u64;
+        self
+    }
+
+    pub(crate) fn has_claimable_voucher(&self, voucher_cm: &VoucherCm) -> bool {
+        self.claimable_voucher_indices.contains_key(voucher_cm)
+    }
+
+    pub(crate) const fn claimable_vouchers_root(&self) -> RewardsRoot {
+        self.claimable_vouchers_root
+    }
+
+    /// Get the Merkle path for a given voucher commitment
+    pub(crate) fn voucher_merkle_path(&self, voucher_cm: VoucherCm) -> Option<MerklePath<ZkHash>> {
+        let index = self.claimable_voucher_indices.get(&voucher_cm)?;
+        self.claimable_vouchers.path(*index)
     }
 
     /// Claim the reward associated with a voucher.
@@ -120,7 +161,9 @@ impl LeaderState {
                 n_claimable_vouchers: self.n_claimable_vouchers,
                 nfs,
                 claimable_rewards,
-                vouchers: self.vouchers.clone(),
+                claimable_vouchers: self.claimable_vouchers.clone(),
+                claimable_voucher_indices: self.claimable_voucher_indices.clone(),
+                pending_vouchers: self.pending_vouchers.clone(),
             },
             Balance::from(reward_amount),
         ))
@@ -129,7 +172,6 @@ impl LeaderState {
 
 #[cfg(test)]
 mod tests {
-    use lb_core::mantle::TxHash;
     use lb_groth16::{Field as _, Fr};
 
     use super::*;
@@ -152,7 +194,6 @@ mod tests {
         let op1 = LeaderClaimOp {
             rewards_root: state.claimable_vouchers_root,
             voucher_nullifier: Fr::ZERO.into(),
-            mantle_tx_hash: TxHash::default(),
         };
         let (state, bal) = state.claim(&op1).unwrap();
         assert_eq!(bal, 100);
@@ -160,7 +201,6 @@ mod tests {
         let op2 = LeaderClaimOp {
             rewards_root: state.claimable_vouchers_root,
             voucher_nullifier: Fr::ONE.into(),
-            mantle_tx_hash: TxHash::default(),
         };
         let (state, bal) = state.claim(&op2).unwrap();
         assert_eq!(bal, 100);
@@ -168,7 +208,6 @@ mod tests {
         let op3 = LeaderClaimOp {
             rewards_root: state.claimable_vouchers_root,
             voucher_nullifier: Fr::from(2u64).into(),
-            mantle_tx_hash: TxHash::default(),
         };
         let (state, bal) = state.claim(&op3).unwrap();
         assert_eq!(bal, 100);
@@ -218,7 +257,6 @@ mod tests {
         let op = LeaderClaimOp {
             voucher_nullifier: Fr::ZERO.into(),
             rewards_root: state.claimable_vouchers_root,
-            mantle_tx_hash: TxHash::default(),
         };
         let (state, balance) = state.claim(&op).unwrap();
         assert_eq!(balance, 0);

@@ -1,3 +1,4 @@
+use derivative::Derivative;
 use itertools::Itertools as _;
 use lb_blend_crypto::cipher::Cipher;
 use lb_blend_proofs::{
@@ -5,9 +6,8 @@ use lb_blend_proofs::{
     selection::{self, VerifiedProofOfSelection, inputs::VerifyInputs},
 };
 use lb_core::codec::{DeserializeOp as _, SerializeOp as _};
-use lb_key_management_system_keys::{
-    keys::{Ed25519PublicKey, Ed25519Signature, UnsecuredEd25519Key},
-    operators::ed25519::derive_x25519::SharedKey,
+use lb_key_management_system_keys::keys::{
+    Ed25519PublicKey, Ed25519Signature, SharedKey, UnsecuredEd25519Key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,11 +29,13 @@ use crate::{
 pub type MessageIdentifier = Ed25519PublicKey;
 
 /// An unverified encapsulated message that is received from a peer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Derivative, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derivative(Debug)]
 pub struct EncapsulatedMessage {
     /// A public header that is not encapsulated.
     public_header: PublicHeader,
     /// Encapsulated parts
+    #[derivative(Debug = "ignore")] // too long
     encapsulated_part: EncapsulatedPart,
 }
 

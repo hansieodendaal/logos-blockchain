@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 async-trait                      = "0.1"
 cucumber                         = { features = ["output-junit"], version = "=0.22.0" }
+derivative                       = "2.2.0"
 futures                          = { default-features = false, version = "0.3" }
 futures-util                     = { default-features = false, version = "0.3.31" }
 hex                              = { default-features = false, version = "0.4.3" }
@@ -37,6 +38,7 @@ lb-key-management-system-service = { workspace = true }
 lb-libp2p                        = { workspace = true }
 lb-network-service               = { features = ["libp2p"], workspace = true }
 lb-node                          = { default-features = false, features = ["testing"], workspace = true }
+lb-pol                           = { features = ["high-active-slot-coefficient"], workspace = true }
 lb-sdp-service                   = { workspace = true }
 lb-time-service                  = { workspace = true }
 lb-tracing                       = { workspace = true }
@@ -50,11 +52,16 @@ reqwest                          = { features = ["json"], workspace = true }
 serde_json                       = "1.0"
 serde_yaml                       = "0.9"
 serial_test                      = "3.1.1"
+strum                            = "0.27.2"
 tempfile                         = { workspace = true }
-testing-framework-core           = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", rev = "e32c0366204e2904452b8b0d0fc9c32d194ac365" }
-testing-framework-runner-compose = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", rev = "e32c0366204e2904452b8b0d0fc9c32d194ac365" }
-testing-framework-runner-local   = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", rev = "e32c0366204e2904452b8b0d0fc9c32d194ac365" }
-testing-framework-workflows      = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", rev = "e32c0366204e2904452b8b0d0fc9c32d194ac365" }
+#testing-framework-core           = { branch = "master", git = "https://github.com/logos-blockchain/logos-blockchain-testing.git" }
+#testing-framework-runner-compose = { branch = "master", git = "https://github.com/logos-blockchain/logos-blockchain-testing.git" }
+#testing-framework-runner-local   = { branch = "master", git = "https://github.com/logos-blockchain/logos-blockchain-testing.git" }
+#testing-framework-workflows      = { branch = "master", git = "https://github.com/logos-blockchain/logos-blockchain-testing.git" }
+testing-framework-core           = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", tag = "test_ref_04" }
+testing-framework-runner-compose = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", tag = "test_ref_04" }
+testing-framework-runner-local   = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", tag = "test_ref_04" }
+testing-framework-workflows      = { git = "https://github.com/logos-blockchain/logos-blockchain-testing.git", tag = "test_ref_04" }
 thiserror                        = { default-features = false, version = "2.0" }
 time                             = { default-features = false, version = "0.3" }
 tokio                            = "1"
@@ -62,15 +69,9 @@ tracing                          = { workspace = true }
 tracing-subscriber               = { features = ["env-filter", "fmt"], version = "0.3" }
 
 [features]
-cucumber = []
+cucumber             = []
 cucumber_stand_alone = []
-pol-dev-mode = [
-  "lb-chain-leader-service/pol-dev-mode",
-  "lb-chain-network-service/pol-dev-mode",
-  "lb-chain-service/pol-dev-mode",
-  "lb-core/pol-dev-mode",
-]
-testing_framework = []
+testing_framework    = []
 
 [[test]]
 name = "test_cryptarchia_happy_path"

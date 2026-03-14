@@ -2,6 +2,7 @@
 
 use std::{
     fmt::{Debug, Display},
+    marker::PhantomData,
     time::Duration,
 };
 
@@ -16,12 +17,14 @@ use axum::{
 use lb_api_service::{Backend, http::consensus::Cryptarchia};
 use lb_banning_service::BanningService;
 use lb_chain_broadcast_service::BlockBroadcastService;
+use lb_chain_leader_service::api::ChainLeaderServiceData;
+use lb_chain_service::CryptarchiaConsensus;
 use lb_core::{
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction},
 };
+use lb_http_api_common::paths;
 pub use lb_http_api_common::settings::AxumBackendSettings;
-use lb_http_api_common::{paths, utils::create_rate_limit_layer};
 use lb_sdp_service::{mempool::SdpMempoolAdapter, wallet::SdpWalletAdapter};
 use lb_services_utils::wait_until_services_are_ready;
 use lb_storage_service::{StorageService, backends::rocksdb::RocksBackend};
@@ -39,19 +42,14 @@ use tower_http::{
 };
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-#[cfg(feature = "block-explorer")]
-use {
-    super::handlers::{blocks, blocks_stream},
-    lb_chain_service::CryptarchiaConsensus,
-};
 
 use super::handlers::{
-    add_tx, block, cryptarchia_headers, cryptarchia_info, cryptarchia_lib_stream, libp2p_info,
-    mantle_metrics, mantle_status, wallet,
+    add_tx, block, blocks, blocks_stream, cryptarchia_headers, cryptarchia_info,
+    cryptarchia_lib_stream, libp2p_info, mantle_metrics, mantle_status, wallet,
 };
 use crate::{
     WalletService,
-    api::handlers::{post_activity, post_declaration, post_withdrawal},
+    api::handlers::{leader_claim, post_activity, post_declaration, post_withdrawal},
 };
 
 pub(crate) type BlockStorageBackend = RocksBackend;
@@ -63,13 +61,17 @@ pub struct AxumBackend<
     MempoolStorageAdapter,
     SdpMempool,
     SdpWallet,
+    ChainLeader,
 > {
     settings: AxumBackendSettings,
-    _time_backend: core::marker::PhantomData<TimeBackend>,
-    _storage_adapter: core::marker::PhantomData<HttpStorageAdapter>,
-    _mempool_storage_adapter: core::marker::PhantomData<MempoolStorageAdapter>,
-    _sdp_mempool_adapter: core::marker::PhantomData<SdpMempool>,
-    _sdp_wallet_adapter: core::marker::PhantomData<SdpWallet>,
+    _phantom: PhantomData<(
+        TimeBackend,
+        HttpStorageAdapter,
+        MempoolStorageAdapter,
+        SdpMempool,
+        SdpWallet,
+        ChainLeader,
+    )>,
 }
 
 #[derive(OpenApi)]
@@ -77,9 +79,23 @@ pub struct AxumBackend<
 struct ApiDoc;
 
 #[async_trait::async_trait]
-impl<TimeBackend, StorageAdapter, MempoolStorageAdapter, SdpMempool, SdpWallet, RuntimeServiceId>
-    Backend<RuntimeServiceId>
-    for AxumBackend<TimeBackend, StorageAdapter, MempoolStorageAdapter, SdpMempool, SdpWallet>
+impl<
+    TimeBackend,
+    StorageAdapter,
+    MempoolStorageAdapter,
+    SdpMempool,
+    SdpWallet,
+    ChainLeader,
+    RuntimeServiceId,
+> Backend<RuntimeServiceId>
+    for AxumBackend<
+        TimeBackend,
+        StorageAdapter,
+        MempoolStorageAdapter,
+        SdpMempool,
+        SdpWallet,
+        ChainLeader,
+    >
 where
     TimeBackend: lb_time_service::backends::TimeBackend + Send + 'static,
     TimeBackend::Settings: Clone + Send + Sync,
@@ -96,6 +112,7 @@ where
     MempoolStorageAdapter::Error: Debug,
     SdpMempool: SdpMempoolAdapter + Send + Sync + 'static,
     SdpWallet: SdpWalletAdapter + Send + Sync + 'static,
+    ChainLeader: ChainLeaderServiceData,
     RuntimeServiceId: Debug
         + Sync
         + Send
@@ -130,8 +147,10 @@ where
             >,
         >
         + AsServiceId<lb_sdp_service::SdpService<SdpMempool, SdpWallet, RuntimeServiceId>>
-        + AsServiceId<WalletService>,
+        + AsServiceId<WalletService>
+        + AsServiceId<ChainLeader>,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
+
 {
     type Error = std::io::Error;
     type Settings = AxumBackendSettings;
@@ -142,11 +161,7 @@ where
     {
         Ok(Self {
             settings,
-            _time_backend: core::marker::PhantomData,
-            _storage_adapter: core::marker::PhantomData,
-            _mempool_storage_adapter: core::marker::PhantomData,
-            _sdp_mempool_adapter: core::marker::PhantomData,
-            _sdp_wallet_adapter: core::marker::PhantomData,
+            _phantom: PhantomData,
         })
     }
 
@@ -158,6 +173,7 @@ where
             &overwatch_handle,
             Some(Duration::from_secs(60)),
             Cryptarchia<_>,
+            ChainLeader,
             lb_network_service::NetworkService<_, _>,
             BlockStorageService<_>,
             TxMempoolService<_, _, _,  _>
@@ -229,30 +245,39 @@ where
                 routing::post(post_withdrawal::<SdpMempool, SdpWallet, RuntimeServiceId>),
             )
             .route(
+                paths::LEADER_CLAIM,
+                routing::post(leader_claim::<ChainLeader, RuntimeServiceId>),
+            )
+            .route(
                 paths::wallet::BALANCE,
                 routing::get(wallet::get_balance::<WalletService, _>),
             )
             .route(
                 paths::wallet::TRANSACTIONS_TRANSFER_FUNDS,
-                routing::post(wallet::post_transactions_transfer_funds::<WalletService, _>),
-            );
-
-        #[cfg(feature = "block-explorer")]
-        let app = app
-            .route(
-                paths::BLOCKS,
-                routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
-            )
-            .route(
-                paths::BLOCKS_STREAM,
-                routing::get(
-                    blocks_stream::<
-                        BlockStorageBackend,
-                        CryptarchiaConsensus<_, _, _, _>,
-                        RuntimeServiceId,
+                routing::post(
+                    wallet::post_transactions_transfer_funds::<
+                        WalletService,
+                        MempoolStorageAdapter,
+                        _,
                     >,
                 ),
             );
+
+        let app = app.route(
+            paths::BLOCKS_STREAM,
+            routing::get(
+                blocks_stream::<
+                    BlockStorageBackend,
+                    CryptarchiaConsensus<_, _, _, _>,
+                    RuntimeServiceId,
+                >,
+            ),
+        );
+
+        let app = app.route(
+            paths::BLOCKS,
+            routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
+        );
 
         let app = app
             .with_state(handle.clone())
@@ -261,7 +286,6 @@ where
             .layer(ConcurrencyLimitLayer::new(
                 self.settings.max_concurrent_requests,
             ))
-            .layer(create_rate_limit_layer(&self.settings))
             .layer(TraceLayer::new_for_http());
 
         let cors_layer = builder

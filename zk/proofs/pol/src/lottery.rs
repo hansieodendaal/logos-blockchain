@@ -6,6 +6,16 @@ use std::{
 use num_bigint::BigUint;
 use num_traits::{CheckedSub as _, Num as _};
 
+#[must_use]
+pub const fn slot_activation_coefficient() -> f64 {
+    #[cfg(not(feature = "high-active-slot-coefficient"))]
+    {
+        1f64 / 30f64
+    }
+    #[cfg(feature = "high-active-slot-coefficient")]
+    0.1f64
+}
+
 /// From [Proof of Leadership spec](https://www.notion.so/nomos-tech/Proof-of-Leadership-Specification-21c261aa09df819ba5b6d95d0fe3066d?source=copy_link#256261aa09df800fbc88e5aae5ea7e06)
 pub static P: LazyLock<BigUint> = LazyLock::new(|| {
     BigUint::from_str_radix(
@@ -17,20 +27,42 @@ pub static P: LazyLock<BigUint> = LazyLock::new(|| {
 
 /// From [Proof of Leadership spec](https://www.notion.so/nomos-tech/Proof-of-Leadership-Specification-21c261aa09df819ba5b6d95d0fe3066d?source=copy_link#256261aa09df800fbc88e5aae5ea7e06)
 pub static T0_CONSTANT: LazyLock<BigUint> = LazyLock::new(|| {
-    BigUint::from_str_radix(
-        "1a3fb997fd58374772808c13d1c2ddacb5ab3ea77413f86fd6e0d3d978e5438",
-        16,
-    )
-    .expect("Constant should parse")
+    #[cfg(not(feature = "high-active-slot-coefficient"))]
+    {
+        BigUint::from_str_radix(
+            "1a3fb997fd58374772808c13d1c2ddacb5ab3ea77413f86fd6e0d3d978e5438",
+            16,
+        )
+        .expect("Constant should parse")
+    }
+    #[cfg(feature = "high-active-slot-coefficient")]
+    {
+        BigUint::from_str_radix(
+            "5193d04d01fb16d1b9c55677fc83950d1cf88207f4a5756431fde6db9ab1768",
+            16,
+        )
+        .expect("Constant should parse")
+    }
 });
 
 /// From [Proof of Leadership spec](https://www.notion.so/nomos-tech/Proof-of-Leadership-Specification-21c261aa09df819ba5b6d95d0fe3066d?source=copy_link#256261aa09df800fbc88e5aae5ea7e06)
 pub static T1_CONSTANT: LazyLock<BigUint> = LazyLock::new(|| {
-    BigUint::from_str_radix(
-        "71e790b41991052e30c93934b5612412e7958837bac8b1c524c24d84cc7d0",
-        16,
-    )
-    .expect("Constant should parse")
+    #[cfg(not(feature = "high-active-slot-coefficient"))]
+    {
+        BigUint::from_str_radix(
+            "71e790b41991052e30c93934b5612412e7958837bac8b1c524c24d84cc7d0",
+            16,
+        )
+        .expect("Constant should parse")
+    }
+    #[cfg(feature = "high-active-slot-coefficient")]
+    {
+        BigUint::from_str_radix(
+            "44c2a290c72d4dc7d6e514a4b9683cc6e7c15e64f0f59482ec7d3f5906784a",
+            16,
+        )
+        .expect("Constant should parse")
+    }
 });
 
 pub fn compute_lottery_values(total_stake: u64) -> (BigUint, BigUint) {

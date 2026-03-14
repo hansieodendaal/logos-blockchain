@@ -12,7 +12,7 @@ pub struct Config {
 
 impl Config {
     #[must_use]
-    pub fn base_period_length(&self) -> NonZero<u64> {
+    pub const fn base_period_length(&self) -> NonZero<u64> {
         self.consensus_config.base_period_length()
     }
 
@@ -70,10 +70,7 @@ mod tests {
                 epoch_period_nonce_buffer: NonZero::new(3).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(4).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config {
-                security_param: NonZero::new(5).unwrap(),
-                active_slot_coeff: 0.5,
-            },
+            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(5).unwrap(), 0.5),
             sdp_config: crate::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -94,6 +91,8 @@ mod tests {
                         message_frequency_per_round: NonNegativeF64::try_from(1.0).unwrap(),
                         num_blend_layers: NonZeroU64::new(3).unwrap(),
                         minimum_network_size: NonZeroU64::new(1).unwrap(),
+                        data_replication_factor: 0,
+                        activity_threshold_sensitivity: 1,
                     },
                 },
                 min_stake: MinStake {
@@ -117,10 +116,7 @@ mod tests {
                 epoch_period_nonce_buffer: NonZero::new(3).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(4).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config {
-                security_param: NonZero::new(5).unwrap(),
-                active_slot_coeff: 0.5,
-            },
+            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(5).unwrap(), 0.5),
             sdp_config: crate::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -141,6 +137,8 @@ mod tests {
                         message_frequency_per_round: NonNegativeF64::try_from(1.0).unwrap(),
                         num_blend_layers: NonZeroU64::new(3).unwrap(),
                         minimum_network_size: NonZeroU64::new(1).unwrap(),
+                        data_replication_factor: 0,
+                        activity_threshold_sensitivity: 1,
                     },
                 },
                 min_stake: MinStake {

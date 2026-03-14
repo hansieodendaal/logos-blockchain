@@ -1,3 +1,4 @@
+use core::future::ready;
 use std::{
     collections::HashSet,
     task::{Context, Poll},
@@ -262,7 +263,7 @@ impl Behaviour {
 
             self.incoming_streams_to_close.push(
                 async move {
-                    let _ = stream.close().await;
+                    drop(stream.close().await);
                 }
                 .boxed(),
             );
@@ -294,7 +295,7 @@ impl Behaviour {
         if concurrent_requests >= MAX_INCOMING_REQUESTS {
             self.incoming_streams_to_close.push(
                 async move {
-                    let _ = stream.close().await;
+                    drop(stream.close().await);
                 }
                 .boxed(),
             );
@@ -317,7 +318,11 @@ impl Behaviour {
 
     fn handle_blocks_request_available(&self, request_stream: BlocksRequestStream) {
         self.receiving_block_responses.push(
-            Downloader::receive_blocks(request_stream, self.config.peer_response_timeout).boxed(),
+            ready(Downloader::receive_blocks(
+                request_stream,
+                self.config.peer_response_timeout,
+            ))
+            .boxed(),
         );
 
         self.try_notify_waker();
@@ -533,7 +538,7 @@ mod tests {
     use lb_cryptarchia_engine::Slot;
     use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, bytes::Bytes, swarm::SwarmEvent};
     use libp2p_swarm_test::SwarmExt as _;
-    use rand::{Rng, thread_rng};
+    use rand::{Rng as _, thread_rng};
     use tokio::sync::oneshot;
 
     use crate::{
@@ -650,8 +655,6 @@ mod tests {
             while let Some(event) = provider_swarm.next().await {
                 if let SwarmEvent::Behaviour(Event::ProvideBlocksRequest { .. }) = event {
                     tokio::time::sleep(Duration::from_secs(100)).await;
-                } else {
-                    continue;
                 }
             }
         });
@@ -733,7 +736,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
     }
 
-    async fn setup_provider_swarm() -> (Swarm<Behaviour>, PeerId, Multiaddr) {
+    fn setup_provider_swarm() -> (Swarm<Behaviour>, PeerId, Multiaddr) {
         let mut provider_swarm = new_swarm_with_quic();
         let provider_peer_id = *provider_swarm.local_peer_id();
 
@@ -790,13 +793,13 @@ mod tests {
     impl ProviderBehavior for RejectingProvider {
         fn handle_tip_request(&self) -> TipResponse {
             ProviderResponse::Unavailable {
-                reason: "Node is not in online mode".to_string(),
+                reason: "Node is not in online mode".to_owned(),
             }
         }
 
         fn handle_blocks_request(&self, _requested: usize) -> BlocksResponse {
             ProviderResponse::Unavailable {
-                reason: "Node is not in online mode".to_string(),
+                reason: "Node is not in online mode".to_owned(),
             }
         }
     }
@@ -852,7 +855,7 @@ mod tests {
     }
 
     async fn start_provider_and_downloader(blocks_count: usize) -> (Swarm<Behaviour>, PeerId) {
-        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm().await;
+        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm();
 
         tokio::spawn(run_provider(
             provider_swarm,
@@ -864,7 +867,7 @@ mod tests {
     }
 
     async fn start_rejecting_provider() -> (Swarm<Behaviour>, PeerId) {
-        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm().await;
+        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm();
 
         tokio::spawn(run_provider(provider_swarm, RejectingProvider));
 
@@ -873,7 +876,7 @@ mod tests {
     }
 
     async fn start_provider_with_stream_error() -> (Swarm<Behaviour>, PeerId) {
-        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm().await;
+        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm();
 
         tokio::spawn(run_provider(
             provider_swarm,

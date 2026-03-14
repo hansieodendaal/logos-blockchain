@@ -17,7 +17,6 @@ ignored = ["serde_json"]
 
 [features]
 axum            = ["dep:axum", "dep:hyper", "utoipa-swagger-ui/axum"]
-block-explorer  = []
 default         = ["axum"]
 instrumentation = []
 
@@ -27,6 +26,7 @@ bytes                      = { workspace = true }
 futures                    = { default-features = false, version = "0.3.31" }
 lb-banning-service         = { workspace = true }
 lb-chain-broadcast-service = { workspace = true }
+lb-chain-leader-service    = { workspace = true }
 lb-chain-service           = { features = ["libp2p"], workspace = true }
 lb-core                    = { workspace = true }
 lb-network-service         = { workspace = true }
@@ -52,8 +52,9 @@ axum = { default-features = false, features = [
 hyper = { default-features = false, optional = true, version = "1.0" }
 
 # openapi related dependencies
-utoipa            = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
+utoipa = { workspace = true }
+# XCompiling from Unix has issues downloading assets. Also, building with Nix can't download assets.
+utoipa-swagger-ui = { features = ["vendored"], workspace = true }
 
 [dev-dependencies]
 axum              = { default-features = false, features = ["http1", "http2", "json", "query", "tokio"], version = "0.7.5" }

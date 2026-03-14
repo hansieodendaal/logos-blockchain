@@ -1,14 +1,19 @@
 use core::{
     fmt::{Debug, Display},
     future::ready,
-    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
 use lb_banning_service::BanningService;
-use lb_blend::proofs::quota::inputs::prove::private::ProofOfLeadershipQuotaInputs;
+use lb_blend::{
+    proofs::quota::inputs::prove::private::ProofOfLeadershipQuotaInputs,
+    scheduling::message_blend::provers::{
+        core_and_leader::RealCoreAndLeaderProofsGenerator, leader::RealLeaderProofsGenerator,
+    },
+};
 use lb_blend_service::{
+    RealProofsVerifier,
     core::kms::PreloadKMSBackendCorePoQGenerator,
     epoch_info::{PolEpochInfo, PolInfoProvider as PolInfoProviderTrait},
     membership::service::Adapter,
@@ -26,11 +31,8 @@ use tokio::sync::oneshot::channel;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::generic_services::{
-    CryptarchiaLeaderService, CryptarchiaService, SdpService, WalletService,
-    blend::proofs::{BlendProofsVerifier, CoreProofsGenerator, EdgeProofsGenerator},
+    ChainNetworkService, CryptarchiaLeaderService, CryptarchiaService, SdpService, WalletService,
 };
-
-mod proofs;
 
 pub type BlendMembershipAdapter<RuntimeServiceId> =
     Adapter<BlockBroadcastService<RuntimeServiceId>, PeerId>;
@@ -40,8 +42,8 @@ pub type BlendCoreService<RuntimeServiceId> = lb_blend_service::core::BlendServi
     lb_blend_service::core::network::libp2p::Libp2pAdapter<RuntimeServiceId>,
     BlendMembershipAdapter<RuntimeServiceId>,
     SdpService<RuntimeServiceId>,
-    CoreProofsGenerator<PreloadKMSBackendCorePoQGenerator<RuntimeServiceId>>,
-    BlendProofsVerifier,
+    RealCoreAndLeaderProofsGenerator<PreloadKMSBackendCorePoQGenerator<RuntimeServiceId>>,
+    RealProofsVerifier,
     NtpTimeBackend,
     CryptarchiaService<RuntimeServiceId>,
     PolInfoProvider,
@@ -52,7 +54,7 @@ pub type BlendEdgeService<RuntimeServiceId> = lb_blend_service::edge::BlendServi
         PeerId,
         <lb_blend_service::core::network::libp2p::Libp2pAdapter<RuntimeServiceId> as lb_blend_service::core::network::NetworkAdapter<RuntimeServiceId>>::BroadcastSettings,
         BlendMembershipAdapter<RuntimeServiceId>,
-        EdgeProofsGenerator,
+        RealLeaderProofsGenerator,
         NtpTimeBackend,
         CryptarchiaService<RuntimeServiceId>,
         PolInfoProvider,
@@ -74,6 +76,7 @@ where
     RuntimeServiceId: AsServiceId<
             CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
+                ChainNetworkService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
                 RuntimeServiceId,
             >,
@@ -93,9 +96,12 @@ where
 
         wait_until_services_are_ready!(
             overwatch_handle,
-            Some(Duration::from_secs(60)),
+            // No timeout since chain-leader service becomes ready
+            // only after switching to Online mode.
+            None,
             CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
+                ChainNetworkService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
                 RuntimeServiceId,
             >
@@ -105,6 +111,7 @@ where
         let cryptarchia_service_relay = overwatch_handle
             .relay::<CryptarchiaLeaderService<
                 CryptarchiaService<RuntimeServiceId>,
+                ChainNetworkService<RuntimeServiceId>,
                 WalletService<CryptarchiaService<RuntimeServiceId>, RuntimeServiceId>,
                 RuntimeServiceId,
             >>()
@@ -112,7 +119,7 @@ where
             .ok()?;
         let (sender, receiver) = channel();
         cryptarchia_service_relay
-            .send(LeaderMsg::WinningPolEpochSlotStreamSubscribe { sender })
+            .send(LeaderMsg::PotentialWinningPolEpochSlotStreamSubscribe { sender })
             .await
             .ok()?;
         let pol_winning_slot_receiver = receiver.await.ok()?;

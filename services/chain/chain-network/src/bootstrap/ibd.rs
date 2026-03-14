@@ -54,12 +54,16 @@ where
     }
 
     async fn process_block(&mut self, block: Block<Cryptarchia::Tx>) -> Result<(), Error> {
-        crate::process_block::<_, Mempool, _>(block, &self.cryptarchia, &self.mempool_adapter)
-            .await
-            .map_err(|e| {
-                error!("Error processing block during IBD: {:?}", e);
-                Error::from(e)
-            })
+        crate::apply_block_and_reconcile_mempool::<_, Mempool, _>(
+            block,
+            &self.cryptarchia,
+            &self.mempool_adapter,
+        )
+        .await
+        .map_err(|e| {
+            error!("Error processing block during IBD: {:?}", e);
+            Error::from(e)
+        })
     }
 
     async fn has_processed_block(&self, block_id: HeaderId) -> Result<bool, Error> {
@@ -1086,10 +1090,7 @@ mod tests {
                 epoch_period_nonce_buffer: NonZero::new(1).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(1).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config {
-                security_param: NonZero::new(1).unwrap(),
-                active_slot_coeff: 1.0,
-            },
+            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(1).unwrap(), 1.0),
             sdp_config: lb_ledger::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -1110,6 +1111,8 @@ mod tests {
                         message_frequency_per_round: NonNegativeF64::try_from(1.0).unwrap(),
                         num_blend_layers: NonZeroU64::new(3).unwrap(),
                         minimum_network_size: NonZeroU64::new(1).unwrap(),
+                        data_replication_factor: 0,
+                        activity_threshold_sensitivity: 1,
                     },
                 },
                 min_stake: MinStake {

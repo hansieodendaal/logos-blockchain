@@ -1,5 +1,6 @@
 use core::{convert::Infallible, str::FromStr};
 use std::{
+    io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs as _},
     path::{Path, PathBuf},
 };
@@ -7,14 +8,10 @@ use std::{
 use ::time::OffsetDateTime;
 use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
-use hex::FromHex as _;
 use lb_banning_service::BanningService;
-use lb_chain_leader_service::LeaderConfig;
-use lb_key_management_system_service::keys::UnsecuredZkKey;
 use lb_libp2p::{Multiaddr, ed25519::SecretKey};
 use lb_tracing::logging::{gelf::GelfConfig, local::FileConfig};
 use lb_tracing_service::{LoggerLayer, Tracing};
-use num_bigint::BigUint;
 use overwatch::services::ServiceData;
 use serde::Deserialize;
 use tracing::{Level, warn};
@@ -63,8 +60,6 @@ pub struct CliArgs {
     /// Overrides http config.
     #[clap(flatten)]
     http: HttpArgs,
-    #[clap(flatten)]
-    cryptarchia_leader: CryptarchiaLeaderArgs,
     #[clap(flatten)]
     time: TimeArgs,
     #[clap(flatten)]
@@ -171,12 +166,6 @@ pub struct HttpArgs {
 
     #[clap(long = "http-cors-origin", env = "HTTP_CORS_ORIGIN")]
     pub cors_origins: Option<Vec<String>>,
-}
-
-#[derive(Parser, Debug, Clone)]
-pub struct CryptarchiaLeaderArgs {
-    #[clap(long = "consensus-utxo-sk", env = "CONSENSUS_UTXO_SK")]
-    pub secret_key: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -297,7 +286,6 @@ impl UserConfig {
             http: http_args,
             network: network_args,
             blend: blend_args,
-            cryptarchia_leader: cryptarchia_leader_args,
             time: time_args,
             deployment: deployment_args,
             ..
@@ -306,7 +294,6 @@ impl UserConfig {
         update_network(&mut self.network, network_args)?;
         update_blend(&mut self.blend, blend_args)?;
         update_http(&mut self.http, http_args)?;
-        update_cryptarchia_leader_consensus(&mut self.cryptarchia.leader, cryptarchia_leader_args)?;
         update_time(&mut self.time, &time_args)?;
 
         let deployment_settings = match deployment_args.deployment_type() {
@@ -429,24 +416,6 @@ pub fn update_http(
     Ok(())
 }
 
-pub fn update_cryptarchia_leader_consensus(
-    leader: &mut LeaderConfig,
-    consensus_args: CryptarchiaLeaderArgs,
-) -> Result<()> {
-    let CryptarchiaLeaderArgs { secret_key } = consensus_args;
-    let Some(secret_key) = secret_key else {
-        return Ok(());
-    };
-
-    let sk = UnsecuredZkKey::from(BigUint::from_bytes_le(&<[u8; 16]>::from_hex(secret_key)?));
-    let pk = sk.to_public_key();
-
-    leader.sk = sk;
-    leader.pk = pk;
-
-    Ok(())
-}
-
 pub fn update_time(time: &mut TimeConfig, time_args: &TimeArgs) -> Result<()> {
     match time_args.to_mode() {
         ChainStartMode::Now => {
@@ -482,9 +451,21 @@ pub fn deserialize_config_at_path<Config>(
 where
     Config: for<'de> Deserialize<'de>,
 {
+    let file = std::fs::File::open(config_path)?;
+    deserialize_config_from_reader(file, unknown_keys_strategy)
+}
+
+pub fn deserialize_config_from_reader<Config, Reader>(
+    reader: Reader,
+    unknown_keys_strategy: OnUnknownKeys,
+) -> Result<Config, ConfigDeserializationError<Config>>
+where
+    Config: for<'de> Deserialize<'de>,
+    Reader: Read,
+{
     let mut ignored_fields = Vec::new();
     let config = serde_ignored::deserialize::<_, _, Config>(
-        serde_yaml::Deserializer::from_reader(std::fs::File::open(config_path)?),
+        serde_yaml::Deserializer::from_reader(reader),
         |path| {
             ignored_fields.push(path.to_string());
         },
@@ -494,7 +475,7 @@ where
         (ignored_fields, _) if ignored_fields.is_empty() => Ok(config),
         (ignored_fields, OnUnknownKeys::Warn) => {
             warn!(
-                "The following unrecognized fields were found in the config file: {ignored_fields:?}."
+                "The following unrecognized fields were found in the config: {ignored_fields:?}."
             );
             Ok(config)
         }
@@ -510,7 +491,7 @@ where
 /// Configuration for a running node. It is the combination of user-provided and
 /// deployment-specific settings.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "testing", derive(serde::Serialize))]
+#[cfg_attr(feature = "testing", derive(serde::Serialize, serde::Deserialize))]
 pub struct RunConfig {
     #[cfg_attr(feature = "testing", serde(flatten))]
     pub user: UserConfig,

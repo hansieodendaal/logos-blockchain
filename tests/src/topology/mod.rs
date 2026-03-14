@@ -27,7 +27,6 @@ use crate::{
         consensus::{SHORT_PROLONGED_BOOTSTRAP_PERIOD, create_consensus_configs},
         time::default_time_config,
     },
-    verify_pol_proof_dev_mode,
 };
 
 pub struct TopologyConfig {
@@ -81,8 +80,6 @@ pub struct Topology {
 
 impl Topology {
     pub async fn spawn(config: TopologyConfig) -> Self {
-        verify_pol_proof_dev_mode();
-
         let n_participants = config.n_validators;
 
         // we use the same random bytes for:
@@ -385,6 +382,10 @@ pub fn create_kms_configs(
                     (
                         blend_conf.core.zk.secret_key_kms_id.clone(),
                         zk_secret_key.clone().into(),
+                    ),
+                    (
+                        key_id_for_preload_backend(&consensus_configs[i].known_key.clone().into()),
+                        consensus_configs[i].known_key.clone().into(),
                     ),
                     // SDP funding secret key - used by wallet for signing SDP transactions
                     (
