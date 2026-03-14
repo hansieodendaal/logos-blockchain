@@ -11,7 +11,10 @@ use std::{fmt::Display, iter, pin::Pin, time::Duration};
 
 use futures::{StreamExt as _, stream};
 use lb_chain_network_service::api::{ChainNetworkServiceApi, ChainNetworkServiceData};
-use lb_chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
+use lb_chain_service::{
+    Epoch,
+    api::{CryptarchiaServiceApi, CryptarchiaServiceData},
+};
 use lb_core::{
     block::{Block, Error as BlockError, MAX_TRANSACTIONS},
     header::HeaderId,
@@ -19,9 +22,9 @@ use lb_core::{
         AuthenticatedMantleTx, SignedMantleTx, Transaction, TxHash, TxSelect,
         gas::MainnetGasConstants, ops::leader_claim::LeaderClaimOp,
     },
-    proofs::leader_proof::{Groth16LeaderProof, LeaderPrivate},
+    proofs::leader_proof::{Groth16LeaderProof, LeaderPrivate, LeaderPublic},
 };
-use lb_cryptarchia_engine::{Epoch, Slot};
+use lb_cryptarchia_engine::Slot;
 use lb_key_management_system_service::{api::KmsServiceApi, keys::Ed25519Key};
 use lb_ledger::LedgerState;
 use lb_services_utils::wait_until_services_are_ready;
@@ -53,11 +56,11 @@ use crate::{
     wallet::{LeaderWalletError, fund_and_sign_leader_claim_tx},
 };
 
-pub(crate) type WinningPolInfo = (LeaderPrivate, Epoch);
+pub(crate) type WinningPolInfo = (LeaderPrivate, LeaderPublic, Epoch);
 
-const LEADER_ID: &str = "Leader";
+const SERVICE_ID: &str = "ChainLeader";
 
-pub(crate) const LOG_TARGET: &str = "cryptarchia::leader";
+pub(crate) const LOG_TARGET: &str = "chain-leader::service";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -412,13 +415,13 @@ where
                         let latest_tree = tip_state.latest_utxos();
 
                         let epoch_state = match cryptarchia_api.get_epoch_state(slot).await {
-                            Ok(Some(state)) => state,
-                            Ok(None) => {
-                                error!("trying to propose a block for slot {} but epoch state is not available", u64::from(slot));
+                            Ok(Ok(state)) => state,
+                            Ok(Err(e)) => {
+                                error!("trying to propose a block for slot {} but epoch state is not available: {e}", u64::from(slot));
                                 continue;
                             }
                             Err(e) => {
-                                error!("Failed to get epoch state: {:?}", e);
+                                error!("Failed to get epoch state: {e}");
                                 continue;
                             }
                         };
@@ -431,10 +434,16 @@ where
                             }
                         };
 
-                        // If it's a new epoch or the service just started, pre-compute the first winning slot and notify consumers.
-                        winning_pol_slot_notifier.process_epoch(&eligible_utxos.response, latest_tree, &epoch_state, &kms_api).await;
+                        let eligible: Vec<_> = match &ledger_config.faucet_pk {
+                            Some(fpk) => eligible_utxos.response.into_iter()
+                                .filter(|u| u.utxo.note.pk != *fpk).collect(),
+                            None => eligible_utxos.response,
+                        };
 
-                       if let Some((proof, signing_key)) = build_proof_for(&eligible_utxos.response, latest_tree, &epoch_state, slot, &winning_pol_slot_notifier, &wallet_api, &kms_api).await {
+                        // If it's a new epoch or the service just started, pre-compute the first winning slot and notify consumers.
+                        winning_pol_slot_notifier.process_epoch(&eligible, latest_tree, &epoch_state, &kms_api).await;
+
+                       if let Some((proof, signing_key)) = build_proof_for(&eligible, latest_tree, &epoch_state, slot, &winning_pol_slot_notifier, &wallet_api, &kms_api).await {
                             // TODO: spawn as a separate task?
                             match Self::propose_block(
                                 parent,
@@ -465,14 +474,14 @@ where
             }
         };
 
-        // It sucks to use `LEADER_ID` when we have `<RuntimeServiceId as
+        // It sucks to use `SERVICE_ID` when we have `<RuntimeServiceId as
         // AsServiceId<Self>>::SERVICE_ID`.
         // Somehow it just does not let us use it.
         //
         // Hypothesis:
         // 1. Probably related to too many generics.
         // 2. It seems `span` requires a `const` string literal.
-        async_loop.instrument(span!(Level::TRACE, LEADER_ID)).await;
+        async_loop.instrument(span!(Level::TRACE, SERVICE_ID)).await;
 
         Ok(())
     }

@@ -1,6 +1,6 @@
 pub mod configs;
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use configs::{
     GeneralConfig,
@@ -9,22 +9,24 @@ use configs::{
     tracing::create_tracing_configs,
 };
 use lb_core::{
-    mantle::{GenesisTx as _, Note, NoteId},
+    mantle::{GenesisTx as _, Note, NoteId, genesis_tx::GenesisTx},
     sdp::{Locator, ServiceType},
 };
-use lb_key_management_system_service::{backend::preload::PreloadKMSBackendSettings, keys::ZkKey};
+use lb_key_management_system_service::keys::ZkKey;
 use lb_network_service::backends::libp2p::Libp2pInfo;
+use lb_node::config::{KmsConfig, kms::serde::PreloadKmsBackendSettings};
 use lb_utils::net::get_available_udp_port;
 use rand::{Rng as _, thread_rng};
 
 use crate::{
-    adjust_timeout,
     common::kms::key_id_for_preload_backend,
     nodes::validator::{Validator, create_validator_config},
     topology::configs::{
         api::create_api_configs,
         blend::{GeneralBlendConfig, create_blend_configs},
         consensus::{SHORT_PROLONGED_BOOTSTRAP_PERIOD, create_consensus_configs},
+        deployment::e2e_deployment_settings_with_genesis_tx,
+        sdp::create_sdp_configs,
         time::default_time_config,
     },
 };
@@ -33,6 +35,9 @@ pub struct TopologyConfig {
     pub n_validators: usize,
     pub network_params: NetworkParams,
     pub extra_genesis_notes: Vec<GenesisNoteSpec>,
+    /// Override the SDP `lock_period` for this test topology.
+    /// If None, uses the default from deployment settings (10).
+    pub lock_period_override: Option<u64>,
 }
 
 impl TopologyConfig {
@@ -42,6 +47,7 @@ impl TopologyConfig {
             n_validators: 1,
             network_params: NetworkParams::default(),
             extra_genesis_notes: Vec::new(),
+            lock_period_override: None,
         }
     }
 
@@ -51,12 +57,19 @@ impl TopologyConfig {
             n_validators: 2,
             network_params: NetworkParams::default(),
             extra_genesis_notes: Vec::new(),
+            lock_period_override: None,
         }
     }
 
     #[must_use]
     pub fn with_extra_genesis_note(mut self, note_spec: GenesisNoteSpec) -> Self {
         self.extra_genesis_notes.push(note_spec);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_lock_period(mut self, lock_period: u64) -> Self {
+        self.lock_period_override = Some(lock_period);
         self
     }
 }
@@ -93,7 +106,7 @@ impl Topology {
             blend_ports.push(get_available_udp_port().unwrap());
         }
 
-        let mut consensus_configs =
+        let (consensus_configs, genesis_tx) =
             create_consensus_configs(&ids, SHORT_PROLONGED_BOOTSTRAP_PERIOD);
         let network_configs = create_network_configs(&ids, &config.network_params);
         let blend_configs = create_blend_configs(&ids, &blend_ports);
@@ -102,11 +115,7 @@ impl Topology {
         let time_config = default_time_config();
 
         // Setup genesis TX with Blend service declarations.
-        let base_ledger_tx = consensus_configs[0]
-            .genesis_tx()
-            .mantle_tx()
-            .ledger_tx
-            .clone();
+        let base_ledger_tx = genesis_tx.mantle_tx().ledger_tx.clone();
         let mut ledger_tx = base_ledger_tx.clone();
         let base_outputs = ledger_tx.outputs.len();
         for note_spec in &config.extra_genesis_notes {
@@ -121,34 +130,29 @@ impl Topology {
                     provider_sk: private_key.clone(),
                     zk_sk: zk_secret_key.clone(),
                     locator: Locator(blend_conf.core.backend.listening_address.clone()),
-                    note: consensus_configs[0].blend_notes[i].clone(),
+                    note: consensus_configs[i].blend_note.clone(),
                 },
             )
             .collect();
 
         // Update genesis TX to contain Blend providers.
-        let genesis_tx = create_genesis_tx_with_declarations(ledger_tx, providers);
-        let updated_ledger_tx = genesis_tx.mantle_tx().ledger_tx.clone();
+        let genesis_tx_with_declarations =
+            create_genesis_tx_with_declarations(ledger_tx, providers);
+        let updated_ledger_tx = genesis_tx_with_declarations.mantle_tx().ledger_tx.clone();
         let injected_utxos: Vec<_> = updated_ledger_tx
             .utxos()
             .skip(base_outputs)
             .collect::<Vec<_>>();
-
-        for c in &mut consensus_configs {
-            c.utxos.extend(injected_utxos.iter().copied());
-        }
 
         let injected_infos = injected_utxos
             .iter()
             .map(|utxo| InjectedGenesisNote { note_id: utxo.id() })
             .collect::<Vec<_>>();
 
-        for c in &mut consensus_configs {
-            c.override_genesis_tx(genesis_tx.clone());
-        }
-
         // Set Blend keys in KMS of each node config.
         let kms_configs = create_kms_configs(&blend_configs, &consensus_configs);
+
+        let sdp_configs = create_sdp_configs(&genesis_tx_with_declarations, n_participants);
 
         let mut node_configs = vec![];
 
@@ -161,12 +165,18 @@ impl Topology {
                 tracing_config: tracing_configs[i].clone(),
                 time_config: time_config.clone(),
                 kms_config: kms_configs[i].clone(),
+                sdp_config: sdp_configs[i].clone(),
             });
         }
 
         let general_configs = node_configs.clone();
 
-        let validators = Self::spawn_validators(node_configs).await;
+        let validators = Self::spawn_validators(
+            node_configs,
+            genesis_tx_with_declarations,
+            config.lock_period_override,
+        )
+        .await;
 
         Self {
             validators,
@@ -175,10 +185,25 @@ impl Topology {
         }
     }
 
-    async fn spawn_validators(config: Vec<GeneralConfig>) -> Vec<Validator> {
+    async fn spawn_validators(
+        config: Vec<GeneralConfig>,
+        genesis_tx: GenesisTx,
+        lock_period_override: Option<u64>,
+    ) -> Vec<Validator> {
         let mut validators = Vec::new();
         for general_config in config {
-            let config = create_validator_config(general_config);
+            let mut deployment = e2e_deployment_settings_with_genesis_tx(genesis_tx.clone());
+            if let Some(lock_period) = lock_period_override {
+                for params in deployment
+                    .cryptarchia
+                    .sdp_config
+                    .service_params
+                    .values_mut()
+                {
+                    params.lock_period = lock_period;
+                }
+            }
+            let config = create_validator_config(general_config, deployment);
             validators.push(Validator::spawn(config).await.unwrap());
         }
         validators
@@ -187,6 +212,11 @@ impl Topology {
     #[must_use]
     pub fn validators(&self) -> &[Validator] {
         &self.validators
+    }
+
+    #[must_use]
+    pub fn validators_mut(&mut self) -> &mut [Validator] {
+        &mut self.validators
     }
 
     #[must_use]
@@ -268,14 +298,13 @@ trait ReadinessCheck<'a> {
     fn timeout_message(&self, data: Self::Data) -> String;
 
     async fn wait(&'a self) {
-        let timeout_duration = adjust_timeout(std::time::Duration::from_secs(60));
-        let timeout = tokio::time::timeout(timeout_duration, async {
+        let timeout = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let data = self.collect().await;
                 if self.is_ready(&data) {
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
 
@@ -368,12 +397,12 @@ fn find_expected_peer_counts(
 pub fn create_kms_configs(
     blend_configs: &[GeneralBlendConfig],
     consensus_configs: &[GeneralConsensusConfig],
-) -> Vec<PreloadKMSBackendSettings> {
+) -> Vec<KmsConfig> {
     blend_configs
         .iter()
         .enumerate()
-        .map(
-            |(i, (blend_conf, private_key, zk_secret_key))| PreloadKMSBackendSettings {
+        .map(|(i, (blend_conf, private_key, zk_secret_key))| KmsConfig {
+            backend: PreloadKmsBackendSettings {
                 keys: [
                     (
                         blend_conf.non_ephemeral_signing_key_id.clone(),
@@ -395,6 +424,6 @@ pub fn create_kms_configs(
                 ]
                 .into(),
             },
-        )
+        })
         .collect()
 }

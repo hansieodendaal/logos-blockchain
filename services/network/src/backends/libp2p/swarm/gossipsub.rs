@@ -49,10 +49,6 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         }
     }
 
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: Address this at some point."
-    )]
     pub(super) fn broadcast_and_retry(
         &mut self,
         topic: Topic,
@@ -76,7 +72,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             }
             Err(gossipsub::PublishError::InsufficientPeers) if retry_count < MAX_RETRY => {
                 let wait = exp_backoff(retry_count);
-                tracing::error!(
+                tracing::debug!(
                     "failed to broadcast message to topic due to insufficient peers, trying again in {wait:?}"
                 );
 

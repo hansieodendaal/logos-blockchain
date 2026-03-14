@@ -15,8 +15,9 @@ use lb_blend::{
     },
     network::core::{
         NetworkBehaviourEvent,
-        with_core::behaviour::{
-            Event as CoreToCoreEvent, IntervalStreamProvider, NegotiatedPeerState,
+        with_core::{
+            behaviour::{Event as CoreToCoreEvent, IntervalStreamProvider, NegotiatedPeerState},
+            error::Error,
         },
         with_edge::behaviour::Event as CoreToEdgeEvent,
     },
@@ -170,6 +171,8 @@ where
     /// excluding the currently connected peers, the peers that we are already
     /// trying to dial, and the blocked peers.
     fn dial_random_peers_except(&mut self, amount: usize, except: Option<PeerId>) {
+        tracing::debug!(target: LOG_TARGET, amount, ?except, "Dialing random peers");
+
         let exclude_peers: HashSet<PeerId> = self
             .swarm
             .connected_peers()
@@ -193,6 +196,8 @@ where
     /// Dial new peers, if necessary, to maintain the peering degree.
     /// We aim to have at least the peering degree number of "healthy" peers.
     fn check_and_dial_new_peers_except(&mut self, except: Option<PeerId>) {
+        tracing::debug!(target: LOG_TARGET, ?except, "Checking if we need to dial new peers");
+
         let membership_size = self.public_info.session.membership.size();
         if membership_size < self.minimum_network_size.get() {
             tracing::warn!(target: LOG_TARGET, "Not dialing any peers because set of core nodes is smaller than the minimum network size. {membership_size} < {}", self.minimum_network_size.get());
@@ -342,9 +347,9 @@ where
             .validate_and_publish_message(msg)
         {
             tracing::error!(target: LOG_TARGET, "Failed to publish message to blend network: {e:?}");
-            tracing::info!(counter.failed_outbound_messages = 1);
+            tracing::trace!(counter.failed_outbound_messages = 1);
         } else {
-            tracing::info!(counter.successful_outbound_messages = 1);
+            tracing::trace!(counter.successful_outbound_messages = 1);
         }
     }
 
@@ -360,25 +365,27 @@ where
             .with_core_mut()
             .validate_and_forward_message(msg, except)
         {
-            tracing::error!(target: LOG_TARGET, "Failed to forward message to blend network: {e:?}");
-            tracing::info!(counter.failed_outbound_messages = 1);
+            // If we have a single connection, then we will always hit the `NoPeers` error.
+            // In this case it's ok not to log such error, since this function is only
+            // called on FORWARDED messages, not on PUBLISHED ones, for which we want to
+            // know if that is the issue.
+            if !matches!(e, Error::NoPeers) {
+                tracing::error!(target: LOG_TARGET, "Failed to forward message to blend network: {e:?}");
+                tracing::trace!(counter.failed_outbound_messages = 1);
+            }
         } else {
-            tracing::info!(counter.successful_outbound_messages = 1);
+            tracing::trace!(counter.successful_outbound_messages = 1);
         }
     }
 
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "Tracing macros generate more code that triggers this warning."
-    )]
     fn report_message_to_service(&self, msg: EncapsulatedMessageWithVerifiedPublicHeader) {
-        tracing::debug!("Received message from a peer: {msg:?}");
+        tracing::trace!("Received message from a peer: {msg:?}");
 
         if let Err(e) = self.incoming_message_sender.send(msg) {
             tracing::error!(target: LOG_TARGET, "Failed to send incoming message to channel: {e}");
-            tracing::info!(counter.failed_inbound_messages = 1);
+            tracing::trace!(counter.failed_inbound_messages = 1);
         } else {
-            tracing::info!(counter.successful_inbound_messages = 1);
+            tracing::trace!(counter.successful_inbound_messages = 1);
         }
     }
 
@@ -426,9 +433,9 @@ where
             .validate_and_publish_message(msg)
         {
             tracing::error!(target: LOG_TARGET, "Failed to publish message to blend network: {e:?}");
-            tracing::info!(counter.failed_outbound_messages = 1);
+            tracing::trace!(counter.failed_outbound_messages = 1);
         } else {
-            tracing::info!(counter.successful_outbound_messages = 1);
+            tracing::trace!(counter.successful_outbound_messages = 1);
         }
     }
 }
@@ -436,6 +443,7 @@ where
 impl<Rng, ProofsVerifier, ObservationWindowProvider>
     BlendSwarm<Rng, ProofsVerifier, ObservationWindowProvider>
 where
+    Rng: RngCore,
     ProofsVerifier: ProofsVerifierTrait + Clone,
     ObservationWindowProvider:
         IntervalStreamProvider<IntervalStream: Unpin + Send, IntervalItem = RangeInclusive<u64>>,
@@ -451,6 +459,7 @@ where
                     self.public_info.session.membership.clone(),
                     ProofsVerifier::new(self.public_info.clone().into()),
                 );
+                self.check_and_dial_new_peers_except(None);
             }
             BlendSwarmMessage::CompleteSessionTransition => {
                 self.swarm.behaviour_mut().blend.finish_session_transition();
@@ -500,7 +509,7 @@ where
                 connection_id,
                 error,
             } => {
-                tracing::error!(
+                tracing::warn!(
                     target: LOG_TARGET,
                     "Dialing error for peer: {peer_id:?} on connection: {connection_id:?}. Error: {error:?}"
                 );
@@ -514,7 +523,7 @@ where
             }
             _ => {
                 tracing::debug!(target: LOG_TARGET, "Received event from blend network that will be ignored.");
-                tracing::info!(counter.ignored_event = 1);
+                tracing::trace!(counter.ignored_event = 1);
             }
         }
     }

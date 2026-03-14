@@ -6,14 +6,14 @@ use core::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    blend::deployment::Settings as BlendDeploymentSettings,
+    OnUnknownKeys, blend::deployment::Settings as BlendDeploymentSettings,
     cryptarchia::deployment::Settings as CryptarchiaDeploymentSettings,
-    mempool::deployment::Settings as MempoolDeploymentSettings,
+    deserialize_config_from_reader, mempool::deployment::Settings as MempoolDeploymentSettings,
     network::deployment::Settings as NetworkDeploymentSettings,
     time::deployment::Settings as TimeDeploymentSettings,
 };
 
-mod devnet;
+pub mod devnet;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
 pub enum WellKnownDeployment {
@@ -54,7 +54,21 @@ pub struct DeploymentSettings {
 impl From<WellKnownDeployment> for DeploymentSettings {
     fn from(value: WellKnownDeployment) -> Self {
         match value {
-            WellKnownDeployment::Devnet => devnet::deployment_settings(),
+            WellKnownDeployment::Devnet => deserialize_config_from_reader(
+                devnet::SERIALIZED_DEPLOYMENT.as_bytes(),
+                OnUnknownKeys::Fail,
+            )
+            .expect("Devnet deployment config is valid."),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{DeploymentSettings, WellKnownDeployment};
+
+    #[test]
+    fn devnet_initialization() {
+        drop(DeploymentSettings::from(WellKnownDeployment::Devnet));
     }
 }

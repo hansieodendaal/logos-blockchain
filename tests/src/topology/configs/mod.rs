@@ -3,16 +3,17 @@ pub mod blend;
 pub mod consensus;
 pub mod deployment;
 pub mod network;
+pub mod sdp;
 pub mod time;
 pub mod tracing;
 
 use blend::GeneralBlendConfig;
 use consensus::{GeneralConsensusConfig, ProviderInfo, create_genesis_tx_with_declarations};
 use lb_core::{
-    mantle::GenesisTx as _,
+    mantle::{GenesisTx as _, genesis_tx::GenesisTx},
     sdp::{Locator, ServiceType},
 };
-use lb_key_management_system_service::backend::preload::PreloadKMSBackendSettings;
+use lb_node::config::{KmsConfig, kms::serde::PreloadKmsBackendSettings};
 use lb_utils::net::get_available_udp_port;
 use network::GeneralNetworkConfig;
 use rand::{Rng as _, thread_rng};
@@ -21,7 +22,10 @@ use tracing::GeneralTracingConfig;
 use crate::{
     common::kms::key_id_for_preload_backend,
     topology::configs::{
-        api::GeneralApiConfig, consensus::SHORT_PROLONGED_BOOTSTRAP_PERIOD, network::NetworkParams,
+        api::GeneralApiConfig,
+        consensus::SHORT_PROLONGED_BOOTSTRAP_PERIOD,
+        network::NetworkParams,
+        sdp::{GeneralSdpConfig, create_sdp_configs},
         time::GeneralTimeConfig,
     },
 };
@@ -34,11 +38,12 @@ pub struct GeneralConfig {
     pub blend_config: GeneralBlendConfig,
     pub tracing_config: GeneralTracingConfig,
     pub time_config: GeneralTimeConfig,
-    pub kms_config: PreloadKMSBackendSettings,
+    pub kms_config: KmsConfig,
+    pub sdp_config: GeneralSdpConfig,
 }
 
 #[must_use]
-pub fn create_general_configs(n_nodes: usize) -> Vec<GeneralConfig> {
+pub fn create_general_configs(n_nodes: usize) -> (Vec<GeneralConfig>, GenesisTx) {
     create_general_configs_with_network(n_nodes, &NetworkParams::default())
 }
 
@@ -46,7 +51,7 @@ pub fn create_general_configs(n_nodes: usize) -> Vec<GeneralConfig> {
 pub fn create_general_configs_with_network(
     n_nodes: usize,
     network_params: &NetworkParams,
-) -> Vec<GeneralConfig> {
+) -> (Vec<GeneralConfig>, GenesisTx) {
     create_general_configs_with_blend_core_subset(n_nodes, n_nodes, network_params)
 }
 
@@ -57,7 +62,7 @@ pub fn create_general_configs_with_blend_core_subset(
     // That would be also useful for non-even token distributions: https://github.com/logos-blockchain/logos-blockchain/issues/1888
     n_blend_core_nodes: usize,
     network_params: &NetworkParams,
-) -> Vec<GeneralConfig> {
+) -> (Vec<GeneralConfig>, GenesisTx) {
     assert!(
         n_blend_core_nodes <= n_nodes,
         "n_blend_core_nodes({n_blend_core_nodes}) must be less than or equal to n_nodes({n_nodes})",
@@ -73,7 +78,7 @@ pub fn create_general_configs_with_blend_core_subset(
         blend_ports.push(get_available_udp_port().unwrap());
     }
 
-    let mut consensus_configs =
+    let (consensus_configs, genesis_tx) =
         consensus::create_consensus_configs(&ids, SHORT_PROLONGED_BOOTSTRAP_PERIOD);
     let network_configs = network::create_network_configs(&ids, network_params);
     let api_configs = api::create_api_configs(&ids);
@@ -91,26 +96,20 @@ pub fn create_general_configs_with_blend_core_subset(
                 provider_sk: private_key.clone(),
                 zk_sk: secret_zk_key.clone(),
                 locator: Locator(blend_conf.core.backend.listening_address.clone()),
-                note: consensus_configs[0].blend_notes[i].clone(),
+                note: consensus_configs[i].blend_note.clone(),
             },
         )
         .collect();
-    let ledger_tx = consensus_configs[0]
-        .genesis_tx()
-        .mantle_tx()
-        .ledger_tx
-        .clone();
-    let genesis_tx = create_genesis_tx_with_declarations(ledger_tx, providers);
-    for c in &mut consensus_configs {
-        c.override_genesis_tx(genesis_tx.clone());
-    }
+    let ledger_tx = genesis_tx.mantle_tx().ledger_tx.clone();
+    let genesis_tx_with_declarations = create_genesis_tx_with_declarations(ledger_tx, providers);
+    let sdp_configs = create_sdp_configs(&genesis_tx_with_declarations, n_nodes);
 
     // Set note keys and Blend keys in KMS of each node config.
     let kms_configs: Vec<_> = blend_configs
         .iter()
         .enumerate()
-        .map(
-            |(i, (blend_conf, private_key, zk_secret_key))| PreloadKMSBackendSettings {
+        .map(|(i, (blend_conf, private_key, zk_secret_key))| KmsConfig {
+            backend: PreloadKmsBackendSettings {
                 keys: [
                     (
                         blend_conf.non_ephemeral_signing_key_id.clone(),
@@ -119,6 +118,12 @@ pub fn create_general_configs_with_blend_core_subset(
                     (
                         blend_conf.core.zk.secret_key_kms_id.clone(),
                         zk_secret_key.clone().into(),
+                    ),
+                    (
+                        key_id_for_preload_backend(
+                            &consensus_configs[i].blend_note.sk.clone().into(),
+                        ),
+                        consensus_configs[i].blend_note.sk.clone().into(),
                     ),
                     (
                         key_id_for_preload_backend(&consensus_configs[i].known_key.clone().into()),
@@ -132,7 +137,7 @@ pub fn create_general_configs_with_blend_core_subset(
                 ]
                 .into(),
             },
-        )
+        })
         .collect();
 
     let mut general_configs = vec![];
@@ -146,8 +151,9 @@ pub fn create_general_configs_with_blend_core_subset(
             tracing_config: tracing_configs[i].clone(),
             time_config: time_config.clone(),
             kms_config: kms_configs[i].clone(),
+            sdp_config: sdp_configs[i].clone(),
         });
     }
 
-    general_configs
+    (general_configs, genesis_tx_with_declarations)
 }

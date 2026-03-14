@@ -12,12 +12,11 @@ use lb_core::{
 use lb_cryptarchia_engine::{Epoch, Slot};
 use lb_groth16::{Fr, fr_from_bytes};
 use lb_key_management_system_keys::keys::ZkPublicKey;
-use lb_pol::slot_activation_coefficient;
 use lb_utxotree::MerklePath;
 
 use crate::cryptarchia::{
     block_density::BlockDensity,
-    stake::{LEARNING_RATE, PRECISION, StakeInference},
+    stake::{PRECISION, StakeInference},
 };
 
 pub type UtxoTree = lb_utxotree::UtxoTree<NoteId, Utxo, ZkHasher>;
@@ -27,17 +26,22 @@ use crate::mantle::sdp::locked_notes::LockedNotes;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EpochState {
-    // The epoch this snapshot is for
+    /// The epoch this snapshot is for
     pub epoch: Epoch,
-    // value of the ledger nonce after 'epoch_period_nonce_buffer' slots from the beginning of the
-    // epoch
+    /// value of the ledger nonce after `epoch_period_nonce_buffer` slots from
+    /// the beginning of the epoch
     #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
     pub nonce: Fr,
-    // stake distribution snapshot taken at the beginning of the epoch
-    // (in practice, this is equivalent to the utxos the are spendable at the beginning of the
-    // epoch)
+    /// stake distribution snapshot taken at the beginning of the epoch
+    /// (in practice, this is equivalent to the utxos the are spendable at the
+    /// beginning of the epoch)
     pub utxos: UtxoTree,
     pub total_stake: Value,
+    /// Lottery values computed based on `total_stake`
+    #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
+    pub lottery_0: Fr,
+    #[cfg_attr(feature = "serde", serde(with = "lb_groth16::serde::serde_fr"))]
+    pub lottery_1: Fr,
 }
 
 impl EpochState {
@@ -60,6 +64,8 @@ impl EpochState {
             nonce,
             utxos,
             total_stake: self.total_stake,
+            lottery_0: self.lottery_0,
+            lottery_1: self.lottery_1,
         }
     }
 
@@ -76,6 +82,11 @@ impl EpochState {
     #[must_use]
     pub const fn total_stake(&self) -> Value {
         self.total_stake
+    }
+
+    #[must_use]
+    pub const fn lottery_values(&self) -> (Fr, Fr) {
+        (self.lottery_0, self.lottery_1)
     }
 
     #[must_use]
@@ -115,6 +126,11 @@ pub struct LedgerState {
 }
 
 impl LedgerState {
+    /// Synthesizes the epoch state for the given slot.
+    ///
+    /// This function must be called before any other function that updates
+    /// [`LedgerState`]. Otherwise, previously accumulated values (e.g. nonce
+    /// and block density) will be lost.
     fn update_epoch_state<Id>(self, slot: Slot, config: &Config) -> Result<Self, LedgerError<Id>> {
         if slot <= self.slot {
             return Err(LedgerError::InvalidSlot {
@@ -123,23 +139,16 @@ impl LedgerState {
             });
         }
 
-        // increment density for new slot
-        let mut block_density_inference = self.block_density.clone();
-        block_density_inference.increment_block_density(slot);
-        // infere new total stake
-        let total_stake = self.stake_inference.total_stake_inference::<PRECISION>(
-            self.epoch_state.total_stake,
-            block_density_inference.current_block_density(),
-        );
         let current_epoch = config.epoch(self.slot);
         let new_epoch = config.epoch(slot);
 
-        // there are 3 cases to consider:
-        // 1. we are in the same epoch as the parent state: update the next epoch state
-        // 2. we are in the next epoch use the next epoch state as the current epoch:
+        // There are 3 cases to consider:
+        // 1. We are in the same epoch as the parent state: Update the next epoch state
+        // 2. We are in the next epoch: Use the next epoch state as the current epoch
         //    state and reset next epoch state
-        // 3. we are in the next-next or later epoch: use the parent state as the epoch
-        //    state and reset next epoch state
+        // 3. We are in the next-next or later epoch: Use the parent state as the epoch
+        //    state and reset next epoch state. Total stake should be adjusted with zero
+        //    block density for skipped epochs.
         if current_epoch == new_epoch {
             // case 1)
             let next_epoch_state = self
@@ -149,18 +158,37 @@ impl LedgerState {
             Ok(Self {
                 slot,
                 next_epoch_state,
-                block_density: block_density_inference,
                 ..self
             })
         } else if new_epoch == current_epoch + 1 {
             // case 2)
-            let block_density = BlockDensity::new(self.stake_inference.period(), slot);
+
+            // infer new total stake
+            let total_stake = self.stake_inference.total_stake_inference::<PRECISION>(
+                self.epoch_state.total_stake,
+                self.block_density.current_block_density(),
+            );
+            let (lottery_0, lottery_1) = config
+                .lottery_constants()
+                .compute_lottery_values(total_stake);
+
+            tracing::info!(
+                old_epoch = ?current_epoch,
+                new_epoch = ?new_epoch,
+                old_total_stake = self.epoch_state.total_stake,
+                new_total_stake = total_stake,
+                slot = ?slot,
+                "epoch transition"
+            );
+            let block_density = BlockDensity::new(new_epoch, config);
             let epoch_state = self.next_epoch_state.clone();
             let next_epoch_state = EpochState {
                 epoch: new_epoch + 1,
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             Ok(Self {
                 slot,
@@ -171,18 +199,47 @@ impl LedgerState {
             })
         } else {
             // case 3)
-            let block_density = BlockDensity::new(self.stake_inference.period(), slot);
+
+            // First, infer total stake using block density of the current epoch
+            let mut total_stake = self.stake_inference.total_stake_inference::<PRECISION>(
+                self.epoch_state.total_stake,
+                self.block_density.current_block_density(),
+            );
+            // Adjust total stake with zero block density for skipped epochs
+            for _ in u32::from(self.next_epoch_state.epoch())..u32::from(new_epoch) {
+                total_stake = self
+                    .stake_inference
+                    .total_stake_inference::<PRECISION>(total_stake, 0);
+            }
+            let (lottery_0, lottery_1) = config
+                .lottery_constants()
+                .compute_lottery_values(total_stake);
+
+            tracing::warn!(
+                old_epoch = ?current_epoch,
+                new_epoch = ?new_epoch,
+                epochs_skipped = u32::from(new_epoch) - u32::from(current_epoch) - 1,
+                old_total_stake = self.epoch_state.total_stake,
+                new_total_stake = total_stake,
+                slot = ?slot,
+                "skipped epochs"
+            );
+            let block_density = BlockDensity::new(new_epoch, config);
             let epoch_state = EpochState {
                 epoch: new_epoch,
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             let next_epoch_state = EpochState {
                 epoch: new_epoch + 1,
                 nonce: self.nonce,
                 utxos: self.utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             };
             Ok(Self {
                 slot,
@@ -209,7 +266,8 @@ impl LedgerState {
             self.latest_utxos().root(),
             self.epoch_state.nonce,
             slot.into(),
-            self.epoch_state.total_stake,
+            self.epoch_state.lottery_0,
+            self.epoch_state.lottery_1,
         );
         if !proof.verify(&public_inputs) {
             return Err(LedgerError::InvalidProof);
@@ -227,10 +285,14 @@ impl LedgerState {
     where
         LeaderProof: leader_proof::LeaderProof,
     {
+        // First, synthesize epoch state for `slot` before update the ledger state.
+        // Then, apply the proof and update the nonce. Finally, increment block density
+        // since this function is called for a new block.
         Ok(self
             .update_epoch_state(slot, config)?
             .try_apply_proof(slot, proof, config)?
-            .update_nonce(&proof.entropy(), slot))
+            .update_nonce(&proof.entropy(), slot)
+            .increment_block_density(slot))
     }
 
     pub fn try_apply_tx<Id, Constants: GasConstants>(
@@ -288,6 +350,15 @@ impl LedgerState {
         Self { nonce, ..self }
     }
 
+    fn increment_block_density(self, slot: Slot) -> Self {
+        let mut block_density = self.block_density.clone();
+        block_density.increment_block_density(slot);
+        Self {
+            block_density,
+            ..self
+        }
+    }
+
     #[must_use]
     pub const fn slot(&self) -> Slot {
         self.slot
@@ -313,52 +384,23 @@ impl LedgerState {
         &self.epoch_state.utxos
     }
 
-    /// Computes the epoch state for a given slot.
+    /// Synthesizes the epoch state for a given slot.
     ///
     /// This handles the case where epochs have been skipped (no blocks
-    /// produced). When the requested epoch is ahead of the stored epoch
-    /// states, it synthesizes an epoch state with adjusted total stake
-    /// using 0 block density for each skipped epoch.
+    /// produced). Details can be found in [`Self::update_epoch_state`].
     ///
-    /// Returns `None` if the requested epoch is in the past (before current
-    /// `epoch_state`).
-    #[must_use]
-    pub fn epoch_state_for_slot(&self, slot: Slot, config: &Config) -> Option<EpochState> {
-        let requested_epoch = config.epoch(slot);
-
-        if self.epoch_state.epoch() == requested_epoch {
-            Some(self.epoch_state.clone())
-        } else if self.next_epoch_state.epoch() == requested_epoch {
-            Some(self.next_epoch_state.clone())
-        } else if requested_epoch > self.next_epoch_state.epoch() {
-            // Epochs were skipped - synthesize epoch state with adjusted total stake.
-            // Use 0 density since no blocks were produced in the skipped epochs.
-            let mut total_stake = self.epoch_state.total_stake;
-
-            for _ in u32::from(self.next_epoch_state.epoch())..u32::from(requested_epoch) {
-                total_stake = self
-                    .stake_inference
-                    .total_stake_inference::<PRECISION>(total_stake, 0);
-            }
-
-            tracing::warn!(
-                "EpochState skipping epochs {}..{}, adjusting total stake: {} -> {}",
-                u32::from(self.next_epoch_state.epoch()),
-                u32::from(requested_epoch),
-                self.epoch_state.total_stake,
-                total_stake
-            );
-
-            Some(EpochState {
-                epoch: requested_epoch,
-                nonce: self.nonce,
-                utxos: self.utxos.clone(),
-                total_stake,
-            })
-        } else {
-            // Requested epoch is in the past
-            None
-        }
+    /// Returns [`LedgerError::InvalidSlot`] if the slot is in the past before
+    /// the current ledger state.
+    pub fn epoch_state_for_slot<Id>(
+        &self,
+        slot: Slot,
+        config: &Config,
+    ) -> Result<EpochState, LedgerError<Id>> {
+        Ok(self
+            .clone()
+            .update_epoch_state(slot, config)?
+            .epoch_state()
+            .clone())
     }
 
     pub fn from_genesis_tx<Id>(
@@ -387,15 +429,20 @@ impl LedgerState {
         let total_stake = utxos
             .utxos()
             .iter()
+            .filter(|(_, (utxo, _))| config.faucet_pk.is_none_or(|fpk| utxo.note.pk != fpk))
             .map(|(_, (utxo, _))| utxo.note.value)
-            .sum::<Value>();
+            .sum::<Value>()
+            .max(1); // TODO: Change total_stake to NonZeroU64: https://github.com/logos-blockchain/logos-blockchain/issues/2166
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let slot: Slot = 0.into();
         let stake_inference = Arc::new(StakeInference::new(
-            LEARNING_RATE,
-            slot_activation_coefficient(),
-            config.consensus_config.security_param().get().into(),
+            config.consensus_config.stake_inference_learning_rate(),
+            config.consensus_config.slot_activation_coeff().as_f64(),
+            config.total_stake_inference_period(),
         ));
-        let block_density = BlockDensity::new(stake_inference.period(), slot);
+        let block_density = BlockDensity::new(config.epoch(slot), config);
         Self {
             utxos: utxos.clone(),
             nonce,
@@ -405,12 +452,16 @@ impl LedgerState {
                 nonce,
                 utxos: utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             epoch_state: EpochState {
                 epoch: 0.into(),
                 nonce,
                 utxos,
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             block_density,
             stake_inference,
@@ -447,7 +498,7 @@ pub mod tests {
     use lb_cryptarchia_engine::EpochConfig;
     use lb_groth16::Field as _;
     use lb_key_management_system_keys::keys::{Ed25519PublicKey, ZkKey};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use num_bigint::BigUint;
     use rand::{RngCore as _, thread_rng};
 
@@ -563,7 +614,8 @@ pub mod tests {
                 },
                 ledger_state.epoch_state.nonce,
                 slot.into(),
-                ledger_state.epoch_state.total_stake,
+                ledger_state.epoch_state.lottery_0,
+                ledger_state.epoch_state.lottery_1,
             ),
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
@@ -577,8 +629,8 @@ pub mod tests {
             lb_core::sdp::ServiceType::BlendNetwork,
             ServiceParameters {
                 lock_period: 10,
-                inactivity_period: 20,
-                retention_period: 100,
+                inactivity_period: 1,
+                retention_period: 1,
                 timestamp: 0,
                 session_duration: 10,
             },
@@ -586,11 +638,15 @@ pub mod tests {
 
         Config {
             epoch_config: EpochConfig {
-                epoch_stake_distribution_stabilization: NonZero::new(4).unwrap(),
+                epoch_stake_distribution_stabilization: NonZero::new(3).unwrap(),
                 epoch_period_nonce_buffer: NonZero::new(3).unwrap(),
-                epoch_period_nonce_stabilization: NonZero::new(3).unwrap(),
+                epoch_period_nonce_stabilization: NonZero::new(4).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(1).unwrap(), 1.0),
+            consensus_config: lb_cryptarchia_engine::Config::new(
+                NonZero::new(1).unwrap(),
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
+                1f64.try_into().expect("1 > 0"),
+            ),
             sdp_config: crate::mantle::sdp::Config {
                 service_params: Arc::new(service_params),
                 service_rewards_params: ServiceRewardsParameters {
@@ -608,6 +664,7 @@ pub mod tests {
                     timestamp: 0,
                 },
             },
+            faucet_pk: None,
         }
     }
 
@@ -615,34 +672,42 @@ pub mod tests {
     pub fn genesis_state(utxos: &[Utxo]) -> LedgerState {
         let config = config();
         let total_stake = utxos.iter().map(|u| u.note.value).sum();
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let utxos = utxos
             .iter()
             .map(|utxo| (utxo.id(), *utxo))
             .collect::<UtxoTree>();
+        let slot = 0.into();
         let stake_inference = Arc::new(StakeInference::new(
-            LEARNING_RATE,
-            slot_activation_coefficient(),
-            config.consensus_config.security_param().get().into(),
+            config.consensus_config.stake_inference_learning_rate(),
+            config.consensus_config.slot_activation_coeff().as_f64(),
+            config.total_stake_inference_period(),
         ));
-        let block_density_inference = BlockDensity::new(stake_inference.period(), 0.into());
+        let block_density = BlockDensity::new(config.epoch(slot), &config);
         LedgerState {
             utxos: utxos.clone(),
             nonce: Fr::ZERO,
-            slot: 0.into(),
+            slot,
             next_epoch_state: EpochState {
                 epoch: 1.into(),
                 nonce: Fr::ZERO,
                 utxos: utxos.clone(),
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             epoch_state: EpochState {
                 epoch: 0.into(),
                 nonce: Fr::ZERO,
                 utxos,
                 total_stake,
+                lottery_0,
+                lottery_1,
             },
             stake_inference,
-            block_density: block_density_inference,
+            block_density,
         }
     }
 
@@ -709,49 +774,82 @@ pub mod tests {
         let utxos = std::iter::repeat_with(utxo).take(4).collect::<Vec<_>>();
         let utxo_4 = utxo();
         let utxo_5 = utxo();
-        let (mut ledger, genesis) = ledger(&utxos, config());
 
-        // An epoch will be 10 slots long, with stake distribution snapshot taken at the
-        // start of the epoch and nonce snapshot before slot 7
+        let config = config();
+        assert_eq!(config.epoch_length(), 100);
+        let (mut ledger, genesis) = ledger(&utxos, config);
+        // block density slot range should be [0, 59]
+        assert_eq!(
+            ledger.states[&genesis]
+                .cryptarchia_ledger
+                .block_density
+                .period_range(),
+            &(0.into()..=59.into())
+        );
 
-        let h_1 = update_ledger(&mut ledger, genesis, 1, utxos[0]).unwrap();
+        let h_1 = update_ledger(&mut ledger, genesis, 10, utxos[0]).unwrap();
         assert_eq!(
             ledger.states[&h_1].cryptarchia_ledger.epoch_state.epoch,
             0.into()
         );
 
-        let h_2 = update_ledger(&mut ledger, h_1, 6, utxos[1]).unwrap();
+        let h_2 = update_ledger(&mut ledger, h_1, 60, utxos[1]).unwrap();
 
-        let h_3 = apply_and_add_utxo(&mut ledger, h_2, 9, utxos[2], utxo_4);
+        let h_3 = apply_and_add_utxo(&mut ledger, h_2, 90, utxos[2], utxo_4);
 
-        // test epoch jump
-        let h_4 = update_ledger(&mut ledger, h_3, 20, utxos[3]).unwrap();
-        // nonce for epoch 2 should be taken at the end of slot 16, but in our case the
-        // last block is at slot 9
+        // test epoch jump: epoch 0 -> 2
+        // Jump to the slot that is not the 1st slot of epoch 2
+        let h_4 = update_ledger(&mut ledger, h_3, 222, utxos[3]).unwrap();
+        // nonce for epoch 2 should be taken at the end of slot 160, but in our case the
+        // last block is at slot 90
         assert_eq!(
             ledger.states[&h_4].cryptarchia_ledger.epoch_state.nonce,
             ledger.states[&h_3].cryptarchia_ledger.nonce,
         );
-        // stake distribution snapshot should be taken at the end of slot 9
+        // stake distribution snapshot should be taken at the end of slot 90
         assert_eq!(
             ledger.states[&h_4].cryptarchia_ledger.epoch_state.utxos,
             ledger.states[&h_3].cryptarchia_ledger.utxos,
         );
-
-        // nonce for epoch 1 should be taken at the end of slot 6
-        update_ledger(&mut ledger, h_3, 10, utxos[3]).unwrap();
-        let h_5 = apply_and_add_utxo(&mut ledger, h_3, 10, utxos[3], utxo_5);
+        // block density slot range should be [200, 259]
         assert_eq!(
-            ledger.states[&h_5].cryptarchia_ledger.epoch_state.nonce,
-            ledger.states[&h_2].cryptarchia_ledger.nonce,
+            ledger.states[&h_4]
+                .cryptarchia_ledger
+                .block_density
+                .period_range(),
+            &(200.into()..=259.into())
         );
 
-        let h_6 = update_ledger(&mut ledger, h_5, 20, utxos[3]).unwrap();
-        // stake distribution snapshot should be taken at the end of slot 9, check that
-        // changes in slot 10 are ignored
+        // nonce for epoch 1 should be taken at the end of slot 10
+        update_ledger(&mut ledger, h_3, 100, utxos[3]).unwrap();
+        let h_5 = apply_and_add_utxo(&mut ledger, h_3, 100, utxos[3], utxo_5);
+        assert_eq!(
+            ledger.states[&h_5].cryptarchia_ledger.epoch_state.nonce,
+            ledger.states[&h_1].cryptarchia_ledger.nonce,
+        );
+        // block density slot range should be [100, 159]
+        assert_eq!(
+            ledger.states[&h_5]
+                .cryptarchia_ledger
+                .block_density
+                .period_range(),
+            &(100.into()..=159.into())
+        );
+
+        let h_6 = update_ledger(&mut ledger, h_5, 200, utxos[3]).unwrap();
+        // stake distribution snapshot should be taken at the end of slot 90, check that
+        // changes in slot 100 are ignored
         assert_eq!(
             ledger.states[&h_6].cryptarchia_ledger.epoch_state.utxos,
             ledger.states[&h_3].cryptarchia_ledger.utxos,
+        );
+        // block density slot range should be [200, 259]
+        assert_eq!(
+            ledger.states[&h_6]
+                .cryptarchia_ledger
+                .block_density
+                .period_range(),
+            &(200.into()..=259.into())
         );
     }
 
@@ -759,8 +857,10 @@ pub mod tests {
     fn test_new_utxos_becoming_eligible_after_stake_distribution_stabilizes() {
         let utxo_1 = utxo();
         let utxo = utxo();
+        let config = config();
+        let epoch_length = config.epoch_length();
 
-        let (mut ledger, genesis) = ledger(&[utxo], config());
+        let (mut ledger, genesis) = ledger(&[utxo], config);
 
         // EPOCH 0
         // mint a new utxo to be used for leader elections in upcoming epochs
@@ -773,7 +873,7 @@ pub mod tests {
         ));
 
         // EPOCH 1
-        for i in 10..20 {
+        for i in epoch_length..(2 * epoch_length) {
             // the newly minted utxo is still not eligible in the following epoch since the
             // stake distribution snapshot is taken at the beginning of the previous epoch
             assert!(matches!(
@@ -784,7 +884,7 @@ pub mod tests {
 
         // EPOCH 2
         // the utxo is finally eligible 2 epochs after it was first minted
-        update_ledger(&mut ledger, h_0_1, 20, utxo_1).unwrap();
+        update_ledger(&mut ledger, h_0_1, 2 * epoch_length, utxo_1).unwrap();
     }
 
     #[test]
@@ -826,7 +926,8 @@ pub mod tests {
                 latest_root: ledger_state.latest_utxos().root(),
                 epoch_nonce: ledger_state.epoch_state.nonce,
                 slot: slot.into(),
-                total_stake: ledger_state.epoch_state.total_stake,
+                lottery_0: ledger_state.epoch_state.lottery_0,
+                lottery_1: ledger_state.epoch_state.lottery_1,
             },
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
@@ -850,7 +951,8 @@ pub mod tests {
                 latest_root: BigUint::from(1u8).into(), // Invalid latest root
                 epoch_nonce: ledger_state.epoch_state.nonce,
                 slot: slot.into(),
-                total_stake: ledger_state.epoch_state.total_stake,
+                lottery_0: ledger_state.epoch_state.lottery_0,
+                lottery_1: ledger_state.epoch_state.lottery_1,
             },
             leader_key: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
             voucher_cm: VoucherCm::default(),
@@ -1069,6 +1171,7 @@ pub mod tests {
     fn test_epoch_state_for_slot_with_empty_epochs() {
         let utxo = utxo();
         let config = config();
+        let epoch_length = config.epoch_length();
         let ledger_state = genesis_state(&[utxo]);
 
         // Genesis state is at epoch 0, with epoch_state for epoch 0 and
@@ -1078,26 +1181,26 @@ pub mod tests {
         let initial_total_stake = ledger_state.epoch_state.total_stake;
 
         // Query for epoch 0 (current epoch) - should return epoch_state
-        let epoch_0_slot: Slot = 5.into();
+        let epoch_0_slot: Slot = (epoch_length - 1).into();
         let epoch_0_state = ledger_state
-            .epoch_state_for_slot(epoch_0_slot, &config)
+            .epoch_state_for_slot::<HeaderId>(epoch_0_slot, &config)
             .expect("Should return epoch state for current epoch");
         assert_eq!(epoch_0_state.epoch, 0.into());
         assert_eq!(epoch_0_state.total_stake, initial_total_stake);
 
         // Query for epoch 1 (next epoch) - should return next_epoch_state
-        let epoch_1_slot: Slot = 15.into(); // epoch length is 10
+        let epoch_1_slot: Slot = (epoch_length + 1).into();
         let epoch_1_state = ledger_state
-            .epoch_state_for_slot(epoch_1_slot, &config)
+            .epoch_state_for_slot::<HeaderId>(epoch_1_slot, &config)
             .expect("Should return epoch state for next epoch");
         assert_eq!(epoch_1_state.epoch, 1.into());
         assert_eq!(epoch_1_state.total_stake, initial_total_stake);
 
         // Query for epoch 2 (skipped epoch) - should synthesize with reduced total
         // stake
-        let epoch_2_slot: Slot = 25.into();
+        let epoch_2_slot: Slot = (2 * epoch_length + 1).into();
         let epoch_2_state = ledger_state
-            .epoch_state_for_slot(epoch_2_slot, &config)
+            .epoch_state_for_slot::<HeaderId>(epoch_2_slot, &config)
             .expect("Should synthesize epoch state for skipped epoch");
         assert_eq!(epoch_2_state.epoch, 2.into());
         // With 0 density and LEARNING_RATE=1, total stake drops to minimum (1)
@@ -1107,9 +1210,9 @@ pub mod tests {
         );
 
         // Query for epoch 3 (multiple skipped epochs) - stake stays at minimum
-        let epoch_3_slot: Slot = 35.into();
+        let epoch_3_slot: Slot = (3 * epoch_length + 1).into();
         let epoch_3_state = ledger_state
-            .epoch_state_for_slot(epoch_3_slot, &config)
+            .epoch_state_for_slot::<HeaderId>(epoch_3_slot, &config)
             .expect("Should synthesize epoch state for multiple skipped epochs");
         assert_eq!(epoch_3_state.epoch, 3.into());
         assert_eq!(
@@ -1120,5 +1223,47 @@ pub mod tests {
         // Verify nonce and utxos are preserved from current state
         assert_eq!(epoch_3_state.nonce, ledger_state.nonce);
         assert_eq!(epoch_3_state.utxos, ledger_state.utxos);
+    }
+
+    /// Test that a proof built from the jumped (synthesized) epoch state can be
+    /// applied successfully
+    #[test]
+    fn test_try_apply_header_with_proof_from_jumped_epoch() {
+        let utxo = utxo();
+        let config = config();
+        let genesis_state = genesis_state(&[utxo]);
+
+        // First, apply a header from epoch 0 to increase block density
+        let slot = Slot::from(1);
+        assert_eq!(config.epoch(slot), 0.into());
+        let proof = generate_proof(&genesis_state, &utxo, slot);
+        let ledger_state_1 = genesis_state
+            .try_apply_header::<DummyProof, HeaderId>(slot, &proof, &config)
+            .unwrap();
+
+        // Now, apply a header from the 2nd slot of epoch 2
+        let slot = Slot::from(config.epoch_length() * 2 + 1);
+        assert_eq!(config.epoch(slot), 2.into());
+
+        // First, synthesize epoch state for epoch 2
+        let synthesized_ledger_state = ledger_state_1
+            .clone()
+            .update_epoch_state::<HeaderId>(slot, &config)
+            .unwrap();
+        assert_eq!(synthesized_ledger_state.slot, slot);
+
+        // Build a proof with the synthesized epoch state
+        let proof = generate_proof(&synthesized_ledger_state, &utxo, slot);
+
+        // Apply it to `ledger_state_1`.
+        // Must succeed if epoch state in `ledger_state_1` is jumped
+        // correctly to epoch 2 as the same as `synthesized_ledger_state`.
+        let ledger_state_2 = ledger_state_1
+            .clone()
+            .try_apply_header::<DummyProof, HeaderId>(slot, &proof, &config)
+            .unwrap();
+        assert_eq!(ledger_state_2.slot, slot);
+        assert_ne!(ledger_state_2.nonce, ledger_state_1.nonce); // advanced
+        assert_eq!(ledger_state_2.epoch_state.epoch, 2.into());
     }
 }

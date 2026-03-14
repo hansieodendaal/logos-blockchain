@@ -48,9 +48,9 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 
 use crate::api::{
+    openapi::schema,
     queries::BlockRangeQuery,
-    responses,
-    responses::overwatch::get_relay_or_500,
+    responses::{self, overwatch::get_relay_or_500},
     serializers::blocks::{ApiBlock, ApiProcessedBlockEvent},
 };
 
@@ -74,7 +74,7 @@ macro_rules! make_request_and_return_response {
     get,
     path = paths::MANTLE_METRICS,
     responses(
-        (status = 200, description = "Get the mempool metrics of the cl service", body = MempoolMetrics),
+        (status = 200, description = "Get the mempool metrics of the cl service", body = inline(schema::MempoolMetrics)),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
@@ -375,24 +375,34 @@ where
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn post_declaration<MempoolAdapter, WalletAdapter, RuntimeServiceId>(
+pub async fn post_declaration<MempoolAdapter, WalletAdapter, ChainService, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Json(declaration): Json<lb_core::sdp::DeclarationMessage>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
     WalletAdapter: SdpWalletAdapter + Send + Sync + 'static,
+    ChainService: lb_chain_service::api::CryptarchiaServiceData + Send + Sync + 'static,
     RuntimeServiceId: Debug
         + Sync
         + Send
         + Display
         + 'static
-        + AsServiceId<lb_sdp_service::SdpService<MempoolAdapter, WalletAdapter, RuntimeServiceId>>,
+        + AsServiceId<ChainService>
+        + AsServiceId<
+            lb_sdp_service::SdpService<
+                MempoolAdapter,
+                WalletAdapter,
+                ChainService,
+                RuntimeServiceId,
+            >,
+        >,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(lb_api_service::http::sdp::post_declaration_handler::<
         MempoolAdapter,
         WalletAdapter,
+        ChainService,
         RuntimeServiceId,
     >(handle, declaration))
 }
@@ -405,24 +415,34 @@ where
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn post_activity<MempoolAdapter, WalletAdapter, RuntimeServiceId>(
+pub async fn post_activity<MempoolAdapter, WalletAdapter, ChainService, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Json(metadata): Json<lb_core::sdp::ActivityMetadata>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
     WalletAdapter: SdpWalletAdapter + Send + Sync + 'static,
+    ChainService: lb_chain_service::api::CryptarchiaServiceData + Send + Sync + 'static,
     RuntimeServiceId: Debug
         + Sync
         + Send
         + Display
         + 'static
-        + AsServiceId<lb_sdp_service::SdpService<MempoolAdapter, WalletAdapter, RuntimeServiceId>>,
+        + AsServiceId<ChainService>
+        + AsServiceId<
+            lb_sdp_service::SdpService<
+                MempoolAdapter,
+                WalletAdapter,
+                ChainService,
+                RuntimeServiceId,
+            >,
+        >,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(lb_api_service::http::sdp::post_activity_handler::<
         MempoolAdapter,
         WalletAdapter,
+        ChainService,
         RuntimeServiceId,
     >(handle, metadata))
 }
@@ -435,24 +455,33 @@ where
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn post_withdrawal<MempoolAdapter, WalletAdapter, RuntimeServiceId>(
+pub async fn post_withdrawal<MempoolAdapter, WalletAdapter, ChainService, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Json(declaration_id): Json<lb_core::sdp::DeclarationId>,
 ) -> Response
 where
     MempoolAdapter: SdpMempoolAdapter + Send + Sync + 'static,
     WalletAdapter: SdpWalletAdapter + Send + Sync + 'static,
+    ChainService: lb_chain_service::api::CryptarchiaServiceData + Send + Sync + 'static,
     RuntimeServiceId: Debug
         + Sync
         + Send
         + Display
-        + 'static
-        + AsServiceId<lb_sdp_service::SdpService<MempoolAdapter, WalletAdapter, RuntimeServiceId>>,
+        + AsServiceId<ChainService>
+        + AsServiceId<
+            lb_sdp_service::SdpService<
+                MempoolAdapter,
+                WalletAdapter,
+                ChainService,
+                RuntimeServiceId,
+            >,
+        >,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(lb_api_service::http::sdp::post_withdrawal_handler::<
         MempoolAdapter,
         WalletAdapter,
+        ChainService,
         RuntimeServiceId,
     >(handle, declaration_id))
 }

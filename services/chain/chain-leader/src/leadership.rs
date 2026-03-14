@@ -17,10 +17,6 @@ use tokio::sync::{oneshot, watch::Sender};
 
 use crate::{WinningPolInfo, kms::KmsAdapter};
 
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "TODO: Address this at some point"
-)]
 /// Return a leadership proof and signing key if the current slot is a
 /// winning one, and notifies consumers of winning slot info.
 ///
@@ -82,6 +78,7 @@ where
 
             winning_pol_info_notifier.notify_about_winning_slot(
                 private_inputs.clone(),
+                public_inputs,
                 epoch_state.epoch,
                 slot,
             );
@@ -160,7 +157,8 @@ fn public_inputs_for_slot(
         latest_tree.root(),
         epoch_state.nonce,
         slot.into(),
-        epoch_state.total_stake(),
+        epoch_state.lottery_0,
+        epoch_state.lottery_1,
     )
 }
 
@@ -230,7 +228,6 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
             .await;
     }
 
-    #[expect(clippy::cognitive_complexity, reason = "TODO: extract inner loop")]
     async fn check_epoch_winning_utxos<RuntimeServiceId>(
         &mut self,
         utxos: &[UtxoWithKeyId],
@@ -283,9 +280,13 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
                     }
                 };
 
-                if let Err(err) = self.sender.send(Some((leader_private, epoch_state.epoch))) {
-                    tracing::error!(
-                        "Failed to send pre-calculated PoL winning slots to receivers. Error: {err:?}"
+                if self
+                    .sender
+                    .send(Some((leader_private, public_inputs, epoch_state.epoch)))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        "No active listeners for pre-calculated PoL winning slots. Not broadcasting."
                     );
                 } else {
                     // We stop the iteration as soon as the first winning slot for this epoch is
@@ -305,6 +306,7 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
     pub(super) fn notify_about_winning_slot(
         &self,
         private_inputs: LeaderPrivate,
+        public_inputs: LeaderPublic,
         epoch: Epoch,
         slot: Slot,
     ) {
@@ -320,9 +322,13 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
             return;
         }
 
-        if let Err(err) = self.sender.send(Some((private_inputs, epoch))) {
-            tracing::error!(
-                "Failed to send pre-calculated PoL winning slots to receivers. Error: {err:?}"
+        if self
+            .sender
+            .send(Some((private_inputs, public_inputs, epoch)))
+            .is_err()
+        {
+            tracing::debug!(
+                "No active listeners for pre-calculated PoL winning slots. Not broadcasting."
             );
         }
     }
@@ -347,7 +353,7 @@ mod pol_tests {
     use lb_ledger::mantle::sdp::{
         Config as SdpConfig, ServiceRewardsParameters, rewards::blend::RewardsParameters,
     };
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use lb_wallet_service::{WalletMsg, WalletServiceSettings, api::WalletServiceData};
     use overwatch::services::{
         ServiceData,
@@ -362,12 +368,13 @@ mod pol_tests {
     /// verified successfully.
     #[tokio::test]
     async fn test_build_proof_for() {
+        let config = test_config();
+
         // Create secret key and leader
         let kms = DummyKms;
         let key_id = KeyId::from("0");
         let sk = UnsecuredZkKey::new(Fr::from(0u64));
         let pk = sk.to_public_key();
-        let config = test_config();
 
         // Create a UTXO
         let utxo = Tx::new(vec![], vec![Note::new(1000u64, pk)])
@@ -379,11 +386,17 @@ mod pol_tests {
         let latest_tree = UtxoTree::new().insert(utxo.id(), utxo).0;
 
         // Create EpochState
+        let total_stake = utxo.note.value;
+        let (lottery_0, lottery_1) = config
+            .lottery_constants()
+            .compute_lottery_values(total_stake);
         let epoch_state = EpochState {
             epoch: 1.into(),
             nonce: Fr::from(999u64),
             utxos: aged_tree.clone(),
-            total_stake: utxo.note.value,
+            total_stake,
+            lottery_0,
+            lottery_1,
         };
 
         // Create notifier channel (not used in this test)
@@ -413,7 +426,8 @@ mod pol_tests {
             latest_tree.root(),
             epoch_state.nonce,
             winning_slot.into(),
-            utxo.note.value,
+            epoch_state.lottery_0,
+            epoch_state.lottery_1,
         );
         assert!(
             proof.verify(&public_inputs),
@@ -456,7 +470,11 @@ mod pol_tests {
                 epoch_period_nonce_buffer: NonZero::new(3).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(4).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(5).unwrap(), 0.05),
+            consensus_config: lb_cryptarchia_engine::Config::new(
+                NonZero::new(5).unwrap(),
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
+                1f64.try_into().expect("1 > 0"),
+            ),
             sdp_config: SdpConfig {
                 service_params: Arc::new(
                     [(
@@ -486,6 +504,7 @@ mod pol_tests {
                     timestamp: 0,
                 },
             },
+            faucet_pk: None,
         }
     }
 

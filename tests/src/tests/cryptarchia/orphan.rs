@@ -2,7 +2,6 @@ use std::{slice, time::Duration};
 
 use futures::stream::{self, StreamExt as _};
 use logos_blockchain_tests::{
-    adjust_timeout,
     common::{
         sync::{format_cryptarhica_info, wait_for_validators_mode_and_height},
         time::max_block_propagation_time,
@@ -10,6 +9,7 @@ use logos_blockchain_tests::{
     nodes::validator::{Validator, create_validator_config},
     topology::configs::{
         create_general_configs_with_blend_core_subset,
+        deployment::e2e_deployment_settings_with_genesis_tx,
         network::{Libp2pNetworkLayout, NetworkParams},
     },
 };
@@ -22,7 +22,7 @@ async fn test_orphan_handling() {
     let n_initial_validators = 2;
     let min_height = 5;
 
-    let general_configs = create_general_configs_with_blend_core_subset(
+    let (general_configs, genesis_tx) = create_general_configs_with_blend_core_subset(
         n_validators,
         n_initial_validators,
         &NetworkParams {
@@ -32,7 +32,10 @@ async fn test_orphan_handling() {
 
     let mut validators = vec![];
     for config in general_configs.iter().take(n_initial_validators) {
-        let config = create_validator_config(config.clone());
+        let config = create_validator_config(
+            config.clone(),
+            e2e_deployment_settings_with_genesis_tx(genesis_tx.clone()),
+        );
         validators.push(Validator::spawn(config).await.unwrap());
     }
     println!("Initial validators started: {}", validators.len());
@@ -55,14 +58,17 @@ async fn test_orphan_handling() {
     // Start the 3rd node. We don't set IBD peers for the node,
     // so it has to catch up via orphan handling
     println!("Starting 3rd node ...");
-    let config = create_validator_config(general_configs[n_initial_validators].clone());
+    let config = create_validator_config(
+        general_configs[n_initial_validators].clone(),
+        e2e_deployment_settings_with_genesis_tx(genesis_tx),
+    );
     let behind_node = [Validator::spawn(config).await.unwrap()];
 
     // Orphan handling will be triggered once one of the initial nodes proposes
     // a new block and it is delivered to the behind node.
     // We set a timeout long enough, since there is a non-zero probability that the
     // behind node also proposes blocks (which wouldn't trigger orphan handling).
-    tokio::time::timeout(adjust_timeout(Duration::from_secs(300)), async {
+    tokio::time::timeout(Duration::from_secs(300), async {
         loop {
             let initial_nodes_info: Vec<_> = stream::iter(&validators)
                 .then(async |n| n.consensus_info(false).await)

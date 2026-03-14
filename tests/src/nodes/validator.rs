@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     process::{Child, Command, Stdio},
     str::FromStr as _,
@@ -13,41 +12,36 @@ use lb_chain_service::CryptarchiaInfo;
 use lb_common_http_client::CommonHttpClient;
 use lb_core::{
     block::Block,
-    mantle::{SignedMantleTx, Transaction as _, TxHash, Value},
+    mantle::{SignedMantleTx, Transaction as _, TxHash},
     sdp::Declaration,
 };
-use lb_http_api_common::{
-    paths::{
-        CRYPTARCHIA_HEADERS, CRYPTARCHIA_INFO, MANTLE_SDP_DECLARATIONS, NETWORK_INFO, STORAGE_BLOCK,
-    },
-    settings::AxumBackendSettings,
+use lb_http_api_common::paths::{
+    CRYPTARCHIA_HEADERS, CRYPTARCHIA_INFO, MANTLE_SDP_DECLARATIONS, NETWORK_INFO, STORAGE_BLOCK,
 };
 use lb_key_management_system_service::keys::secured_key::SecuredKey as _;
 use lb_network_service::backends::libp2p::Libp2pInfo;
 use lb_node::{
-    HeaderId, RocksBackendSettings, UserConfig,
-    config::{RunConfig, mempool::serde::Config as MempoolConfig},
+    HeaderId, UserConfig,
+    config::{
+        ApiConfig, CryptarchiaConfig, RunConfig, SdpConfig, StorageConfig, WalletConfig,
+        api::serde::AxumBackendSettings,
+        cryptarchia::serde::RequiredValues as CryptarchiaConfigRequiredValues,
+        deployment::DeploymentSettings, sdp::serde::RequiredValues as SdpConfigRequiredValues,
+        state::Config as StateConfig, tracing::serde as tracing,
+        wallet::serde::RequiredValues as WalletConfigRequiredValues,
+    },
 };
-use lb_sdp_service::SdpSettings;
-use lb_tracing::logging::local::FileConfig;
-use lb_tracing_service::LoggerLayer;
 use lb_tx_service::MempoolMetrics;
 use lb_utils::net::get_available_tcp_port;
-use lb_wallet_service::WalletServiceSettings;
 use reqwest::Url;
 use tempfile::NamedTempFile;
 use tokio::time::error::Elapsed;
 
 use super::{CLIENT, create_tempdir, get_exe_path, persist_tempdir};
 use crate::{
-    IS_DEBUG_TRACING, adjust_timeout,
-    common::kms::key_id_for_preload_backend,
-    nodes::LOGS_PREFIX,
-    topology::configs::{GeneralConfig, deployment::default_e2e_deployment_settings},
+    IS_DEBUG_TRACING, common::kms::key_id_for_preload_backend, nodes::LOGS_PREFIX,
+    topology::configs::GeneralConfig,
 };
-
-const BIN_PATH_DEBUG: &str = "../target/debug/logos-blockchain-node";
-const BIN_PATH_RELEASE: &str = "../target/release/logos-blockchain-node";
 
 pub enum Pool {
     Mantle,
@@ -100,6 +94,46 @@ impl Validator {
         .is_ok()
     }
 
+    /// Kill the validator process.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    /// Restart the validator process using the same config and state directory.
+    /// This preserves persisted state (like SDP nonces fetched from ledger).
+    pub async fn restart(&mut self) -> Result<(), Elapsed> {
+        // Kill the current process
+        drop(self.child.kill());
+        self.wait_for_exit(Duration::from_secs(5)).await;
+
+        // Re-write config files (they were temporary and may have been cleaned up)
+        let mut user_config_file = NamedTempFile::new().unwrap();
+        let mut deployment_config_file = NamedTempFile::new().unwrap();
+
+        serde_yaml::to_writer(&mut user_config_file, &self.config.user).unwrap();
+        serde_yaml::to_writer(&mut deployment_config_file, &self.config.deployment).unwrap();
+
+        // Spawn new process with same config
+        let exe_path = get_exe_path();
+        self.child = Command::new(exe_path)
+            .arg("--deployment")
+            .arg(deployment_config_file.path().as_os_str())
+            .arg(user_config_file.path().as_os_str())
+            .current_dir(self.tempdir.path())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+
+        // Wait for the node to come online
+        tokio::time::timeout(Duration::from_secs(10), async {
+            self.wait_online().await;
+        })
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn spawn(mut config: RunConfig) -> Result<Self, Elapsed> {
         let dir = create_tempdir().unwrap();
         let mut user_config_file = NamedTempFile::new().unwrap();
@@ -107,17 +141,25 @@ impl Validator {
 
         if !*IS_DEBUG_TRACING {
             // setup logging so that we can intercept it later in testing
-            config.user.tracing.logger = LoggerLayer::File(FileConfig {
-                directory: dir.path().to_owned(),
-                prefix: Some(LOGS_PREFIX.into()),
-            });
+            config.user.tracing.logger = tracing::logger::Layers {
+                file: Some(tracing::logger::FileConfig {
+                    directory: dir.path().to_owned(),
+                    prefix: Some(LOGS_PREFIX.into()),
+                }),
+                loki: None,
+                gelf: None,
+                otlp: None,
+                stdout: false,
+                stderr: false,
+            };
         }
 
-        config.user.storage.db_path = dir.path().join("db");
+        config.user.state.base_folder = dir.path().to_path_buf();
+        "db".clone_into(&mut config.user.storage.backend.folder_name);
 
         serde_yaml::to_writer(&mut user_config_file, &config.user).unwrap();
         serde_yaml::to_writer(&mut deployment_config_file, &config.deployment).unwrap();
-        let exe_path = get_exe_path(BIN_PATH_DEBUG, BIN_PATH_RELEASE);
+        let exe_path = get_exe_path();
         let child = Command::new(exe_path)
             .arg("--deployment")
             .arg(deployment_config_file.path().as_os_str())
@@ -128,15 +170,15 @@ impl Validator {
             .spawn()
             .unwrap();
         let node = Self {
-            addr: config.user.http.backend_settings.address,
-            testing_http_addr: config.user.testing_http.backend_settings.address,
+            addr: config.user.api.backend.listen_address,
+            testing_http_addr: config.user.api.testing.listen_address,
             child,
             tempdir: dir,
             config,
             http_client: CommonHttpClient::new_with_client(CLIENT.clone(), None),
         };
 
-        tokio::time::timeout(adjust_timeout(Duration::from_secs(10)), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             node.wait_online().await;
         })
         .await?;
@@ -324,70 +366,104 @@ impl Validator {
 }
 
 #[must_use]
-pub fn create_validator_config(config: GeneralConfig) -> RunConfig {
-    let testing_http_address = format!("127.0.0.1:{}", get_available_tcp_port().unwrap())
-        .parse()
-        .unwrap();
+pub fn create_validator_config(
+    config: GeneralConfig,
+    deployment_config: DeploymentSettings,
+) -> RunConfig {
+    let network_config = config.network_config;
 
-    let user_config = UserConfig {
-        network: config.network_config,
-        blend: config.blend_config.0,
-        time: config.time_config,
-        cryptarchia: config.consensus_config.user_config().clone(),
-        mempool: MempoolConfig {
-            recovery_path: "./recovery/mempool.json".into(),
+    let blend_config = config.blend_config.0;
+
+    let time_config = config.time_config;
+
+    let cryptarchia_config = {
+        let mut base_config =
+            CryptarchiaConfig::with_required_values(CryptarchiaConfigRequiredValues {
+                // We use the same funding key used for SDP.
+                funding_pk: config.consensus_config.funding_pk,
+            });
+        base_config.service.bootstrap.prolonged_bootstrap_period =
+            config.consensus_config.prolonged_bootstrap_period;
+        base_config
+    };
+
+    let tracing_config = config.tracing_config.tracing_settings;
+
+    let api_config = ApiConfig {
+        backend: AxumBackendSettings {
+            listen_address: config.api_config.address,
+            max_concurrent_requests: 1000,
+            ..Default::default()
         },
-        tracing: config.tracing_config.tracing_settings,
-        http: lb_api_service::ApiServiceSettings {
-            backend_settings: AxumBackendSettings {
-                address: config.api_config.address,
-                max_concurrent_requests: 1000,
-                ..Default::default()
-            },
+        testing: AxumBackendSettings {
+            listen_address: format!("127.0.0.1:{}", get_available_tcp_port().unwrap())
+                .parse()
+                .unwrap(),
+            max_concurrent_requests: 1000,
+            ..Default::default()
         },
-        storage: RocksBackendSettings {
-            db_path: "./db".into(),
-            read_only: false,
-            column_family: Some("blocks".into()),
-        },
-        sdp: SdpSettings {
-            declaration: None,
-            wallet_config: lb_sdp_service::wallet::SdpWalletConfig {
-                max_tx_fee: Value::MAX,
-                funding_pk: config.consensus_config.funding_sk.as_public_key(),
-            },
-        },
-        wallet: WalletServiceSettings {
-            known_keys: HashMap::from_iter([
-                (
-                    key_id_for_preload_backend(&config.consensus_config.known_key.clone().into()),
-                    config.consensus_config.known_key.as_public_key(),
-                ),
-                (
-                    key_id_for_preload_backend(&config.consensus_config.funding_sk.clone().into()),
-                    config.consensus_config.funding_sk.as_public_key(),
-                ),
-            ]),
+    };
+
+    let storage_config = StorageConfig::default();
+
+    let mut sdp_config = SdpConfig::with_required_values(SdpConfigRequiredValues {
+        funding_pk: config.consensus_config.funding_sk.as_public_key(),
+    });
+
+    if let Some(declaration_id) = config.sdp_config.declaration_id {
+        sdp_config.declaration_id = Some(declaration_id);
+    }
+
+    let wallet_config = {
+        let mut base_config = WalletConfig::with_required_values(WalletConfigRequiredValues {
             voucher_master_key_id: key_id_for_preload_backend(
                 &config.consensus_config.known_key.clone().into(),
             ),
-            recovery_path: "./recovery/wallet.json".into(),
-        },
-        key_management: config.kms_config,
-        testing_http: lb_api_service::ApiServiceSettings {
-            backend_settings: AxumBackendSettings {
-                address: testing_http_address,
-                max_concurrent_requests: 1000,
-                ..Default::default()
-            },
-        },
+        });
+        base_config.known_keys = [
+            (
+                key_id_for_preload_backend(&config.consensus_config.known_key.clone().into()),
+                config.consensus_config.known_key.as_public_key(),
+            ),
+            (
+                key_id_for_preload_backend(&config.consensus_config.funding_sk.clone().into()),
+                config.consensus_config.funding_sk.as_public_key(),
+            ),
+        ]
+        .into_iter()
+        .chain(config.consensus_config.other_keys.iter().map(|sk| {
+            (
+                key_id_for_preload_backend(&sk.clone().into()),
+                sk.as_public_key(),
+            )
+        }))
+        .collect();
+
+        base_config
+    };
+
+    let kms_config = config.kms_config;
+
+    let state_config = StateConfig::default();
+
+    let user_config = UserConfig {
+        network: network_config,
+        blend: blend_config,
+        time: time_config,
+        cryptarchia: cryptarchia_config,
+        tracing: tracing_config,
+        api: api_config,
+        storage: storage_config,
+        sdp: sdp_config,
+        wallet: wallet_config,
+        kms: kms_config,
+        state: state_config,
         banning: BanningConfig {
             whitelist: vec![],
             blacklist: vec![],
             ..Default::default()
         },
     };
-    let deployment_config = default_e2e_deployment_settings();
 
     RunConfig {
         deployment: deployment_config,

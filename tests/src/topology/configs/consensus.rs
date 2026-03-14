@@ -1,12 +1,8 @@
-use core::{num::NonZeroUsize, time::Duration};
-use std::collections::HashSet;
+use core::time::Duration;
 
-use lb_chain_leader_service::LeaderWalletConfig;
-use lb_chain_network_service::{IbdConfig, OrphanConfig, SyncConfig};
-use lb_chain_service::{OfflineGracePeriodConfig, StartingState};
 use lb_core::{
     mantle::{
-        MantleTx, Note, OpProof, Utxo, Value,
+        MantleTx, Note, NoteId, OpProof, Utxo,
         genesis_tx::GenesisTx,
         ledger::Tx as LedgerTx,
         ops::{
@@ -18,10 +14,7 @@ use lb_core::{
 };
 use lb_groth16::CompressedGroth16Proof;
 use lb_key_management_system_service::keys::{Ed25519Key, ZkKey, ZkPublicKey, ZkSignature};
-use lb_node::{
-    SignedMantleTx, Transaction as _,
-    config::cryptarchia::serde::{Config, LeaderConfig, NetworkConfig, ServiceConfig},
-};
+use lb_node::{SignedMantleTx, Transaction as _};
 use num_bigint::BigUint;
 
 pub const SHORT_PROLONGED_BOOTSTRAP_PERIOD: Duration = Duration::from_secs(1);
@@ -49,44 +42,27 @@ impl ProviderInfo {
 
 /// General consensus configuration for a chosen participant, that later could
 /// be converted into a specific service or services configuration.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GeneralConsensusConfig {
-    user_config: Config,
-    genesis_tx: GenesisTx,
-    pub utxos: Vec<Utxo>,
     pub known_key: ZkKey,
-    pub blend_notes: Vec<ServiceNote>,
+    pub blend_note: ServiceNote,
     pub funding_sk: ZkKey,
+    pub funding_pk: ZkPublicKey,
+    pub other_keys: Vec<ZkKey>,
+    pub prolonged_bootstrap_period: Duration,
 }
 
-impl GeneralConsensusConfig {
-    pub fn override_genesis_tx(&mut self, genesis_tx: GenesisTx) {
-        self.user_config.service.starting_state = StartingState::Genesis {
-            genesis_tx: genesis_tx.clone(),
-        };
-        self.genesis_tx = genesis_tx;
-    }
-
-    #[must_use]
-    pub const fn user_config(&self) -> &Config {
-        &self.user_config
-    }
-
-    #[must_use]
-    pub const fn genesis_tx(&self) -> &GenesisTx {
-        &self.genesis_tx
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ServiceNote {
     pub pk: ZkPublicKey,
     pub sk: ZkKey,
     pub note: Note,
+    pub note_id: NoteId,
     pub output_index: usize,
 }
 
-fn create_genesis_tx(utxos: &[Utxo]) -> GenesisTx {
+#[must_use]
+pub fn create_genesis_tx(utxos: &[Utxo]) -> GenesisTx {
     // Create a genesis inscription op (similar to config.yaml)
     let inscription = InscriptionOp {
         channel_id: ChannelId::from([0; 32]),
@@ -120,7 +96,7 @@ fn create_genesis_tx(utxos: &[Utxo]) -> GenesisTx {
 pub fn create_consensus_configs(
     ids: &[[u8; 32]],
     prolonged_bootstrap_period: Duration,
-) -> Vec<GeneralConsensusConfig> {
+) -> (Vec<GeneralConsensusConfig>, GenesisTx) {
     let mut regular_note_keys = Vec::new();
     let mut blend_notes = Vec::new();
     let mut sdp_notes = Vec::new();
@@ -133,59 +109,27 @@ pub fn create_consensus_configs(
     );
     let genesis_tx = create_genesis_tx(&utxos);
 
-    regular_note_keys
-        .into_iter()
-        .enumerate()
-        .map(|(i, sk)| {
-            let funding_sk = sdp_notes[i].sk.clone();
-            let funding_pk = sdp_notes[i].pk;
+    (
+        regular_note_keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, sk)| {
+                let funding_sk = sdp_notes[i].sk.clone();
+                let funding_pk = sdp_notes[i].pk;
+                let blend_note = blend_notes[i].clone();
 
-            GeneralConsensusConfig {
-                blend_notes: blend_notes.clone(),
-                genesis_tx: genesis_tx.clone(),
-                utxos: utxos.clone(),
-                known_key: sk,
-                funding_sk,
-                user_config: Config {
-                    network: NetworkConfig {
-                        bootstrap: lb_chain_network_service::BootstrapConfig {
-                            ibd: IbdConfig {
-                                delay_before_new_download: Duration::from_secs(10),
-                                peers: HashSet::new(),
-                            },
-                        },
-                        sync: SyncConfig {
-                            orphan: OrphanConfig {
-                                max_orphan_cache_size: NonZeroUsize::new(5)
-                                    .expect("Max orphan cache size must be non-zero"),
-                            },
-                        },
-                    },
-                    service: ServiceConfig {
-                        bootstrap: lb_chain_service::BootstrapConfig {
-                            force_bootstrap: false,
-                            offline_grace_period: OfflineGracePeriodConfig {
-                                grace_period: Duration::from_secs(20 * 60),
-                                state_recording_interval: Duration::from_secs(60),
-                            },
-                            prolonged_bootstrap_period,
-                        },
-                        recovery_file: "./recovery/cryptarchia.json".into(),
-                        starting_state: StartingState::Genesis {
-                            genesis_tx: genesis_tx.clone(),
-                        },
-                    },
-                    leader: LeaderConfig {
-                        wallet: LeaderWalletConfig {
-                            max_tx_fee: Value::MAX,
-                            // We use the same funding key used for SDP.
-                            funding_pk,
-                        },
-                    },
-                },
-            }
-        })
-        .collect()
+                GeneralConsensusConfig {
+                    blend_note,
+                    known_key: sk,
+                    funding_sk,
+                    funding_pk,
+                    other_keys: Vec::new(),
+                    prolonged_bootstrap_period,
+                }
+            })
+            .collect(),
+        genesis_tx,
+    )
 }
 
 fn create_utxos(
@@ -227,34 +171,38 @@ fn create_utxos(
         let sk_blend = ZkKey::from(BigUint::from_bytes_le(&sk_blend_data));
         let pk_blend = sk_blend.to_public_key();
         let note_blend = Note::new(1, pk_blend);
+        let utxo = Utxo {
+            note: note_blend,
+            tx_hash: BigUint::from(0u8).into(),
+            output_index: 0,
+        };
         blend_notes.push(ServiceNote {
             pk: pk_blend,
             sk: sk_blend,
             note: note_blend,
+            note_id: utxo.id(),
             output_index,
         });
-        utxos.push(Utxo {
-            note: note_blend,
-            tx_hash: BigUint::from(0u8).into(),
-            output_index: 0,
-        });
+        utxos.push(utxo);
         output_index += 1;
 
         let sk_sdp_data = derive_key_material(b"sdp", &id);
         let sk_sdp = ZkKey::from(BigUint::from_bytes_le(&sk_sdp_data));
         let pk_sdp = sk_sdp.to_public_key();
         let note_sdp = Note::new(100, pk_sdp);
+        let utxo = Utxo {
+            note: note_sdp,
+            tx_hash: BigUint::from(0u8).into(),
+            output_index,
+        };
         sdp_notes.push(ServiceNote {
             pk: pk_sdp,
             sk: sk_sdp,
             note: note_sdp,
+            note_id: utxo.id(),
             output_index,
         });
-        utxos.push(Utxo {
-            note: note_sdp,
-            tx_hash: BigUint::from(0u8).into(),
-            output_index,
-        });
+        utxos.push(utxo);
         output_index += 1;
     }
 

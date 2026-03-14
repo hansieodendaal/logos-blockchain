@@ -156,10 +156,6 @@ where
     }
 
     #[expect(deprecated, reason = "Self::OutboundOpenInfo is deprecated")]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: Address this at some point."
-    )]
     #[expect(clippy::too_many_lines, reason = "TODO: Address this at some point.")]
     fn poll(
         &mut self,
@@ -167,8 +163,8 @@ where
     ) -> Poll<
         ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
     > {
-        tracing::info!(gauge.pending_outbound_messages = self.outbound_msgs.len() as u64,);
-        tracing::info!(
+        tracing::trace!(gauge.pending_outbound_messages = self.outbound_msgs.len() as u64,);
+        tracing::trace!(
             gauge.pending_events_to_behaviour = self.pending_events_to_behaviour.len() as u64,
         );
 
@@ -327,10 +323,6 @@ where
         deprecated,
         reason = "Self::InboundOpenInfo and Self::OutboundOpenInfo are deprecated"
     )]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: Address this at some point."
-    )]
     fn on_connection_event(
         &mut self,
         event: ConnectionEvent<
@@ -375,7 +367,7 @@ where
             }
         };
 
-        tracing::info!(counter.connection_event = 1, event = event_name);
+        tracing::trace!(counter.connection_event = 1, event = event_name);
         self.try_wake();
     }
 }

@@ -65,9 +65,9 @@ use crate::{
 
 // Limit the number of blocks returned by GetHeaders
 const HEADERS_LIMIT: usize = 512;
-const CRYPTARCHIA_ID: &str = "Cryptarchia";
+const SERVICE_ID: &str = "Chain";
 
-pub(crate) const LOG_TARGET: &str = "cryptarchia::service";
+pub(crate) const LOG_TARGET: &str = "chain::service";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -124,7 +124,7 @@ pub enum ConsensusMsg<Tx> {
     },
     GetEpochState {
         slot: Slot,
-        tx: oneshot::Sender<Option<EpochState>>,
+        tx: oneshot::Sender<Result<EpochState, Error>>,
     },
     /// Apply a block to the chain,
     /// and return the tip and reorged txs if successful.
@@ -217,12 +217,16 @@ impl Cryptarchia {
         genesis_id: HeaderId,
         ledger_config: lb_ledger::Config,
         state: lb_cryptarchia_engine::State,
+        lib_slot: Slot,
+        lib_length: u64,
     ) -> Self {
         Self {
             consensus: <lb_cryptarchia_engine::Cryptarchia<_>>::from_lib(
                 lib_id,
-                ledger_config.consensus_config,
+                ledger_config.consensus_config.clone(),
                 state,
+                lib_slot,
+                lib_length,
             ),
             ledger: <lb_ledger::Ledger<_>>::new(lib_id, lib_ledger_state, ledger_config),
             genesis_id,
@@ -322,10 +326,10 @@ impl Cryptarchia {
         Ok((cryptarchia, pruned_blocks, reorged_blocks))
     }
 
-    fn epoch_state_for_slot(&self, slot: Slot) -> Option<EpochState> {
+    fn epoch_state_for_slot(&self, slot: Slot) -> Result<EpochState, Error> {
         let tip = self.tip();
         let state = self.ledger.state(&tip).expect("no state for tip");
-        state.epoch_state_for_slot(slot, self.ledger.config())
+        Ok(state.epoch_state_for_slot(slot, self.ledger.config())?)
     }
 
     /// Remove the ledger states associated with blocks that have been pruned by
@@ -420,6 +424,12 @@ pub enum StartingState {
         lib_ledger_state: Box<LedgerState>,
         genesis_id: HeaderId,
     },
+}
+
+impl From<GenesisTx> for StartingState {
+    fn from(value: GenesisTx) -> Self {
+        Self::Genesis { genesis_tx: value }
+    }
 }
 
 impl FileBackendSettings for CryptarchiaSettings {
@@ -654,16 +664,14 @@ where
             }
         };
 
-        // It sucks to use `CRYPTARCHIA_ID` when we have `<RuntimeServiceId as
+        // It sucks to use `SERVICE_ID` when we have `<RuntimeServiceId as
         // AsServiceId<Self>>::SERVICE_ID`.
         // Somehow it just does not let us use it.
         //
         // Hypothesis:
         // 1. Probably related to too many generics.
         // 2. It seems `span` requires a `const` string literal.
-        async_loop
-            .instrument(span!(Level::TRACE, CRYPTARCHIA_ID))
-            .await;
+        async_loop.instrument(span!(Level::TRACE, SERVICE_ID)).await;
 
         Ok(())
     }
@@ -794,8 +802,8 @@ where
                 });
             }
             ConsensusMsg::GetEpochState { slot, tx } => {
-                let epoch_state = cryptarchia.epoch_state_for_slot(slot);
-                tx.send(epoch_state).unwrap_or_else(|_| {
+                let result = cryptarchia.epoch_state_for_slot(slot);
+                tx.send(result).unwrap_or_else(|_| {
                     error!("Could not send epoch state through channel");
                 });
             }
@@ -894,8 +902,7 @@ where
         new_block_subscription_sender: &broadcast::Sender<ProcessedBlockEvent>,
         lib_broadcaster: &broadcast::Sender<LibUpdate>,
     ) -> Result<(Cryptarchia, PrunedBlocks<HeaderId>, Vec<Tx>), Error> {
-        debug!("received proposal {:?}", block);
-
+        debug!("Received proposal with ID: {:?}", block.header().id());
         let header = block.header();
         let prev_lib = cryptarchia.lib();
 
@@ -917,12 +924,14 @@ where
             .await
             .map_err(|e| Error::Storage(format!("Failed to store block: {e}")))?;
 
-        let immutable_blocks = pruned_blocks.immutable_blocks().clone();
-        relays
-            .storage_adapter()
-            .store_immutable_block_ids(immutable_blocks)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to store immutable block ids: {e}")))?;
+        Self::store_immutable_blocks_index(
+            &pruned_blocks,
+            Some(prev_lib),
+            new_lib,
+            cryptarchia.consensus.lib_branch().slot(),
+            relays.storage_adapter(),
+        )
+        .await?;
 
         let processed_block_event = ProcessedBlockEvent {
             block_id: header.id(),
@@ -981,6 +990,29 @@ where
         .collect();
 
         Ok((cryptarchia, pruned_blocks, reorged_txs))
+    }
+
+    /// Store immutable block IDs to storage, including the new LIB if needed.
+    /// If `prev_lib` is None, always includes the new LIB.
+    /// If `prev_lib` is Some, only includes new LIB if it changed.
+    async fn store_immutable_blocks_index(
+        pruned_blocks: &PrunedBlocks<HeaderId>,
+        prev_lib: Option<HeaderId>,
+        new_lib: HeaderId,
+        new_lib_slot: Slot,
+        storage_adapter: &StorageAdapter<Storage, Tx, RuntimeServiceId>,
+    ) -> Result<(), Error> {
+        let mut immutable_blocks = pruned_blocks.immutable_blocks().clone();
+        // The new LIB is also immutable and should be immediately queryable by slot.
+        // prune_immutable_blocks() only returns blocks older than the new LIB,
+        // so we explicitly add the new LIB here.
+        if prev_lib.is_none_or(|prev| prev != new_lib) {
+            immutable_blocks.insert(new_lib_slot, new_lib);
+        }
+        storage_adapter
+            .store_immutable_block_ids(immutable_blocks)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to store immutable block ids: {e}")))
     }
 
     /// Retrieves the blocks in the range from `from` to `to` from the storage.
@@ -1063,6 +1095,8 @@ where
             genesis_id,
             ledger_config,
             state,
+            self.state.lib_block_slot,
+            self.state.lib_block_length,
         );
 
         // We reapply blocks here instead of saving ledger states to correcly make use
@@ -1228,7 +1262,7 @@ where
                     height: tip.length(),
                 });
 
-                info!("Sending tip response: {response:?}");
+                debug!("Sending tip response: {response:?}");
                 if let Err(e) = reply_sender.send(response).await {
                     error!("Failed to send tip header: {e}");
                 }
@@ -1270,9 +1304,14 @@ where
 
         notify_chain_online_subscribers(chain_online_subscription_channel);
 
-        if let Err(e) = storage_adapter
-            .store_immutable_block_ids(pruned_blocks.immutable_blocks().clone())
-            .await
+        if let Err(e) = Self::store_immutable_blocks_index(
+            &pruned_blocks,
+            None,
+            cryptarchia.lib(),
+            cryptarchia.consensus.lib_branch().slot(),
+            storage_adapter,
+        )
+        .await
         {
             error!("Could not store immutable block IDs: {e}");
         }

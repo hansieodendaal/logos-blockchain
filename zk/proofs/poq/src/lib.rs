@@ -19,6 +19,7 @@ use lb_groth16::{
     CompressedGroth16Proof, Groth16Input, Groth16InputDeser, Groth16Proof, Groth16ProofJsonDeser,
 };
 use thiserror::Error;
+use tracing::error;
 pub use wallet_inputs::{
     AGED_NOTE_MERKLE_TREE_HEIGHT, NotePathAndSelectors, PoQWalletInputs, PoQWalletInputsData,
 };
@@ -69,7 +70,13 @@ pub fn prove(inputs: PoQWitnessInputs) -> Result<(PoQProof, PoQVerifierInput), P
         serde_json::from_slice(&verifier_inputs).map_err(ProveError::Json)?;
     let proof: Groth16Proof = proof.try_into().map_err(ProveError::Groth16JsonProof)?;
     Ok((
-        CompressedGroth16Proof::try_from(&proof).unwrap(),
+        CompressedGroth16Proof::try_from(&proof).unwrap_or_else(|e| {
+            error!("Fatal CompressedGroth16Proof::try_from: {e}");
+            // We panic here because this should never happen, and if it does, it's a
+            // critical error that we want to be immediately visible during
+            // development and testing.
+            panic!("Fatal CompressedGroth16Proof::try_from: {e}")
+        }),
         verifier_inputs
             .try_into()
             .map_err(ProveError::Groth16JsonInput)?,
@@ -113,6 +120,8 @@ pub fn verify(proof: &PoQProof, public_inputs: PoQVerifierInput) -> Result<bool,
 mod tests {
     use std::str::FromStr as _;
 
+    use lb_pol::LotteryConstants;
+    use lb_utils::math::NonNegativeRatio;
     use num_bigint::BigUint;
 
     use super::*;
@@ -210,6 +219,9 @@ mod tests {
             ]
             .map(|(value, selector)| (BigUint::from_str(value).unwrap().into(), selector)),
         };
+        let (lottery_0, lottery_1) =
+            LotteryConstants::new(NonNegativeRatio::new(1, 10.try_into().unwrap()))
+                .compute_lottery_values(5000);
         let chain_data = PoQChainInputsData {
             session: 150,
             core_root: BigUint::from_str(
@@ -227,7 +239,8 @@ mod tests {
             )
             .unwrap()
             .into(),
-            total_stake: 5000,
+            lottery_0,
+            lottery_1,
         };
         let common_data = PoQCommonInputsData {
             core_quota: 15,
@@ -259,7 +272,8 @@ mod tests {
             pol_epoch_nonce: chain_data.pol_epoch_nonce,
             pol_ledger_aged: chain_data.pol_ledger_aged,
             session: chain_data.session,
-            total_stake: chain_data.total_stake,
+            lottery_0: chain_data.lottery_0,
+            lottery_1: chain_data.lottery_1,
         };
         assert!(verify(&proof, recomputed_verify_inputs.into()).unwrap());
     }
@@ -267,6 +281,9 @@ mod tests {
     #[expect(clippy::too_many_lines, reason = "For the sake of the test let it be")]
     #[test]
     fn test_leader_full_flow() {
+        let (lottery_0, lottery_1) =
+            LotteryConstants::new(NonNegativeRatio::new(1, 10.try_into().unwrap()))
+                .compute_lottery_values(5000);
         let chain_data = PoQChainInputsData {
             session: 150,
             core_root: BigUint::from_str(
@@ -284,7 +301,8 @@ mod tests {
             )
             .unwrap()
             .into(),
-            total_stake: 5000,
+            lottery_0,
+            lottery_1,
         };
         let common_data = PoQCommonInputsData {
             core_quota: 15,
@@ -462,7 +480,8 @@ mod tests {
             pol_epoch_nonce: chain_data.pol_epoch_nonce,
             pol_ledger_aged: chain_data.pol_ledger_aged,
             session: chain_data.session,
-            total_stake: chain_data.total_stake,
+            lottery_0: chain_data.lottery_0,
+            lottery_1: chain_data.lottery_1,
         };
         assert!(verify(&proof, recomputed_verify_inputs.into()).unwrap());
     }

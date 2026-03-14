@@ -2,20 +2,30 @@ port: 4400
 n_hosts: 4
 timeout: 10
 
+faucet_settings:
+  enabled: true
+
+deployment_settings_storage_path:
+  deployment-settings.yaml
+
+entropy_file: /etc/logos-blockchain/entropy
+
+mode: Run
+
 # Tracing
 tracing_settings:
-  logger: !Loki
-    endpoint: http://loki:3100/
-    host_identifier: node
-  tracing: !Otlp
-    endpoint: http://tempo:4317/
-    sample_ratio: 0.5
-    service_name: node
-  filter: !EnvFilter
-    filters:
-      logos-blockchain: debug
-  metrics: !Otlp
-    endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
-    host_identifier: node
+  logger:
+    otlp:
+      endpoint: "http://otel:4317"
+      service_name: "init_node"
+    stdout: false
+    stderr: false
+    file:
+      directory: "./state/logs"
+    loki: null
+    gelf: null
+  tracing: None
+  filter: None
+  metrics: None
   console: None
-  level: INFO
+  level: "DEBUG"

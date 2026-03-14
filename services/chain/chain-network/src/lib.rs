@@ -38,7 +38,7 @@ use overwatch::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::oneshot;
-use tracing::{Level, debug, error, info, instrument, span};
+use tracing::{Level, debug, error, info, instrument, span, trace};
 use tracing_futures::Instrument as _;
 
 pub use crate::{
@@ -52,9 +52,9 @@ use crate::{
     sync::orphan_handler::OrphanBlocksDownloader,
 };
 
-const CRYPTARCHIA_ID: &str = "Cryptarchia";
+const SERVICE_ID: &str = "ChainNetwork";
 
-pub(crate) const LOG_TARGET: &str = "cryptarchia::service";
+pub(crate) const LOG_TARGET: &str = "chain-network::service";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -85,7 +85,7 @@ pub struct ChainNetworkSettings<NodeId, NetworkAdapterSettings>
 where
     NodeId: Clone + Eq + Hash,
 {
-    pub network_adapter_settings: NetworkAdapterSettings,
+    pub network: NetworkAdapterSettings,
     pub bootstrap: BootstrapConfig<NodeId>,
     pub sync: SyncConfig,
 }
@@ -240,7 +240,7 @@ where
         .await;
 
         let ChainNetworkSettings {
-            network_adapter_settings,
+            network: network_config,
             bootstrap: bootstrap_config,
             sync: sync_config,
         } = self
@@ -249,8 +249,7 @@ where
             .notifier()
             .get_updated_settings();
 
-        let network_adapter =
-            NetAdapter::new(network_adapter_settings, relays.network_relay().clone()).await;
+        let network_adapter = NetAdapter::new(network_config, relays.network_relay().clone()).await;
 
         let mut incoming_proposals = network_adapter.proposals_stream().await?;
         let mut chainsync_events = network_adapter.chainsync_events_stream().await?;
@@ -271,7 +270,6 @@ where
         .await?;
 
         let initial_block_download = InitialBlockDownload::new(
-            bootstrap_config.ibd,
             ChainNetworkIbdBlockProcessor::<_, Mempool, _> {
                 cryptarchia: relays.cryptarchia().clone(),
                 mempool_adapter: relays.mempool_adapter().clone(),
@@ -279,9 +277,9 @@ where
             network_adapter,
         );
 
-        match initial_block_download.run().await {
+        match initial_block_download.run(bootstrap_config.ibd).await {
             Ok(_) => {
-                info!("Initial Block Download completed successfully.");
+                info!("Initial Block Download completed successfully");
                 // Notify chain-service that IBD is complete so it can start the prolonged
                 // bootstrap timer
                 if let Err(e) = relays.cryptarchia().notify_ibd_completed().await {
@@ -289,8 +287,9 @@ where
                 }
             }
             Err(e) => {
-                error!("Initial Block Download failed: {e:?}. Initiating graceful shutdown.");
-
+                error!(
+                    "Initial Block Download failed: {e:?}. Initiating graceful shutdown. Retry with different bootstrap peers"
+                );
                 if let Err(shutdown_err) = self
                     .service_resources_handle
                     .overwatch_handle
@@ -299,11 +298,6 @@ where
                 {
                     error!("Failed to shutdown overwatch: {shutdown_err:?}");
                 }
-
-                error!(
-                    "Initial Block Download did not complete successfully: {e}. Common causes: unresponsive initial peers, \
-                network issues, or incorrect peer addresses. Consider retrying with different bootstrap peers."
-                );
 
                 return Err(DynError::from(format!(
                     "Initial Block Download failed: {e:?}"
@@ -348,7 +342,7 @@ where
                             relays.mempool_adapter(),
                         ).await {
                             Ok(()) => {
-                                info!(counter.consensus_processed_blocks = 1);
+                                trace!(counter.consensus_processed_blocks = 1);
                             }
                             Err(e) => {
                                 error!(target: LOG_TARGET, "Error processing orphan downloader block: {e:?}");
@@ -364,16 +358,14 @@ where
             }
         };
 
-        // It sucks to use `CRYPTARCHIA_ID` when we have `<RuntimeServiceId as
+        // It sucks to use `SERVICE_ID` when we have `<RuntimeServiceId as
         // AsServiceId<Self>>::SERVICE_ID`.
         // Somehow it just does not let us use it.
         //
         // Hypothesis:
         // 1. Probably related to too many generics.
         // 2. It seems `span` requires a `const` string literal.
-        async_loop
-            .instrument(span!(Level::TRACE, CRYPTARCHIA_ID))
-            .await;
+        async_loop.instrument(span!(Level::TRACE, SERVICE_ID)).await;
 
         Ok(())
     }
@@ -473,16 +465,14 @@ where
                 orphan_downloader.enqueue_orphan(block_id, info.tip, info.lib);
 
                 error!(
-                    target: LOG_TARGET,
-                    "Received block with parent {:?} that is not in the ledger state. Ignoring block.",
-                    parent
+                    target: LOG_TARGET, ?block_id, ?parent,
+                    "Parent block missing, enqueued block for orphan processing",
                 );
             }
-            other => {
+            err => {
                 error!(
-                    target: LOG_TARGET,
-                    "Error processing reconstructed block: {:?}",
-                    other
+                    target: LOG_TARGET, %err, ?block_id,
+                    "Error processing reconstructed block",
                 );
             }
         }
@@ -515,7 +505,7 @@ where
         {
             Ok(()) => {
                 orphan_downloader.remove_orphan(&block_id);
-                info!(counter.consensus_processed_blocks = 1);
+                trace!(counter.consensus_processed_blocks = 1);
             }
             Err(err) => {
                 Self::handle_proposal_processing_error(err, block_id, orphan_downloader);
@@ -616,7 +606,7 @@ where
         RecoverableMempool<BlockId = HeaderId, Key = TxHash, Item = Cryptarchia::Tx> + Send + Sync,
     RuntimeServiceId: Send + Sync,
 {
-    debug!("received proposal {:?}", block);
+    debug!("Received proposal with ID: {:?}", block.header().id());
 
     let (tip, reorged_txs) = cryptarchia.apply_block(block.clone()).await?;
 

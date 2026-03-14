@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use cucumber::World as _;
 use logos_blockchain_tests::cucumber::{
-    defaults::{init_logging_defaults, init_node_log_dir_defaults, init_tracing},
+    defaults::{
+        ARTEFACTS, SCENARIO_OUTPUT_DIR_REL, init_logging_defaults, init_node_log_dir_defaults,
+        init_tracing,
+    },
     world::{CucumberWorld, DeployerKind},
 };
 
@@ -10,12 +13,13 @@ use logos_blockchain_tests::cucumber::{
 async fn cucumber_local_idle_smoke() {
     // Required env vars (set on the command line when running this test):
     // - `LOGOS_BLOCKCHAIN_NODE_BIN=...`
-    // - `LOGOS_BLOCKCHAIN_KZGRS_PARAMS_PATH=...` (path to KZG params
-    //   directory/file, e.g. `tests/kzgrs`)
     // - `RUST_LOG=info` (optional; better visibility)
 
     init_logging_defaults();
-    init_node_log_dir_defaults(DeployerKind::Local);
+    init_node_log_dir_defaults(
+        &DeployerKind::Local,
+        Some(&PathBuf::from(SCENARIO_OUTPUT_DIR_REL).join(ARTEFACTS)),
+    );
     init_tracing();
 
     let _init_result = tracing_subscriber::fmt()

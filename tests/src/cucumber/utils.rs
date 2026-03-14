@@ -1,19 +1,24 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, time::Duration};
 
-use testing_framework_core::scenario::{Builder, ScenarioBuilder};
+use lb_testing_framework::{CoreBuilderExt as _, ScenarioBuilder};
+use tokio::time::{Instant, MissedTickBehavior};
+use tracing::{info, warn};
 
 use crate::cucumber::{
-    error::StepError,
+    error::{StepError, StepResult},
     world::{DeployerKind, NetworkKind, TopologySpec},
 };
 
+type ScenarioBuilderWith = ScenarioBuilder;
+
 #[must_use]
-pub fn make_builder(topology: TopologySpec) -> Builder<()> {
-    ScenarioBuilder::topology_with(|t| {
+pub fn make_builder(topology: &TopologySpec) -> ScenarioBuilderWith {
+    ScenarioBuilder::deployment_with(|t| {
         let base = match topology.network {
-            NetworkKind::Star => t.network_star(),
+            NetworkKind::Star => t,
         };
-        base.nodes(topology.validators.get())
+        base.nodes(topology.nodes.get())
+            .scenario_base_dir(topology.scenario_base_dir.clone())
     })
 }
 
@@ -38,6 +43,52 @@ pub fn parse_deployer(value: &str) -> Result<DeployerKind, StepError> {
 pub fn shared_host_bin_path(binary_name: &str) -> PathBuf {
     let cucumber_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     cucumber_dir.join("../assets/stack/bin").join(binary_name)
+}
+
+pub async fn track_progress<Fut>(operation: &str, interval: Duration, wait: Fut) -> StepResult
+where
+    Fut: Future<Output = StepResult>,
+{
+    info!(target: super::TARGET, "Waiting for {operation}");
+
+    let started_at = Instant::now();
+
+    let mut wait_task = Box::pin(wait);
+    let mut progress = tokio::time::interval(interval);
+
+    progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let _ = progress.tick().await;
+
+    loop {
+        tokio::select! {
+            result = &mut wait_task => {
+                result.inspect_err(|source| {
+                    warn!(
+                        target: super::TARGET,
+                        "{operation} failed after {:.2?}: {source}",
+                        started_at.elapsed()
+                    );
+                })?;
+                break;
+            }
+            _ = progress.tick() => {
+                info!(
+                    target: super::TARGET,
+                    "Still waiting for {operation} after {:.2?}",
+                    started_at.elapsed()
+                );
+            }
+        }
+    }
+
+    info!(
+        target: super::TARGET,
+        "{operation} completed in {:.2?}",
+        started_at.elapsed()
+    );
+
+    Ok(())
 }
 
 #[macro_export]

@@ -1,26 +1,51 @@
-use core::num::NonZeroU32;
+use core::num::{NonZero, NonZeroU32};
 use std::collections::HashMap;
 
 use lb_core::{
     block::BlockNumber,
+    mantle::genesis_tx::GenesisTx,
     sdp::{MinStake, ServiceType},
 };
-use lb_cryptarchia_engine::{Config as ConsensusConfig, EpochConfig};
-use lb_pol::slot_activation_coefficient;
+use lb_cryptarchia_engine::Config as ConsensusConfig;
+use lb_key_management_system_service::keys::ZkPublicKey;
+use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Settings {
     pub epoch_config: EpochConfig,
     pub security_param: NonZeroU32,
+    pub slot_activation_coeff: NonNegativeRatio,
+    pub learning_rate: NonNegativeF64,
     pub sdp_config: SdpConfig,
     pub gossipsub_protocol: String,
+    pub genesis_state: GenesisTx,
+    #[serde(default)]
+    pub faucet_pk: Option<ZkPublicKey>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochConfig {
+    // The stake distribution is always taken at the beginning of the previous epoch.
+    // This parameters controls how many slots to wait for it to be stabilized
+    // The value is computed as epoch_stake_distribution_stabilization * int(floor(k / f))
+    pub epoch_stake_distribution_stabilization: NonZero<u8>,
+    // This parameter controls how many slots we wait after the stake distribution
+    // snapshot has stabilized to take the nonce snapshot.
+    pub epoch_period_nonce_buffer: NonZero<u8>,
+    // This parameter controls how many slots we wait for the nonce snapshot to be considered
+    // stabilized
+    pub epoch_period_nonce_stabilization: NonZero<u8>,
 }
 
 impl Settings {
     #[must_use]
-    pub const fn consensus_config(&self) -> ConsensusConfig {
-        ConsensusConfig::new(self.security_param, slot_activation_coefficient())
+    pub fn consensus_config(&self) -> ConsensusConfig {
+        ConsensusConfig::new(
+            self.security_param,
+            self.slot_activation_coeff,
+            self.learning_rate,
+        )
     }
 }
 

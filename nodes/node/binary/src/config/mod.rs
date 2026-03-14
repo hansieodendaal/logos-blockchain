@@ -5,45 +5,56 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ::time::OffsetDateTime;
-use clap::{Parser, ValueEnum, builder::OsStr};
+use ::tracing::{Level, warn};
+use clap::{Parser, Subcommand, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
 use lb_banning_service::BanningService;
 use lb_libp2p::{Multiaddr, ed25519::SecretKey};
-use lb_tracing::logging::{gelf::GelfConfig, local::FileConfig};
-use lb_tracing_service::{LoggerLayer, Tracing};
-use overwatch::services::ServiceData;
 use serde::Deserialize;
-use tracing::{Level, warn};
 
-use crate::{
-    ApiService, CryptarchiaService, KeyManagementService, RuntimeServiceId, StorageService,
-    config::{
-        blend::serde::Config as BlendConfig,
-        cryptarchia::serde::Config as CryptarchiaConfig,
-        deployment::{DeploymentSettings, WellKnownDeployment},
-        mempool::serde::Config as MempoolConfig,
-        network::serde::Config as NetworkConfig,
-        time::serde::Config as TimeConfig,
-    },
-    generic_services::{SdpService, WalletService},
+use crate::config::tracing::serde::logger::{FileConfig, GelfConfig};
+pub use crate::config::{
+    api::serde::Config as ApiConfig,
+    blend::serde::Config as BlendConfig,
+    cryptarchia::serde::Config as CryptarchiaConfig,
+    deployment::{DeploymentSettings, WellKnownDeployment},
+    kms::serde::Config as KmsConfig,
+    network::serde::Config as NetworkConfig,
+    sdp::serde::Config as SdpConfig,
+    state::Config as StateConfig,
+    storage::serde::Config as StorageConfig,
+    time::serde::Config as TimeConfig,
+    tracing::serde::Config as TracingConfig,
+    wallet::serde::Config as WalletConfig,
 };
 
+pub mod api;
 pub mod blend;
 pub mod cryptarchia;
 pub mod deployment;
+pub mod kms;
 pub mod mempool;
 pub mod network;
+pub mod sdp;
+pub mod state;
+pub mod storage;
 pub mod time;
+pub mod tracing;
+pub mod wallet;
 
 #[cfg(test)]
 mod tests;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about, long_about = None,
+          args_conflicts_with_subcommands = true,
+          subcommand_negates_reqs = true)]
 pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Path for a yaml-encoded network config file
-    config: PathBuf,
+    config: Option<PathBuf>,
     /// Dry-run flag. If active, the binary will try to deserialize the config
     /// file and then exit.
     #[clap(long = "check-config", action)]
@@ -59,17 +70,75 @@ pub struct CliArgs {
     blend: BlendArgs,
     /// Overrides http config.
     #[clap(flatten)]
-    http: HttpArgs,
-    #[clap(flatten)]
-    time: TimeArgs,
+    api: ApiArgs,
     #[clap(flatten)]
     deployment: DeploymentArgs,
+    #[clap(flatten)]
+    state: StateArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Initialize a new user config with generated keys
+    #[cfg(feature = "config-gen")]
+    Init(InitArgs),
+    /// Publish text inscriptions as zone blocks
+    Inscribe(logos_blockchain_tui_zone::InscribeArgs),
+}
+
+#[cfg(feature = "config-gen")]
+#[derive(Parser, Debug)]
+pub struct InitArgs {
+    /// Trusted peers to bootstrap from (multiaddr format)
+    #[clap(long = "initial-peers", short = 'p', num_args = 1.., value_delimiter = ',')]
+    pub initial_peers: Vec<Multiaddr>,
+
+    /// Output file path for the generated config
+    #[clap(long = "output", short = 'o', default_value = "user_config.yaml")]
+    pub output: PathBuf,
+
+    /// Network listen port
+    #[clap(long = "net-port", default_value = "3000")]
+    pub net_port: u16,
+
+    /// Blend listen port
+    #[clap(long = "blend-port", default_value = "3400")]
+    pub blend_port: u16,
+
+    /// HTTP API listen address
+    #[clap(long = "http-addr", default_value = "0.0.0.0:8080")]
+    pub http_addr: SocketAddr,
+
+    /// External address for nodes with a known public IP (disables NAT
+    /// traversal). Format: /ip4/<public-ip>/udp/<port>/quic-v1
+    #[clap(long = "external-address")]
+    pub external_address: Option<Multiaddr>,
+
+    /// Skip automatic public IP detection
+    #[clap(long = "no-public-ip-check")]
+    pub no_public_ip_check: bool,
+
+    /// Deployment configuration (well-known name or path to custom config)
+    #[clap(long = "deployment", default_value = DeploymentType::default())]
+    pub deployment: DeploymentType,
+
+    #[clap(long = "state-path")]
+    pub state_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "config-gen")]
+impl Default for InitArgs {
+    fn default() -> Self {
+        Self::parse_from::<Vec<String>, String>(vec![])
+    }
 }
 
 impl CliArgs {
     #[must_use]
     pub fn config_path(&self) -> &Path {
-        &self.config
+        self.config
+            .as_deref()
+            .expect("config path is required when not using a subcommand")
     }
 
     #[must_use]
@@ -160,43 +229,18 @@ pub struct BlendArgs {
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct HttpArgs {
+pub struct ApiArgs {
     #[clap(long = "http-host", env = "HTTP_HOST")]
-    pub http_addr: Option<SocketAddr>,
+    pub addr: Option<SocketAddr>,
 
     #[clap(long = "http-cors-origin", env = "HTTP_CORS_ORIGIN")]
     pub cors_origins: Option<Vec<String>>,
 }
 
 #[derive(Parser, Debug, Clone)]
-pub struct TimeArgs {
-    #[clap(
-        long = "consensus-chain-start",
-        env = "CONSENSUS_CHAIN_START",
-        group = "start_time"
-    )]
-    chain_start_time: Option<i64>,
-    #[clap(long = "dev-mode-reset-chain-clock", group = "start_time")]
-    dev_mode_reset_chain_clock: bool,
-}
-
-pub enum ChainStartMode {
-    FromEnv(i64),
-    FromConfig,
-    Now,
-}
-
-impl TimeArgs {
-    #[must_use]
-    pub const fn to_mode(&self) -> ChainStartMode {
-        if self.dev_mode_reset_chain_clock {
-            ChainStartMode::Now
-        } else if let Some(ts) = self.chain_start_time {
-            ChainStartMode::FromEnv(ts)
-        } else {
-            ChainStartMode::FromConfig
-        }
-    }
+pub struct StateArgs {
+    #[clap(long = "state-path", env = "STATE_PATH")]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -259,42 +303,56 @@ impl FromStr for DeploymentType {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-#[cfg_attr(feature = "testing", derive(serde::Serialize))]
+#[cfg_attr(
+    any(feature = "testing", feature = "config-gen"),
+    derive(serde::Serialize)
+)]
 pub struct UserConfig {
+    #[serde(default)]
     pub network: NetworkConfig,
     pub blend: BlendConfig,
     pub cryptarchia: CryptarchiaConfig,
+    #[serde(default)]
     pub time: TimeConfig,
-    pub mempool: MempoolConfig,
-
-    pub tracing: <Tracing<RuntimeServiceId> as ServiceData>::Settings,
-    pub sdp: <SdpService<RuntimeServiceId> as ServiceData>::Settings,
-    pub http: <ApiService as ServiceData>::Settings,
-    pub storage: <StorageService as ServiceData>::Settings,
-    pub key_management: <KeyManagementService as ServiceData>::Settings,
-    pub wallet: <WalletService<CryptarchiaService, RuntimeServiceId> as ServiceData>::Settings,
+    pub sdp: SdpConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub kms: KmsConfig,
+    pub wallet: WalletConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+    #[serde(default)]
+    pub state: StateConfig,
+    #[serde(default)]
     pub banning: <BanningService<RuntimeServiceId> as ServiceData>::Settings,
+}
 
-    #[cfg(feature = "testing")]
-    pub testing_http: <ApiService as ServiceData>::Settings,
+pub struct RequiredValues {
+    pub blend: BlendConfig,
+    pub cryptarchia: CryptarchiaConfig,
+    pub sdp: SdpConfig,
+    pub wallet: WalletConfig,
 }
 
 impl UserConfig {
     pub fn update_from_args(mut self, args: CliArgs) -> Result<RunConfig> {
         let CliArgs {
             log: log_args,
-            http: http_args,
+            api: api_args,
             network: network_args,
             blend: blend_args,
-            time: time_args,
             deployment: deployment_args,
+            state: state_args,
             ..
         } = args;
         update_tracing(&mut self.tracing, log_args)?;
         update_network(&mut self.network, network_args)?;
-        update_blend(&mut self.blend, blend_args)?;
-        update_http(&mut self.http, http_args)?;
-        update_time(&mut self.time, &time_args)?;
+        update_blend(&mut self.blend, blend_args);
+        update_api(&mut self.api, api_args);
+        update_state(&mut self.state, state_args);
 
         let deployment_settings = match deployment_args.deployment_type() {
             DeploymentType::WellKnown(well_known_deployment) => (*well_known_deployment).into(),
@@ -311,12 +369,27 @@ impl UserConfig {
             user: self,
         })
     }
+
+    #[must_use]
+    pub fn with_required_values(required_values: RequiredValues) -> Self {
+        Self {
+            blend: required_values.blend,
+            cryptarchia: required_values.cryptarchia,
+            sdp: required_values.sdp,
+            wallet: required_values.wallet,
+
+            api: ApiConfig::default(),
+            kms: KmsConfig::default(),
+            network: NetworkConfig::default(),
+            state: StateConfig::default(),
+            storage: StorageConfig::default(),
+            time: TimeConfig::default(),
+            tracing: TracingConfig::default(),
+        }
+    }
 }
 
-pub fn update_tracing(
-    tracing: &mut <Tracing<RuntimeServiceId> as ServiceData>::Settings,
-    tracing_args: LogArgs,
-) -> Result<()> {
+pub fn update_tracing(tracing: &mut TracingConfig, tracing_args: LogArgs) -> Result<()> {
     let LogArgs {
         backend,
         log_addr: addr,
@@ -325,32 +398,41 @@ pub fn update_tracing(
         level,
     } = tracing_args;
 
-    // Override the file config with the one from env variables.
-    if let Some(backend) = backend {
-        tracing.logger = match backend {
-            LoggerLayerType::Gelf => LoggerLayer::Gelf(GelfConfig {
-                addr: addr
-                    .ok_or_else(|| eyre!("Gelf backend requires an address."))?
-                    .to_socket_addrs()?
-                    .next()
-                    .ok_or_else(|| eyre!("Invalid gelf address"))?,
-            }),
-            LoggerLayerType::File => LoggerLayer::File(FileConfig {
-                directory: directory.ok_or_else(|| eyre!("File backend requires a directory."))?,
-                prefix,
-            }),
-            LoggerLayerType::Stdout => LoggerLayer::Stdout,
-            LoggerLayerType::Stderr => LoggerLayer::Stderr,
+    if let Some(backend_type) = backend {
+        match backend_type {
+            LoggerLayerType::Gelf => {
+                tracing.logger.gelf = Some(GelfConfig {
+                    addr: addr
+                        .ok_or_else(|| eyre!("Gelf backend requires an address."))?
+                        .to_socket_addrs()?
+                        .next()
+                        .ok_or_else(|| eyre!("Invalid gelf address"))?,
+                });
+            }
+            LoggerLayerType::File => {
+                tracing.logger.file = Some(FileConfig {
+                    directory: directory
+                        .ok_or_else(|| eyre!("File backend requires a directory."))?,
+                    prefix,
+                });
+            }
+            LoggerLayerType::Stdout => {
+                tracing.logger.stdout = true;
+            }
+            LoggerLayerType::Stderr => {
+                tracing.logger.stderr = true;
+            }
         }
     }
 
     if let Some(level_str) = level {
-        tracing.level = match level_str.as_str() {
+        tracing.level = match level_str.to_uppercase().as_str() {
+            "TRACE" => Level::TRACE,
             "DEBUG" => Level::DEBUG,
             "INFO" => Level::INFO,
             "ERROR" => Level::ERROR,
             "WARN" => Level::WARN,
-            _ => return Err(eyre!("Invalid log level provided.")),
+            _ => return Err(eyre!("Invalid log level provided: {}", level_str)),
         };
     }
     Ok(())
@@ -386,47 +468,32 @@ pub fn update_network(network: &mut NetworkConfig, network_args: NetworkArgs) ->
     Ok(())
 }
 
-pub fn update_blend(blend: &mut BlendConfig, blend_args: BlendArgs) -> Result<()> {
+pub fn update_blend(blend: &mut BlendConfig, blend_args: BlendArgs) {
     let BlendArgs { blend_addr } = blend_args;
 
     if let Some(addr) = blend_addr {
         blend.set_listening_address(addr);
     }
-
-    Ok(())
 }
 
-pub fn update_http(
-    http: &mut <ApiService as ServiceData>::Settings,
-    http_args: HttpArgs,
-) -> Result<()> {
-    let HttpArgs {
-        http_addr,
-        cors_origins,
-    } = http_args;
+pub fn update_api(api: &mut ApiConfig, args: ApiArgs) {
+    let ApiArgs { addr, cors_origins } = args;
 
-    if let Some(addr) = http_addr {
-        http.backend_settings.address = addr;
+    if let Some(addr) = addr {
+        api.backend.listen_address = addr;
     }
 
     if let Some(cors) = cors_origins {
-        http.backend_settings.cors_origins = cors;
+        api.backend.cors_origins = cors;
     }
-
-    Ok(())
 }
 
-pub fn update_time(time: &mut TimeConfig, time_args: &TimeArgs) -> Result<()> {
-    match time_args.to_mode() {
-        ChainStartMode::Now => {
-            time.chain_start_time = OffsetDateTime::now_utc();
-        }
-        ChainStartMode::FromEnv(ts) => {
-            time.chain_start_time = OffsetDateTime::from_unix_timestamp(ts)?;
-        }
-        ChainStartMode::FromConfig => {}
+pub fn update_state(state: &mut StateConfig, args: StateArgs) {
+    let StateArgs { path } = args;
+
+    if let Some(path) = path {
+        state.base_folder = path;
     }
-    Ok(())
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -1,14 +1,22 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use lb_tests::nodes::validator::create_validator_config;
-use lb_tracing_service::TracingSettings;
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::State,
+    http::{Response, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use lb_node::config::TracingConfig;
+use lb_tests::nodes::create_validator_config;
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
+use time::OffsetDateTime;
 use tokio::sync::oneshot::channel;
 
 use crate::{
-    Host, RegistrationInfo,
+    CfgsyncMode, FaucetSettings, Host, RegistrationInfo,
     repo::{ConfigRepo, RepoResponse},
 };
 
@@ -17,9 +25,15 @@ pub struct CfgSyncConfig {
     pub port: u16,
     pub n_hosts: usize,
     pub timeout: u64,
+    pub chain_start_time: Option<OffsetDateTime>,
+    pub deployment_settings_storage_path: PathBuf,
+    pub entropy_file: PathBuf,
 
+    pub mode: CfgsyncMode,
+
+    pub faucet_settings: FaucetSettings,
     // Tracing params
-    pub tracing_settings: TracingSettings,
+    pub tracing_settings: TracingConfig,
 }
 
 impl CfgSyncConfig {
@@ -31,8 +45,13 @@ impl CfgSyncConfig {
     }
 
     #[must_use]
-    pub fn to_tracing_settings(&self) -> TracingSettings {
+    pub fn tracing_settings(&self) -> TracingConfig {
         self.tracing_settings.clone()
+    }
+
+    #[must_use]
+    pub fn faucet_settings(&self) -> FaucetSettings {
+        self.faucet_settings.clone()
     }
 }
 
@@ -46,8 +65,9 @@ async fn init_node(
     (reply_rx.await).map_or_else(
         |_| (StatusCode::INTERNAL_SERVER_ERROR, "Error receiving config").into_response(),
         |config_response| match config_response {
-            RepoResponse::Config(config) => {
-                let config = create_validator_config(*config);
+            RepoResponse::Config(response) => {
+                let (config, deployment_settings) = *response;
+                let config = create_validator_config(config, deployment_settings);
                 (StatusCode::OK, Json(config)).into_response()
             }
             RepoResponse::Timeout => (StatusCode::REQUEST_TIMEOUT).into_response(),
@@ -55,32 +75,38 @@ async fn init_node(
     )
 }
 
-async fn generate_config(
-    State(repo): State<Arc<ConfigRepo>>,
-    Json(info): Json<RegistrationInfo>,
-) -> impl IntoResponse {
-    let host = Host::from(info);
-
-    repo.append(host).map_or_else(
-        || {
-            (
-                StatusCode::BAD_REQUEST,
-                "Network not initialized. Initial nodes must sync first.",
-            )
-                .into_response()
-        },
-        |cfg| {
-            let node_config = create_validator_config(cfg);
-            let yaml = serde_yaml::to_string(&node_config).unwrap_or_default();
-
-            (StatusCode::OK, [(CONTENT_TYPE, "text/yaml")], yaml).into_response()
-        },
+async fn handle_mode_error() -> (StatusCode, &'static str) {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        "Setup is disabled: Server is in Read-Only mode.",
     )
 }
 
-pub fn cfgsync_app(config_repo: Arc<ConfigRepo>) -> Router {
-    Router::new()
-        .route("/init-with-node", post(init_node))
-        .route("/generate-config", post(generate_config))
-        .with_state(config_repo)
+async fn deployment_settings(State(repo): State<Arc<ConfigRepo>>) -> impl IntoResponse {
+    match tokio::fs::read(&repo.deployment_settings_storage_path).await {
+        Ok(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/yaml")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(e) => {
+            eprintln!("Failed to read deployment file: {e}");
+            (StatusCode::NOT_FOUND, "Deployment file not found").into_response()
+        }
+    }
+}
+
+pub fn cfgsync_app(config_repo: Arc<ConfigRepo>, mode: CfgsyncMode) -> Router {
+    let mut router = Router::new().route("/deployment-settings", get(deployment_settings));
+
+    match mode {
+        CfgsyncMode::Setup => {
+            router = router.route("/init-with-node", post(init_node));
+        }
+        CfgsyncMode::Run => {
+            router = router.route("/init-with-node", post(handle_mode_error));
+        }
+    }
+
+    router.with_state(config_repo)
 }

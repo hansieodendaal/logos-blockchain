@@ -21,7 +21,8 @@ workspace = true
 
 [dependencies]
 async-trait                      = "0.1"
-clap                             = { default-features = false, features = ["derive", "env", "std", "string"], version = "4" }
+cfg-if                           = { workspace = true }
+clap                             = { default-features = false, features = ["derive", "env", "help", "std", "string"], version = "4" }
 color-eyre                       = { default-features = false, version = "0.6.0" }
 futures                          = { default-features = false, version = "0.3" }
 hex                              = { default-features = false, version = "0.4.3" }
@@ -34,7 +35,7 @@ lb-chain-broadcast-service       = { workspace = true }
 lb-chain-leader-service          = { workspace = true }
 lb-chain-network-service         = { features = ["libp2p"], workspace = true }
 lb-chain-service                 = { workspace = true }
-lb-core                          = { workspace = true }
+lb-core                          = { features = ["mock"], workspace = true }
 lb-cryptarchia-engine            = { workspace = true }
 lb-groth16                       = { workspace = true }
 lb-http-api-common               = { workspace = true }
@@ -52,9 +53,13 @@ lb-time-service                  = { features = ["ntp", "serde"], workspace = tr
 lb-tracing                       = { workspace = true }
 lb-tracing-service               = { workspace = true }
 lb-tx-service                    = { features = ["rocksdb-backend"], workspace = true }
-lb-utils                         = { features = ["serde"], workspace = true }
+lb-utils                         = { features = ["serde", "time"], workspace = true }
 lb-wallet-service                = { workspace = true }
+libp2p                           = { features = ["autonat", "gossipsub", "identify", "kad", "macros"], workspace = true }
+logos-blockchain-tui-zone        = { path = "../../../testnet/tui-zone" }
+num-bigint                       = { default-features = false, version = "0.4" }
 overwatch                        = { workspace = true }
+rand                             = { workspace = true }
 serde                            = { workspace = true }
 serde_ignored                    = { workspace = true }
 serde_json                       = { workspace = true }
@@ -64,6 +69,7 @@ thiserror                        = { workspace = true }
 tokio                            = "1"
 tokio-stream                     = { default-features = false, version = "0.1" }
 tracing                          = { workspace = true }
+url                              = { default-features = false, version = "2.5.8" }
 
 # openapi related dependencies
 utoipa = { workspace = true }
@@ -76,8 +82,12 @@ time       = { default-features = false, version = "0.3" }
 tower      = { default-features = false, features = ["limit"], version = "0.4" }
 tower-http = { default-features = false, features = ["cors", "limit", "timeout", "trace"], version = "0.5" }
 
+[dev-dependencies]
+rand = { workspace = true }
+
 [features]
-default         = ["tracing"]
+config-gen      = ["lb-key-management-system-service/unsafe"]
+default         = ["config-gen", "tracing"]
 instrumentation = []
 profiling       = ["lb-http-api-common/profiling", "lb-tracing-service/profiling"]
 testing         = ["lb-key-management-system-service/unsafe"]

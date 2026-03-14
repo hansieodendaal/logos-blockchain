@@ -331,7 +331,7 @@ mod tests {
     };
     use lb_cryptarchia_engine::EpochConfig;
     use lb_ledger::mantle::sdp::{ServiceRewardsParameters, rewards};
-    use lb_utils::math::NonNegativeF64;
+    use lb_utils::math::{NonNegativeF64, NonNegativeRatio};
     use num_bigint::BigUint;
 
     use super::*;
@@ -680,7 +680,11 @@ mod tests {
                 epoch_period_nonce_buffer: NonZero::new(1).unwrap(),
                 epoch_period_nonce_stabilization: NonZero::new(1).unwrap(),
             },
-            consensus_config: lb_cryptarchia_engine::Config::new(NonZero::new(1).unwrap(), 1.0),
+            consensus_config: lb_cryptarchia_engine::Config::new(
+                NonZero::new(1).unwrap(),
+                NonNegativeRatio::new(1, 10.try_into().unwrap()),
+                1f64.try_into().expect("1 > 0"),
+            ),
             sdp_config: lb_ledger::mantle::sdp::Config {
                 service_params: Arc::new(
                     [(
@@ -710,6 +714,7 @@ mod tests {
                     timestamp: 0,
                 },
             },
+            faucet_pk: None,
         }
     }
 }

@@ -1,48 +1,50 @@
-use lb_tracing::{
-    logging::loki::LokiConfig, metrics::otlp::OtlpMetricsConfig, tracing::otlp::OtlpTracingConfig,
-};
-use lb_tracing_service::{
-    ConsoleLayer, FilterLayer, LoggerLayer, MetricsLayer, TracingLayer, TracingSettings,
-};
-use tracing::Level;
+use lb_node::config::tracing::serde as tracing;
 
 use crate::IS_DEBUG_TRACING;
 
 #[derive(Clone, Default)]
 pub struct GeneralTracingConfig {
-    pub tracing_settings: TracingSettings,
+    pub tracing_settings: tracing::Config,
 }
 
 impl GeneralTracingConfig {
     fn local_debug_tracing(id: usize) -> Self {
         let host_identifier = format!("node-{id}");
         Self {
-            tracing_settings: TracingSettings {
-                logger: LoggerLayer::Loki(LokiConfig {
-                    endpoint: "http://localhost:3100".try_into().unwrap(),
-                    host_identifier: host_identifier.clone(),
-                }),
-                tracing: TracingLayer::Otlp(OtlpTracingConfig {
+            tracing_settings: tracing::Config {
+                logger: tracing::logger::Layers {
+                    otlp: Some(tracing::logger::OtlpConfig {
+                        endpoint: "http://localhost:3100".try_into().unwrap(),
+                        service_name: host_identifier.clone(),
+                    }),
+                    stdout: true,
+                    file: None,
+                    gelf: None,
+                    loki: None,
+                    stderr: false,
+                },
+                tracing: tracing::tracing::Layer::Otlp(tracing::tracing::OtlpConfig {
                     endpoint: "http://localhost:4317".try_into().unwrap(),
                     sample_ratio: 0.5,
                     service_name: host_identifier.clone(),
                 }),
-                filter: FilterLayer::EnvFilter(lb_tracing::filter::envfilter::EnvFilterConfig {
-                    // Allow events only from modules that matches the regex, if it matches - use
-                    // provided tracing level. Libp2p related crates are very log intensive in debug
-                    // mode.
-                    filters: std::iter::once(&("logos-blockchain", "debug"))
+                filter: tracing::filter::Layer::Env(tracing::filter::EnvConfig {
+                    // Allow events only from modules that matches the regex, if it matches -
+                    // use provided tracing level. Libp2p related crates
+                    // are very log intensive in debug mode.
+                    filters: [("logos-blockchain", "debug"), ("libp2p", "debug")]
+                        .into_iter()
                         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                         .collect(),
                 }),
-                metrics: MetricsLayer::Otlp(OtlpMetricsConfig {
+                metrics: tracing::metrics::Layer::Otlp(tracing::metrics::OtlpConfig {
                     endpoint: "http://127.0.0.1:9090/api/v1/otlp/v1/metrics"
                         .try_into()
                         .unwrap(),
                     host_identifier,
                 }),
-                console: ConsoleLayer::None,
-                level: Level::DEBUG,
+                console: tracing::console::Layer::None,
+                level: tracing::Level::DEBUG,
             },
         }
     }

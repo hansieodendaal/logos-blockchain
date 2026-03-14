@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use tokio::time::{Interval, MissedTickBehavior};
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
 pub struct Slot(u64);
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -27,6 +27,11 @@ impl Epoch {
     #[must_use]
     pub const fn into_inner(self) -> u32 {
         self.0
+    }
+
+    #[must_use]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
     }
 }
 

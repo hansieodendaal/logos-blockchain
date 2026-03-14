@@ -1,5 +1,6 @@
 pub use identify::Settings as IdentifySettings;
-pub use kademlia::Settings as KademliaSettings;
+pub use kademlia::{CachingSettings, KBucketInserts, Settings as KademliaSettings};
+pub use lb_cryptarchia_sync::Config as ChainSyncSettings;
 use libp2p::identity::ed25519;
 pub use nat::{
     Settings as NatSettings, TraversalSettings, autonat_client::Settings as AutonatClientSettings,
@@ -45,7 +46,7 @@ pub struct SwarmConfig {
 
     /// Chain sync config
     #[serde(default)]
-    pub chain_sync_config: lb_cryptarchia_sync::Config,
+    pub chain_sync_config: ChainSyncSettings,
 
     /// Nat config
     #[serde(default)]
@@ -91,7 +92,7 @@ mod tests {
                 chain_sync_protocol_name: StreamProtocol::new("/chainsync/test"),
                 kademlia_config: kademlia::Settings::default(),
                 identify_config: identify::Settings::default(),
-                chain_sync_config: lb_cryptarchia_sync::Config::default(),
+                chain_sync_config: ChainSyncSettings::default(),
                 nat_config: nat::Settings::default(),
             }
         }
