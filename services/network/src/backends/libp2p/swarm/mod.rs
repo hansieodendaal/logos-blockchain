@@ -16,7 +16,7 @@ macro_rules! log_error {
 use std::{collections::HashMap, time::Duration};
 
 use lb_libp2p::{
-    DialOpts, Multiaddr, PeerId, Swarm, SwarmEvent,
+    DialOpts, Multiaddr, PeerId, Protocol, Swarm, SwarmEvent,
     behaviour::BehaviourEvent,
     libp2p::{kad::QueryId, swarm::ConnectionId},
 };
@@ -582,8 +582,15 @@ mod tests {
 
         let config = create_libp2p_config(vec![], get_available_udp_port().unwrap());
 
-        let mut handler =
-            SwarmHandler::new(config, tx, rx, pubsub_events_tx, chainsync_events_tx, OsRng);
+        let mut handler = SwarmHandler::new(
+            config,
+            tx,
+            rx,
+            pubsub_events_tx,
+            chainsync_events_tx,
+            OsRng,
+            None,
+        );
 
         let remote_peer = PeerId::random();
         let remote_addr = format!(

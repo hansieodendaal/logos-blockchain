@@ -476,7 +476,7 @@ where
                 RuntimeServiceId,
             >,
         >,
-    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + 'static,
 {
     make_request_and_return_response!(lb_api_service::http::sdp::post_withdrawal_handler::<
         MempoolAdapter,
