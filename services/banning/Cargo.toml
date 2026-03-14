@@ -14,10 +14,10 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-lb-utils    = { workspace = true, features = ["time"] }
-libp2p      = { workspace = true, features = ["serde"] }
+lb-utils    = { features = ["time"], workspace = true }
+libp2p      = { features = ["serde"], workspace = true }
 overwatch   = { workspace = true }
-serde       = { workspace = true, features = ["derive"] }
-serde_with  = { workspace = true }
-tokio       = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+serde       = { features = ["derive"], workspace = true }
+serde_with  = { features = ["macros"], workspace = true }
+tokio       = { features = ["macros", "rt", "sync", "time"], workspace = true }
 tracing     = { workspace = true }

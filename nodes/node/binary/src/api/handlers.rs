@@ -645,6 +645,7 @@ pub mod wallet {
                     RuntimeServiceId,
                 >,
             >,
+        RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
     {
         let wallet_api = {
             let wallet_relay = match get_relay_or_500::<WalletService, _>(&handle).await {

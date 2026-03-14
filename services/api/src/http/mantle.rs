@@ -2,8 +2,9 @@ use core::fmt::Debug;
 use std::{fmt::Display, num::NonZeroUsize, ops::RangeInclusive};
 
 use bytes::Bytes;
-use lb_banning_service::BanningService;use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use futures::{Stream, StreamExt as _, future::join_all};
+use lb_banning_service::BanningService;
+use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use lb_chain_service::{
     ConsensusMsg, ProcessedBlockEvent, Slot,
     storage::{StorageAdapter as _, adapters::StorageAdapter},

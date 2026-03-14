@@ -150,7 +150,6 @@ where
         + AsServiceId<WalletService>
         + AsServiceId<ChainLeader>,
     RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
-
 {
     type Error = std::io::Error;
     type Settings = AxumBackendSettings;

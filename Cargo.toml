@@ -84,9 +84,9 @@ resolver = "2"
 
 [workspace.dependencies]
 # Internal
-lb-api-service                   = { default-features = false, package = "logos-blockchain-api-service", path = "./services/api" }
-lb-banning-service               = { default-features = false, path = "./services/banning", package = "logos-blockchain-banning-service" }
-lb-blend-crypto                  = { default-features = false, package = "logos-blockchain-blend", path = "./blend/core" }
+lb-api-service                     = { default-features = false, package = "logos-blockchain-api-service", path = "./services/api" }
+lb-banning-service                 = { default-features = false, package = "logos-blockchain-banning-service", path = "./services/banning" }
+lb-blend                           = { default-features = false, package = "logos-blockchain-blend", path = "./blend/core" }
 lb-blend-crypto                    = { default-features = false, package = "logos-blockchain-blend-crypto", path = "./blend/crypto" }
 lb-blend-message                   = { default-features = false, package = "logos-blockchain-blend-message", path = "./blend/message" }
 lb-blend-network                   = { default-features = false, package = "logos-blockchain-blend-network", path = "./blend/network" }
