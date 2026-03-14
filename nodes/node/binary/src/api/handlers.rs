@@ -110,6 +110,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::mantle_mempool_metrics::<
         StorageAdapter,
@@ -123,6 +124,7 @@ pub async fn get_sdp_declarations<RuntimeServiceId>(
 where
     RuntimeServiceId:
         Debug + Send + Sync + Display + 'static + AsServiceId<Cryptarchia<RuntimeServiceId>>,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::get_sdp_declarations::<RuntimeServiceId>(&handle))
 }
@@ -172,6 +174,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mantle::mantle_mempool_status::<
         StorageAdapter,
@@ -239,6 +242,7 @@ pub async fn cryptarchia_lib_stream<RuntimeServiceId>(
 where
     RuntimeServiceId:
         Debug + Sync + Display + AsServiceId<BlockBroadcastService<RuntimeServiceId>> + 'static,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     let stream = mantle::lib_block_stream(&handle).await;
     match stream {
@@ -269,6 +273,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>> + Send,
 {
     make_request_and_return_response!(libp2p::libp2p_info::<RuntimeServiceId>(&handle))
 }
@@ -342,6 +347,7 @@ where
                 RuntimeServiceId,
             >,
         >,
+    RuntimeServiceId: AsServiceId<BanningService<RuntimeServiceId>>,
 {
     make_request_and_return_response!(mempool::add_tx::<
         Libp2pNetworkBackend,
