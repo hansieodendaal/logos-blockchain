@@ -39,8 +39,9 @@ use utoipa::OpenApi as _;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::handlers::{
-    add_tx, block, blocks, blocks_stream, cryptarchia_headers, cryptarchia_info,
-    cryptarchia_lib_stream, libp2p_info, mantle_metrics, mantle_status, wallet,
+    add_tx, block, blocks, blocks_stream, channel_inscriptions, channel_inscriptions_stream,
+    cryptarchia_headers, cryptarchia_info, cryptarchia_lib_stream, libp2p_info, mantle_metrics,
+    mantle_status, wallet,
 };
 use crate::{
     WalletService,
@@ -280,6 +281,22 @@ where
         let app = app.route(
             paths::BLOCKS,
             routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
+        );
+
+        let app = app.route(
+            paths::CHANNEL_INSCRIPTIONS,
+            routing::get(channel_inscriptions::<BlockStorageBackend, RuntimeServiceId>),
+        );
+
+        let app = app.route(
+            paths::CHANNEL_INSCRIPTIONS_STREAM,
+            routing::get(
+                channel_inscriptions_stream::<
+                    BlockStorageBackend,
+                    CryptarchiaConsensus<_, _, _, _>,
+                    RuntimeServiceId,
+                >,
+            ),
         );
 
         let app = app

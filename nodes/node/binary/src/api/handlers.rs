@@ -1,4 +1,7 @@
-use std::fmt::{Debug, Display};
+use std::{
+    collections::HashSet,
+    fmt::{Debug, Display},
+};
 
 use axum::{
     Json,
@@ -6,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse as _, Response},
 };
-use futures::FutureExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use lb_api_service::http::{
     DynError,
     consensus::{self, Cryptarchia},
@@ -15,16 +18,27 @@ use lb_api_service::http::{
 };
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
-use lb_chain_service::ConsensusMsg;
+use lb_chain_service::{
+    ConsensusMsg,
+    storage::{StorageAdapter as _, adapters::StorageAdapter as ChainStorageAdapter},
+};
 use lb_core::{
     block::Block,
     header::HeaderId,
-    mantle::{SignedMantleTx, Transaction},
+    mantle::{
+        SignedMantleTx, Transaction,
+        ops::{Op, channel::ChannelId},
+    },
 };
 use lb_http_api_common::{
-    bodies::wallet::{
-        balance::WalletBalanceResponseBody,
-        transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
+    bodies::{
+        channel_inscriptions::{
+            ChannelInscriptionItem, ChannelInscriptionsResponseBody, ChannelInscriptionsStreamEvent,
+        },
+        wallet::{
+            balance::WalletBalanceResponseBody,
+            transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
+        },
     },
     paths,
 };
@@ -44,11 +58,10 @@ use overwatch::{
     services::{AsServiceId, ServiceData},
 };
 use serde::{Deserialize, Serialize};
-use tokio_stream::StreamExt as _;
 
 use crate::api::{
     openapi::schema,
-    queries::BlockRangeQuery,
+    queries::{BlockRangeQuery, ChannelInscriptionsQuery, ChannelInscriptionsStreamQuery},
     responses::{self, overwatch::get_relay_or_500},
     serializers::blocks::{ApiBlock, ApiProcessedBlockEvent},
 };
@@ -495,6 +508,130 @@ where
     make_request_and_return_response!(consensus::leader::claim(&handle))
 }
 
+fn collect_channel_inscription_items(
+    block: &Block<SignedMantleTx>,
+    channel_id: ChannelId,
+    include_inscription: bool,
+) -> Vec<ChannelInscriptionItem> {
+    let header = block.header();
+    let header_id = header.id();
+    let parent_block = header.parent_block();
+    let slot: u64 = header.slot().into();
+    let mut items = Vec::new();
+
+    for tx in block.transactions() {
+        let tx_hash = tx.mantle_tx.hash();
+        for op in &tx.mantle_tx.ops {
+            if let Op::ChannelInscribe(inscribe) = op
+                && inscribe.channel_id == channel_id
+            {
+                items.push(ChannelInscriptionItem {
+                    channel_id,
+                    header_id,
+                    parent_block,
+                    slot,
+                    tx_hash,
+                    parent_msg_id: inscribe.parent,
+                    this_msg_id: inscribe.id(),
+                    inscription: include_inscription.then_some(inscribe.inscription.clone()),
+                });
+            }
+        }
+    }
+
+    items
+}
+
+fn channel_stream_events_for_block(
+    block: &Block<SignedMantleTx>,
+    channel_id: ChannelId,
+    include_inscription: bool,
+) -> Vec<ChannelInscriptionsStreamEvent> {
+    collect_channel_inscription_items(block, channel_id, include_inscription)
+        .into_iter()
+        .map(|item| ChannelInscriptionsStreamEvent::InscriptionObserved { item })
+        .collect()
+}
+
+async fn fetch_canonical_bootstrap_blocks<StorageBackend, RuntimeServiceId>(
+    handle: &OverwatchHandle<RuntimeServiceId>,
+    from_slot: usize,
+    tip_id: HeaderId,
+    lib_id: HeaderId,
+    live_tip_block: &Block<SignedMantleTx>,
+) -> Result<Vec<Block<SignedMantleTx>>, DynError>
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>,
+{
+    let mut blocks = Vec::new();
+    let mut seen_headers = HashSet::new();
+
+    let storage_relay = handle
+        .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
+        .await?;
+    let storage_adapter =
+        ChainStorageAdapter::<StorageBackend, SignedMantleTx, RuntimeServiceId>::new(storage_relay)
+            .await;
+
+    let lib_slot = if tip_id == lib_id {
+        let slot: u64 = live_tip_block.header().slot().into();
+        slot
+    } else {
+        storage_adapter
+            .get_block(&lib_id)
+            .await
+            .map_or(0u64, |block| block.header().slot().into())
+    };
+
+    if from_slot as u64 <= lib_slot && lib_slot > 0 {
+        for block in mantle::get_blocks(handle, from_slot, lib_slot as usize).await? {
+            seen_headers.insert(block.header().id());
+            blocks.push(block);
+        }
+    }
+
+    let mut canonical_headers =
+        consensus::cryptarchia_headers::<RuntimeServiceId>(handle, Some(tip_id), Some(lib_id))
+            .await?;
+    canonical_headers.reverse();
+
+    for header_id in canonical_headers {
+        if seen_headers.contains(&header_id) {
+            continue;
+        }
+
+        let block = if header_id == tip_id {
+            Some(live_tip_block.clone())
+        } else {
+            storage_adapter.get_block(&header_id).await
+        };
+
+        let Some(block) = block else {
+            continue;
+        };
+
+        let slot: u64 = block.header().slot().into();
+        if slot < from_slot as u64 {
+            continue;
+        }
+
+        seen_headers.insert(header_id);
+        blocks.push(block);
+    }
+
+    Ok(blocks)
+}
+
 #[utoipa::path(
     get,
     path = paths::BLOCKS,
@@ -529,6 +666,160 @@ where
 
 #[utoipa::path(
     get,
+    path = paths::CHANNEL_INSCRIPTIONS,
+    params(
+        ("channel_id" = String, Path, description = "Channel id"),
+        ChannelInscriptionsQuery
+    ),
+    responses(
+        (status = 200, description = "Get channel inscriptions by slot range"),
+        (status = 500, description = "Internal server error", body = String),
+    )
+)]
+pub async fn channel_inscriptions<StorageBackend, RuntimeServiceId>(
+    State(handle): State<OverwatchHandle<RuntimeServiceId>>,
+    Path(channel_id): Path<ChannelId>,
+    Query(query): Query<ChannelInscriptionsQuery>,
+) -> Response
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    StorageBackend::Block: Serialize,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    let include_inscription = query.include_inscription.unwrap_or(false);
+    let api_response =
+        mantle::get_blocks(&handle, query.slot_from, query.slot_to).map(move |blocks| {
+            let mut items = Vec::new();
+            for block in blocks? {
+                items.extend(collect_channel_inscription_items(
+                    &block,
+                    channel_id,
+                    include_inscription,
+                ));
+            }
+
+            Ok::<ChannelInscriptionsResponseBody, DynError>(ChannelInscriptionsResponseBody {
+                items,
+                next_cursor: None,
+            })
+        });
+
+    make_request_and_return_response!(api_response)
+}
+
+#[utoipa::path(
+    get,
+    path = paths::CHANNEL_INSCRIPTIONS_STREAM,
+    params(
+        ("channel_id" = String, Path, description = "Channel id"),
+        ChannelInscriptionsStreamQuery
+    ),
+    responses(
+        (status = 200, description = "Stream channel inscriptions and chain progress events"),
+        (status = 500, description = "Internal server error", body = String),
+    )
+)]
+pub async fn channel_inscriptions_stream<StorageBackend, ConsensusService, RuntimeServiceId>(
+    State(handle): State<OverwatchHandle<RuntimeServiceId>>,
+    Path(channel_id): Path<ChannelId>,
+    Query(query): Query<ChannelInscriptionsStreamQuery>,
+) -> Response
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    StorageBackend::Block: Serialize,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    ConsensusService: ServiceData<Message = ConsensusMsg<SignedMantleTx>> + 'static,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>
+        + AsServiceId<ConsensusService>
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    let include_inscription = query.include_inscription.unwrap_or(false);
+    let from_slot = query.from_slot.unwrap_or(0);
+
+    let live_stream =
+        match mantle::get_new_blocks_stream::<_, _, ConsensusService, _>(&handle).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        };
+    let mut live_stream = Box::pin(live_stream);
+
+    let Some(snapshot) = live_stream.next().await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "channel inscription stream snapshot unavailable".to_owned(),
+        )
+            .into_response();
+    };
+
+    let bootstrap_blocks =
+        match fetch_canonical_bootstrap_blocks::<StorageBackend, RuntimeServiceId>(
+            &handle,
+            from_slot,
+            snapshot.tip,
+            snapshot.lib,
+            &snapshot.block,
+        )
+        .await
+        {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        };
+
+    let mut bootstrap_headers = HashSet::new();
+    let mut bootstrap_events = Vec::new();
+    for block in &bootstrap_blocks {
+        bootstrap_headers.insert(block.header().id());
+        bootstrap_events.extend(channel_stream_events_for_block(
+            block,
+            channel_id,
+            include_inscription,
+        ));
+    }
+    bootstrap_events.push(ChannelInscriptionsStreamEvent::LibAdvanced {
+        tip: snapshot.tip,
+        lib: snapshot.lib,
+    });
+
+    let bootstrap_stream = futures::stream::iter(bootstrap_events);
+    let live_events = live_stream.flat_map(move |event| {
+        let header_id = event.block.header().id();
+        let slot: u64 = event.block.header().slot().into();
+        if bootstrap_headers.contains(&header_id) || slot < from_slot as u64 {
+            return futures::stream::iter(Vec::<ChannelInscriptionsStreamEvent>::new());
+        }
+
+        let mut events =
+            channel_stream_events_for_block(&event.block, channel_id, include_inscription);
+        events.push(ChannelInscriptionsStreamEvent::LibAdvanced {
+            tip: event.tip,
+            lib: event.lib,
+        });
+        futures::stream::iter(events)
+    });
+
+    responses::ndjson::from_stream(bootstrap_stream.chain(live_events))
+}
+
+#[utoipa::path(
+    get,
     path = paths::BLOCKS_STREAM,
     responses(
         (status = 200, description = "Stream of processed blocks with chain state"),
@@ -554,7 +845,7 @@ where
 {
     let stream = mantle::get_new_blocks_stream::<_, _, ConsensusService, _>(&handle)
         .await
-        .map(|stream| stream.map(ApiProcessedBlockEvent::from));
+        .map(|stream| futures::StreamExt::map(stream, ApiProcessedBlockEvent::from));
     match stream {
         Ok(stream) => responses::ndjson::from_stream(stream),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),

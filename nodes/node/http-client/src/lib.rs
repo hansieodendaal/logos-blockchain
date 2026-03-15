@@ -7,18 +7,21 @@ pub use lb_chain_service::Slot;
 use lb_core::{
     block::Block,
     header::{ContentId, HeaderId},
-    mantle::SignedMantleTx,
+    mantle::{SignedMantleTx, ops::channel::ChannelId},
     proofs::leader_proof::Groth16LeaderProof,
 };
 use lb_groth16::fr_to_bytes;
 use lb_http_api_common::{
-    bodies::wallet::{
-        balance::WalletBalanceResponseBody,
-        transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
+    bodies::{
+        channel_inscriptions::{ChannelInscriptionsResponseBody, ChannelInscriptionsStreamEvent},
+        wallet::{
+            balance::WalletBalanceResponseBody,
+            transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
+        },
     },
     paths::{
-        BLOCKS, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM, MEMPOOL_ADD_TX,
-        STORAGE_BLOCK,
+        BLOCKS, BLOCKS_STREAM, CHANNEL_INSCRIPTIONS, CHANNEL_INSCRIPTIONS_STREAM, CRYPTARCHIA_INFO,
+        CRYPTARCHIA_LIB_STREAM, MEMPOOL_ADD_TX, STORAGE_BLOCK,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
     settings::default_max_body_size,
@@ -270,6 +273,76 @@ impl CommonHttpClient {
             StatusCode::OK => Ok(blocks_stream),
             StatusCode::INTERNAL_SERVER_ERROR => Err(Error::Server("Error".to_owned())),
             _ => Err(Error::Server(format!("Unexpected response [{status}]",))),
+        }
+    }
+
+    /// Get channel inscriptions in a slot range.
+    pub async fn get_channel_inscriptions(
+        &self,
+        base_url: Url,
+        channel_id: ChannelId,
+        slot_from: u64,
+        slot_to: u64,
+        include_inscription: bool,
+    ) -> Result<ChannelInscriptionsResponseBody, Error> {
+        let mut request_url = base_url
+            .join(
+                CHANNEL_INSCRIPTIONS
+                    .replace(":channel_id", &channel_id.as_hex())
+                    .trim_start_matches('/'),
+            )
+            .map_err(Error::Url)?;
+        request_url
+            .query_pairs_mut()
+            .append_pair("slot_from", &slot_from.to_string())
+            .append_pair("slot_to", &slot_to.to_string())
+            .append_pair("include_inscription", &include_inscription.to_string());
+
+        self.get::<(), ChannelInscriptionsResponseBody>(request_url, None)
+            .await
+    }
+
+    /// Subscribe to channel inscription events and chain progress updates.
+    pub async fn subscribe_channel_inscriptions(
+        &self,
+        base_url: Url,
+        channel_id: ChannelId,
+        from_slot: Option<u64>,
+        include_inscription: bool,
+    ) -> Result<impl Stream<Item = ChannelInscriptionsStreamEvent>, Error> {
+        let mut request_url = base_url
+            .join(
+                CHANNEL_INSCRIPTIONS_STREAM
+                    .replace(":channel_id", &channel_id.as_hex())
+                    .trim_start_matches('/'),
+            )
+            .map_err(Error::Url)?;
+
+        {
+            let mut query = request_url.query_pairs_mut();
+            query.append_pair("include_inscription", &include_inscription.to_string());
+            if let Some(from_slot) = from_slot {
+                query.append_pair("from_slot", &from_slot.to_string());
+            }
+        }
+
+        let mut request = self.client.get(request_url);
+        if let Some(basic_auth) = &self.basic_auth {
+            request = request.basic_auth(&basic_auth.username, basic_auth.password.as_deref());
+        }
+
+        let response = request.send().await.map_err(Error::Request)?;
+        let status = response.status();
+
+        let events_stream = response.bytes_stream().filter_map(async |item| {
+            let bytes = item.ok()?;
+            serde_json::from_slice::<ChannelInscriptionsStreamEvent>(&bytes).ok()
+        });
+
+        match status {
+            StatusCode::OK => Ok(events_stream),
+            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::Server("Error".to_owned())),
+            _ => Err(Error::Server(format!("Unexpected response [{status}]"))),
         }
     }
 

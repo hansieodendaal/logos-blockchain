@@ -19,7 +19,9 @@ use utoipa::OpenApi;
         crate::api::handlers::wallet::get_balance,
         crate::api::handlers::wallet::post_transactions_transfer_funds,
         crate::api::handlers::blocks_stream,
-        crate::api::handlers::blocks
+        crate::api::handlers::blocks,
+        crate::api::handlers::channel_inscriptions,
+        crate::api::handlers::channel_inscriptions_stream
     ),
     components(schemas(schema::Status, schema::MempoolMetrics)),
     tags()

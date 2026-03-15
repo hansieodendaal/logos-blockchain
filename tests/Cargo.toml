@@ -91,6 +91,10 @@ name = "test_mempool_api"
 path = "src/tests/mempool/api.rs"
 
 [[test]]
+name = "test_channel_inscriptions_stream"
+path = "src/tests/mempool/channel_inscriptions_stream.rs"
+
+[[test]]
 name = "test_mantle_sdp_ops"
 path = "src/tests/mantle/sdp_ops.rs"
 

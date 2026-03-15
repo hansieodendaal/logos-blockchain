@@ -14,6 +14,8 @@ pub const LEADER_CLAIM: &str = "/leader/claim";
 
 pub const BLOCKS: &str = "/cryptarchia/blocks";
 pub const BLOCKS_STREAM: &str = "/cryptarchia/events/blocks/stream";
+pub const CHANNEL_INSCRIPTIONS: &str = "/channels/:channel_id/inscriptions";
+pub const CHANNEL_INSCRIPTIONS_STREAM: &str = "/channels/:channel_id/inscriptions/stream";
 
 pub mod wallet {
     pub const BALANCE: &str = "/wallet/:public_key/balance";
