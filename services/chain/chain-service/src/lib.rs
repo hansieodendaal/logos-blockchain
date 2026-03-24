@@ -353,6 +353,15 @@ impl Cryptarchia {
         tracing::debug!(target: LOG_TARGET, "Pruned {pruned_states_count} old forks and their ledger states.");
     }
 
+    /// Shrinks the memory held by the ledger states.
+    ///
+    /// This should be called after a significant number of ledger states have
+    /// been pruned by [`Self::prune_ledger_states`] to free up memory. This
+    /// should not be called frequently since it is an expensive operation.
+    fn shrink_ledger_states(&mut self) {
+        self.ledger.shrink();
+    }
+
     fn online(self) -> (Self, PrunedBlocks<HeaderId>) {
         let (consensus, pruned_blocks) = self.consensus.online();
         let mut cryptarchia = Self {
@@ -360,7 +369,13 @@ impl Cryptarchia {
             consensus,
             genesis_id: self.genesis_id,
         };
+
+        // Prune the ledger states of all the pruned blocks.
+        // Also, shrink the set of ledger states to free up memory,
+        // assuming that many blocks have been pruned during bootstrapping.
         cryptarchia.prune_ledger_states(pruned_blocks.all());
+        cryptarchia.shrink_ledger_states();
+
         (cryptarchia, pruned_blocks)
     }
 

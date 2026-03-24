@@ -164,6 +164,15 @@ where
     pub fn prune_state_at(&mut self, block: &Id) -> bool {
         self.states.remove(block).is_some()
     }
+
+    /// Shrinks the map of ledger states to free up memory that has been pruned
+    /// so far.
+    ///
+    /// This shouldn't be called frequently since the entire map is
+    /// reconstructed.
+    pub fn shrink(&mut self) {
+        self.states.shrink_to_fit();
+    }
 }
 
 /// A ledger state
