@@ -8,7 +8,8 @@ use rpds::StackSync;
 
 const EMPTY_VALUE: Fr = Fr::ZERO;
 
-/// An append-only persistent Merkle Mountain Range (MMR).
+/// An append-only persistent Merkle Mountain Range (MMR), which can accept up
+/// to 2^(`MAX_HEIGHT`-1) elements (leaves).
 ///
 /// Compared to other merkle tree variants, this does not store leaves but
 /// only the necessary internal nodes to update the root hash with new
@@ -71,8 +72,11 @@ where
         }
     }
 
-    #[must_use]
-    pub fn push(&self, elem: T) -> Self {
+    pub fn push(&self, elem: T) -> Result<Self, MmrFull> {
+        if self.roots.peek().is_some_and(|r| r.height == MAX_HEIGHT) {
+            return Err(MmrFull);
+        }
+
         let root = Hash::digest(&[*elem.as_ref()]);
         let mut last_root = Root { root, height: 1 };
         let mut roots = self.roots.clone();
@@ -84,11 +88,9 @@ where
                     root: Hash::compress(&[root.root, last_root.root]),
                     height: last_root.height + 1,
                 };
-                // we want the frontier root to have a fixed height, so each individual root
-                // must be less than MAX_HEIGHT
                 assert!(
-                    last_root.height < MAX_HEIGHT,
-                    "Height must be less than {MAX_HEIGHT}"
+                    last_root.height <= MAX_HEIGHT,
+                    "Height must be less than or equal to {MAX_HEIGHT}"
                 );
             } else {
                 break;
@@ -97,12 +99,13 @@ where
 
         roots = roots.push(last_root);
 
-        Self {
+        Ok(Self {
             roots,
             _hash: std::marker::PhantomData,
-        }
+        })
     }
 
+    // TODO: fix: this builds a root one level too high
     #[must_use]
     pub fn frontier_root(&self) -> Fr {
         let mut root = empty_subtree_root::<Hash>(0);
@@ -128,11 +131,17 @@ where
     }
 
     #[must_use]
+    pub const fn capacity(&self) -> usize {
+        Self::num_leaves(MAX_HEIGHT)
+    }
+
+    const fn num_leaves(height: u8) -> usize {
+        1 << (height - 1)
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.roots
-            .iter()
-            .map(|r| (1 << (r.height - 1)) as usize)
-            .sum()
+        self.roots.iter().map(|r| Self::num_leaves(r.height)).sum()
     }
 
     #[must_use]
@@ -152,6 +161,10 @@ fn empty_subtree_root<Hash: Digest>(height: usize) -> Fr {
         hashes
     })[height]
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("MMR is full")]
+pub struct MmrFull;
 
 #[cfg(test)]
 mod test {
@@ -224,7 +237,7 @@ mod test {
     fn test_frontier_root_8(elems: Vec<[u8; 32]>) {
         let mut mmr = <MerkleMountainRange<TestFr, ZkHasher, 8>>::new();
         for elem in &elems {
-            mmr = mmr.push(elem.as_ref().into());
+            mmr = mmr.push(elem.as_ref().into()).unwrap();
         }
         assert_eq!(mmr.frontier_root(), root(&padded_leaves(elems, 8)));
     }
@@ -234,7 +247,7 @@ mod test {
     fn test_frontier_root_16(elems: Vec<[u8; 32]>) {
         let mut mmr = <MerkleMountainRange<TestFr, ZkHasher, 16>>::new();
         for elem in &elems {
-            mmr = mmr.push(elem.as_ref().into());
+            mmr = mmr.push(elem.as_ref().into()).unwrap();
         }
         assert_eq!(mmr.frontier_root(), root(&padded_leaves(elems, 16)));
     }
@@ -248,13 +261,18 @@ mod test {
 
     #[test]
     fn test_mmr_push() {
-        let mut mmr = <MerkleMountainRange<TestFr, ZkHasher>>::new().push(b"hello".as_ref().into());
+        const HEIGHT: u8 = 3; // max 2^(3-1) = 4 leaves
+        let mut mmr = <MerkleMountainRange<TestFr, ZkHasher, HEIGHT>>::new();
+        assert_eq!(mmr.capacity(), 4);
+        assert_eq!(mmr.len(), 0);
+
+        mmr = mmr.push(b"hello".as_ref().into()).unwrap();
         assert_eq!(mmr.len(), 1);
         assert_eq!(mmr.roots.size(), 1);
         assert_eq!(mmr.roots.peek().unwrap().height, 1);
         assert_eq!(mmr.roots.peek().unwrap().root, leaf(b"hello"));
 
-        mmr = mmr.push(b"world".as_ref().into());
+        mmr = mmr.push(b"world".as_ref().into()).unwrap();
         assert_eq!(mmr.len(), 2);
         assert_eq!(mmr.roots.size(), 1);
         assert_eq!(mmr.roots.peek().unwrap().height, 2);
@@ -263,7 +281,7 @@ mod test {
             <ZkHasher as Digest>::compress(&[leaf(b"hello"), leaf(b"world")])
         );
 
-        mmr = mmr.push(b"!".as_ref().into());
+        mmr = mmr.push(b"!".as_ref().into()).unwrap();
         assert_eq!(mmr.len(), 3);
         assert_eq!(mmr.roots.size(), 2);
         let top_root = mmr.roots.iter().last().unwrap();
@@ -275,7 +293,7 @@ mod test {
         assert_eq!(mmr.roots.peek().unwrap().height, 1);
         assert_eq!(mmr.roots.peek().unwrap().root, leaf(b"!"));
 
-        mmr = mmr.push(b"!".as_ref().into());
+        mmr = mmr.push(b"!".as_ref().into()).unwrap();
         assert_eq!(mmr.len(), 4);
         assert_eq!(mmr.roots.size(), 1);
         assert_eq!(mmr.roots.peek().unwrap().height, 3);
@@ -286,5 +304,10 @@ mod test {
                 <ZkHasher as Digest>::compress(&[leaf(b"!"), leaf(b"!")])
             ])
         );
+
+        assert!(matches!(
+            mmr.push(b"already full".as_ref().into()),
+            Err(MmrFull)
+        ));
     }
 }
