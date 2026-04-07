@@ -1034,8 +1034,8 @@ where
             .map_err(|e| Error::Storage(format!("Failed to store immutable block ids: {e}")))
     }
 
-    /// Retrieves the blocks in the range from `from` to `to` from the storage.
-    /// Both `from` and `to` are included in the range.
+    /// Retrieves the blocks in the range from `from` (exclusive) to `to`
+    /// (inclusive) from the storage.
     /// This is implemented here, and not as a method of `StorageAdapter`, to
     /// simplify the panic and error message handling.
     ///
@@ -1052,7 +1052,8 @@ where
     ///
     /// # Returns
     ///
-    /// A vector of blocks in the range from `from` to `to`.
+    /// A vector of blocks in the range from `from` (exclusive) to `to`
+    /// (inclusive).
     /// If no blocks are found, returns an empty vector.
     /// If any of the [`HeaderId`]s are invalid, returns an error with the first
     /// invalid header id.
@@ -1061,9 +1062,10 @@ where
         to: HeaderId,
         storage_adapter: &StorageAdapter<Storage, Tx, RuntimeServiceId>,
     ) -> Vec<Block<Tx>> {
-        // Due to the blocks traversal order, this yields `to..from` order
+        // Due to the blocks traversal order, this yields `[to..from)` order
         let blocks = futures::stream::unfold(to, async |header_id| {
             if header_id == from {
+                // Don't load the `from` block since the range is exclusive of `from`.
                 None
             } else {
                 let block = storage_adapter
@@ -1073,11 +1075,15 @@ where
                         panic!("Could not retrieve block {to} from storage during recovery")
                     });
                 let parent_header_id = block.header().parent();
+                debug!(
+                    target: LOG_TARGET, id = ?header_id, parent = ?parent_header_id,
+                    "loaded block from storage",
+                );
                 Some((block, parent_header_id))
             }
         });
 
-        // To avoid confusion, the order is reversed so it fits the natural `from..to`
+        // To avoid confusion, the order is reversed so it fits the natural `(from..to]`
         // order
         blocks.collect::<Vec<_>>().await.into_iter().rev().collect()
     }
@@ -1100,6 +1106,11 @@ where
         relays: &CryptarchiaConsensusRelays<Tx, Storage, RuntimeServiceId>,
         current_slot: Slot,
     ) -> (Cryptarchia, PrunedBlocks<HeaderId>) {
+        info!(
+            target: LOG_TARGET, tip = ?self.state.tip, lib = ?self.state.lib, lib_height = self.state.lib_block_length, genesis = ?self.state.genesis_id,
+            "initializing cryptarchia from state recovery",
+        );
+
         let lib_id = self.state.lib;
         let genesis_id = self.state.genesis_id;
         let state = choose_engine_state(
@@ -1118,13 +1129,15 @@ where
             self.state.lib_block_length,
         );
 
-        // We reapply blocks here instead of saving ledger states to correcly make use
-        // of structural sharing If forking is low, this might not be necessary
+        // Load blocks from LIB (exclusive) to tip (inclusive) from storage.
+        // These blocks will be applied to `cryptarchia` below.
+        info!(
+            target: LOG_TARGET, lib = ?lib_id, tip = ?self.state.tip,
+            "loading blocks from storage: (lib, tip]",
+        );
         let blocks =
             Self::get_blocks_in_range(lib_id, self.state.tip, relays.storage_adapter()).await;
-
-        // Skip LIB block since it's already applied
-        let blocks = blocks.into_iter().skip(1);
+        info!(target: LOG_TARGET, "loaded {} blocks from storage: (lib, tip]", blocks.len());
 
         // Stream the already applied state.
         let init_tip = cryptarchia.tip();
@@ -1139,7 +1152,8 @@ where
         Self::broadcast_session_updates_for_block(&cryptarchia, &init_tip, relays, None).await;
 
         let mut pruned_blocks = PrunedBlocks::new();
-        for block in blocks {
+        let n_blocks = blocks.len();
+        for (i, block) in blocks.into_iter().enumerate() {
             match Self::process_block(
                 &mut cryptarchia,
                 block,
@@ -1151,6 +1165,7 @@ where
             .await
             {
                 Ok((new_pruned_blocks, _)) => {
+                    debug!(target: LOG_TARGET, "{}/{} blocks applied during initialization", i + 1, n_blocks);
                     pruned_blocks.extend(&new_pruned_blocks);
                 }
                 Err(e) => {
@@ -1158,6 +1173,11 @@ where
                 }
             }
         }
+
+        info!(
+            target: LOG_TARGET, tip_height = cryptarchia.consensus.tip_branch().length(), lib_height = cryptarchia.consensus.lib_branch().length(),
+            "{n_blocks} blocks recovered. finishing initialization",
+        );
 
         (cryptarchia, pruned_blocks)
     }
