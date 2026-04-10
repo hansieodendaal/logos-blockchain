@@ -799,11 +799,13 @@ where
             .ok_or(Error::NoClaimableVoucher)?
             .nullifier;
 
+        let reward_amount = ledger_state.mantle_ledger().leader_reward_amount();
         let signed_tx = fund_and_sign_leader_claim_tx(
             LeaderClaimOp {
                 rewards_root: ledger_state.mantle_ledger().claimable_vouchers_root(),
                 voucher_nullifier,
             },
+            reward_amount,
             tip,
             wallet,
             config,

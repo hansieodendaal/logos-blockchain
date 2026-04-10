@@ -16,6 +16,7 @@ use lb_core::{
     mantle::{
         AuthenticatedMantleTx, GenesisTx, NoteId, Op, OpProof, Utxo, Value, VerificationError,
         gas::{Gas, GasConstants, GasCost, GasOverflow},
+        tx::MantleTxContext,
     },
     proofs::leader_proof,
     sdp::{Declaration, DeclarationId, ProviderId, ProviderInfo, ServiceType, SessionNumber},
@@ -342,6 +343,13 @@ impl LedgerState {
 
             // Check the transaction is balanced
             let total_gas_cost = AuthenticatedMantleTx::total_gas_cost::<Constants>(&tx)?;
+            tracing::debug!(
+                balance,
+                total_gas_cost = total_gas_cost.into_inner(),
+                storage_gas_price = ?tx.mantle_tx().storage_gas_price,
+                execution_gas_price = ?tx.mantle_tx().execution_gas_price,
+                "tx balance check"
+            );
             match balance.cmp(&Balance::from(total_gas_cost.into_inner())) {
                 Ordering::Less => return Err(LedgerError::InsufficientBalance),
                 Ordering::Greater => return Err(LedgerError::UnbalancedTransaction),
@@ -477,6 +485,14 @@ impl LedgerState {
     #[must_use]
     pub fn active_sessions(&self) -> HashMap<ServiceType, SessionNumber> {
         self.mantle_ledger.active_sessions()
+    }
+
+    #[must_use]
+    pub fn tx_context(&self) -> MantleTxContext {
+        MantleTxContext {
+            gas_context: self.mantle_ledger().channels().into(),
+            leader_reward_amount: self.mantle_ledger().leader_reward_amount(),
+        }
     }
 
     /// Applies a transaction to the ledger state, returning the updated state
