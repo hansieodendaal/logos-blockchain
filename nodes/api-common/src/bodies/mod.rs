@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+pub mod channel;
 pub mod channel_inscriptions;
 pub mod wallet;
 

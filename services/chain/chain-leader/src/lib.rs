@@ -66,7 +66,7 @@ pub(crate) type WinningPolInfo = (LeaderPrivate, LeaderPublic, Epoch);
 
 const SERVICE_ID: &str = "ChainLeader";
 
-pub(crate) const LOG_TARGET: &str = "chain-leader::service";
+pub(crate) const LOG_TARGET: &str = "chain_leader::service";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -81,7 +81,7 @@ pub enum Error {
     #[error("Failed to create valid block during proposal: {0}")]
     BlockCreation(#[from] BlockError),
     #[error("Wallet API error: {0}")]
-    Wallet(#[from] WalletApiError),
+    Wallet(#[from] Box<WalletApiError>),
     #[error("Leader wallet error: {0}")]
     LeaderWallet(#[from] LeaderWalletError),
     #[error("Mempool error: {0}")]
@@ -92,6 +92,12 @@ pub enum Error {
     NoClaimableVoucher,
     #[error("Ledger state not found for {0:?}")]
     LedgerStateNotFound(HeaderId),
+}
+
+impl From<WalletApiError> for Error {
+    fn from(error: WalletApiError) -> Self {
+        Self::Wallet(Box::new(error))
+    }
 }
 
 #[derive(Debug)]
@@ -369,26 +375,26 @@ where
             blend_broadcast_settings.clone(),
         );
 
-        // Wait for other service (except ChainLeader) to become ready, with timeout.
+        // Wait for other services to become ready, with timeout.
+        // (except Chain and ChainLeader)
         wait_until_services_are_ready!(
             &self.service_resources_handle.overwatch_handle,
             Some(Duration::from_secs(60)),
             BlendService,
             TxMempoolService<_, _, _, _>,
             TimeService<_, _>,
-            CryptarchiaService,
             Wallet,
             PreloadKmsService<_>,
             // TODO: Remove once the need to broadcast directly bypassing Blend is gone.
             NetworkService<_, _>
         )
         .await?;
-        // Wait for ChainLeader service to become ready.
-        // No timeout since it becomes ready only after IBD is complete.
+        // Wait for Chain and ChainLeader services to become ready, without timeout
         wait_until_services_are_ready!(
             &self.service_resources_handle.overwatch_handle,
             None,
-            ChainNetwork
+            CryptarchiaService, // becomes ready after recoverying blocks
+            ChainNetwork        // becomes ready after IBD
         )
         .await?;
 
@@ -595,7 +601,7 @@ where
     )]
     #[instrument(
         level = "debug",
-        skip(tx_selector, relays, ledger_state, ledger_config)
+        skip(tx_selector, relays, ledger_state, ledger_config, proof, signing_key)
     )]
     async fn propose_block(
         parent: HeaderId,
@@ -700,6 +706,10 @@ where
 
     /// Apply our own proposed block to the chain and publish it to the blend
     /// network.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     async fn apply_and_publish_block_proposal(
         block: Block<Mempool::Item>,
         chain_network_api: &ChainNetworkServiceApi<ChainNetwork, RuntimeServiceId>,
@@ -789,11 +799,13 @@ where
             .ok_or(Error::NoClaimableVoucher)?
             .nullifier;
 
+        let reward_amount = ledger_state.mantle_ledger().leader_reward_amount();
         let signed_tx = fund_and_sign_leader_claim_tx(
             LeaderClaimOp {
                 rewards_root: ledger_state.mantle_ledger().claimable_vouchers_root(),
                 voucher_nullifier,
             },
+            reward_amount,
             tip,
             wallet,
             config,

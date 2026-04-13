@@ -29,13 +29,6 @@ pub fn make_builder(topology: &TopologySpec) -> ScenarioBuilderWith {
     })
 }
 
-#[must_use]
-pub fn is_truthy_env(key: &str) -> bool {
-    env::var(key)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-}
-
 pub fn resolve_literal_or_env(value: &str, field_name: &str) -> Result<String, StepError> {
     let trimmed = value.trim();
     if let Some(raw_name) = trimmed
@@ -71,6 +64,7 @@ pub fn parse_deployer(value: &str) -> Result<DeployerKind, StepError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "local" | "host" => Ok(DeployerKind::Local),
         "compose" | "docker" => Ok(DeployerKind::Compose),
+        "k8s" | "kubernetes" => Ok(DeployerKind::K8s),
         other => Err(StepError::UnsupportedDeployer {
             value: other.to_owned(),
         }),
@@ -83,6 +77,10 @@ pub fn shared_host_bin_path(binary_name: &str) -> PathBuf {
     cucumber_dir.join("../assets/stack/bin").join(binary_name)
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Singular fn with multiple branches to handle different events and futures."
+)]
 pub async fn track_progress<Fut>(operation: &str, interval: Duration, wait: Fut) -> StepResult
 where
     Fut: Future<Output = StepResult>,

@@ -2,9 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use cucumber::{gherkin::Step, given, then, when};
 use lb_libp2p::{Multiaddr, PeerId};
-use lb_testing_framework::{
-    DeploymentBuilder, LbcLocalDeployer, TopologyConfig, configs::wallet::WalletAccount,
-};
+use lb_testing_framework::{DeploymentBuilder, LbcLocalDeployer, TopologyConfig};
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
@@ -12,14 +10,15 @@ use crate::cucumber::{
     error::{StepError, StepResult},
     steps::{
         TARGET,
+        manual_cluster::{build_manual_cluster_deployment, stop_active_manual_cluster},
         manual_nodes::{
+            config_override::set_user_config_override,
             snapshots::{save_named_blockchain_snapshot, validate_snapshot_path_component},
             utils::{
-                NodesToStartUnordered, create_snapshots_all_nodes, genesis_block_utxos,
-                get_cryptarchia_info_all_nodes, nodes_converged, parse_genesis_wallet_tokens_row,
-                parse_url, parse_wallet_resources_table_row,
-                poll_all_nodes_and_update_consensus_cache, restart_node, start_node,
-                start_nodes_order_respecting_dependencies,
+                NodesToStartUnordered, create_snapshots_all_nodes, get_cryptarchia_info_all_nodes,
+                nodes_converged, parse_genesis_wallet_tokens_row, parse_url,
+                parse_wallet_resources_table_row, poll_all_nodes_and_update_consensus_cache,
+                restart_node, start_node, start_nodes_order_respecting_dependencies,
                 verify_genesis_wallet_resources_table_indexes,
                 verify_node_wallet_resources_table_indexes,
                 wait_for_all_nodes_to_be_synced_to_chain,
@@ -37,36 +36,9 @@ const PUBLIC_CRYPTARCHIA_ENDPOINT_PASSWORD: &str = "password";
 #[given(expr = "I have a cluster with capacity of {int} nodes")]
 #[when(expr = "I have a cluster with capacity of {int} nodes")]
 fn step_manual_cluster(world: &mut CucumberWorld, step: &Step, nodes_count: usize) -> StepResult {
-    let mut config = TopologyConfig::with_node_numbers(nodes_count)
-        .with_allow_multiple_genesis_tokens(true)
-        .with_allow_zero_value_genesis_tokens(true);
-
-    for genesis_token in &world.genesis_tokens {
-        let wallet_account = WalletAccount::deterministic(
-            genesis_token.account_index as u64,
-            genesis_token.token_amount,
-            true,
-        )?;
-        world
-            .wallet_accounts
-            .insert(genesis_token.account_index, wallet_account.clone());
-        for _ in 0..genesis_token.token_count {
-            config.wallet_config.accounts.push(wallet_account.clone());
-        }
-    }
-
-    let deployment = match DeploymentBuilder::new(config).build() {
-        Ok(deployment) => deployment,
-        Err(e) => {
-            warn!(target: TARGET, "Step '{step}' error: {e}");
-            return Err(StepError::LogicalError {
-                message: format!("failed to build manual cluster: {e}"),
-            });
-        }
-    };
-    if let Some(genesis_tx) = deployment.config.genesis_tx.clone() {
-        world.genesis_block_utxos = genesis_block_utxos(&genesis_tx);
-    }
+    let deployment = build_manual_cluster_deployment(world, nodes_count).inspect_err(|e| {
+        warn!(target: TARGET, "Step '{step}' error: {e}");
+    })?;
     let deployer = LbcLocalDeployer::new();
     let cluster = deployer.manual_cluster_from_descriptors(deployment);
     world.local_cluster = Some(cluster);
@@ -91,7 +63,8 @@ fn step_manual_devnet_cluster(
 
     let config = TopologyConfig::with_node_numbers(nodes_count)
         .with_allow_multiple_genesis_tokens(true)
-        .with_allow_zero_value_genesis_tokens(true);
+        .with_allow_zero_value_genesis_tokens(true)
+        .with_test_context(world.test_context.clone());
 
     let deployment = match DeploymentBuilder::new(config).build() {
         Ok(deployment) => deployment,
@@ -223,6 +196,72 @@ const fn step_we_use_ibd_peers(world: &mut CucumberWorld) {
 #[when(expr = "we join an external network")]
 const fn step_we_join_external_network(world: &mut CucumberWorld) {
     world.join_external_network = Some(true);
+}
+
+#[given(expr = "we will have distinct node groups to query wallet balances:")]
+#[when(expr = "we will have distinct node groups to query wallet balances:")]
+fn step_define_node_groups(world: &mut CucumberWorld, step: &Step) -> Result<(), StepError> {
+    let table = step.table.as_ref().ok_or(StepError::LogicalError {
+        message: "Expected a data table".to_owned(),
+    })?;
+
+    if table.rows.is_empty() || table.rows[0].len() != 2 {
+        return Err(StepError::LogicalError {
+            message: "Expected table columns: | group_name | node_name |".to_owned(),
+        });
+    }
+
+    if table.rows[0][0].trim() != "group_name" || table.rows[0][1].trim() != "node_name" {
+        return Err(StepError::LogicalError {
+            message: "Expected table columns: | group_name | node_name |".to_owned(),
+        });
+    }
+
+    world.node_groups.clear();
+    world.node_to_group.clear();
+
+    for row in table.rows.iter().skip(1) {
+        if row.len() != 2 {
+            return Err(StepError::LogicalError {
+                message: "Each node-group row must have exactly two columns".to_owned(),
+            });
+        }
+
+        let group_name = row[0].trim().to_owned();
+        let node_name = row[1].trim().to_owned();
+
+        if let Some(existing_group) = world.node_to_group.get(&node_name) {
+            return Err(StepError::LogicalError {
+                message: format!(
+                    "Node `{node_name}` appears in both group `{existing_group}` and `{group_name}`"
+                ),
+            });
+        }
+
+        world
+            .node_groups
+            .entry(group_name.clone())
+            .or_default()
+            .insert(node_name.clone());
+        world.node_to_group.insert(node_name, group_name);
+    }
+
+    Ok(())
+}
+
+#[given(expr = "I have user config setting {string} as {string}")]
+#[when(expr = "I have user config setting {string} as {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Required by cucumber expression"
+)]
+fn step_set_user_config_setting(
+    world: &mut CucumberWorld,
+    step: &Step,
+    setting_path: String,
+    setting_value: String,
+) -> StepResult {
+    set_user_config_override(world, &step.value, &setting_path, &setting_value)
 }
 
 #[given(expr = "I will create a blockchain snapshot {string} of all nodes when stopping")]
@@ -636,14 +675,7 @@ fn step_stop_all_nodes(world: &mut CucumberWorld) -> StepResult {
         .map(|(node_name, info)| (node_name.clone(), info.started_node.name.clone()))
         .collect();
 
-    let cluster = world
-        .local_cluster
-        .as_ref()
-        .ok_or(StepError::LogicalError {
-            message: "No local cluster available".into(),
-        })?;
-
-    cluster.stop_all();
+    stop_active_manual_cluster(world)?;
 
     if let Some(snapshot_name) = world.blockchain_snapshot_name_on_stop.as_ref() {
         create_snapshots_all_nodes(world, snapshot_name)?;

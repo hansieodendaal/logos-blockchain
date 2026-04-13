@@ -6,10 +6,14 @@ use rand::RngCore;
 use crate::backends::libp2p::swarm::SwarmHandler;
 
 impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     pub(super) fn handle_identify_event(&mut self, event: identify::Event) {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
-                tracing::debug!(
+                tracing::trace!(
                     "Identified peer {} with addresses {:?}",
                     peer_id,
                     info.listen_addrs
@@ -23,7 +27,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                     .iter()
                     .any(|p| kad_protocol_names.contains(&p))
                 {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Adding discovered node to Kademlia, seen addresses: {:?}",
                         info.listen_addrs
                     );
@@ -31,7 +35,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                     // in order to enable peer discovery
                     for addr in &info.listen_addrs {
                         if !is_kademlia_candidate_address(addr) {
-                            tracing::debug!(
+                            tracing::trace!(
                                 "Skipping non-routable identify address for Kademlia: {}",
                                 addr
                             );
@@ -42,7 +46,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 }
             }
             event => {
-                tracing::debug!("Identify event: {:?}", event);
+                tracing::trace!("Identify event: {:?}", event);
             }
         }
     }

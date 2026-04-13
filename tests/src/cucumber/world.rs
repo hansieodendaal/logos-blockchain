@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     env,
     fmt::Debug,
     num::NonZero,
@@ -18,10 +18,12 @@ use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_libp2p::{Multiaddr, PeerId};
 use lb_node::config::RunConfig;
 use lb_testing_framework::{
-    LbcEnv, LbcManualCluster, NodeHttpClient, ScenarioBuilder, ScenarioBuilderExt as _,
-    configs::wallet::WalletAccount, workloads,
+    LbcEnv, LbcK8sManualCluster, LbcManualCluster, NodeHttpClient, ScenarioBuilder,
+    ScenarioBuilderExt as _, configs::wallet::WalletAccount, workloads,
 };
-use testing_framework_core::scenario::{NodeControlCapability, Scenario, StartedNode};
+use testing_framework_core::scenario::{
+    NodeControlCapability, PeerSelection, Scenario, StartedNode,
+};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -47,6 +49,19 @@ pub enum DeployerKind {
     #[default]
     Local,
     Compose,
+    K8s,
+}
+
+impl DeployerKind {
+    #[must_use]
+    pub const fn uses_host_log_dir(self) -> bool {
+        matches!(self, Self::Local | Self::K8s)
+    }
+
+    #[must_use]
+    pub const fn requires_local_node_binary(self) -> bool {
+        matches!(self, Self::Local)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +79,15 @@ pub struct PublicCryptarchiaEndpointPeer {
     pub url: String,
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserConfigOverride {
+    /// Dot-separated user config path, e.g.
+    /// `network.backend.swarm.gossipsub.retain_scores`.
+    pub path: String,
+    /// YAML value parsed from the step input.
+    pub value: serde_yaml::Value,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -104,6 +128,9 @@ pub struct ConsensusLivenessSpec {
 pub struct CucumberWorld {
     /// The deployer kind that this scenario is configured for.
     pub deployer: Option<DeployerKind>,
+    /// The unique test context, helfull to guarantee unique genesis transaction
+    /// inscription.
+    pub test_context: Option<String>,
     /// Base directory for scenario artifacts like logs and generated configs.
     pub scenario_base_dir: PathBuf,
     /// Automated: Scenario specification
@@ -126,6 +153,9 @@ pub struct CucumberWorld {
     /// information, which includes the started node instance and any relevant
     /// metadata.
     pub local_cluster: Option<LbcManualCluster>,
+    /// Manual: Optional k8s manual cluster instance for scenarios that use the
+    /// k8s deployer.
+    pub k8s_manual_cluster: Option<LbcK8sManualCluster>,
     /// Manual: List of nodes with their info.
     pub nodes_info: HashMap<String, NodeInfo>,
     /// Manual: List of genesis tokens allocated to wallets accounts.
@@ -147,6 +177,11 @@ pub struct CucumberWorld {
     /// Manual: Mapping of logical node names to their corresponding libp2p peer
     /// IDs.
     pub node_peer_ids: HashMap<String, PeerId>,
+    /// Manual: `group_name` -> set of `node_names`. Empty means "no groups
+    /// defined" and all nodes participate.
+    pub node_groups: HashMap<String, BTreeSet<String>>,
+    /// Manual: `node_name` -> `group_name` reverse lookup.
+    pub node_to_group: HashMap<String, String>,
     /// Manual: Whether to populate the IBD peers for each node after starting
     /// them,
     pub populate_ibd_peers_from_initial_peers: Option<bool>,
@@ -160,6 +195,8 @@ pub struct CucumberWorld {
     /// Manual: Public base endpoints and credentials used to query
     /// `/cryptarchia/info` for external chain sync reference.
     pub public_cryptarchia_endpoint_peers: Option<Vec<PublicCryptarchiaEndpointPeer>>,
+    /// Manual: Dynamic user-config overrides applied on node startup.
+    pub user_config_overrides: Vec<UserConfigOverride>,
     /// Manual: If set, nodes use a `DeploymentSettings` loaded from disk
     /// bypassing generated genesis/test deployment.
     pub deployment_config_override_path: Option<PathBuf>,
@@ -223,6 +260,7 @@ impl Debug for CucumberWorld {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CucumberWorld")
             .field("deployer", &format!("{:?}", self.deployer))
+            .field("test_context", &format!("{:?}", self.test_context))
             .field("scenario_base_dir", &self.scenario_base_dir)
             .field("spec", &format!("{:?}", self.spec))
             .field("run", &format!("{:?}", self.run))
@@ -251,6 +289,13 @@ impl Debug for CucumberWorld {
                     &"None"
                 }
             })
+            .field("k8s_manual_cluster", {
+                if self.k8s_manual_cluster.is_some() {
+                    &"Has LbcK8sManualCluster"
+                } else {
+                    &"None"
+                }
+            })
             .field("nodes_info", &self.nodes_info.len())
             .field("genesis_tokens", &self.genesis_tokens.len())
             .field("wallet_info", &self.wallet_info.len())
@@ -272,6 +317,8 @@ impl Debug for CucumberWorld {
             )
             .field("node_header_heights", &self.node_header_heights.len())
             .field("node_peer_ids", &self.node_peer_ids.len())
+            .field("node_groups", &self.node_groups.len())
+            .field("node_to_group", &self.node_to_group.len())
             .field(
                 "initial_override_peers_display",
                 &initial_peers_override_display(self.initial_peers_override.as_ref()),
@@ -285,6 +332,10 @@ impl Debug for CucumberWorld {
                 &public_cryptarchia_endpoint_peers_display(
                     self.public_cryptarchia_endpoint_peers.as_ref(),
                 ),
+            )
+            .field(
+                "user_config_overrides",
+                &user_config_overrides_display(&self.user_config_overrides),
             )
             .field(
                 "deployment_config_override_path",
@@ -436,6 +487,11 @@ impl CucumberWorld {
         self.deployer = Some(deployer);
     }
 
+    /// Set the unique test context for this scenario.
+    pub fn set_test_context(&mut self, test_context: String) {
+        self.test_context = Some(test_context);
+    }
+
     /// Set the directory where scenario artifacts should be stored.
     pub fn set_scenario_base_dir(&mut self, log_dir: &Path, deployer: &DeployerKind) {
         let log_dir = PathBuf::from(log_dir);
@@ -553,57 +609,22 @@ impl CucumberWorld {
             .map_err(|source| StepError::ScenarioBuild { source })
     }
 
+    /// Build a scenario for k8s deployment based on the current world
+    /// configuration.
+    pub fn build_k8s_scenario(&self) -> Result<Scenario<LbcEnv>, StepError> {
+        let builder = self.make_builder_for_deployer(DeployerKind::K8s)?;
+        builder
+            .build()
+            .map_err(|source| StepError::ScenarioBuild { source })
+    }
+
     /// Perform preflight checks to ensure the world is properly configured for
     /// the expected deployer kind.
     pub fn preflight(&self, expected: DeployerKind) -> Result<(), StepError> {
-        let actual = self.deployer.ok_or(StepError::MissingDeployer)?;
-        if actual != expected {
-            return Err(StepError::DeployerMismatch { expected, actual });
-        }
+        self.ensure_expected_deployer(expected)?;
 
-        if expected == DeployerKind::Local {
-            let node_ok = env::var_os(LOGOS_BLOCKCHAIN_NODE_BIN)
-                .map(PathBuf::from)
-                .is_some_and(|p| p.is_file())
-                || shared_host_bin_path("logos-blockchain-node").is_file();
-
-            if !(node_ok) {
-                if let Some(default_exe_path) = {
-                    env::current_dir().map_or(None, |current_dir| {
-                        let debug_binary = current_dir.join(BIN_PATH_DEBUG);
-                        let release_binary = current_dir.join(BIN_PATH_RELEASE);
-                        if matches!(std::fs::exists(&debug_binary), Ok(true)) {
-                            Some(debug_binary)
-                        } else if matches!(std::fs::exists(&release_binary), Ok(true)) {
-                            Some(release_binary)
-                        } else {
-                            None
-                        }
-                    })
-                } {
-                    if env::var_os(LOGOS_BLOCKCHAIN_NODE_BIN).is_some() {
-                        warn!(
-                            target: TARGET,
-                            "'{LOGOS_BLOCKCHAIN_NODE_BIN:?}' does not point to a valid file, \
-                            Overriding '{LOGOS_BLOCKCHAIN_NODE_BIN}' to point to '{}'.",
-                            default_exe_path.display()
-                        );
-                    }
-                    set_default_env(
-                        LOGOS_BLOCKCHAIN_NODE_BIN,
-                        &default_exe_path.display().to_string(),
-                    );
-                    return Ok(());
-                }
-
-                return Err(StepError::Preflight {
-                    message: format!(
-                        "Missing Logos host binaries. Set {LOGOS_BLOCKCHAIN_NODE_BIN}, \
-                    or run `scripts/run/run-examples.sh host` to restore them into \
-                    `testing-framework/assets/stack/bin`."
-                    ),
-                });
-            }
+        if expected.requires_local_node_binary() {
+            Self::ensure_local_node_binary()?;
         }
 
         Ok(())
@@ -617,10 +638,7 @@ impl CucumberWorld {
         &self,
         expected: DeployerKind,
     ) -> Result<ScenarioBuilderWith, StepError> {
-        let actual = self.deployer.ok_or(StepError::MissingDeployer)?;
-        if actual != expected {
-            return Err(StepError::DeployerMismatch { expected, actual });
-        }
+        self.ensure_expected_deployer(expected)?;
 
         let topology = self
             .spec
@@ -662,8 +680,34 @@ impl CucumberWorld {
         Ok(builder)
     }
 
-    /// Helper to resolve a node name to the actual started node name.
-    pub fn resolve_node_name(&self, node_name: &str) -> Result<String, StepError> {
+    fn ensure_expected_deployer(&self, expected: DeployerKind) -> Result<(), StepError> {
+        let actual = self.deployer.ok_or(StepError::MissingDeployer)?;
+
+        if actual != expected {
+            return Err(StepError::DeployerMismatch { expected, actual });
+        }
+
+        Ok(())
+    }
+
+    fn ensure_local_node_binary() -> Result<(), StepError> {
+        if host_node_binary_from_env_var_available() {
+            return Ok(());
+        }
+
+        let default_binary = default_node_binary_path().ok_or_else(missing_node_binary_error)?;
+        warn_if_overriding_invalid_node_binary(&default_binary);
+        let default_binary_display = default_binary.display().to_string();
+
+        set_default_env(LOGOS_BLOCKCHAIN_NODE_BIN, &default_binary_display);
+
+        Ok(())
+    }
+
+    /// Helper to resolve a node name to the actual started node name. This is
+    /// useful for steps that refer to nodes by a logical name, and need to
+    /// find the corresponding started node in the world.
+    pub fn resolve_node_runtime_name(&self, node_name: &str) -> Result<String, StepError> {
         Ok(self
             .nodes_info
             .get(node_name)
@@ -673,6 +717,40 @@ impl CucumberWorld {
             .started_node
             .name
             .clone())
+    }
+
+    pub fn resolve_wallet_node_name(&self, wallet_name: &str) -> Result<String, StepError> {
+        Ok(self
+            .wallet_info
+            .get(wallet_name)
+            .ok_or(StepError::LogicalError {
+                message: format!("Wallet '{wallet_name}' not found"),
+            })?
+            .node_name
+            .clone())
+    }
+
+    /// Helper to resolve a list of node names to a `PeerSelection::Named` with
+    /// their corresponding started node names.
+    pub fn peer_selection_from_names(
+        &self,
+        initial_peers: &[String],
+    ) -> Result<PeerSelection, StepError> {
+        Ok(PeerSelection::Named(
+            self.resolve_named_peers(initial_peers),
+        ))
+    }
+
+    /// Helper to resolve a list of node names to their corresponding started
+    /// node names.
+    pub fn resolve_named_peers(&self, initial_peers: &[String]) -> Vec<String> {
+        initial_peers
+            .iter()
+            .map(|peer| {
+                self.resolve_node_runtime_name(peer)
+                    .unwrap_or_else(|_| peer.clone())
+            })
+            .collect()
     }
 
     /// Helper to resolve a node http client to the actual started node name.
@@ -686,6 +764,11 @@ impl CucumberWorld {
             .started_node
             .client
             .clone())
+    }
+
+    /// Helper to retrieve all node names.
+    pub fn all_node_names(&self) -> Vec<String> {
+        self.nodes_info.keys().cloned().collect::<Vec<_>>()
     }
 
     /// Helper to resolve all user wallet names to the actual wallet
@@ -738,19 +821,11 @@ impl CucumberWorld {
         &self,
         wallet: &WalletInfo,
         signed_tx: &SignedMantleTx,
+        node_client: &NodeHttpClient,
     ) -> Result<(), StepError> {
-        let node = self
-            .nodes_info
-            .get(&wallet.node_name)
-            .ok_or(StepError::LogicalError {
-                message: format!(
-                    "Node '{}' for wallet '{}' not found",
-                    wallet.node_name, wallet.wallet_name
-                ),
-            })?;
         tokio::time::timeout(
             Duration::from_secs(10),
-            node.started_node.client.submit_transaction(signed_tx),
+            node_client.submit_transaction(signed_tx),
         )
         .await
         .map_err(|_| StepError::Timeout {
@@ -850,6 +925,13 @@ impl CucumberWorld {
                     &"None"
                 }
             })
+            .field("k8s_manual_cluster", {
+                if self.k8s_manual_cluster.is_some() {
+                    &"Has LbcK8sManualCluster"
+                } else {
+                    &"None"
+                }
+            })
             .field("nodes_info", &nodes_info_display(&self.nodes_info))
             .field("genesis_tokens", &format!("{:?}", self.genesis_tokens))
             .field("wallet_info", &wallet_info_display(&self.wallet_info))
@@ -877,6 +959,8 @@ impl CucumberWorld {
                 &node_header_heights_display(&self.node_header_heights),
             )
             .field("node_peer_ids", &node_peer_ids_display(&self.node_peer_ids))
+            .field("node_groups", &self.node_groups)
+            .field("node_to_group", &self.node_to_group)
             .field(
                 "initial_override_peers_display",
                 &initial_peers_override_display(self.initial_peers_override.as_ref()),
@@ -892,12 +976,61 @@ impl CucumberWorld {
                 ),
             )
             .field(
+                "user_config_overrides",
+                &user_config_overrides_display(&self.user_config_overrides),
+            )
+            .field(
                 "deployment_config_override_path",
                 &deployment_config_override_path_display(
                     self.deployment_config_override_path.as_ref(),
                 ),
             )
             .finish()
+    }
+}
+
+fn host_node_binary_from_env_var_available() -> bool {
+    env::var_os(LOGOS_BLOCKCHAIN_NODE_BIN)
+        .map(PathBuf::from)
+        .is_some_and(|path| path.is_file())
+        || shared_host_bin_path("logos-blockchain-node").is_file()
+}
+
+fn default_node_binary_path() -> Option<PathBuf> {
+    let current_dir = env::current_dir().ok()?;
+    let debug_binary = current_dir.join(BIN_PATH_DEBUG);
+    let release_binary = current_dir.join(BIN_PATH_RELEASE);
+
+    if matches!(std::fs::exists(&debug_binary), Ok(true)) {
+        return Some(debug_binary);
+    }
+
+    if matches!(std::fs::exists(&release_binary), Ok(true)) {
+        return Some(release_binary);
+    }
+
+    None
+}
+
+fn warn_if_overriding_invalid_node_binary(path: &Path) {
+    if env::var_os(LOGOS_BLOCKCHAIN_NODE_BIN).is_none() {
+        return;
+    }
+
+    warn!(
+        target: TARGET,
+        "'{LOGOS_BLOCKCHAIN_NODE_BIN:?}' does not point to a valid file, overriding it to '{}'.",
+        path.display()
+    );
+}
+
+fn missing_node_binary_error() -> StepError {
+    StepError::Preflight {
+        message: format!(
+            "Missing Logos host binaries. Set {LOGOS_BLOCKCHAIN_NODE_BIN}, \
+            or run `scripts/run/run-examples.sh host` to restore them into \
+            `testing-framework/assets/stack/bin`."
+        ),
     }
 }
 
@@ -1060,4 +1193,16 @@ fn deployment_config_override_path_display(
         || "None".to_owned(),
         |path| format!("Some({})", path.display()),
     )
+}
+
+fn user_config_overrides_display(overrides: &[UserConfigOverride]) -> String {
+    if overrides.is_empty() {
+        return "[]".to_owned();
+    }
+
+    let values = overrides
+        .iter()
+        .map(|override_item| format!("{}={:?}", override_item.path, override_item.value))
+        .collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
 }

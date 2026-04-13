@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt as _};
-use lb_chain_broadcast_service::BlockInfo;
-use lb_chain_service::CryptarchiaInfo;
-pub use lb_chain_service::Slot;
+pub use lb_chain_broadcast_service::BlockInfo;
+pub use lb_chain_service::{CryptarchiaInfo, Slot, State};
 use lb_core::{
     block::Block,
     header::{ContentId, HeaderId},
@@ -55,7 +54,9 @@ pub struct ApiBlock {
 pub struct ProcessedBlockEvent {
     pub block: ApiBlock,
     pub tip: HeaderId,
+    pub tip_slot: Slot,
     pub lib: HeaderId,
+    pub lib_slot: Slot,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -252,7 +253,7 @@ impl CommonHttpClient {
     pub async fn get_blocks_stream(
         &self,
         base_url: Url,
-    ) -> Result<impl Stream<Item = ProcessedBlockEvent>, Error> {
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
         let request_url = base_url
             .join(BLOCKS_STREAM.trim_start_matches('/'))
             .map_err(Error::Url)?;

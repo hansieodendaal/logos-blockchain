@@ -29,9 +29,8 @@ use lb_wallet_service::{WalletService, api::WalletApi};
 use num_bigint::BigUint;
 
 use crate::{
-    LogosBlockchainNode,
+    LogosBlockchainNode, ValueResult,
     api::{
-        ValueResult,
         cryptarchia::{Hash, HeaderId, get_cryptarchia_info_sync},
         free,
         types::value::Value,
@@ -244,13 +243,13 @@ pub unsafe extern "C" fn get_known_addresses(
 ///
 /// if (result.status == OperationStatus_Ok) {
 ///     KnownAddresses addresses = result.value;
-///     
+///
 ///     // Use the addresses...
 ///     for (size_t i = 0; i < addresses.len; i++) {
 ///         uint8_t* address = addresses.addresses[i];
 ///         // Process the 32-byte address...
 ///     }
-///     
+///
 ///     // Free the memory when done
 ///     free_known_addresses(addresses);
 /// }
@@ -306,7 +305,7 @@ pub(crate) fn get_balance_sync(
             .await;
             api.get_balance(Some(tip), wallet_address)
                 .await
-                .map(|tip_response| tip_response.response)
+                .map(|tip_response| tip_response.response.map(|balance| balance.balance))
         })
         .map_err(|_| OperationStatus::DynError)
 }

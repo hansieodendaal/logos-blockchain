@@ -1,3 +1,5 @@
+use core::pin::Pin;
+
 use async_trait::async_trait;
 use futures::stream::{self, Stream, StreamExt as _};
 use lb_blend_message::crypto::{
@@ -10,10 +12,11 @@ use lb_blend_proofs::{
 use lb_cryptarchia_engine::Epoch;
 use lb_groth16::fr_to_bytes;
 use lb_key_management_system_keys::keys::UnsecuredEd25519Key;
-use tokio::{sync::mpsc, task::JoinHandle, time::Instant};
+use lb_utils::tokio::stream::Buffered;
+use tokio::{task::spawn, time::Instant};
 
 use crate::message_blend::{
-    CoreProofOfQuotaGenerator,
+    CoreProofOfQuotaGenerator, buffer_size,
     provers::{BlendLayerProof, ProofsGeneratorSettings},
 };
 
@@ -40,19 +43,12 @@ pub struct RealCoreProofsGenerator<PoQGenerator> {
     remaining_quota: u64,
     pub(super) settings: ProofsGeneratorSettings,
     pub(super) proof_of_quota_generator: PoQGenerator,
-    proof_receiver: mpsc::Receiver<BlendLayerProof>,
-    proof_generation_task_handle: JoinHandle<()>,
+    proofs_stream: Pin<Box<dyn Stream<Item = BlendLayerProof> + Send + Sync>>,
 }
 
 impl<PoQGenerator> RealCoreProofsGenerator<PoQGenerator> {
     pub(super) const fn current_epoch(&self) -> Epoch {
         self.settings.epoch
-    }
-}
-
-impl<PoQGenerator> Drop for RealCoreProofsGenerator<PoQGenerator> {
-    fn drop(&mut self) {
-        self.proof_generation_task_handle.abort();
     }
 }
 
@@ -62,14 +58,13 @@ where
     PoQGenerator: CoreProofOfQuotaGenerator + Clone + Send + Sync + 'static,
 {
     fn new(settings: ProofsGeneratorSettings, proof_of_quota_generator: PoQGenerator) -> Self {
-        let (proof_receiver, proof_generation_task_handle) = spawn_proof_generation(
-            create_proof_stream(settings.public_inputs, proof_of_quota_generator.clone(), 0),
-            settings.encapsulation_layers.get() as usize,
-        );
-
         Self {
-            proof_receiver,
-            proof_generation_task_handle,
+            proofs_stream: Box::pin(create_proof_stream(
+                settings.public_inputs,
+                proof_of_quota_generator.clone(),
+                0,
+                buffer_size(settings.encapsulation_layers.get() as usize),
+            )),
             proof_of_quota_generator,
             remaining_quota: settings.public_inputs.core.quota,
             settings,
@@ -98,7 +93,7 @@ where
     async fn get_next_proof(&mut self) -> Option<BlendLayerProof> {
         let start = Instant::now();
         self.remaining_quota = self.remaining_quota.checked_sub(1)?;
-        let proof = self.proof_receiver.recv().await?;
+        let proof = self.proofs_stream.next().await?;
         tracing::trace!(target: LOG_TARGET, "Generated core Blend layer proof with key nullifier {:?} addressed to node at index {:?} in {:?} ms.", hex::encode(fr_to_bytes(&proof.proof_of_quota.key_nullifier())), proof.proof_of_selection.expected_index(self.settings.membership_size), start.elapsed().as_millis());
         Some(proof)
     }
@@ -116,46 +111,21 @@ where
             return;
         }
 
-        self.proof_generation_task_handle.abort();
-
-        let (proof_receiver, generation_task) = spawn_proof_generation(
-            create_proof_stream(
-                self.settings.public_inputs,
-                self.proof_of_quota_generator.clone(),
-                starting_key_index,
-            ),
-            self.settings.encapsulation_layers.get() as usize,
-        );
-        self.proof_receiver = proof_receiver;
-        self.proof_generation_task_handle = generation_task;
+        self.proofs_stream = Box::pin(create_proof_stream(
+            self.settings.public_inputs,
+            self.proof_of_quota_generator.clone(),
+            starting_key_index,
+            buffer_size(self.settings.encapsulation_layers.get() as usize),
+        ));
     }
-}
-
-// Spawns a background task that eagerly drives the proof stream, sending
-// generated proofs into a bounded channel. This ensures proofs are
-// pre-generated and ready for immediate consumption, rather than being lazily
-// produced only when polled as is the case with a buffered stream.
-fn spawn_proof_generation(
-    stream: impl Stream<Item = BlendLayerProof> + Send + 'static,
-    buffer_size: usize,
-) -> (mpsc::Receiver<BlendLayerProof>, JoinHandle<()>) {
-    let (proof_sender, proof_receiver) = mpsc::channel(buffer_size);
-    let handle = tokio::spawn(async move {
-        tokio::pin!(stream);
-        while let Some(proof) = stream.next().await {
-            if proof_sender.send(proof).await.is_err() {
-                break;
-            }
-        }
-    });
-    (proof_receiver, handle)
 }
 
 fn create_proof_stream<Generator>(
     public_inputs: PoQVerificationInputsMinusSigningKey,
     proof_of_quota_generator: Generator,
     starting_key_index: u64,
-) -> impl Stream<Item = BlendLayerProof>
+    buffer_size: usize,
+) -> impl Stream<Item = BlendLayerProof> + Send
 where
     Generator: CoreProofOfQuotaGenerator + Clone + Send + Sync + 'static,
 {
@@ -164,15 +134,21 @@ where
         .quota
         .checked_sub(starting_key_index)
         .expect("Starting key index should never be larger than core quota.");
-    tracing::debug!(target: LOG_TARGET, "Generating {proofs_to_generate} core quota proofs starting from index: {starting_key_index} with public inputs: {public_inputs:?}.");
+    tracing::trace!(target: LOG_TARGET, "Generating {proofs_to_generate} core quota proofs starting from index: {starting_key_index} with public inputs: {public_inputs:?}.");
 
     let quota = public_inputs.core.quota;
-    stream::iter(starting_key_index..quota)
-        .then(move |key_index| {
+    Buffered::new(
+        stream::iter(starting_key_index..quota)
+        .map(move |key_index| {
             let ephemeral_signing_key = UnsecuredEd25519Key::generate_with_blake_rng();
             let proof_of_quota_generator = proof_of_quota_generator.clone();
 
-            async move {
+            // Spawn eagerly here (outside `async move`) so the task starts as soon as the
+            // stream buffer slot is filled, not when the future is first polled.
+            // Without this, `generate_poq` would only begin when `FuturesOrdered` first
+            // polls the future — which only happens when the consumer polls the stream —
+            // causing avoidable latency when the consumer is idle.
+            let task = spawn(async move {
                 let (proof_of_quota, secret_selection_randomness) = proof_of_quota_generator
                     .generate_poq(
                         &PublicInputs {
@@ -191,6 +167,10 @@ where
                     proof_of_selection,
                     ephemeral_signing_key,
                 }
-            }
-        })
+            });
+
+            async move { task.await.expect("Core PoQ generation task should not fail.") }
+        }),
+        buffer_size,
+    )
 }

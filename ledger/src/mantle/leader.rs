@@ -11,8 +11,6 @@ use lb_cryptarchia_engine::Epoch;
 use lb_utxotree::{DynamicMerkleTree, MerklePath};
 use rpds::{HashTrieMapSync, VectorSync};
 
-use crate::Balance;
-
 /// A leader state in the mantle ledger.
 ///
 /// NOTE: Most collection fields in this struct should use `rpds`
@@ -152,11 +150,24 @@ impl LeaderState {
         self.claimable_vouchers.path(*index)
     }
 
+    /// Compute the per-voucher reward given current state.
+    #[must_use]
+    pub fn reward_amount(&self) -> Value {
+        let n_unclaimed_vouchers = self
+            .n_claimable_vouchers
+            .saturating_sub(self.nfs.size() as u64);
+        if n_unclaimed_vouchers > 0 {
+            self.claimable_rewards / n_unclaimed_vouchers
+        } else {
+            0
+        }
+    }
+
     /// Claim the reward associated with a voucher.
     /// Any cryptographic proof of correct derivation of the voucher nullifier
     /// and membership proof in the merkle tree is expected to happen
     /// outside of this function.
-    pub fn claim(&self, op: &LeaderClaimOp) -> Result<(Self, Balance), Error> {
+    pub fn claim(&self, op: &LeaderClaimOp) -> Result<(Self, Value), Error> {
         if self.nfs.contains(&op.voucher_nullifier) {
             return Err(Error::DuplicatedVoucherNullifier);
         }
@@ -165,31 +176,16 @@ impl LeaderState {
             return Err(Error::VoucherNotFound);
         }
 
+        let reward_amount = self.reward_amount();
         let nfs = self.nfs.insert(op.voucher_nullifier);
-        let n_unclaimed_vouchers = self
-            .n_claimable_vouchers
-            .checked_sub(self.nfs.size() as u64)
-            .expect("more nullifiers than vouchers");
-        let reward_amount = if n_unclaimed_vouchers > 0 {
-            self.claimable_rewards / n_unclaimed_vouchers
-        } else {
-            0
-        };
-
         let claimable_rewards = self.claimable_rewards - reward_amount;
         Ok((
             Self {
-                epoch: self.epoch,
-                claimable_vouchers_root: self.claimable_vouchers_root,
-                n_claimable_vouchers: self.n_claimable_vouchers,
                 nfs,
-                pending_rewards: self.pending_rewards,
                 claimable_rewards,
-                claimable_vouchers: self.claimable_vouchers.clone(),
-                claimable_voucher_indices: self.claimable_voucher_indices.clone(),
-                pending_vouchers: self.pending_vouchers.clone(),
+                ..self.clone()
             },
-            Balance::from(reward_amount),
+            reward_amount,
         ))
     }
 }
@@ -199,6 +195,14 @@ mod tests {
     use lb_groth16::{Field as _, Fr};
 
     use super::*;
+
+    impl LeaderState {
+        #[cfg(test)]
+        #[must_use]
+        pub fn get_pending_rewards(&self) -> Value {
+            self.pending_rewards
+        }
+    }
 
     #[test]
     fn test_reward_amounts() {

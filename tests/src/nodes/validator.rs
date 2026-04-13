@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
     net::SocketAddr,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     str::FromStr as _,
     time::Duration,
@@ -31,16 +32,16 @@ use lb_node::{
         wallet::serde::RequiredValues as WalletConfigRequiredValues,
     },
 };
+use lb_testing_framework::release_reserved_port_block;
 use lb_tx_service::MempoolMetrics;
-use lb_utils::net::get_available_tcp_port;
 use reqwest::Url;
 use tempfile::NamedTempFile;
 use tokio::time::error::Elapsed;
 
 use super::{CLIENT, create_tempdir, get_exe_path, persist_tempdir};
 use crate::{
-    IS_DEBUG_TRACING, common::kms::key_id_for_preload_backend, nodes::LOGS_PREFIX,
-    topology::configs::GeneralConfig,
+    IS_DEBUG_TRACING, common::kms::key_id_for_preload_backend, get_reserved_available_tcp_port,
+    nodes::LOGS_PREFIX, topology::configs::GeneralConfig,
 };
 
 pub enum Pool {
@@ -71,6 +72,7 @@ impl Drop for Validator {
         // are released before the next test iteration spawns new validators.
         // After SIGKILL, wait() returns almost immediately.
         drop(self.child.wait());
+        release_reserved_port_block();
     }
 }
 
@@ -149,19 +151,16 @@ impl Validator {
         self.wait_for_exit(Duration::from_secs(5)).await;
 
         // Re-write config files (they were temporary and may have been cleaned up)
-        let mut user_config_file = NamedTempFile::new().unwrap();
-        let mut deployment_config_file = NamedTempFile::new().unwrap();
-
-        serde_yaml::to_writer(&mut user_config_file, &self.config.user).unwrap();
-        serde_yaml::to_writer(&mut deployment_config_file, &self.config.deployment).unwrap();
+        let (user_config_path, deployment_config_path) =
+            Self::create_config_files(self.tempdir.path(), &self.config);
 
         // Spawn new process with same config
         let exe_path = get_exe_path();
         self.child = Command::new(exe_path)
             .arg("--deployment")
-            .arg(deployment_config_file.path().as_os_str())
+            .arg(deployment_config_path.as_os_str())
             .args(args)
-            .arg(user_config_file.path().as_os_str())
+            .arg(user_config_path.as_os_str())
             .current_dir(self.tempdir.path())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -177,10 +176,20 @@ impl Validator {
         Ok(())
     }
 
+    fn create_config_files(dir: &Path, config: &RunConfig) -> (PathBuf, PathBuf) {
+        let user_config_path = dir.join("user_config.yaml");
+        let deployment_config_path = dir.join("deployment_config.yaml");
+        let mut user_config_file = std::fs::File::create(&user_config_path).unwrap();
+        let mut deployment_config_file = std::fs::File::create(&deployment_config_path).unwrap();
+        serde_yaml::to_writer(&mut user_config_file, &config.user).unwrap();
+        serde_yaml::to_writer(&mut deployment_config_file, &config.deployment).unwrap();
+        println!("User config: '{}'", user_config_path.display());
+        println!("Deployment config: '{}'", deployment_config_path.display());
+        (user_config_path, deployment_config_path)
+    }
+
     pub async fn spawn(mut config: RunConfig) -> Result<Self, Elapsed> {
         let dir = create_tempdir().unwrap();
-        let mut user_config_file = NamedTempFile::new().unwrap();
-        let mut deployment_config_file = NamedTempFile::new().unwrap();
 
         if !*IS_DEBUG_TRACING {
             // setup logging so that we can intercept it later in testing
@@ -200,13 +209,15 @@ impl Validator {
         config.user.state.base_folder = dir.path().to_path_buf();
         "db".clone_into(&mut config.user.storage.backend.folder_name);
 
-        serde_yaml::to_writer(&mut user_config_file, &config.user).unwrap();
-        serde_yaml::to_writer(&mut deployment_config_file, &config.deployment).unwrap();
+        // let user_config_path = dir.path().join("user_config.yaml");
+        let (user_config_path, deployment_config_path) =
+            Self::create_config_files(dir.path(), &config);
+
         let exe_path = get_exe_path();
         let child = Command::new(exe_path)
             .arg("--deployment")
-            .arg(deployment_config_file.path().as_os_str())
-            .arg(user_config_file.path().as_os_str())
+            .arg(deployment_config_path.as_os_str())
+            .arg(user_config_path.as_os_str())
             .current_dir(dir.path())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -424,10 +435,7 @@ impl Validator {
 }
 
 #[must_use]
-pub fn create_validator_config(
-    config: GeneralConfig,
-    deployment_config: DeploymentSettings,
-) -> RunConfig {
+pub fn create_validator_user_config(config: GeneralConfig) -> UserConfig {
     let network_config = config.network_config;
 
     let blend_config = config.blend_config.0;
@@ -454,7 +462,7 @@ pub fn create_validator_config(
             ..Default::default()
         },
         testing: AxumBackendSettings {
-            listen_address: format!("127.0.0.1:{}", get_available_tcp_port().unwrap())
+            listen_address: format!("127.0.0.1:{}", get_reserved_available_tcp_port().unwrap())
                 .parse()
                 .unwrap(),
             max_concurrent_requests: 1000,
@@ -504,7 +512,7 @@ pub fn create_validator_config(
 
     let state_config = StateConfig::default();
 
-    let user_config = UserConfig {
+    UserConfig {
         network: network_config,
         blend: blend_config,
         time: time_config,
@@ -516,10 +524,16 @@ pub fn create_validator_config(
         wallet: wallet_config,
         kms: kms_config,
         state: state_config,
-    };
+    }
+}
 
+#[must_use]
+pub fn create_validator_config(
+    config: GeneralConfig,
+    deployment_config: DeploymentSettings,
+) -> RunConfig {
     RunConfig {
         deployment: deployment_config,
-        user: user_config,
+        user: create_validator_user_config(config),
     }
 }

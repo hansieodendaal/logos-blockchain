@@ -17,7 +17,9 @@ use crate::{
     encap::{
         ProofsVerifier,
         decapsulated::{PartDecapsulationOutput, PrivateHeaderDecapsulationOutput},
-        validated::EncapsulatedMessageWithVerifiedPublicHeader,
+        validated::{
+            EncapsulatedMessageWithVerifiedPublicHeader, EncapsulatedMessageWithVerifiedSignature,
+        },
     },
     input::EncapsulationInput,
     message::{
@@ -55,6 +57,21 @@ impl EncapsulatedMessage {
     #[must_use]
     pub fn into_components(self) -> (PublicHeader, EncapsulatedPart) {
         (self.public_header, self.encapsulated_part)
+    }
+
+    /// Verify the message public header signature.
+    pub fn verify_header_signature(
+        self,
+    ) -> Result<EncapsulatedMessageWithVerifiedSignature, Error> {
+        let public_header_with_verified_signature =
+            self.public_header.verify_signature(&signing_body(
+                &self.encapsulated_part.private_header,
+                &self.encapsulated_part.payload,
+            ))?;
+        Ok(EncapsulatedMessageWithVerifiedSignature::from_components(
+            public_header_with_verified_signature,
+            self.encapsulated_part,
+        ))
     }
 
     /// Verify the message public header.
@@ -232,6 +249,7 @@ where
 {
     verify_last_reconstructed_public_header(public_header, private_header, payload)?;
     // Verify the proof of quota in the reconstructed public header
+    tracing::trace!("Verifying proof of quota of intermediate reconstructed public header.");
     public_header.verify_proof_of_quota(verifier)?;
     Ok(())
 }

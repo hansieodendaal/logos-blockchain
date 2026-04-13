@@ -7,7 +7,10 @@ use derivative::Derivative;
 use lb_core::{
     crypto::{ZkDigest, ZkHasher},
     mantle::{
-        GenesisTx, NoteId, TxHash, Utxo, Value, gas::GasConstants, ops::transfer::TransferOp,
+        GenesisTx, NoteId, TxHash, Utxo, Value,
+        gas::{Gas, GasConstants, GasCost, GasPrice},
+        genesis_tx::{GENESIS_EXECUTION_GAS_PRICE, GENESIS_STORAGE_GAS_PRICE},
+        ops::transfer::TransferOp,
     },
     proofs::leader_proof::{self, LeaderPublic},
 };
@@ -20,6 +23,26 @@ use crate::cryptarchia::{
     block_density::BlockDensity,
     stake::{PRECISION, StakeInference},
 };
+
+// corresponds to the denominator of q
+const EXECUTION_MARKET_EMA_DENOMINATOR: u128 = 10;
+// Corresponds to the numerator of q
+const EXECUTION_MARKET_EMA_PREV_WEIGHT: u128 = 9;
+// Corresponds to 7 * G_target because the numerator is 1 + phi (G_avg -
+// G_target)
+const EXECUTION_MARKET_BASE_FEE_NUMERATOR: u128 = 11_176_760;
+// Corresponds to 8 * G_target because the denominator is 1 + phi (G_avg -
+// // G_target)
+const EXECUTION_MARKET_BASE_FEE_DENOMINATOR: u128 = 12_773_440;
+
+// Corresponds to the denominator of 1/beta
+const STORAGE_MARKET_EMA_DENOMINATOR: u128 = 2;
+// Corresponds to the denominator of 1+ alpha and 1-alpha
+const STORAGE_MARKET_CLAMP_DENOMINATOR: u128 = 8;
+// Corresponds to the numerator of 1-alpha
+const STORAGE_MARKET_CLAMP_DOWN_NUMERATOR: u128 = 7;
+// Corresponds to the numerator of 1+alpha
+const STORAGE_MARKET_CLAMP_UP_NUMERATOR: u128 = 9;
 
 pub type UtxoTree = lb_utxotree::UtxoTree<NoteId, Utxo, ZkHasher>;
 use super::{Balance, Config, LedgerError};
@@ -131,7 +154,17 @@ pub struct LedgerState {
     stake_inference: Arc<StakeInference>,
     // rolling fee window of 120 blocks, used to derive block rewards
     #[cfg_attr(feature = "serde", serde(with = "serde_arrays"))]
-    fee_window: [Value; WINDOW_SIZE],
+    fee_window: [GasCost; WINDOW_SIZE],
+    // Smoothed Average Execution Gas used up to the last block
+    average_execution_gas: Gas,
+    // Execution Base Fee that are burned and minimum required to pay.
+    execution_base_fee: GasPrice,
+    // Exponential Moving Average Storage Gas used in the currect epoch
+    storage_gas_ema: Gas,
+    // Actual storage Gas price of the currect epoch
+    storage_gas_price: GasPrice,
+    // The amount of Storage Gas consumed in the current epoch
+    storage_gas_consumed_in_epoch: Gas,
 }
 
 impl LedgerState {
@@ -169,9 +202,11 @@ impl LedgerState {
         // 1. We are in the same epoch as the parent state: Update the next epoch state
         // 2. We are in the next epoch: Use the next epoch state as the current epoch
         //    state and reset next epoch state
-        // 3. We are in the next-next or later epoch: Use the parent state as the epoch
-        //    state and reset next epoch state. Total stake should be adjusted with zero
-        //    block density for skipped epochs.
+        // 3. We are in the next-next or later epoch (which mean that some epochs had no
+        //    block): Use the parent state as the epoch state and reset next epoch
+        //    state. Total stake should be adjusted with zero block density for skipped
+        //    epochs. Storage Market is updated with 0 storage gas used for skipped
+        //    epochs.
         if current_epoch == new_epoch {
             // case 1)
             Ok(Self {
@@ -218,11 +253,19 @@ impl LedgerState {
                 lottery_0,
                 lottery_1,
             };
+            let (new_price, new_ema) = update_storage_market(
+                self.storage_gas_price,
+                self.storage_gas_consumed_in_epoch,
+                self.storage_gas_ema,
+            );
             Ok(Self {
                 slot,
                 next_epoch_state,
                 epoch_state,
                 block_density,
+                storage_gas_consumed_in_epoch: 0.into(),
+                storage_gas_ema: new_ema,
+                storage_gas_price: new_price,
                 ..self
             })
         } else {
@@ -242,6 +285,18 @@ impl LedgerState {
             let (lottery_0, lottery_1) = config
                 .lottery_constants()
                 .compute_lottery_values(total_stake);
+
+            // Update Storage Market
+            // First, using the current epoch
+            let (mut new_price, mut new_ema) = update_storage_market(
+                self.storage_gas_price,
+                self.storage_gas_consumed_in_epoch,
+                self.storage_gas_ema,
+            );
+            // Then for the empty epochs
+            for _ in u32::from(next_epoch_state.epoch())..u32::from(new_epoch) {
+                (new_price, new_ema) = update_storage_market(new_price, 0.into(), new_ema);
+            }
 
             tracing::warn!(
                 old_epoch = ?current_epoch,
@@ -274,8 +329,34 @@ impl LedgerState {
                 next_epoch_state,
                 epoch_state,
                 block_density,
+                storage_gas_consumed_in_epoch: 0.into(),
+                storage_gas_ema: new_ema,
+                storage_gas_price: new_price,
                 ..self
             })
+        }
+    }
+
+    #[must_use]
+    pub fn update_execution_market(self, block_execution_gas_consumed: Gas) -> Self {
+        // First update the `average_execution_gas`
+        let avg_numerator = u128::from(block_execution_gas_consumed.into_inner())
+            + EXECUTION_MARKET_EMA_PREV_WEIGHT
+                * u128::from(self.average_execution_gas.into_inner());
+        let new_average_execution_gas: Gas =
+            ((avg_numerator / EXECUTION_MARKET_EMA_DENOMINATOR) as Value).into();
+
+        // Then update the `execution_base_fee`
+        let fee_numerator = u128::from(self.execution_base_fee.into_inner())
+            * (EXECUTION_MARKET_BASE_FEE_NUMERATOR
+                + u128::from(self.average_execution_gas.into_inner()));
+        let new_base_fee =
+            ((fee_numerator / EXECUTION_MARKET_BASE_FEE_DENOMINATOR) as Value).into();
+
+        Self {
+            average_execution_gas: new_average_execution_gas,
+            execution_base_fee: new_base_fee,
+            ..self
         }
     }
 
@@ -343,7 +424,7 @@ impl LedgerState {
                 .map_err(|_| LedgerError::InvalidNote(*input))?;
             balance = balance
                 .checked_add(utxo.note.value.into())
-                .ok_or(LedgerError::Overflow)?;
+                .ok_or(LedgerError::BalanceOverflow)?;
             pks.push(utxo.note.pk);
         }
 
@@ -357,7 +438,7 @@ impl LedgerState {
             }
             balance = balance
                 .checked_sub(utxo.note.value.into())
-                .ok_or(LedgerError::Overflow)?;
+                .ok_or(LedgerError::BalanceOverflow)?;
             self.utxos = self.utxos.insert(utxo.id(), utxo).0;
         }
         Ok((self, balance))
@@ -387,18 +468,21 @@ impl LedgerState {
         }
     }
 
-    pub const fn update_fee_window(&mut self, index: usize, total_fee: u64) {
+    pub const fn update_fee_window(&mut self, index: usize, total_fee: GasCost) {
         self.fee_window[index] = total_fee;
     }
 
     #[must_use]
-    pub const fn get_fee_from_index(&self, index: usize) -> Value {
+    pub const fn get_fee_from_index(&self, index: usize) -> GasCost {
         self.fee_window[index]
     }
 
     #[must_use]
     pub fn get_summed_fees(&self) -> u128 {
-        self.fee_window.iter().map(|x| u128::from(*x)).sum()
+        self.fee_window
+            .iter()
+            .map(|x| u128::from(x.into_inner()))
+            .sum()
     }
 
     #[must_use]
@@ -419,6 +503,16 @@ impl LedgerState {
     #[must_use]
     pub const fn latest_utxos(&self) -> &UtxoTree {
         &self.utxos
+    }
+
+    #[must_use]
+    pub const fn execution_base_fee(&self) -> &GasPrice {
+        &self.execution_base_fee
+    }
+
+    #[must_use]
+    pub const fn storage_gas_price(&self) -> &GasPrice {
+        &self.storage_gas_price
     }
 
     #[must_use]
@@ -502,9 +596,45 @@ impl LedgerState {
             },
             block_density,
             stake_inference,
-            fee_window: [0u64; 120],
+            fee_window: [0.into(); 120],
+            average_execution_gas: 0.into(),
+            execution_base_fee: GENESIS_EXECUTION_GAS_PRICE,
+            storage_gas_ema: 0.into(),
+            storage_gas_price: GENESIS_STORAGE_GAS_PRICE,
+            storage_gas_consumed_in_epoch: 0.into(),
         }
     }
+}
+
+// This function upgrade the storage Gas price when a new epoch starts assuming
+// the structure contains how much storage gas was consumed in the previous
+// epoch according to <https://www.notion.so/nomos-tech/v1-1-Storage-Markets-Specification-326261aa09df804ab483f573f522baf5>
+fn update_storage_market(
+    storage_gas_price: GasPrice,
+    storage_gas_consumed_in_epoch: Gas,
+    storage_gas_ema: Gas,
+) -> (GasPrice, Gas) {
+    let previous_price = u128::from(storage_gas_price.into_inner());
+    let total_storage_gas = u128::from(storage_gas_consumed_in_epoch.into_inner());
+    let previous_ema = u128::from(storage_gas_ema.into_inner());
+
+    let new_ema: Gas =
+        (((total_storage_gas + previous_ema) / STORAGE_MARKET_EMA_DENOMINATOR) as Value).into();
+    let new_ema_unsigned = u128::from(new_ema.into_inner());
+    let comparator = STORAGE_MARKET_CLAMP_DENOMINATOR * total_storage_gas;
+    let new_price = if comparator <= STORAGE_MARKET_CLAMP_DOWN_NUMERATOR * new_ema_unsigned {
+        ((previous_price * STORAGE_MARKET_CLAMP_DOWN_NUMERATOR / STORAGE_MARKET_CLAMP_DENOMINATOR)
+            as Value)
+            .into()
+    } else if comparator >= STORAGE_MARKET_CLAMP_UP_NUMERATOR * new_ema_unsigned {
+        ((previous_price * STORAGE_MARKET_CLAMP_UP_NUMERATOR / STORAGE_MARKET_CLAMP_DENOMINATOR)
+            as Value)
+            .into()
+    } else {
+        ((previous_price * total_storage_gas / new_ema_unsigned) as Value).into()
+    };
+
+    (new_price, new_ema)
 }
 
 #[expect(
@@ -528,8 +658,8 @@ pub mod tests {
     use lb_core::{
         crypto::{Digest as _, Hasher},
         mantle::{
-            GasCost as _, MantleTx, Note, Op, OpProof::ZkSig, SignedMantleTx, Transaction as _,
-            gas::MainnetGasConstants, ops::leader_claim::VoucherCm,
+            AuthenticatedMantleTx, MantleTx, Note, Op, OpProof::ZkSig, SignedMantleTx,
+            Transaction as _, gas::MainnetGasConstants, ops::leader_claim::VoucherCm,
         },
         sdp::ServiceParameters,
     };
@@ -593,6 +723,17 @@ pub mod tests {
 
         fn voucher_cm(&self) -> &VoucherCm {
             &self.voucher_cm
+        }
+    }
+
+    impl LedgerState {
+        #[cfg(test)]
+        #[must_use]
+        pub fn set_execution_base_fee(self, new_execution_fee: GasPrice) -> Self {
+            Self {
+                execution_base_fee: new_execution_fee,
+                ..self
+            }
         }
     }
 
@@ -746,8 +887,13 @@ pub mod tests {
                 lottery_1,
             },
             stake_inference,
-            fee_window: [0u64; 120],
+            fee_window: [0.into(); 120],
+            average_execution_gas: 0.into(),
             block_density,
+            execution_base_fee: GENESIS_EXECUTION_GAS_PRICE,
+            storage_gas_ema: 0.into(),
+            storage_gas_price: GENESIS_STORAGE_GAS_PRICE,
+            storage_gas_consumed_in_epoch: 0.into(),
         }
     }
 
@@ -1110,8 +1256,8 @@ pub mod tests {
         let transfer_op = TransferOp::new(inputs, outputs);
         let mantle_tx = MantleTx {
             ops: vec![Op::Transfer(transfer_op.clone())],
-            execution_gas_price: 1,
-            storage_gas_price: 1,
+            execution_gas_price: GENESIS_EXECUTION_GAS_PRICE,
+            storage_gas_price: GENESIS_STORAGE_GAS_PRICE,
         };
         let transfer_sig = ZkKey::multi_sign(&sks, &mantle_tx.hash().into()).unwrap();
         (
@@ -1144,7 +1290,7 @@ pub mod tests {
         let (tx, transfer_op, transfer_sig) =
             create_tx_with_transfer(&[(&note_sk, &input_utxo)], vec![output_note1, output_note2]);
 
-        let _fees = tx.gas_cost::<MainnetGasConstants>();
+        let _fees = AuthenticatedMantleTx::total_gas_cost::<MainnetGasConstants>(&tx);
         let (new_state, balance) = ledger_state
             .try_apply_transfer::<(), MainnetGasConstants>(
                 &locked_notes,
@@ -1180,7 +1326,7 @@ pub mod tests {
             vec![],
         );
         let locked_notes = LockedNotes::new();
-        let _fees = tx.gas_cost::<MainnetGasConstants>();
+        let _fees = AuthenticatedMantleTx::total_gas_cost::<MainnetGasConstants>(&tx);
         let (final_state, final_balance) = new_state
             .try_apply_transfer::<(), MainnetGasConstants>(
                 &locked_notes,
@@ -1308,7 +1454,7 @@ pub mod tests {
         let (tx, transfer_op, transfer_sig) =
             create_tx_with_transfer(&[(&input_sk, &input_utxo)], vec![]);
 
-        let _fees = tx.gas_cost::<MainnetGasConstants>();
+        let _fees = AuthenticatedMantleTx::total_gas_cost::<MainnetGasConstants>(&tx);
         let result = ledger_state.try_apply_transfer::<(), MainnetGasConstants>(
             &locked_notes,
             &transfer_op,
@@ -1447,5 +1593,147 @@ pub mod tests {
             config.consensus_config.slot_activation_coeff().as_f64(),
             config.total_stake_inference_period(),
         )
+    }
+
+    #[test]
+    fn test_storage_market_update() {
+        // empty epoch
+        assert_eq!(
+            (437.into(), 340.into()),
+            update_storage_market(500.into(), 0.into(), 681.into())
+        );
+
+        // Some random values
+        // 1) raw = 113 * 1.125 = 127.125 -> 127
+        assert_eq!(
+            (127.into(), 450.into()),
+            update_storage_market(113.into(), 600.into(), 300.into())
+        );
+
+        // 2) raw = 113 * 0.875 = 98.875 -> 98
+        assert_eq!(
+            (98.into(), 500.into()),
+            update_storage_market(113.into(), 200.into(), 800.into())
+        );
+
+        // 3) raw = 221 * 1.125 = 248.625 -> 248
+        assert_eq!(
+            (248.into(), 550.into()),
+            update_storage_market(221.into(), 900.into(), 200.into())
+        );
+
+        // 4) raw = 221 * 0.875 = 193.375 -> 193
+        assert_eq!(
+            (193.into(), 500.into()),
+            update_storage_market(221.into(), 100.into(), 900.into())
+        );
+
+        // 5) raw = 345 * 1.125 = 388.125 -> 388
+        assert_eq!(
+            (388.into(), 165.into()),
+            update_storage_market(345.into(), 250.into(), 80.into())
+        );
+
+        // 6) raw = 345 * 0.875 = 301.875 -> 301
+        assert_eq!(
+            (301.into(), 400.into()),
+            update_storage_market(345.into(), 50.into(), 750.into())
+        );
+
+        // 7) raw = 517 * 1.125 = 581.625 -> 581
+        assert_eq!(
+            (581.into(), 160.into()),
+            update_storage_market(517.into(), 220.into(), 100.into())
+        );
+
+        // 8) raw = 517 * 0.875 = 452.375 -> 452
+        assert_eq!(
+            (452.into(), 485.into()),
+            update_storage_market(517.into(), 120.into(), 850.into())
+        );
+
+        // 9) raw = 999 * 1.125 = 1123.875 -> 1123
+        assert_eq!(
+            (1123.into(), 650.into()),
+            update_storage_market(999.into(), 1000.into(), 300.into())
+        );
+
+        // 10) raw = 999 * 0.875 = 874.125 -> 874
+        assert_eq!(
+            (874.into(), 650.into()),
+            update_storage_market(999.into(), 300.into(), 1000.into())
+        );
+    }
+
+    #[test]
+    fn test_execution_market_update() {
+        // Create a base ledger first
+        let mut ledger = LedgerState::from_utxos([], &config(), Fr::ZERO);
+
+        // Some random values to test
+        let old_avg = 1_596_688.into();
+        let old_price = 113.into();
+        let gas_used = 1_596_618.into();
+        // 1) G_avg = (1596618 + 9*1596688)/10 = 1596681
+        // price = 113 * (1 + 1 / 12_773_440) = 113.00000884648146 -> 113
+        ledger.execution_base_fee = old_price;
+        ledger.average_execution_gas = old_avg;
+        ledger = ledger.update_execution_market(gas_used);
+        assert_eq!(
+            (ledger.execution_base_fee, ledger.average_execution_gas),
+            (113.into(), 1_596_681.into())
+        );
+
+        let old_avg = 1_596_676.into();
+        let old_price = 221.into();
+        let gas_used = 1_596_706.into();
+        // 2) G_avg = (1596706 + 9*1596676)/10 = 1596679
+        // price = 221 * (1 - 1 / 12_773_440) = 220.99998269847435 -> 220
+        ledger.execution_base_fee = old_price;
+        ledger.average_execution_gas = old_avg;
+        ledger = ledger.update_execution_market(gas_used);
+        assert_eq!(
+            (ledger.execution_base_fee, ledger.average_execution_gas),
+            (220.into(), 1_596_679.into())
+        );
+
+        let old_avg = 1_597_925.into();
+        let old_price = 345.into();
+        let gas_used = 1_597_815.into();
+        // 3) G_avg = (1597815 + 9*1597925)/10 = 1597914
+        // price = 345 * (1 + 1234 / 12_773_440) = 345.0333293145777 -> 345
+        ledger.execution_base_fee = old_price;
+        ledger.average_execution_gas = old_avg;
+        ledger = ledger.update_execution_market(gas_used);
+        assert_eq!(
+            (ledger.execution_base_fee, ledger.average_execution_gas),
+            (345.into(), 1_597_914.into())
+        );
+
+        let old_avg = 1_592_354.into();
+        let old_price = 517.into();
+        let gas_used = 1_592_404.into();
+        // 4) G_avg = (1592404 + 9*1592354)/10 = 1592359
+        // price = 517 * (1 - 4321 / 12_773_440) = 516.8251092109878 -> 516
+        ledger.execution_base_fee = old_price;
+        ledger.average_execution_gas = old_avg;
+        ledger = ledger.update_execution_market(gas_used);
+        assert_eq!(
+            (ledger.execution_base_fee, ledger.average_execution_gas),
+            (516.into(), 1_592_359.into())
+        );
+
+        let old_avg = 1_604_466.into();
+        let old_price = 999.into();
+        let gas_used = 1_604_376.into();
+        // 5) G_avg = (1604376 + 9*1604466)/10 = 1604457
+        // price = 999 * (1 + 7777 / 12_773_440) = 999.6082326295813 -> 999
+        ledger.execution_base_fee = old_price;
+        ledger.average_execution_gas = old_avg;
+        ledger = ledger.update_execution_market(gas_used);
+        assert_eq!(
+            (ledger.execution_base_fee, ledger.average_execution_gas),
+            (999.into(), 1_604_457.into())
+        );
     }
 }

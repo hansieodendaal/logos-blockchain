@@ -11,9 +11,10 @@ use lb_chain_service::{
 use lb_core::{
     block::Block,
     header::HeaderId,
-    mantle::{SignedMantleTx, Transaction, TxHash},
+    mantle::{SignedMantleTx, Transaction, TxHash, ops::channel::ChannelId},
     sdp::Declaration,
 };
+use lb_ledger::mantle::channel::ChannelState;
 use lb_storage_service::{
     StorageMsg, StorageService,
     api::{
@@ -31,6 +32,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 
+use crate::http::consensus::{Cryptarchia, cryptarchia_ledger_state};
+
 /// A block along with the current chain state (tip and LIB) at the time it was
 /// processed. This allows clients to track the canonical chain without needing
 /// to poll /cryptarchia/info.
@@ -39,8 +42,10 @@ pub struct BlockWithChainState<Tx> {
     pub block: Block<Tx>,
     /// The current canonical tip after processing this block.
     pub tip: HeaderId,
+    pub tip_slot: Slot,
     /// The current Last Irreversible Block after processing this block.
     pub lib: HeaderId,
+    pub lib_slot: Slot,
 }
 
 pub type MempoolService<StorageAdapter, RuntimeServiceId> = TxMempoolService<
@@ -55,6 +60,23 @@ pub type MempoolService<StorageAdapter, RuntimeServiceId> = TxMempoolService<
     StorageAdapter,
     RuntimeServiceId,
 >;
+
+pub async fn channel<RuntimeServiceId>(
+    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+    id: ChannelId,
+) -> Result<ChannelState, super::DynError>
+where
+    RuntimeServiceId:
+        Debug + Send + Sync + Display + 'static + AsServiceId<Cryptarchia<RuntimeServiceId>>,
+{
+    let ledger_state = cryptarchia_ledger_state(handle).await?;
+    ledger_state
+        .mantle_ledger()
+        .channels()
+        .channel_state(&id)
+        .cloned()
+        .ok_or_else(|| "channel not found".into())
+}
 
 pub async fn mantle_mempool_metrics<StorageAdapter, RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
@@ -226,7 +248,9 @@ where
             Some(BlockWithChainState {
                 block,
                 tip: event.tip,
+                tip_slot: event.tip_slot,
                 lib: event.lib,
+                lib_slot: event.lib_slot,
             })
         }
     });
@@ -349,16 +373,10 @@ pub async fn get_sdp_declarations<RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
 ) -> Result<Vec<Declaration>, super::DynError>
 where
-    RuntimeServiceId: Debug
-        + Send
-        + Sync
-        + Display
-        + 'static
-        + AsServiceId<super::consensus::Cryptarchia<RuntimeServiceId>>,
+    RuntimeServiceId:
+        Debug + Send + Sync + Display + 'static + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    let relay = handle
-        .relay::<super::consensus::Cryptarchia<RuntimeServiceId>>()
-        .await?;
+    let relay = handle.relay::<Cryptarchia<RuntimeServiceId>>().await?;
     let (sender, receiver) = oneshot::channel();
 
     relay

@@ -9,6 +9,7 @@ use lb_blend_proofs::quota::inputs::prove::{
     private::ProofOfLeadershipQuotaInputs, public::LeaderInputs,
 };
 use lb_cryptarchia_engine::Epoch;
+use lb_groth16::fr_to_bytes;
 use lb_key_management_system_keys::keys::X25519PrivateKey;
 
 use crate::{
@@ -30,6 +31,7 @@ pub struct SessionCryptographicProcessor<NodeId, CorePoQGenerator, ProofsGenerat
     /// The non-ephemeral encryption key (NEK) for decapsulating messages.
     non_ephemeral_encryption_key: X25519PrivateKey,
     membership: Membership<NodeId>,
+    session: u64,
     proofs_generator: ProofsGenerator,
     _phantom: PhantomData<CorePoQGenerator>,
 }
@@ -43,6 +45,10 @@ impl<NodeId, CorePoQGenerator, ProofsGenerator>
 
     pub(super) const fn membership(&self) -> &Membership<NodeId> {
         &self.membership
+    }
+
+    pub const fn session(&self) -> u64 {
+        self.session
     }
 
     #[cfg(test)]
@@ -64,7 +70,7 @@ where
         core_proof_of_quota_generator: CorePoQGenerator,
         epoch: Epoch,
     ) -> Self {
-        tracing::debug!(
+        tracing::trace!(
             "Creating session cryptographic processor with public info {public_info:?} and epoch {epoch:?}"
         );
 
@@ -83,12 +89,13 @@ where
                 generator_settings,
                 core_proof_of_quota_generator,
             ),
+            session: public_info.session,
             _phantom: PhantomData,
         }
     }
 
     pub fn rotate_epoch(&mut self, new_epoch_public_info: LeaderInputs, new_epoch: Epoch) {
-        tracing::debug!(
+        tracing::trace!(
             "Rotating epoch with new public info {new_epoch_public_info:?} and new epoch {new_epoch:?}"
         );
         self.proofs_generator
@@ -174,8 +181,8 @@ where
             })
             // Map retrieved indices to the nodes' public keys.
             .enumerate()
-            .inspect(|(layer, (_, node_index))| {
-                tracing::debug!("Encapsulating layer {layer:?} of message type {payload_type:?} for node at index {node_index:?}. Local node index: {:?}", self.membership.local_index());
+            .inspect(|(layer, (proof, node_index))| {
+                tracing::trace!("Encapsulating layer {layer:?} of message type {payload_type:?} for node at index {node_index:?} with proof with public key and key nullifier: ({:?}, {:?}). Local node index: {:?}", proof.ephemeral_signing_key.public_key(), hex::encode(fr_to_bytes(&proof.proof_of_quota.key_nullifier())), self.membership.local_index());
             })
             .map(|(_, (proof, node_index))| {
                 (
@@ -190,12 +197,13 @@ where
         let inputs = proofs_and_signing_keys
             .into_iter()
             .map(|(proof, receiver_non_ephemeral_signing_key)| {
-                EncapsulationInput::new(
+                EncapsulationInput::try_new(
                     proof.ephemeral_signing_key,
                     &receiver_non_ephemeral_signing_key,
                     proof.proof_of_quota,
                     proof.proof_of_selection,
                 )
+                .expect("Layer proof signing key assumed not to be identity")
             })
             .collect::<Vec<_>>();
 
@@ -325,7 +333,7 @@ mod test {
             transaction_hash: ZkHash::ONE,
         };
 
-        processor.set_epoch_private(new_private_inputs, leader_inputs, Epoch::new(1));
+        processor.set_epoch_private(new_private_inputs.clone(), leader_inputs, Epoch::new(1));
 
         assert!(processor.proofs_generator.1 == Some(new_private_inputs));
     }
