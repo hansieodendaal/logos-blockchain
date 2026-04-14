@@ -293,6 +293,59 @@ fn serde_encapsulated_and_verified() {
         .unwrap();
 }
 
+#[test]
+fn encapsulate_and_decapsulate_via_two_step_verification() {
+    const PAYLOAD_BODY: &[u8] = b"hello";
+    let verifier = NeverFailingProofsVerifier;
+
+    let (inputs, blend_node_enc_keys) = generate_inputs(2);
+    let msg = EncapsulatedMessage::from(EncapsulatedMessageWithVerifiedPublicHeader::new(
+        &inputs,
+        PayloadType::Data,
+        PAYLOAD_BODY.try_into().unwrap(),
+    ));
+
+    // Step 1: verify signature (forwarding would happen here)
+    let sig_verified = msg.verify_header_signature().unwrap();
+
+    // Step 2: verify PoQ (the service layer does this before decapsulation)
+    let fully_verified = sig_verified.verify_proof_of_quota(&verifier).unwrap();
+
+    // Step 3: decapsulate
+    let DecapsulationOutput::Incompleted {
+        remaining_encapsulated_message: msg,
+        ..
+    } = fully_verified
+        .decapsulate(
+            blend_node_enc_keys.last().unwrap(),
+            &RequiredProofOfSelectionVerificationInputs::default(),
+            &verifier,
+        )
+        .unwrap()
+    else {
+        panic!("Expected an incompleted message");
+    };
+
+    let DecapsulationOutput::Completed {
+        fully_decapsulated_message,
+        ..
+    } = msg
+        .verify_public_header(&verifier)
+        .unwrap()
+        .decapsulate(
+            blend_node_enc_keys.first().unwrap(),
+            &RequiredProofOfSelectionVerificationInputs::default(),
+            &verifier,
+        )
+        .unwrap()
+    else {
+        panic!("Expected a completed message");
+    };
+
+    assert_eq!(fully_decapsulated_message.payload_type(), PayloadType::Data);
+    assert_eq!(fully_decapsulated_message.payload_body(), PAYLOAD_BODY);
+}
+
 fn generate_inputs(cnt: usize) -> (Vec<EncapsulationInput>, Vec<X25519PrivateKey>) {
     let recipient_signing_keys =
         core::iter::repeat_with(UnsecuredEd25519Key::generate_with_blake_rng)
