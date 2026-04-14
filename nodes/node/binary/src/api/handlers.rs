@@ -28,17 +28,17 @@ use lb_core::{
     mantle::{
         Op, SignedMantleTx, Transaction, gas::MainnetGasConstants, ops::channel::ChannelId,
         tx_builder::MantleTxBuilder,
-        ops::{Op, channel::ChannelId},
     },
 };
 use lb_http_api_common::{
     bodies::{
         channel::{ChannelDepositRequestBody, ChannelDepositResponseBody},
+        channel_inscriptions::{
+            ChannelInscriptionItem, ChannelInscriptionsResponseBody, ChannelInscriptionsStreamEvent,
+        },
         wallet::{
             balance::WalletBalanceResponseBody,
             transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
-        channel_inscriptions::{
-            ChannelInscriptionItem, ChannelInscriptionsResponseBody, ChannelInscriptionsStreamEvent,
         },
     },
     paths,
@@ -624,51 +624,6 @@ where
     make_request_and_return_response!(consensus::leader::claim(&handle))
 }
 
-fn collect_channel_inscription_items(
-    block: &Block<SignedMantleTx>,
-    channel_id: ChannelId,
-    include_inscription: bool,
-) -> Vec<ChannelInscriptionItem> {
-    let header = block.header();
-    let header_id = header.id();
-    let parent_block = header.parent_block();
-    let slot: u64 = header.slot().into();
-    let mut items = Vec::new();
-
-    for tx in block.transactions() {
-        let tx_hash = tx.mantle_tx.hash();
-        for op in &tx.mantle_tx.ops {
-            if let Op::ChannelInscribe(inscribe) = op
-                && inscribe.channel_id == channel_id
-            {
-                items.push(ChannelInscriptionItem {
-                    channel_id,
-                    header_id,
-                    parent_block,
-                    slot,
-                    tx_hash,
-                    parent_msg_id: inscribe.parent,
-                    this_msg_id: inscribe.id(),
-                    inscription: include_inscription.then_some(inscribe.inscription.clone()),
-                });
-            }
-        }
-    }
-
-    items
-}
-
-fn channel_stream_events_for_block(
-    block: &Block<SignedMantleTx>,
-    channel_id: ChannelId,
-    include_inscription: bool,
-) -> Vec<ChannelInscriptionsStreamEvent> {
-    collect_channel_inscription_items(block, channel_id, include_inscription)
-        .into_iter()
-        .map(|item| ChannelInscriptionsStreamEvent::InscriptionObserved { item })
-        .collect()
-}
-
 async fn fetch_canonical_bootstrap_blocks<StorageBackend, RuntimeServiceId>(
     handle: &OverwatchHandle<RuntimeServiceId>,
     from_slot: usize,
@@ -780,6 +735,125 @@ where
     make_request_and_return_response!(api_blocks)
 }
 
+fn collect_channel_inscription_items(
+    block: &Block<SignedMantleTx>,
+    channel_id: ChannelId,
+    include_inscription: bool,
+) -> Vec<ChannelInscriptionItem> {
+    let header = block.header();
+    let header_id = header.id();
+    let parent_block = header.parent_block();
+    let slot: u64 = header.slot().into();
+    let mut items = Vec::new();
+
+    for tx in block.transactions() {
+        let tx_hash = tx.mantle_tx.hash();
+        for op in &tx.mantle_tx.ops {
+            if let Op::ChannelInscribe(inscribe) = op
+                && inscribe.channel_id == channel_id
+            {
+                items.push(ChannelInscriptionItem {
+                    channel_id,
+                    header_id,
+                    parent_block,
+                    slot,
+                    tx_hash,
+                    parent_msg_id: inscribe.parent,
+                    this_msg_id: inscribe.id(),
+                    inscription: include_inscription.then_some(inscribe.inscription.clone()),
+                });
+            }
+        }
+    }
+
+    items
+}
+
+fn channel_stream_events_for_block(
+    block: &Block<SignedMantleTx>,
+    channel_id: ChannelId,
+    include_inscription: bool,
+) -> Vec<ChannelInscriptionsStreamEvent> {
+    collect_channel_inscription_items(block, channel_id, include_inscription)
+        .into_iter()
+        .map(|item| ChannelInscriptionsStreamEvent::InscriptionObserved { item })
+        .collect()
+}
+
+fn paginate_channel_inscription_items(
+    items: Vec<ChannelInscriptionItem>,
+    cursor: Option<u64>,
+    limit: Option<usize>,
+) -> ChannelInscriptionsResponseBody {
+    let start = cursor
+        .and_then(|cursor| usize::try_from(cursor).ok())
+        .unwrap_or(0);
+
+    if start >= items.len() {
+        return ChannelInscriptionsResponseBody {
+            items: Vec::new(),
+            next_cursor: None,
+        };
+    }
+
+    let page_len = limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| items.len().saturating_sub(start));
+    let end = start.saturating_add(page_len).min(items.len());
+    let next_cursor = (end < items.len()).then_some(end as u64);
+
+    ChannelInscriptionsResponseBody {
+        items: items.into_iter().skip(start).take(end - start).collect(),
+        next_cursor,
+    }
+}
+
+async fn fetch_channel_inscription_blocks<StorageBackend, RuntimeServiceId>(
+    handle: &OverwatchHandle<RuntimeServiceId>,
+    slot_from: usize,
+    slot_to: usize,
+    include_mutable: bool,
+) -> Result<Vec<Block<SignedMantleTx>>, DynError>
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>,
+{
+    if !include_mutable {
+        return mantle::get_blocks(handle, slot_from, slot_to).await;
+    }
+
+    let info = consensus::cryptarchia_info(handle).await?;
+    let storage_relay = handle
+        .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
+        .await?;
+    let storage_adapter =
+        ChainStorageAdapter::<StorageBackend, SignedMantleTx, RuntimeServiceId>::new(storage_relay)
+            .await;
+
+    let Some(live_tip_block) = storage_adapter.get_block(&info.tip).await else {
+        return Ok(Vec::new());
+    };
+
+    let mut blocks =
+        fetch_canonical_bootstrap_blocks(handle, slot_from, info.tip, info.lib, &live_tip_block)
+            .await?;
+    blocks.retain(|block| {
+        let slot: u64 = block.header().slot().into();
+        slot <= slot_to as u64
+    });
+
+    Ok(blocks)
+}
+
 #[utoipa::path(
     get,
     path = paths::CHANNEL_INSCRIPTIONS,
@@ -804,30 +878,39 @@ where
         TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
     <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
     RuntimeServiceId: Debug
+        + Send
         + Sync
         + Display
         + 'static
-        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    let include_inscription = query.include_inscription.unwrap_or(false);
-    let api_response =
-        mantle::get_blocks(&handle, query.slot_from, query.slot_to).map(move |blocks| {
-            let mut items = Vec::new();
-            for block in blocks? {
-                items.extend(collect_channel_inscription_items(
-                    &block,
-                    channel_id,
-                    include_inscription,
-                ));
-            }
+    let include_inscription = query.include_inscriptions.unwrap_or(false);
+    let include_mutable = query.include_mutable.unwrap_or(false);
+    make_request_and_return_response!(async {
+        let blocks = fetch_channel_inscription_blocks::<StorageBackend, RuntimeServiceId>(
+            &handle,
+            query.slot_from,
+            query.slot_to,
+            include_mutable,
+        )
+        .await?;
 
-            Ok::<ChannelInscriptionsResponseBody, DynError>(ChannelInscriptionsResponseBody {
-                items,
-                next_cursor: None,
-            })
-        });
+        let mut items = Vec::new();
+        for block in blocks {
+            items.extend(collect_channel_inscription_items(
+                &block,
+                channel_id,
+                include_inscription,
+            ));
+        }
 
-    make_request_and_return_response!(api_response)
+        Ok::<ChannelInscriptionsResponseBody, DynError>(paginate_channel_inscription_items(
+            items,
+            query.cursor,
+            query.limit,
+        ))
+    })
 }
 
 #[utoipa::path(
@@ -863,7 +946,7 @@ where
         + AsServiceId<ConsensusService>
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let include_inscription = query.include_inscription.unwrap_or(false);
+    let include_inscription = query.include_inscriptions.unwrap_or(false);
     let from_slot = query.from_slot.unwrap_or(0);
 
     let live_stream =

@@ -19,7 +19,12 @@ pub struct ChannelInscriptionsQuery {
     pub slot_from: usize,
     #[param(minimum = 0)]
     pub slot_to: usize,
-    pub include_inscription: Option<bool>,
+    pub include_inscriptions: Option<bool>,
+    pub include_mutable: Option<bool>,
+    #[param(minimum = 0)]
+    pub cursor: Option<u64>,
+    #[param(minimum = 1)]
+    pub limit: Option<usize>,
 }
 
 #[derive(IntoParams)]
@@ -28,5 +33,5 @@ pub struct ChannelInscriptionsQuery {
 pub struct ChannelInscriptionsStreamQuery {
     #[param(minimum = 0)]
     pub from_slot: Option<usize>,
-    pub include_inscription: Option<bool>,
+    pub include_inscriptions: Option<bool>,
 }

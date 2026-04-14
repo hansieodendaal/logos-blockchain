@@ -27,7 +27,7 @@ pub fn create_channel_inscribe_tx(
     channel_id: ChannelId,
     inscription: Vec<u8>,
     parent: MsgId,
-) -> SignedMantleTx {
+) -> (SignedMantleTx, MsgId) {
     let verifying_key_bytes = signing_key.public_key().to_bytes();
     let verifying_key = Ed25519PublicKey::from_bytes(&verifying_key_bytes).unwrap();
 
@@ -37,6 +37,7 @@ pub fn create_channel_inscribe_tx(
         parent,
         signer: verifying_key,
     };
+    let msg_id = inscribe_op.id();
 
     let inscribe_tx = MantleTx {
         ops: vec![Op::ChannelInscribe(inscribe_op)],
@@ -50,10 +51,13 @@ pub fn create_channel_inscribe_tx(
         .to_bytes();
     let signature = Ed25519Signature::from_bytes(&signature_bytes);
 
-    SignedMantleTx {
-        ops_proofs: vec![OpProof::Ed25519Sig(signature)],
-        mantle_tx: inscribe_tx,
-    }
+    (
+        SignedMantleTx {
+            ops_proofs: vec![OpProof::Ed25519Sig(signature)],
+            mantle_tx: inscribe_tx,
+        },
+        msg_id,
+    )
 }
 
 #[must_use]

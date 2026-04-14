@@ -113,7 +113,7 @@ async fn sdp_ops_e2e() {
         .expect("submit declare transaction");
 
     let declare_results = validator
-        .wait_for_transactions_inclusion(vec![declare_hash], inclusion_timeout)
+        .wait_for_transactions_inclusion(&[declare_hash], inclusion_timeout)
         .await;
 
     assert!(
@@ -167,7 +167,7 @@ async fn sdp_ops_e2e() {
         .expect("submit withdraw transaction");
 
     let withdraw_results = validator
-        .wait_for_transactions_inclusion(vec![withdraw_hash], inclusion_timeout)
+        .wait_for_transactions_inclusion(&[withdraw_hash], inclusion_timeout)
         .await;
 
     assert!(
@@ -301,7 +301,7 @@ async fn large_inscription_e2e() {
 
         let inclusion_timeout = Duration::from_secs(60);
         let results = validator
-            .wait_for_transactions_inclusion(vec![tx_hash], inclusion_timeout)
+            .wait_for_transactions_inclusion(&[tx_hash], inclusion_timeout)
             .await;
 
         assert!(

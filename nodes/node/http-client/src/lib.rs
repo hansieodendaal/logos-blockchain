@@ -84,6 +84,75 @@ impl BasicAuthCredentials {
     }
 }
 
+/// Request parameters for fetching channel inscriptions, including slot range,
+/// pagination, and options to include inscriptions and mutable data.
+#[derive(Clone, Debug)]
+pub struct ChannelInscriptionsRequest {
+    /// Starting slot number for the query (inclusive).
+    slot_from: u64,
+    /// Ending slot number for the query (inclusive).
+    slot_to: u64,
+    /// Whether to include inscription content in the response. If false, only
+    /// metadata will be included.
+    include_inscriptions: bool,
+    /// Whether to include mutable canonical tail data. If false, only immutable
+    /// history will be included.
+    include_mutable: bool,
+    /// Optional cursor for pagination. When provided, the query will return
+    /// results starting from this offset.
+    cursor: Option<u64>,
+    /// Optional limit on the number of items to return. If None, the server
+    /// will use a default page size.
+    limit: Option<usize>,
+}
+
+impl ChannelInscriptionsRequest {
+    /// Creates a new `ChannelInscriptionsRequest` with the specified slot range
+    /// and default options.
+    #[must_use]
+    pub const fn new(slot_from: u64, slot_to: u64) -> Self {
+        Self {
+            slot_from,
+            slot_to,
+            include_inscriptions: false,
+            include_mutable: false,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    /// Sets the cursor for pagination and returns an updated request.
+    #[must_use]
+    pub const fn with_cursor(mut self, cursor: Option<u64>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Sets the limit on the number of items to return and returns an updated
+    /// request.
+    #[must_use]
+    pub const fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets whether to include mutable canonical tail data and returns an
+    /// updated request.
+    #[must_use]
+    pub const fn with_include_mutable(mut self, include_mutable: bool) -> Self {
+        self.include_mutable = include_mutable;
+        self
+    }
+
+    /// Sets whether to include inscription content and returns an updated
+    /// request.
+    #[must_use]
+    pub const fn with_include_inscription(mut self, include_inscription: bool) -> Self {
+        self.include_inscriptions = include_inscription;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct CommonHttpClient {
     client: Arc<Client>,
@@ -277,14 +346,13 @@ impl CommonHttpClient {
         }
     }
 
-    /// Get channel inscriptions in a slot range.
+    /// Get channel inscriptions in a slot range with optional cursor
+    /// pagination.
     pub async fn get_channel_inscriptions(
         &self,
         base_url: Url,
         channel_id: ChannelId,
-        slot_from: u64,
-        slot_to: u64,
-        include_inscription: bool,
+        request: ChannelInscriptionsRequest,
     ) -> Result<ChannelInscriptionsResponseBody, Error> {
         let mut request_url = base_url
             .join(
@@ -293,11 +361,24 @@ impl CommonHttpClient {
                     .trim_start_matches('/'),
             )
             .map_err(Error::Url)?;
-        request_url
-            .query_pairs_mut()
-            .append_pair("slot_from", &slot_from.to_string())
-            .append_pair("slot_to", &slot_to.to_string())
-            .append_pair("include_inscription", &include_inscription.to_string());
+
+        {
+            let mut query = request_url.query_pairs_mut();
+            query
+                .append_pair("slot_from", &request.slot_from.to_string())
+                .append_pair("slot_to", &request.slot_to.to_string())
+                .append_pair(
+                    "include_inscriptions",
+                    &request.include_inscriptions.to_string(),
+                )
+                .append_pair("include_mutable", &request.include_mutable.to_string());
+            if let Some(cursor) = request.cursor {
+                query.append_pair("cursor", &cursor.to_string());
+            }
+            if let Some(limit) = request.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+        }
 
         self.get::<(), ChannelInscriptionsResponseBody>(request_url, None)
             .await
@@ -309,7 +390,7 @@ impl CommonHttpClient {
         base_url: Url,
         channel_id: ChannelId,
         from_slot: Option<u64>,
-        include_inscription: bool,
+        include_inscriptions: bool,
     ) -> Result<impl Stream<Item = ChannelInscriptionsStreamEvent>, Error> {
         let mut request_url = base_url
             .join(
@@ -321,7 +402,7 @@ impl CommonHttpClient {
 
         {
             let mut query = request_url.query_pairs_mut();
-            query.append_pair("include_inscription", &include_inscription.to_string());
+            query.append_pair("include_inscriptions", &include_inscriptions.to_string());
             if let Some(from_slot) = from_slot {
                 query.append_pair("from_slot", &from_slot.to_string());
             }

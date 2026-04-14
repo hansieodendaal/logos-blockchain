@@ -393,7 +393,7 @@ impl Validator {
     /// Wait for a list of transactions to be included in blocks
     pub async fn wait_for_transactions_inclusion(
         &self,
-        tx_hashes: Vec<TxHash>,
+        tx_hashes: &[TxHash],
         timeout: Duration,
     ) -> Vec<Option<HeaderId>> {
         let mut results = vec![None; tx_hashes.len()];
