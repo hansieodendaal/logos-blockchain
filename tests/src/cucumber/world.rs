@@ -90,7 +90,7 @@ pub struct PublicCryptarchiaEndpointPeer {
 }
 
 #[derive(Debug, Clone)]
-pub struct UserConfigOverride {
+pub struct ConfigOverride {
     /// Dot-separated user config path, e.g.
     /// `network.backend.swarm.gossipsub.retain_scores`.
     pub path: String,
@@ -205,7 +205,9 @@ pub struct CucumberWorld {
     /// `/cryptarchia/info` for external chain sync reference.
     pub public_cryptarchia_endpoint_peers: Option<Vec<PublicCryptarchiaEndpointPeer>>,
     /// Manual: Dynamic user-config overrides applied on node startup.
-    pub user_config_overrides: Vec<UserConfigOverride>,
+    pub user_config_overrides: Vec<ConfigOverride>,
+    /// Manual: Dynamic deployment-config overrides applied on node startup.
+    pub deployment_config_overrides: Vec<ConfigOverride>,
     /// Manual: If set, nodes use a `DeploymentSettings` loaded from disk
     /// bypassing generated genesis/test deployment.
     pub deployment_config_override_path: Option<PathBuf>,
@@ -266,6 +268,12 @@ pub struct NodeSnapshot {
 }
 
 impl Debug for CucumberWorld {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "This is a debug implementation for the world struct, which has many fields that \
+        are useful to include in the debug output for troubleshooting and visibility into the world \
+        state during test execution."
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CucumberWorld")
             .field("deployer", &format!("{:?}", self.deployer))
@@ -347,6 +355,10 @@ impl Debug for CucumberWorld {
             .field(
                 "user_config_overrides",
                 &user_config_overrides_display(&self.user_config_overrides),
+            )
+            .field(
+                "deployment_config_overrides",
+                &user_config_overrides_display(&self.deployment_config_overrides),
             )
             .field(
                 "deployment_config_override_path",
@@ -1273,7 +1285,7 @@ fn deployment_config_override_path_display(
     )
 }
 
-fn user_config_overrides_display(overrides: &[UserConfigOverride]) -> String {
+fn user_config_overrides_display(overrides: &[ConfigOverride]) -> String {
     if overrides.is_empty() {
         return "[]".to_owned();
     }

@@ -9,6 +9,15 @@ Feature: Cryptarchia
     Then I stop all nodes
 
   @cryptarchia_ci
+  Scenario: Node does not become ready before delayed genesis start
+    Given I have a cluster with capacity of 1 nodes
+    And I have deployment config override "time.chain_start_time" as "now+48s"
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "0"
+    When I start node "NODE_1" and it should become ready between 48 and 53 seconds
+    Then node "NODE_1" is at height 1 in 180 seconds
+    Then I stop all nodes
+
+  @cryptarchia_ci
   Scenario: IBD staggered start
     Given I have a cluster with capacity of 4 nodes
     And we use IBD peers

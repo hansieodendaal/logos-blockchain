@@ -13,7 +13,7 @@ use crate::{
             TARGET,
             manual_cluster::{build_manual_cluster_deployment, stop_active_manual_cluster},
             manual_nodes::{
-                config_override::set_user_config_override,
+                config_override::{set_deployment_config_override, set_user_config_override},
                 snapshots::{save_named_blockchain_snapshot, validate_snapshot_path_component},
                 utils::{
                     NodesToStartUnordered, create_snapshots_all_nodes,
@@ -197,6 +197,40 @@ async fn step_start_manual_stand_alone_node(
     start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await
 }
 
+#[when(expr = "I start node {string} and it should become ready between {int} and {int} seconds")]
+async fn step_start_manual_stand_alone_node_not_ready_before(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    min_wait_seconds: u64,
+    max_wait_seconds: u64,
+) -> StepResult {
+    let start = Instant::now();
+    start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await?;
+
+    let elapsed = start.elapsed();
+    if elapsed < Duration::from_secs(min_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' became ready too early: elapsed {:.2?}, \
+                expected at least {min_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+    if elapsed > Duration::from_secs(max_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' took too long to become ready: elapsed {:.2?}, \
+                expected at most {max_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 #[when(expr = "I restart node {string}")]
 #[expect(
     clippy::needless_pass_by_ref_mut,
@@ -275,8 +309,8 @@ fn step_define_node_groups(world: &mut CucumberWorld, step: &Step) -> Result<(),
     Ok(())
 }
 
-#[given(expr = "I have user config setting {string} as {string}")]
-#[when(expr = "I have user config setting {string} as {string}")]
+#[given(expr = "I have user config override {string} as {string}")]
+#[when(expr = "I have user config override {string} as {string}")]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Required by cucumber expression"
@@ -288,6 +322,21 @@ fn step_set_user_config_setting(
     setting_value: String,
 ) -> StepResult {
     set_user_config_override(world, &step.value, &setting_path, &setting_value)
+}
+
+#[given(expr = "I have deployment config override {string} as {string}")]
+#[when(expr = "I have deployment config override {string} as {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Required by cucumber expression"
+)]
+fn step_set_deployment_config_setting(
+    world: &mut CucumberWorld,
+    step: &Step,
+    setting_path: String,
+    setting_value: String,
+) -> StepResult {
+    set_deployment_config_override(world, &step.value, &setting_path, &setting_value)
 }
 
 #[given(expr = "I will create a blockchain snapshot {string} of all nodes when stopping")]

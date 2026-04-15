@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::Parser as _;
 use color_eyre::eyre::{Result, eyre};
 use logos_blockchain_node::{
@@ -8,6 +10,7 @@ use logos_blockchain_node::{
     },
     get_services_to_start, run_node_from_config,
 };
+use time::OffsetDateTime;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -65,6 +68,32 @@ async fn main() -> Result<()> {
             })?;
         user_config.update_from_args(cli_args)?
     };
+
+    let mut waited_for_chain_start = false;
+    loop {
+        let offset = run_config.deployment.time.chain_start_time - OffsetDateTime::now_utc();
+        let remaining = match Duration::try_from(offset) {
+            Ok(d) => d,
+            Err(_) if offset.is_negative() => Duration::ZERO,
+            Err(_) => Duration::MAX,
+        };
+
+        if remaining == Duration::ZERO {
+            break;
+        }
+
+        waited_for_chain_start = true;
+        let sleep_time = remaining.min(Duration::from_secs(60));
+        println!(
+            "Chain start time is in the future ({:.2?}), sleeping for {sleep_time:.2?} ...",
+            run_config.deployment.time.chain_start_time,
+        );
+
+        tokio::time::sleep(sleep_time).await;
+    }
+    if waited_for_chain_start {
+        println!("Chain start time reached! Continuing startup...");
+    }
 
     let app = run_node_from_config(run_config)
         .map_err(|e| eyre!("{e}"))
