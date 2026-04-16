@@ -62,6 +62,7 @@ time                             = { default-features = false, version = "0.3" }
 tokio                            = { workspace = true }
 tracing                          = { workspace = true }
 tracing-subscriber               = { features = ["env-filter", "fmt"], version = "0.3" }
+serde = { version = "1.0.228", features = ["derive"] }
 
 [features]
 cucumber             = []
