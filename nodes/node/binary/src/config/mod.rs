@@ -105,6 +105,13 @@ pub struct CliArgs {
     deployment: DeploymentArgs,
     #[clap(flatten)]
     state: StateArgs,
+    /// Flag to ignore the blockchain start time. If active, the binary will
+    /// ignore a blockchain start time set in the future and start all
+    /// services. Alternatively, it will "sleep" until a short time before
+    /// blockchain start and then start all services. Block production
+    /// will only commence once blockchain start time has arrived.
+    #[clap(long = "ignore-start", action)]
+    ignore_blockchain_start_time: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -166,6 +173,11 @@ impl CliArgs {
     #[must_use]
     pub const fn dry_run(&self) -> bool {
         self.check_config_only
+    }
+
+    #[must_use]
+    pub const fn ignore_blockchain_start_time(&self) -> bool {
+        self.ignore_blockchain_start_time
     }
 
     #[must_use]

@@ -197,7 +197,7 @@ async fn step_start_manual_stand_alone_node(
     start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await
 }
 
-#[when(expr = "I start node {string} and it should become ready between {int} and {int} seconds")]
+#[when(expr = "I start node {string} to be ready between {int} and {int} seconds")]
 async fn step_start_manual_stand_alone_node_not_ready_before(
     world: &mut CucumberWorld,
     step: &Step,
@@ -207,6 +207,43 @@ async fn step_start_manual_stand_alone_node_not_ready_before(
 ) -> StepResult {
     let start = Instant::now();
     start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await?;
+
+    let elapsed = start.elapsed();
+    if elapsed < Duration::from_secs(min_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' became ready too early: elapsed {:.2?}, \
+                expected at least {min_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+    if elapsed > Duration::from_secs(max_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' took too long to become ready: elapsed {:.2?}, \
+                expected at most {max_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[when(
+    expr = "I start peer node {string} connected to node {string} to be ready between {int} and {int} seconds"
+)]
+async fn step_start_manual_peer_node_not_ready_before(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name: String,
+    min_wait_seconds: u64,
+    max_wait_seconds: u64,
+) -> StepResult {
+    let start = Instant::now();
+    start_node(world, &step.value, &node_name, &Vec::new(), &[peer_name]).await?;
 
     let elapsed = start.elapsed();
     if elapsed < Duration::from_secs(min_wait_seconds) {

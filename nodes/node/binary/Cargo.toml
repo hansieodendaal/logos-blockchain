@@ -87,6 +87,7 @@ tikv-jemallocator = { optional = true, version = "0.6" }
 
 [dev-dependencies]
 rand = { workspace = true }
+lb-tests = { workspace = true }
 
 [features]
 config-gen      = ["lb-key-management-system-service/unsafe"]

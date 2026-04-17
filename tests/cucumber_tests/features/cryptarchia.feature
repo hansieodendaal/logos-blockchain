@@ -8,24 +8,28 @@ Feature: Cryptarchia
     Then all nodes have at least 5 blocks and converged to within 1 blocks in 300 seconds
     Then I stop all nodes
 
-  @wip
-  Scenario: Node does not become ready before delayed genesis start
+  @cryptarchia_ci
+  Scenario: Single node does not become ready before delayed genesis start
     Given I have a cluster with capacity of 1 nodes
     And I have deployment config override "time.chain_start_time" as "now+48s"
-    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "0"
-    # This should change when we implement the logic to delay genesis start until the node is ready
-    When I start node "NODE_1" and it should become ready between 1 and 53 seconds
-#    When I start node "NODE_1" and it should become ready between 48 and 53 seconds
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "2"
+    # Warm-up time for the node to become ready is 20 seconds before chain start time
+    When I start node "NODE_1" to be ready between 28 and 33 seconds
     Then node "NODE_1" is at height 1 in 180 seconds
     Then I stop all nodes
 
   @cryptarchia_ci
-  Scenario: Node does not become ready before delayed genesis start
-    Given I have a cluster with capacity of 1 nodes
-    And I have deployment config override "time.chain_start_time" as "now+48s"
-    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "0"
-    When I start node "NODE_1" and it should become ready between 48 and 53 seconds
-    Then node "NODE_1" is at height 1 in 180 seconds
+  Scenario: Node with ignorant peer does not become ready before delayed genesis start
+    Given I have a cluster with capacity of 2 nodes
+    And all peers must be mode online after startup in 30 seconds
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "2"
+    When I start node "NODE_1" to be ready between 0 and 5 seconds
+    And I have deployment config override "time.chain_start_time" as "now+60s"
+    # Warm-up time for the node to become ready is 20 seconds before chain start time
+    When I start peer node "NODE_2" connected to node "NODE_1" to be ready between 40 and 45 seconds
+    When node "NODE_1" is at height 1 in 300 seconds
+    When node "NODE_2" is at height 1 in 300 seconds
+    Then all nodes have at least 2 blocks and converged to within 1 blocks in 300 seconds
     Then I stop all nodes
 
   @cryptarchia_ci
