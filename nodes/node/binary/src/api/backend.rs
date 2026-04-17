@@ -49,7 +49,7 @@ use crate::{
     api::{
         handlers::{
             channel, channel_deposit, leader_claim, post_activity, post_declaration,
-            post_withdrawal,
+            post_withdrawal, transaction,
         },
         openapi::ApiDoc,
     },

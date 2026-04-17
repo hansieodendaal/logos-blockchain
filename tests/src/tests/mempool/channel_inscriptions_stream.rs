@@ -21,7 +21,7 @@ async fn setup_node_and_channel() -> (Topology, Url, CommonHttpClient, Ed25519Ke
         TopologyConfig::one_validator(),
         Some("test_get_channel_inscriptions_include_mutable_flag"),
     )
-        .await;
+    .await;
     let validator = &topology.validators()[0];
 
     let validator_url = Url::parse(
@@ -29,9 +29,9 @@ async fn setup_node_and_channel() -> (Topology, Url, CommonHttpClient, Ed25519Ke
             "http://{}",
             validator.config().user.api.backend.listen_address
         )
-            .as_str(),
+        .as_str(),
     )
-        .expect("valid validator URL");
+    .expect("valid validator URL");
 
     let client = CommonHttpClient::new(None);
     let signing_key = Ed25519Key::from_bytes(&[11u8; 32]);
