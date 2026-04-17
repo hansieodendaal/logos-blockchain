@@ -722,6 +722,28 @@ async fn step_node_is_at_height(
     }
 }
 
+#[when(expr = "node {string} is exactly at height")]
+#[then(expr = "node {string} is exactly at height")]
+async fn step_node_is_exactly_at_height(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    height: u64,
+) -> StepResult {
+
+    poll_all_nodes_and_update_consensus_cache(&step.value, &mut world.nodes_info).await?;
+    let node_height = world.node_best_height(&node_name)?.unwrap_or_default();
+    if node_height != height {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' is at height {node_height}, required {height}",
+                step.value
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[when(expr = "all nodes converged to within {int} blocks in {int} seconds")]
 #[then(expr = "all nodes converged to within {int} blocks in {int} seconds")]
 async fn step_all_nodes_converged(

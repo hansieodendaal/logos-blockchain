@@ -45,7 +45,6 @@ use lb_blend::{
             session_info::SessionInfo as SchedulerSessionInfo,
         },
         session::{SessionEvent, UninitializedSessionEventStream},
-        stream::UninitializedFirstReadyStream,
     },
 };
 use lb_chain_service::{
@@ -120,7 +119,9 @@ mod state;
 #[cfg(test)]
 mod tests;
 pub use state::RecoveryServiceState as CoreServiceState;
+use tokio::time::timeout;
 
+const FIRST_CLOCK_POLL_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const LOG_TARGET: &str = "blend::service::core";
 
 /// A blend service that sends messages to the blend network
@@ -647,11 +648,9 @@ where
         ),
         remaining_clock_stream,
     ) = async {
-        let (clock_tick, remaining_clock_stream) =
-            UninitializedFirstReadyStream::new(clock_stream, Duration::from_secs(5))
-                .first()
-                .await
-                .expect("The clock system must be available.");
+        let (clock_tick, remaining_clock_stream) = wait_first_clock_tick(clock_stream)
+            .await
+            .expect("The clock system must be available");
         let Some(EpochEvent::NewEpoch(new_epoch_info)) = epoch_handler.tick(clock_tick).await
         else {
             panic!("First poll result of epoch stream should be a `NewEpoch` event.");
@@ -788,6 +787,31 @@ where
         backend,
         rng,
     )
+}
+async fn wait_first_clock_tick(
+    mut clock_stream: impl Stream<Item = SlotTick> + Unpin,
+) -> Result<(SlotTick, impl Stream<Item = SlotTick> + Unpin), ()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        match timeout(FIRST_CLOCK_POLL_LOG_INTERVAL, clock_stream.next()).await {
+            Ok(Some(tick)) => return Ok((tick, clock_stream)),
+            Ok(None) => {
+                error!(
+                    target: LOG_TARGET,
+                    "Clock stream closed before first tick - elapsed {:.2?}",
+                    start.elapsed()
+                );
+                return Err(());
+            }
+            Err(_) => {
+                info!(
+                    target: LOG_TARGET,
+                    "Waiting for first clock tick... elapsed: {:.2?}",
+                    start.elapsed()
+                );
+            }
+        }
+    }
 }
 
 /// Post-initialization step that must be performed after signaling the service

@@ -1,3 +1,65 @@
+///  Handles Cucumber config overrides for manual-node tests.
+/*
+  Overview
+  --------
+  Step values are collected as YAML fragments and later patched into the
+  user/deployment config by path. Most values use normal YAML parsing, so
+  booleans, numbers, strings, sequences, and mappings can be written directly
+  in test steps.
+
+  Supported explicit override functions
+  -------------------------------------
+  - hex(...) Marks a string as hex input. When applied to a byte-sequence
+    field, it is decoded into bytes.
+  - seconds(...) Marks a duration value in seconds. This is converted at apply
+    time into the YAML shape required by the target duration field.
+  - `now_plus_seconds`(...) Produces an `OffsetDateTime` relative to the current
+    UTC time.
+
+  Apply-time coercion
+  -------------------
+  A small amount of target-aware coercion remains necessary when patching
+  YAML:
+  - duration-like fields accept seconds(...)
+  - byte-sequence fields accept hex(...) and plain human-readable strings,
+    which are encoded as UTF-8 bytes
+
+  Design intent
+  -------------
+  The file favors explicit step syntax over broad implicit magic:
+  - plain YAML stays plain YAML
+  - special conversions use named functions
+  - only a narrow amount of destination-aware coercion is kept where the final
+    YAML representation depends on the target field type
+
+  This keeps override steps readable while avoiding hidden parsing rules.
+
+  Examples:
+  ---------
+
+  And I have deployment config override "time.chain_start_time" as "now_plus_seconds(0)"
+  And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(2)"
+
+  # Duration examples
+  And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(1.2)"
+  And I have user config override "network.backend.swarm.gossipsub.heartbeat_interval" as "seconds(1)"
+
+  # Byte / inscription examples
+  And I have deployment config override "cryptarchia.genesis_state.mantle_tx.ops.1.payload.inscription" as "hex(70726f636573735f73746172745f6e6f6e6365)"
+  And I have deployment config override "cryptarchia.genesis_state.mantle_tx.ops.1.payload.inscription" as "process_start_nonce"
+
+  # Scalar YAML (no function needed)
+  And I have user config override "network.backend.swarm.gossipsub.validate_messages" as "true"
+  And I have user config override "network.backend.swarm.gossipsub.history_length" as "5"
+  And I have user config override "network.backend.swarm.gossipsub.gossip_factor" as "0.5"
+
+  # Strings
+  And I have deployment config override "mempool.pubsub_topic" as "my-custom-topic"
+
+  # Complex string (parsed later into Multiaddr etc.)
+  And I have user config override "blend.core.backend.listening_address" as "/ip4/127.0.0.1/udp/20128/quic-v1"
+*/
+///
 use lb_node::config::RunConfig;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_yaml::{Mapping, Value as YamlValue};
@@ -96,28 +158,77 @@ fn normalize_path(step: &str, raw_path: &str) -> Result<String, StepError> {
 }
 
 fn parse_value(step: &str, raw_value: &str) -> Result<YamlValue, StepError> {
-    let value = raw_value.trim();
+    let raw = raw_value.trim();
 
-    if let Some(relative_seconds) = parse_now_plus_seconds(value) {
-        let timestamp = OffsetDateTime::now_utc() + TimeDuration::seconds(relative_seconds);
-        return serde_yaml::to_value(timestamp).map_err(|source| {
-            step_error(
+    if let Some((name, arg)) = parse_call(raw) {
+        return match name {
+            "hex" => parse_hex(arg, step, raw),
+            "seconds" => parse_seconds(arg, step, raw),
+            "now_plus_seconds" => parse_now_plus_seconds_value(arg, step, raw),
+            _ => Err(step_error(
                 step,
-                &format!("failed to convert config value '{value}' to YAML: {source}"),
-            )
-        });
+                &format!("unknown override function '{name}' in '{raw}'"),
+            )),
+        };
     }
 
-    serde_yaml::from_str::<YamlValue>(value)
-        .map_or_else(|_| Ok(YamlValue::String(value.to_owned())), Ok)
+    serde_yaml::from_str::<YamlValue>(raw)
+        .map_or_else(|_| Ok(YamlValue::String(raw.to_owned())), Ok)
 }
 
-fn parse_now_plus_seconds(value: &str) -> Option<i64> {
-    value
-        .strip_prefix("now+")?
-        .strip_suffix('s')?
+fn parse_call(raw: &str) -> Option<(&str, &str)> {
+    let raw = raw.strip_suffix(')')?;
+    let (name, arg) = raw.split_once('(')?;
+    let name = name.trim();
+    let arg = arg.trim();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some((name, arg))
+}
+
+fn parse_named_call<'a>(raw: &'a str, expected_name: &str) -> Option<&'a str> {
+    let (name, arg) = parse_call(raw)?;
+    (name == expected_name).then_some(arg)
+}
+
+fn parse_hex(arg: &str, step: &str, raw: &str) -> Result<YamlValue, StepError> {
+    let hex = arg.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if !is_hex_string(hex) {
+        return Err(step_error(step, &format!("invalid hex override '{raw}'")));
+    }
+
+    Ok(YamlValue::String(hex.to_owned()))
+}
+
+fn parse_seconds(arg: &str, step: &str, raw: &str) -> Result<YamlValue, StepError> {
+    let (seconds, nanos) = parse_seconds_parts(arg)
+        .ok_or_else(|| step_error(step, &format!("invalid seconds override '{raw}'")))?;
+
+    if seconds < 0 {
+        return Err(step_error(
+            step,
+            &format!("negative seconds override '{raw}' is not supported"),
+        ));
+    }
+
+    Ok(YamlValue::String(format!("seconds({seconds}.{nanos:09})")))
+}
+
+fn parse_now_plus_seconds_value(arg: &str, step: &str, raw: &str) -> Result<YamlValue, StepError> {
+    let seconds = arg
         .parse::<i64>()
-        .ok()
+        .map_err(|_| step_error(step, &format!("invalid now_plus_seconds override '{raw}'")))?;
+
+    let timestamp = OffsetDateTime::now_utc() + TimeDuration::seconds(seconds);
+    serde_yaml::to_value(timestamp).map_err(|source| {
+        step_error(
+            step,
+            &format!("failed to convert override '{raw}' to YAML: {source}"),
+        )
+    })
 }
 
 // ============================================================
@@ -192,73 +303,54 @@ fn coerce_at_path(
     };
 
     if is_duration_like_yaml(existing) {
-        return coerce_duration(existing, value, full_path);
-    }
-
-    if is_offset_datetime_like_yaml(existing) {
-        return coerce_datetime(value, full_path);
+        return coerce_seconds(existing, value, full_path);
     }
 
     if is_byte_sequence_like_yaml(existing) {
-        return coerce_bytes(value, full_path);
+        return coerce_string_to_bytes(value, full_path);
     }
 
     Ok(value)
 }
 
-fn coerce_duration(
+fn coerce_seconds(
     existing: &YamlValue,
     value: YamlValue,
     full_path: &str,
 ) -> Result<YamlValue, StepError> {
-    let Some((seconds, nanos)) = parse_duration_parts(&value) else {
+    let Some(raw) = value.as_str() else {
         return Ok(value);
     };
+
+    let Some(arg) = parse_named_call(raw, "seconds") else {
+        return Ok(value);
+    };
+
+    let (seconds, nanos) = parse_seconds_parts(arg)
+        .ok_or_else(|| invalid_path(full_path, &format!("invalid seconds override '{raw}'")))?;
 
     if seconds < 0 {
         return Err(invalid_path(
             full_path,
-            &format!("negative duration '{seconds}' is not supported"),
+            &format!("negative seconds override '{raw}' is not supported"),
         ));
     }
 
     Ok(duration_yaml(existing, seconds, nanos))
 }
 
-fn coerce_datetime(value: YamlValue, full_path: &str) -> Result<YamlValue, StepError> {
+fn coerce_string_to_bytes(value: YamlValue, full_path: &str) -> Result<YamlValue, StepError> {
     let Some(raw) = value.as_str() else {
         return Ok(value);
     };
 
-    let Some(normalized) = normalize_datetime(raw) else {
-        return Ok(value);
+    let bytes = if is_hex_string(raw) {
+        hex::decode(raw).map_err(|source| {
+            invalid_path(full_path, &format!("invalid hex bytes '{raw}': {source}"))
+        })?
+    } else {
+        raw.as_bytes().to_vec()
     };
-
-    let parsed = serde_yaml::from_value::<OffsetDateTime>(YamlValue::String(normalized)).map_err(
-        |source| invalid_path(full_path, &format!("invalid datetime '{raw}': {source}")),
-    )?;
-
-    serde_yaml::to_value(parsed).map_err(|source| {
-        invalid_path(
-            full_path,
-            &format!("failed to serialize datetime '{raw}': {source}"),
-        )
-    })
-}
-
-fn coerce_bytes(value: YamlValue, full_path: &str) -> Result<YamlValue, StepError> {
-    let Some(raw) = value.as_str() else {
-        return Ok(value);
-    };
-
-    let hex = raw.trim_start_matches("0x").trim_start_matches("0X");
-    if !is_hex_string(hex) {
-        return Ok(value);
-    }
-
-    let bytes = hex::decode(hex).map_err(|source| {
-        invalid_path(full_path, &format!("invalid hex bytes '{raw}': {source}"))
-    })?;
 
     Ok(YamlValue::Sequence(
         bytes
@@ -272,32 +364,13 @@ fn coerce_bytes(value: YamlValue, full_path: &str) -> Result<YamlValue, StepErro
 // Duration helpers
 // ============================================================
 
-fn parse_duration_parts(value: &YamlValue) -> Option<(i64, u32)> {
-    if let Some(seconds) = yaml_integer_to_i64(value) {
-        return Some((seconds, 0));
-    }
-
-    if let Some(float_seconds) = value.as_f64() {
-        if !float_seconds.is_finite() || float_seconds.is_sign_negative() {
-            return None;
-        }
-
-        let seconds = float_seconds.trunc() as i64;
-        let nanos =
-            ((float_seconds.fract() * 1_000_000_000.0).round() as u64).min(999_999_999) as u32;
-        return Some((seconds, nanos));
-    }
-
-    parse_duration_string(value.as_str()?.trim())
-}
-
-fn parse_duration_string(raw: &str) -> Option<(i64, u32)> {
-    let normalized = raw.replace(',', ".");
-    if normalized.is_empty() {
+fn parse_seconds_parts(raw: &str) -> Option<(i64, u32)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
         return None;
     }
 
-    if let Some((seconds, fraction)) = normalized.split_once('.') {
+    if let Some((seconds, fraction)) = raw.split_once('.') {
         if !is_ascii_digits(seconds) || !is_ascii_digits(fraction) {
             return None;
         }
@@ -363,62 +436,6 @@ fn is_duration_string(value: &str) -> bool {
     };
 
     is_ascii_digits(secs) && nanos.len() == 9 && is_ascii_digits(nanos)
-}
-
-// ============================================================
-// Datetime helpers
-// ============================================================
-
-fn is_offset_datetime_like_yaml(value: &YamlValue) -> bool {
-    value.as_str().is_some_and(|raw| {
-        serde_yaml::from_value::<OffsetDateTime>(YamlValue::String(raw.to_owned())).is_ok()
-    })
-}
-
-fn normalize_datetime(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let value = trimmed
-        .strip_suffix(" UTC")
-        .map_or_else(|| trimmed.to_owned(), |base| format!("{base} +00:00:00"));
-
-    let (date_time, offset) = value.rsplit_once(' ')?;
-    if !offset.starts_with('+') && !offset.starts_with('-') {
-        return None;
-    }
-
-    if let Some((base, fraction)) = date_time.split_once('.') {
-        if !is_ascii_digits(fraction) {
-            return None;
-        }
-        return Some(format!("{base}.{} {offset}", normalize_nanos(fraction)));
-    }
-
-    Some(format!("{date_time}.000000000 {offset}"))
-}
-
-// ============================================================
-// Byte helpers
-// ============================================================
-
-fn is_byte_sequence_like_yaml(value: &YamlValue) -> bool {
-    let Some(values) = value.as_sequence() else {
-        return false;
-    };
-
-    !values.is_empty()
-        && values
-            .iter()
-            .all(|v| v.as_i64().is_some_and(|n| (0..=255).contains(&n)))
-}
-
-fn is_hex_string(value: &str) -> bool {
-    !value.is_empty()
-        && value.len().is_multiple_of(2)
-        && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ============================================================
@@ -562,6 +579,23 @@ fn is_ascii_digits(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
+fn is_byte_sequence_like_yaml(value: &YamlValue) -> bool {
+    let Some(values) = value.as_sequence() else {
+        return false;
+    };
+
+    !values.is_empty()
+        && values
+            .iter()
+            .all(|v| v.as_i64().is_some_and(|n| (0..=255).contains(&n)))
+}
+
+fn is_hex_string(value: &str) -> bool {
+    !value.is_empty()
+        && value.len().is_multiple_of(2)
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn step_error(step: &str, detail: &str) -> StepError {
     StepError::InvalidArgument {
         message: format!("step `{step}`: {detail}"),
@@ -583,7 +617,6 @@ mod tests {
     use std::time::Duration;
 
     use lb_libp2p::Multiaddr;
-    use time::Duration as TimeDuration;
 
     use super::*;
     use crate::{
@@ -598,6 +631,24 @@ mod tests {
     fn normalize_path_rejects_empty_segments() {
         let path = "network..backend";
         assert!(normalize_path("test-step", path).is_err());
+    }
+
+    #[test]
+    fn parse_value_supports_seconds_function() {
+        let value = parse_value("test-step", "seconds(1.2)").expect("seconds override");
+        assert_eq!(value.as_str(), Some("seconds(1.200000000)"));
+    }
+
+    #[test]
+    fn parse_value_supports_now_plus_seconds_function() {
+        let value = parse_value("test-step", "now_plus_seconds(10)").expect("now override");
+        let _ = serde_yaml::from_value::<OffsetDateTime>(value).expect("timestamp");
+    }
+
+    #[test]
+    fn parse_value_supports_hex_function() {
+        let value = parse_value("test-step", "hex(deadbeef)").expect("hex override");
+        assert_eq!(value.as_str(), Some("deadbeef"));
     }
 
     #[test]
@@ -655,7 +706,7 @@ mod tests {
         };
         let override_3 = ConfigOverride {
             path: "cryptarchia.service.bootstrap.prolonged_bootstrap_period".to_owned(),
-            value: 0.into(),
+            value: serde_yaml::to_value(TimeDuration::ZERO).expect("yaml value"),
         };
         assert!(
             apply_user_config_overrides(&mut config, &[override_1, override_2, override_3]).is_ok()
@@ -675,24 +726,18 @@ mod tests {
             Duration::ZERO
         );
 
-        let slot_duration = config.deployment.time.slot_duration;
-        let slot_duration_override =
-            TimeDuration::try_from(slot_duration + Duration::from_secs(1)).unwrap();
+        let pubsub_topic = config.deployment.mempool.pubsub_topic.clone();
         let override_4 = ConfigOverride {
             path: "time.slot_duration".to_owned(),
-            value: serde_yaml::to_value(slot_duration_override).expect("yaml value"),
+            value: serde_yaml::to_value(TimeDuration::new(1, 0)).expect("yaml value"),
         };
-        let pubsub_topic = config.deployment.mempool.pubsub_topic.clone();
         let override_5 = ConfigOverride {
             path: "mempool.pubsub_topic".to_owned(),
             value: serde_yaml::to_value(add_strings!(&[&pubsub_topic, "_test_1234"]))
                 .expect("yaml value"),
         };
         assert!(apply_deployment_config_overrides(&mut config, &[override_4, override_5]).is_ok());
-        assert_eq!(
-            config.deployment.time.slot_duration,
-            slot_duration + Duration::from_secs(1)
-        );
+        assert_eq!(config.deployment.time.slot_duration, Duration::from_secs(1));
         assert_eq!(
             config.deployment.mempool.pubsub_topic,
             add_strings!(&[&pubsub_topic, "_test_1234"])
@@ -700,8 +745,8 @@ mod tests {
     }
 
     #[test]
-    fn world_overrides_accept_friendly_duration_formats() {
-        let (configs, genesis_tx) = create_general_configs(1, Some("test_override_friendly"));
+    fn world_overrides_accept_explicit_functions() {
+        let (configs, genesis_tx) = create_general_configs(1, Some("test_override_functions"));
         let deployment_settings = e2e_deployment_settings_with_genesis_tx(genesis_tx);
         let mut config = create_validator_config(configs[0].clone(), deployment_settings);
         let mut world = CucumberWorld::default();
@@ -710,40 +755,25 @@ mod tests {
             &mut world,
             "test-step",
             "cryptarchia.service.bootstrap.prolonged_bootstrap_period",
-            "1,2",
+            "seconds(1.2)",
         )
-        .expect("user duration comma override");
-        set_user_config_override(
-            &mut world,
-            "test-step",
-            "cryptarchia.service.bootstrap.offline_grace_period.state_recording_interval",
-            "1.200000000",
-        )
-        .expect("user duration dot override");
+        .expect("user duration override");
         set_user_config_override(
             &mut world,
             "test-step",
             "network.backend.swarm.gossipsub.heartbeat_interval",
-            "1",
+            "seconds(1)",
         )
         .expect("user duration int override");
-
-        set_deployment_config_override(&mut world, "test-step", "time.slot_duration", "1")
-            .expect("deployment duration int override");
+        set_deployment_config_override(&mut world, "test-step", "time.slot_duration", "seconds(1)")
+            .expect("deployment duration override");
         set_deployment_config_override(
             &mut world,
             "test-step",
             "time.chain_start_time",
-            "2026-04-13 06:45:24 +00:00:00",
+            "now_plus_seconds(10)",
         )
-        .expect("deployment chain_start_time without nanos");
-        set_deployment_config_override(
-            &mut world,
-            "test-step",
-            "time.chain_start_time",
-            "2026-04-13 06:45:24 UTC",
-        )
-        .expect("deployment chain_start_time UTC");
+        .expect("deployment time override");
 
         apply_user_config_overrides(&mut config, &world.user_config_overrides)
             .expect("apply user overrides");
@@ -762,16 +792,6 @@ mod tests {
         assert_eq!(
             config
                 .user
-                .cryptarchia
-                .service
-                .bootstrap
-                .offline_grace_period
-                .state_recording_interval,
-            Duration::from_millis(1200)
-        );
-        assert_eq!(
-            config
-                .user
                 .network
                 .backend
                 .swarm
@@ -780,15 +800,6 @@ mod tests {
             Duration::from_secs(1)
         );
         assert_eq!(config.deployment.time.slot_duration, Duration::from_secs(1));
-
-        let expected_chain_start = serde_yaml::from_value::<OffsetDateTime>(YamlValue::String(
-            "2026-04-13 06:45:24.000000000 +00:00:00".to_owned(),
-        ))
-        .expect("expected timestamp");
-        assert_eq!(
-            config.deployment.time.chain_start_time,
-            expected_chain_start
-        );
     }
 
     #[test]
@@ -841,21 +852,19 @@ mod tests {
         )
         .expect("multiaddr override");
 
-        let funding_pk_hex = "0".repeat(64);
         set_user_config_override(
             &mut world,
             "test-step",
             "cryptarchia.leader.wallet.funding_pk",
-            &funding_pk_hex,
+            "hex(0000000000000000000000000000000000000000000000000000000000000000)",
         )
         .expect("zkpk hex string override");
 
-        let node_key_hex = "01".repeat(32);
         set_user_config_override(
             &mut world,
             "test-step",
             "network.backend.swarm.node_key",
-            &node_key_hex,
+            "hex(0101010101010101010101010101010101010101010101010101010101010101)",
         )
         .expect("node_key hex string override");
 
@@ -893,7 +902,86 @@ mod tests {
     }
 
     #[test]
-    fn coerce_bytes_converts_hex_string_to_byte_sequence() {
+    fn deployment_override_hex_inscription_round_trips_into_genesis_inscription_bytes() {
+        let (configs, genesis_tx) =
+            create_general_configs(1, Some("test_override_inscription_hex"));
+        let deployment_settings = e2e_deployment_settings_with_genesis_tx(genesis_tx);
+        let mut config = create_validator_config(configs[0].clone(), deployment_settings);
+        let mut world = CucumberWorld::default();
+
+        // Hex input
+        set_deployment_config_override(
+            &mut world,
+            "test-step",
+            "cryptarchia.genesis_state.mantle_tx.ops.1.payload.inscription",
+            "hex(70726f636573735f73746172745f6e6f6e6365)",
+        )
+        .expect("inscription hex override");
+
+        apply_deployment_config_overrides(&mut config, &world.deployment_config_overrides)
+            .expect("apply deployment overrides");
+
+        let yaml = serde_yaml::to_value(&config.deployment).expect("deployment yaml");
+        let inscription = get_at_path(
+            &yaml,
+            &[
+                "cryptarchia",
+                "genesis_state",
+                "mantle_tx",
+                "ops",
+                "1",
+                "payload",
+                "inscription",
+            ],
+        )
+        .expect("inscription path");
+
+        let seq = inscription.as_sequence().expect("inscription bytes");
+        let got = seq
+            .iter()
+            .map(|v| v.as_i64().expect("byte") as u8)
+            .collect::<Vec<_>>();
+
+        assert_eq!(got, b"process_start_nonce");
+
+        // Human readable string input
+        set_deployment_config_override(
+            &mut world,
+            "test-step",
+            "cryptarchia.genesis_state.mantle_tx.ops.1.payload.inscription",
+            "process_start_nonce",
+        )
+        .expect("inscription text override");
+
+        apply_deployment_config_overrides(&mut config, &world.deployment_config_overrides)
+            .expect("apply deployment overrides");
+
+        let yaml = serde_yaml::to_value(&config.deployment).expect("deployment yaml");
+        let inscription = get_at_path(
+            &yaml,
+            &[
+                "cryptarchia",
+                "genesis_state",
+                "mantle_tx",
+                "ops",
+                "1",
+                "payload",
+                "inscription",
+            ],
+        )
+        .expect("inscription path");
+
+        let seq = inscription.as_sequence().expect("inscription bytes");
+        let got = seq
+            .iter()
+            .map(|v| v.as_i64().expect("byte") as u8)
+            .collect::<Vec<_>>();
+
+        assert_eq!(got, b"process_start_nonce");
+    }
+
+    #[test]
+    fn coerce_hex_string_to_bytes_converts_hex_string_to_byte_sequence() {
         let existing_bytes: Vec<YamlValue> = vec![
             YamlValue::from(0i64),
             YamlValue::from(1i64),
@@ -909,21 +997,33 @@ mod tests {
             m
         });
 
-        for hex_input in &["deadbeef", "0xdeadbeef"] {
-            let result = coerce_at_path(
-                &root,
-                &["data"],
-                YamlValue::String((*hex_input).to_owned()),
-                "data",
-            )
+        let parsed = parse_value("test-step", "hex(deadbeef)").expect("hex override");
+        let result =
+            coerce_at_path(&root, &["data"], parsed, "data").expect("coerce should succeed");
+
+        let seq = result.as_sequence().expect("result should be a sequence");
+        assert_eq!(seq.len(), 4);
+        assert_eq!(seq[0].as_i64(), Some(0xde));
+        assert_eq!(seq[1].as_i64(), Some(0xad));
+        assert_eq!(seq[2].as_i64(), Some(0xbe));
+        assert_eq!(seq[3].as_i64(), Some(0xef));
+    }
+
+    #[test]
+    fn coerce_seconds_converts_to_existing_duration_shape() {
+        let root = YamlValue::Mapping({
+            let mut m = Mapping::new();
+            m.insert(
+                YamlValue::String("duration".to_owned()),
+                YamlValue::String("0.000000000".to_owned()),
+            );
+            m
+        });
+
+        let parsed = parse_value("test-step", "seconds(1.2)").expect("seconds override");
+        let result = coerce_at_path(&root, &["duration"], parsed, "duration")
             .expect("coerce should succeed");
 
-            let seq = result.as_sequence().expect("result should be a sequence");
-            assert_eq!(seq.len(), 4, "input: {hex_input}");
-            assert_eq!(seq[0].as_i64(), Some(0xde), "input: {hex_input}");
-            assert_eq!(seq[1].as_i64(), Some(0xad), "input: {hex_input}");
-            assert_eq!(seq[2].as_i64(), Some(0xbe), "input: {hex_input}");
-            assert_eq!(seq[3].as_i64(), Some(0xef), "input: {hex_input}");
-        }
+        assert_eq!(result.as_str(), Some("1.200000000"));
     }
 }
