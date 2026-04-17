@@ -6,6 +6,7 @@ use std::{
 };
 
 use cucumber::gherkin::Table;
+use futures::future::try_join_all;
 use hex::ToHex as _;
 use lb_chain_service::CryptarchiaInfo;
 use lb_core::mantle::{GenesisTx as _, Transaction as _, Utxo};

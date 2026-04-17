@@ -743,7 +743,6 @@ async fn step_node_is_exactly_at_height(
     node_name: String,
     height: u64,
 ) -> StepResult {
-
     poll_all_nodes_and_update_consensus_cache(&step.value, &mut world.nodes_info).await?;
     let node_height = world.node_best_height(&node_name)?.unwrap_or_default();
     if node_height != height {
