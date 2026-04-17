@@ -1,6 +1,12 @@
 use lb_groth16::fr_from_bytes;
 
-use crate::{LogosBlockchainNode, api::free, errors::OperationStatus, result::PointerResult};
+use crate::{
+    LogosBlockchainNode,
+    api::free,
+    errors::OperationStatus,
+    result::{FfiStatusResult, StatusResult},
+    return_error_if_null_pointer, unwrap_or_return_error,
+};
 
 #[repr(C)]
 pub enum State {
@@ -83,21 +89,18 @@ impl From<lb_chain_service::CryptarchiaInfo> for CryptarchiaInfo {
 /// [`OperationStatus`] error on failure.
 pub(crate) fn get_cryptarchia_info_sync(
     node: &LogosBlockchainNode,
-) -> Result<lb_chain_service::CryptarchiaInfo, OperationStatus> {
-    let Ok(runtime) = tokio::runtime::Runtime::new() else {
-        log::error!("[get_cryptarchia_info_sync] Failed to create tokio runtime. Aborting.");
-        return Err(OperationStatus::RuntimeError);
-    };
-    let Ok(cryptarchia_info) = runtime.block_on(lb_api_service::http::consensus::cryptarchia_info(
-        node.get_overwatch_handle(),
-    )) else {
+) -> StatusResult<lb_chain_service::CryptarchiaInfo> {
+    let runtime_handle = node.get_runtime_handle();
+    let Ok(cryptarchia_info) = runtime_handle.block_on(
+        lb_api_service::http::consensus::cryptarchia_info(node.get_overwatch_handle()),
+    ) else {
         log::error!("[get_cryptarchia_info_sync] Failed to get cryptarchia info. Aborting.");
         return Err(OperationStatus::RelayError);
     };
     Ok(cryptarchia_info)
 }
 
-pub type CryptarchiaInfoResult = PointerResult<CryptarchiaInfo, OperationStatus>;
+pub type FfiCryptarchiaInfoResult = FfiStatusResult<*mut CryptarchiaInfo>;
 
 /// Get the current Cryptarchia info.
 ///
@@ -107,7 +110,7 @@ pub type CryptarchiaInfoResult = PointerResult<CryptarchiaInfo, OperationStatus>
 ///
 /// # Returns
 ///
-/// A [`CryptarchiaInfoResult`] containing a pointer to the allocated
+/// A [`FfiCryptarchiaInfoResult`] containing a pointer to the allocated
 /// [`CryptarchiaInfo`] struct on success, or an [`OperationStatus`] error on
 /// failure.
 ///
@@ -125,20 +128,11 @@ pub type CryptarchiaInfoResult = PointerResult<CryptarchiaInfo, OperationStatus>
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_cryptarchia_info(
     node: *const LogosBlockchainNode,
-) -> CryptarchiaInfoResult {
-    if node.is_null() {
-        log::error!("[get_cryptarchia_info] Received a null `node` pointer. Exiting.");
-        return CryptarchiaInfoResult::from_error(OperationStatus::NullPointer);
-    }
-
+) -> FfiCryptarchiaInfoResult {
+    return_error_if_null_pointer!("get_cryptarchia_info", node);
     let node = unsafe { &*node };
-    match get_cryptarchia_info_sync(node) {
-        Ok(cryptarchia_info) => {
-            let cryptarchia_info = CryptarchiaInfo::from(cryptarchia_info);
-            CryptarchiaInfoResult::from_value(cryptarchia_info)
-        }
-        Err(error) => CryptarchiaInfoResult::from_error(error),
-    }
+    let cryptarchia_info = unwrap_or_return_error!(get_cryptarchia_info_sync(node));
+    FfiCryptarchiaInfoResult::from_value(CryptarchiaInfo::from(cryptarchia_info))
 }
 
 /// Frees the memory allocated for a [`CryptarchiaInfo`] struct.
@@ -147,6 +141,6 @@ pub unsafe extern "C" fn get_cryptarchia_info(
 ///
 /// - `pointer`: A pointer to the [`CryptarchiaInfo`] struct to be freed.
 #[unsafe(no_mangle)]
-pub extern "C" fn free_cryptarchia_info(pointer: *mut CryptarchiaInfo) {
-    free::<CryptarchiaInfo>(pointer);
+pub extern "C" fn free_cryptarchia_info(pointer: *mut CryptarchiaInfo) -> OperationStatus {
+    free::<CryptarchiaInfo>(pointer)
 }
