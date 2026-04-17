@@ -20,13 +20,16 @@ Feature: Cryptarchia
   @cryptarchia_ci
   Scenario: Nodes with delayed genesis start joins network
     # Warm-up time for delayed nodes to become ready is 20 seconds before chain start time
-    Given I have a cluster with capacity of 2 nodes
-    And all peers must be mode online after startup in 30 seconds
-    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(2)"
+    Given I have a cluster with capacity of 3 nodes
+    And we use IBD peers
+#    And all peers must be mode online after startup in 30 seconds
     And I start node "NODE_1"
+    And I start peer node "NODE_2" connected to node "NODE_1"
+    When all nodes have at least 2 blocks and converged to within 1 blocks in 300 seconds
     And I have deployment config override "time.chain_start_time" as "now_plus_seconds(60)"
-    When I start peer node "NODE_2" connected to node "NODE_1" to be ready between 40 and 45 seconds
-    Then all nodes have at least 2 blocks and converged to within 1 blocks in 300 seconds
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(2)"
+    When I start peer node "NODE_3" connected to node "NODE_1" to be ready between 40 and 45 seconds
+    When all nodes have at least 3 blocks and converged to within 1 blocks in 300 seconds
     Then I stop all nodes
 
   @cryptarchia_ci
