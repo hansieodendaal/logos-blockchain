@@ -212,10 +212,6 @@ where
                 routing::get(libp2p_info::<RuntimeServiceId>),
             )
             .route(
-                paths::STORAGE_BLOCK,
-                routing::post(block::<StorageAdapter, RuntimeServiceId>),
-            )
-            .route(
                 paths::MEMPOOL_ADD_TX,
                 routing::post(add_tx::<MempoolStorageAdapter, RuntimeServiceId>),
             )
@@ -276,6 +272,14 @@ where
                         _,
                     >,
                 ),
+            )
+            .route(
+                paths::wallet::SIGN_TX_ED25519,
+                routing::post(wallet::sign_tx_ed25519::<WalletService, MempoolStorageAdapter, _>),
+            )
+            .route(
+                paths::wallet::SIGN_TX_ZK,
+                routing::post(wallet::sign_tx_zk::<WalletService, MempoolStorageAdapter, _>),
             );
 
         let app = app.route(
@@ -289,10 +293,19 @@ where
             ),
         );
 
-        let app = app.route(
-            paths::BLOCKS,
-            routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
-        );
+        let app = app
+            .route(
+                paths::BLOCKS,
+                routing::get(blocks::<BlockStorageBackend, RuntimeServiceId>),
+            )
+            .route(
+                paths::BLOCKS_DETAIL,
+                routing::get(block::<StorageAdapter, RuntimeServiceId>),
+            )
+            .route(
+                paths::TRANSACTION,
+                routing::get(transaction::<StorageAdapter, RuntimeServiceId>),
+            );
 
         let app = app.route(
             paths::CHANNEL_INSCRIPTIONS,
