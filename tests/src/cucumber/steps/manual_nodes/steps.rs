@@ -24,7 +24,7 @@ use crate::{
                     poll_all_nodes_and_update_consensus_cache, restart_node, start_node,
                     start_nodes_order_respecting_dependencies,
                     verify_genesis_wallet_resources_table_indexes,
-                    verify_node_wallet_resources_table_indexes,
+                    verify_node_wallet_resources_table_indexes, wait_all_nodes_responive,
                     wait_for_all_nodes_to_be_synced_to_chain,
                 },
             },
@@ -181,6 +181,7 @@ async fn step_start_nodes_with_wallet_resources(
             &node_name,
             &wallet_start_info,
             &initial_peers,
+            false,
         )
         .await?;
     }
@@ -195,7 +196,33 @@ async fn step_start_manual_stand_alone_node(
     step: &Step,
     node_name: String,
 ) -> StepResult {
-    start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        false,
+    )
+    .await
+}
+
+#[given(expr = "I immediate start node {string}")]
+#[when(expr = "I immediate start node {string}")]
+async fn step_start_manual_network_ready_only_stand_alone_node(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        true,
+    )
+    .await
 }
 
 #[when(expr = "I start node {string} to be ready between {int} and {int} seconds")]
@@ -207,7 +234,15 @@ async fn step_start_manual_stand_alone_node_not_ready_before(
     max_wait_seconds: u64,
 ) -> StepResult {
     let start = Instant::now();
-    start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await?;
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        false,
+    )
+    .await?;
 
     let elapsed = start.elapsed();
     if elapsed < Duration::from_secs(min_wait_seconds) {
@@ -244,7 +279,15 @@ async fn step_start_manual_peer_node_not_ready_before(
     max_wait_seconds: u64,
 ) -> StepResult {
     let start = Instant::now();
-    start_node(world, &step.value, &node_name, &Vec::new(), &[peer_name]).await?;
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        false,
+    )
+    .await?;
 
     let elapsed = start.elapsed();
     if elapsed < Duration::from_secs(min_wait_seconds) {
@@ -669,7 +712,34 @@ async fn step_start_manual_connected_node(
     node_name: String,
     peer_name: String,
 ) -> StepResult {
-    start_node(world, &step.value, &node_name, &Vec::new(), &[peer_name]).await
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        false,
+    )
+    .await
+}
+
+#[given(expr = "I immediate start peer node {string} connected to node {string}")]
+#[when(expr = "I immediate start peer node {string} connected to node {string}")]
+async fn step_immediate_start_manual_connected_node(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        true,
+    )
+    .await
 }
 
 #[given(expr = "I start peer node {string} connected to node {string} and node {string}")]
@@ -687,8 +757,55 @@ async fn step_start_manual_two_connected_nodes(
         &node_name,
         &Vec::new(),
         &[peer_name1, peer_name2],
+        false,
     )
     .await
+}
+
+#[given(expr = "I immediate start peer node {string} connected to node {string} and node {string}")]
+#[when(expr = "I immediate start peer node {string} connected to node {string} and node {string}")]
+async fn step_immediate_start_manual_two_connected_nodes(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name1: String,
+    peer_name2: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name1, peer_name2],
+        true,
+    )
+    .await
+}
+
+#[when(expr = "I wait for all nodes to be responsive in {int} seconds")]
+#[then(expr = "I wait for all nodes to be responsive in {int} seconds")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step functions require the world as the first `&mut` argument"
+)]
+async fn step_wait_all_nodes_responsive(
+    world: &mut CucumberWorld,
+    step: &Step,
+    time_out_seconds: u64,
+) -> StepResult {
+    let cluster = world
+        .local_cluster
+        .as_ref()
+        .ok_or(StepError::LogicalError {
+            message: "No local cluster available".into(),
+        })?;
+    if let Err(e) = wait_all_nodes_responive(cluster, Duration::from_secs(time_out_seconds)).await {
+        return Err(StepError::StepFail {
+            message: format!("Step `{}` error: {e}", step.value),
+        });
+    }
+
+    Ok(())
 }
 
 #[when(expr = "node {string} is at height {int} in {int} seconds")]

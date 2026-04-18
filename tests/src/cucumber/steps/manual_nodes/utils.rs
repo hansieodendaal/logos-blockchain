@@ -19,7 +19,7 @@ use lb_testing_framework::{
 use libp2p::Multiaddr;
 use reqwest::{Client, Url};
 use testing_framework_core::scenario::{PeerSelection, StartNodeOptions, StartedNode};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{info, warn};
 
 use crate::cucumber::{
@@ -595,6 +595,7 @@ pub async fn start_node(
     node_name: &str,
     wallet_start_info: &[WalletStartInfo],
     initial_peers: &[String],
+    immediate_start: bool,
 ) -> StepResult {
     let cluster = world
         .local_cluster
@@ -713,23 +714,27 @@ pub async fn start_node(
             chain_info: HashMap::default(),
             wallet_info,
             runtime_dir: node_runtime_dir,
+            immediate_start,
         },
     );
 
-    // Bootstrap peers must be `Mode::OnLine` for IBD of other peers to succeed.
-    ensure_node_ready(
-        cluster,
-        &client,
-        node_name,
-        &started_node_name,
-        is_bootstrap_node,
-        world.require_all_peers_mode_online_at_startup,
-        startup_settings.join_external_network,
-    )
-    .await
-    .inspect_err(|e| {
-        warn!(target: TARGET, "Step `{step}` error: {e}");
-    })?;
+    // All nodes are required to be network ready responsive, and bootstrap nodes
+    // must be `Mode::OnLine` for IBD of other peers to succeed
+    if !immediate_start {
+        ensure_node_ready(
+            cluster,
+            &client,
+            node_name,
+            &started_node_name,
+            is_bootstrap_node,
+            world.require_all_peers_mode_online_at_startup,
+            startup_settings.join_external_network,
+        )
+        .await
+        .inspect_err(|e| {
+            warn!(target: TARGET, "Step `{step}` error: {e}");
+        })?;
+    }
 
     if world.blockchain_snapshot_on_startup.is_some() {
         match client.consensus_info().await {
@@ -1024,6 +1029,21 @@ async fn verify_online(
         sleep(Duration::from_millis(100)).await;
         count += 1;
     }
+}
+
+/// Wait for all nodes to become responsive
+pub async fn wait_all_nodes_responive(
+    cluster: &LbcManualCluster,
+    time_out: Duration,
+) -> StepResult {
+    timeout(time_out, cluster.wait_network_ready())
+        .await
+        .map_err(|_| StepError::StepFail {
+            message: format!("Not all nodes became responsive after {time_out:?}"),
+        })?
+        .map_err(|e| StepError::StepFail {
+            message: format!("Failed to check all nodes ready: {e}"),
+        })
 }
 
 #[expect(

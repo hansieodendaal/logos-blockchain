@@ -13,7 +13,7 @@ Feature: Cryptarchia
     # Warm-up time for delayed nodes to become ready is 20 seconds before chain start time
     Given I have a cluster with capacity of 1 nodes
     And I have deployment config override "time.chain_start_time" as "now_plus_seconds(48)"
-    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(2)"
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(0)"
     When I start node "NODE_1" to be ready between 28 and 33 seconds
     Then I stop all nodes
 
@@ -21,14 +21,12 @@ Feature: Cryptarchia
   Scenario: Nodes with delayed genesis start joins network
     # Warm-up time for delayed nodes to become ready is 20 seconds before chain start time
     Given I have a cluster with capacity of 3 nodes
-    And we use IBD peers
-#    And all peers must be mode online after startup in 30 seconds
-    And I start node "NODE_1"
-    And I start peer node "NODE_2" connected to node "NODE_1"
-    When all nodes have at least 2 blocks and converged to within 1 blocks in 300 seconds
     And I have deployment config override "time.chain_start_time" as "now_plus_seconds(60)"
-    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(2)"
-    When I start peer node "NODE_3" connected to node "NODE_1" to be ready between 40 and 45 seconds
+    And I have user config override "cryptarchia.service.bootstrap.prolonged_bootstrap_period" as "seconds(0)"
+    And I immediate start node "NODE_1"
+    And I immediate start peer node "NODE_2" connected to node "NODE_1"
+    And I immediate start peer node "NODE_3" connected to node "NODE_2"
+    When I wait for all nodes to be responsive in 45 seconds
     When all nodes have at least 3 blocks and converged to within 1 blocks in 300 seconds
     Then I stop all nodes
 

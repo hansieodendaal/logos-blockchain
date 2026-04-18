@@ -474,6 +474,9 @@ pub struct NodeInfo {
     /// The node's runtime directory where all its runtime artifacts will be
     /// collected
     pub runtime_dir: PathBuf,
+    /// Whether this node is only expected to be network ready after startup and
+    /// not `Mode::OnLine`
+    pub immediate_start: bool,
 }
 
 impl NodeInfo {
@@ -746,6 +749,8 @@ impl CucumberWorld {
             .clone())
     }
 
+    /// Helper to resolve a wallet name to the actual node name that the wallet
+    /// is associated with.
     pub fn resolve_wallet_node_name(&self, wallet_name: &str) -> Result<String, StepError> {
         Ok(self
             .wallet_info
@@ -755,6 +760,14 @@ impl CucumberWorld {
             })?
             .node_name
             .clone())
+    }
+
+    /// Helper to check if a node is configured for immediate start (not
+    /// awaiting network readiness)
+    pub fn network_immediate_start(&self, node_name: &str) -> bool {
+        self.nodes_info
+            .get(node_name)
+            .is_some_and(|info| info.immediate_start)
     }
 
     /// Helper to resolve a list of node names to a `PeerSelection::Named` with

@@ -168,8 +168,6 @@ fn sleep_time_for(remaining: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use lb_tests::{
         nodes::create_validator_config,
         topology::configs::{
@@ -278,23 +276,24 @@ mod tests {
 
         // Wait for future time
         config.deployment.time.chain_start_time = OffsetDateTime::now_utc() + future_time_delta;
-        let start = Instant::now();
         wait_for_genesis_block_start_time(&config, false)
             .await
             .unwrap();
+        let remaining = calculate_remaining(config.deployment.time.chain_start_time);
         assert!(
-            start.elapsed() >= future_time_delta.saturating_sub(WARM_UP_TIME),
-            "Should have slept for at least the remaining time minus the max sleep window"
+            remaining <= WARM_UP_TIME,
+            "Should stop waiting once remaining time reaches warm-up window (remaining={remaining:?}, \
+            warm_up={WARM_UP_TIME:?})"
         );
 
         // Ignore future time
         config.deployment.time.chain_start_time = OffsetDateTime::now_utc() + future_time_delta;
-        let start = Instant::now();
         wait_for_genesis_block_start_time(&config, true)
             .await
             .unwrap();
+        let remaining = calculate_remaining(config.deployment.time.chain_start_time);
         assert!(
-            start.elapsed() <= Duration::from_millis(100),
+            remaining >= future_time_delta.saturating_sub(Duration::from_millis(100)),
             "Should not sleep"
         );
     }
