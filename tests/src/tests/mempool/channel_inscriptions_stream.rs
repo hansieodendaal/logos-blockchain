@@ -18,7 +18,7 @@ use tokio::time::timeout;
 
 async fn setup_node_and_channel() -> (Topology, Url, CommonHttpClient, Ed25519Key, ChannelId) {
     let topology = Topology::spawn(
-        TopologyConfig::one_validator(),
+        TopologyConfig::two_validators(),
         Some("test_get_channel_inscriptions_include_mutable_flag"),
     )
     .await;
@@ -173,19 +173,6 @@ async fn test_get_channel_inscriptions_cursor_pagination() {
         .await
         .expect("full channel inscriptions query should succeed");
 
-    for item in &full_response.items {
-        println!(
-            "this_msg_id: {}, parent_msg_id: {}, inscription: {}",
-            item.this_msg_id.as_hex(),
-            item.parent_msg_id.as_hex(),
-            item.inscription
-                .clone()
-                .unwrap()
-                .iter()
-                .map(|b| *b as char)
-                .collect::<String>()
-        );
-    }
     assert!(
         full_response.items.len() >= 3,
         "test setup should produce at least three inscriptions to paginate"
