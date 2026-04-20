@@ -76,7 +76,7 @@ impl Node for NodeHttpClient {
 
     async fn blocks(&self, slot_from: Slot, slot_to: Slot) -> Result<Vec<ApiBlock>, Error> {
         self.client
-            .get_blocks(
+            .get_immutable_blocks(
                 self.base_url.clone(),
                 slot_from.into_inner(),
                 slot_to.into_inner(),
@@ -111,7 +111,7 @@ impl Node for NodeHttpClient {
     ) -> Result<impl Stream<Item = (ZoneMessage, Slot)>, Error> {
         let blocks = self
             .client
-            .get_blocks(
+            .get_immutable_blocks(
                 self.base_url.clone(),
                 slot_from.into_inner(),
                 slot_to.into_inner(),

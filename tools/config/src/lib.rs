@@ -30,6 +30,7 @@ use crate::{
     kms::create_kms_configs,
     sdp::{GeneralSdpConfig, create_sdp_configs},
     time::{GeneralTimeConfig, set_time_config},
+    unique::get_reserved_available_udp_port,
 };
 
 /// Global flag indicating whether debug tracing configuration is enabled to
@@ -85,7 +86,7 @@ pub fn create_general_configs_with_blend_core_subset(
 
     for id in &mut ids {
         thread_rng().fill(id);
-        blend_ports.push(unique::get_reserved_available_udp_port().unwrap());
+        blend_ports.push(get_reserved_available_udp_port().unwrap());
     }
 
     create_general_configs_from_ids(

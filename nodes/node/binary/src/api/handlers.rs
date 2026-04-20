@@ -16,7 +16,6 @@ use lb_api_service::http::{
 };
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
-use lb_chain_service::ConsensusMsg;
 use lb_core::{
     block::Block,
     header::HeaderId,
@@ -51,17 +50,244 @@ use overwatch::{
     services::{AsServiceId, ServiceData},
 };
 use serde::{Deserialize, Serialize};
-use tokio_stream::StreamExt as _;
 
 use crate::api::{
     openapi::schema,
-    queries::BlockRangeQuery,
+    queries::{BlockRangeQuery, BlocksStreamQuery},
     responses::{self, overwatch::get_relay_or_500},
     serializers::{
         blocks::{ApiBlock, ApiProcessedBlockEvent},
         transactions::ApiSignedTransactionRef,
     },
 };
+
+const BLOCKS_STREAM_CHUNK_SIZE: usize = 1_000;
+const DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS: u64 = 100;
+
+struct BlocksStreamRequest {
+    number_of_blocks: usize,
+    blocks_to: Option<HeaderId>,
+    chunk_size: usize,
+    immutable_only: bool,
+}
+
+fn parse_blocks_stream_request(
+    query: &BlocksStreamQuery,
+) -> Result<BlocksStreamRequest, &'static str> {
+    if query.number_of_blocks == Some(0) {
+        return Err("number_of_blocks must be greater than or equal to 1");
+    }
+
+    Ok(BlocksStreamRequest {
+        number_of_blocks: usize::try_from(
+            query
+                .number_of_blocks
+                .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS),
+        )
+        .unwrap_or(usize::MAX),
+        blocks_to: query.blocks_to,
+        // Keep per-request chunk size bounded so clients cannot exceed server limits.
+        chunk_size: query
+            .chunk_size
+            .unwrap_or(BLOCKS_STREAM_CHUNK_SIZE)
+            .clamp(1, BLOCKS_STREAM_CHUNK_SIZE),
+        immutable_only: query.immutable_only.unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_header_id(byte: u8) -> HeaderId {
+        HeaderId::from([byte; 32])
+    }
+
+    #[test]
+    fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: None,
+            blocks_to: None,
+            chunk_size: None,
+            immutable_only: None,
+        })
+        .expect("query without explicit range should parse");
+
+        assert_eq!(
+            request.number_of_blocks,
+            DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS as usize
+        );
+        assert_eq!(request.blocks_to, None);
+        assert_eq!(request.chunk_size, BLOCKS_STREAM_CHUNK_SIZE);
+        assert!(!request.immutable_only);
+    }
+
+    #[test]
+    fn blocks_stream_request_uses_tip_when_only_number_of_blocks_is_given() {
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: Some(7),
+            blocks_to: None,
+            chunk_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit number_of_blocks should parse");
+
+        assert_eq!(request.number_of_blocks, 7);
+        assert_eq!(request.blocks_to, None);
+    }
+
+    #[test]
+    fn blocks_stream_request_defaults_to_100_blocks_when_only_blocks_to_is_given() {
+        let blocks_to = sample_header_id(7);
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: None,
+            blocks_to: Some(blocks_to),
+            chunk_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit blocks_to should parse");
+
+        assert_eq!(
+            request.number_of_blocks,
+            DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS as usize
+        );
+        assert_eq!(request.blocks_to, Some(blocks_to));
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_zero_blocks() {
+        let result = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: Some(0),
+            blocks_to: None,
+            chunk_size: None,
+            immutable_only: None,
+        });
+
+        assert_eq!(
+            result.err(),
+            Some("number_of_blocks must be greater than or equal to 1")
+        );
+    }
+}
+
+async fn fetch_blocks_stream_chunk<StorageBackend, RuntimeServiceId>(
+    handle: &OverwatchHandle<RuntimeServiceId>,
+    chain_info: &lb_chain_service::CryptarchiaInfo,
+    from: usize,
+    to: usize,
+    immutable_only: bool,
+) -> Result<Vec<ApiProcessedBlockEvent>, DynError>
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    StorageBackend::Block: Serialize,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    let chunk = mantle::get_blocks_in_range_with_snapshot::<_, _, RuntimeServiceId>(
+        handle,
+        from,
+        to,
+        immutable_only,
+        chain_info,
+    )
+    .await?;
+
+    Ok(chunk
+        .into_iter()
+        .map(ApiProcessedBlockEvent::from)
+        .collect())
+}
+
+fn build_blocks_stream<StorageBackend, RuntimeServiceId>(
+    handle: OverwatchHandle<RuntimeServiceId>,
+    chain_info: lb_chain_service::CryptarchiaInfo,
+    first_chunk: Vec<ApiProcessedBlockEvent>,
+    next_from: usize,
+    blocks_to: usize,
+    chunk_size: usize,
+    immutable_only: bool,
+) -> impl futures::Stream<Item = ApiProcessedBlockEvent>
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    StorageBackend::Block: Serialize,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    futures::stream::unfold(
+        (
+            first_chunk.into_iter(),
+            next_from,
+            blocks_to,
+            chunk_size,
+            immutable_only,
+            chain_info,
+            handle,
+        ),
+        async |(
+            mut buffered,
+            mut next_from,
+            blocks_to,
+            chunk_size,
+            immutable_only,
+            chain_info,
+            handle,
+        )| {
+            loop {
+                if let Some(item) = buffered.next() {
+                    return Some((
+                        item,
+                        (
+                            buffered,
+                            next_from,
+                            blocks_to,
+                            chunk_size,
+                            immutable_only,
+                            chain_info,
+                            handle,
+                        ),
+                    ));
+                }
+
+                if next_from > blocks_to {
+                    return None;
+                }
+
+                let chunk_to =
+                    blocks_to.min(next_from.saturating_add(chunk_size.saturating_sub(1)));
+                let Ok(next_chunk) = fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+                    &handle,
+                    &chain_info,
+                    next_from,
+                    chunk_to,
+                    immutable_only,
+                )
+                .await
+                else {
+                    return None;
+                };
+
+                next_from = chunk_to.saturating_add(1);
+                buffered = next_chunk.into_iter();
+            }
+        },
+    )
+}
 
 #[macro_export]
 macro_rules! make_request_and_return_response {
@@ -612,14 +838,14 @@ where
 
 #[utoipa::path(
     get,
-    path = paths::BLOCKS,
+    path = paths::IMMUTABLE_BLOCKS,
     params(BlockRangeQuery),
     responses(
         (status = 200, description = "Get blocks"),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn blocks<StorageBackend, RuntimeServiceId>(
+pub async fn immutable_blocks<StorageBackend, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Query(query): Query<BlockRangeQuery>,
 ) -> Response
@@ -635,10 +861,11 @@ where
         + 'static
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let api_blocks = mantle::get_blocks(&handle, query.slot_from, query.slot_to).map(|blocks| {
-        let api_blocks = blocks?.into_iter().map(ApiBlock::from).collect::<Vec<_>>();
-        Ok::<Vec<ApiBlock>, DynError>(api_blocks)
-    });
+    let api_blocks =
+        mantle::get_immutable_blocks(&handle, query.slot_from, query.slot_to).map(|blocks| {
+            let api_blocks = blocks?.into_iter().map(ApiBlock::from).collect::<Vec<_>>();
+            Ok::<Vec<ApiBlock>, DynError>(api_blocks)
+        });
     make_request_and_return_response!(api_blocks)
 }
 
@@ -678,13 +905,15 @@ where
 #[utoipa::path(
     get,
     path = paths::BLOCKS_STREAM,
+    params(BlocksStreamQuery),
     responses(
         (status = 200, description = "Stream of processed blocks with chain state"),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn blocks_stream<StorageBackend, ConsensusService, RuntimeServiceId>(
+pub async fn blocks_stream<StorageBackend, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
+    Query(query): Query<BlocksStreamQuery>,
 ) -> Response
 where
     StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
@@ -692,21 +921,82 @@ where
     <StorageBackend as StorageChainApi>::Block:
         TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
     <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
-    ConsensusService: ServiceData<Message = ConsensusMsg<SignedMantleTx>> + 'static,
     RuntimeServiceId: Debug
+        + Send
         + Sync
         + Display
         + 'static
-        + AsServiceId<ConsensusService>
+        + AsServiceId<Cryptarchia<RuntimeServiceId>>
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let stream = mantle::get_new_blocks_stream::<_, _, ConsensusService, _>(&handle)
-        .await
-        .map(|stream| stream.map(ApiProcessedBlockEvent::from));
-    match stream {
-        Ok(stream) => responses::ndjson::from_stream(stream),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    let request = match parse_blocks_stream_request(&query) {
+        Ok(request) => request,
+        Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+    };
+
+    let chain_info = match consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await {
+        Ok(info) => info,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    let blocks_to_header = request.blocks_to.unwrap_or(chain_info.tip);
+    let blocks_to_height = match mantle::find_canonical_height_by_header_with_snapshot::<
+        _,
+        _,
+        RuntimeServiceId,
+    >(&handle, blocks_to_header, &chain_info)
+    .await
+    {
+        Ok(Some(height)) => height,
+        Ok(None) => {
+            let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
+            return responses::ndjson::from_stream(empty);
+        }
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    let blocks_from = blocks_to_height
+        .saturating_sub(request.number_of_blocks.saturating_sub(1))
+        .max(1);
+    let capped_blocks_to = blocks_to_height;
+    if blocks_from > capped_blocks_to {
+        let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
+        return responses::ndjson::from_stream(empty);
     }
+
+    let first_chunk_to =
+        capped_blocks_to.min(blocks_from.saturating_add(request.chunk_size.saturating_sub(1)));
+
+    let first_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+        &handle,
+        &chain_info,
+        blocks_from,
+        first_chunk_to,
+        request.immutable_only,
+    )
+    .await
+    {
+        Ok(events) => events,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    let stream = build_blocks_stream::<StorageBackend, RuntimeServiceId>(
+        handle,
+        chain_info,
+        first_chunk,
+        first_chunk_to.saturating_add(1),
+        capped_blocks_to,
+        request.chunk_size,
+        request.immutable_only,
+    );
+
+    responses::ndjson::from_stream(stream)
 }
 
 #[utoipa::path(

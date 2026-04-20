@@ -4984,6 +4984,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
+ "serde_urlencoded",
  "serde_with",
  "serde_yaml",
  "thiserror 2.0.18",

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use futures::{Stream, StreamExt as _};
 pub use lb_chain_broadcast_service::BlockInfo;
@@ -15,7 +15,7 @@ use lb_http_api_common::{
         transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
     },
     paths::{
-        BLOCKS, BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM,
+        BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM, IMMUTABLE_BLOCKS,
         MEMPOOL_ADD_TX,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
@@ -233,14 +233,14 @@ impl CommonHttpClient {
     }
 
     /// Get blocks in a slot range.
-    pub async fn get_blocks(
+    pub async fn get_immutable_blocks(
         &self,
         base_url: Url,
         slot_from: u64,
         slot_to: u64,
     ) -> Result<Vec<ApiBlock>, Error> {
         let mut request_url = base_url
-            .join(BLOCKS.trim_start_matches('/'))
+            .join(IMMUTABLE_BLOCKS.trim_start_matches('/'))
             .map_err(Error::Url)?;
         request_url
             .query_pairs_mut()
@@ -255,9 +255,69 @@ impl CommonHttpClient {
         &self,
         base_url: Url,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
+        self.get_blocks_stream_in_range(base_url, None, None).await
+    }
+
+    /// Stream processed blocks ending at a specific header id.
+    pub async fn get_blocks_stream_in_range(
+        &self,
+        base_url: Url,
+        number_of_blocks: Option<u64>,
+        blocks_to: Option<HeaderId>,
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
+        self.get_blocks_stream_in_range_with_chunk_size(
+            base_url,
+            number_of_blocks,
+            blocks_to,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Stream processed blocks ending at a specific header id.
+    ///
+    /// `chunk_size` lets callers request smaller chunks; the server still
+    /// enforces its own upper bound.
+    pub async fn get_blocks_stream_in_range_with_chunk_size(
+        &self,
+        base_url: Url,
+        number_of_blocks: Option<u64>,
+        blocks_to: Option<HeaderId>,
+        chunk_size: Option<u64>,
+        immutable_only: Option<bool>,
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
+        if number_of_blocks == Some(0) {
+            return Err(Error::Client(
+                "number_of_blocks must be greater than or equal to 1".to_owned(),
+            ));
+        }
+        if chunk_size == Some(0) {
+            return Err(Error::Client(
+                "chunk_size must be greater than or equal to 1".to_owned(),
+            ));
+        }
+
         let request_url = base_url
             .join(BLOCKS_STREAM.trim_start_matches('/'))
             .map_err(Error::Url)?;
+        let mut request_url = request_url;
+        {
+            let mut query = request_url.query_pairs_mut();
+            if let Some(number_of_blocks) = number_of_blocks {
+                query.append_pair("number_of_blocks", &number_of_blocks.to_string());
+            }
+            if let Some(blocks_to) = blocks_to {
+                let blocks_to_hex = hex::encode(blocks_to.as_ref());
+                query.append_pair("blocks_to", &blocks_to_hex);
+            }
+            if let Some(chunk_size) = chunk_size {
+                query.append_pair("chunk_size", &chunk_size.to_string());
+            }
+            if immutable_only == Some(true) {
+                query.append_pair("immutable_only", "true");
+            }
+        }
         let mut request = self.client.get(request_url);
 
         if let Some(basic_auth) = &self.basic_auth {
@@ -266,16 +326,64 @@ impl CommonHttpClient {
 
         let response = request.send().await.map_err(Error::Request)?;
         let status = response.status();
+        let response_url = response.url().clone();
 
-        let blocks_stream = response.bytes_stream().filter_map(async |item| {
-            let bytes = item.ok()?;
-            serde_json::from_slice::<ProcessedBlockEvent>(&bytes).ok()
-        });
-        match status {
-            StatusCode::OK => Ok(blocks_stream),
-            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::Server("Error".to_owned())),
-            _ => Err(Error::Server(format!("Unexpected response [{status}]"))),
+        if status != StatusCode::OK {
+            let body = response.text().await.map_err(Error::Request)?;
+            return match status {
+                StatusCode::INTERNAL_SERVER_ERROR => {
+                    Err(Error::Server(format!("{body} [{response_url}]")))
+                }
+                _ => Err(Error::Server(format!(
+                    "Unexpected response [{status}] at [{response_url}]: {body}"
+                ))),
+            };
         }
+
+        let blocks_stream = futures::stream::unfold(
+            (
+                response.bytes_stream(),
+                Vec::<u8>::new(),
+                VecDeque::<ProcessedBlockEvent>::new(),
+            ),
+            async |(mut byte_stream, mut buffer, mut pending)| {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Some((event, (byte_stream, buffer, pending)));
+                    }
+
+                    if let Some(Ok(bytes)) = byte_stream.next().await {
+                        buffer.extend_from_slice(&bytes);
+
+                        while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                            let line = buffer.drain(..=newline_pos).collect::<Vec<_>>();
+                            let json_line = &line[..line.len().saturating_sub(1)];
+                            if json_line.is_empty() {
+                                continue;
+                            }
+                            if let Ok(event) =
+                                serde_json::from_slice::<ProcessedBlockEvent>(json_line)
+                            {
+                                pending.push_back(event);
+                            }
+                        }
+                    } else {
+                        if !buffer.is_empty()
+                            && let Ok(event) =
+                                serde_json::from_slice::<ProcessedBlockEvent>(&buffer)
+                        {
+                            pending.push_back(event);
+                        }
+
+                        if let Some(event) = pending.pop_front() {
+                            return Some((event, (byte_stream, Vec::new(), pending)));
+                        }
+                        return None;
+                    }
+                }
+            },
+        );
+        Ok(blocks_stream)
     }
 
     /// Get the balance for a specific `ZkPublicKey`.

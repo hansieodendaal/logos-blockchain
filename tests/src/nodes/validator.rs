@@ -10,7 +10,7 @@ use std::{
 use futures::Stream;
 use lb_chain_broadcast_service::BlockInfo;
 use lb_chain_service::CryptarchiaInfo;
-use lb_common_http_client::{ApiBlock, CommonHttpClient};
+use lb_common_http_client::{ApiBlock, CommonHttpClient, ProcessedBlockEvent};
 use lb_config::kms::key_id_for_preload_backend;
 use lb_core::{
     mantle::{Transaction as _, TxHash},
@@ -430,6 +430,50 @@ impl Validator {
     ) -> Result<impl Stream<Item = BlockInfo>, lb_common_http_client::Error> {
         self.http_client
             .get_lib_stream(Url::from_str(&format!("http://{}", self.addr))?)
+            .await
+    }
+
+    pub async fn get_blocks_stream(
+        &self,
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
+        self.http_client
+            .get_blocks_stream(Url::from_str(&format!("http://{}", self.addr))?)
+            .await
+    }
+
+    pub async fn get_blocks_stream_in_range(
+        &self,
+        number_of_blocks: Option<u64>,
+        blocks_to: Option<HeaderId>,
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
+        self.get_blocks_stream_in_range_with_chunk_size(number_of_blocks, blocks_to, None, None)
+            .await
+    }
+
+    pub async fn get_blocks_stream_in_range_with_chunk_size(
+        &self,
+        number_of_blocks: Option<u64>,
+        blocks_to: Option<HeaderId>,
+        chunk_size: Option<u64>,
+        immutable_only: Option<bool>,
+    ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
+        self.http_client
+            .get_blocks_stream_in_range_with_chunk_size(
+                Url::from_str(&format!("http://{}", self.addr))?,
+                number_of_blocks,
+                blocks_to,
+                chunk_size,
+                immutable_only,
+            )
+            .await
+    }
+
+    pub async fn get_api_block(
+        &self,
+        id: HeaderId,
+    ) -> Result<Option<ApiBlock>, lb_common_http_client::Error> {
+        self.http_client
+            .get_block_by_id(Url::from_str(&format!("http://{}", self.addr))?, id)
             .await
     }
 
