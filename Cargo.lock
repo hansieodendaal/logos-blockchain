@@ -5157,6 +5157,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rpds",
+ "serde",
  "serde_json",
  "serde_yaml",
  "serial_test",
