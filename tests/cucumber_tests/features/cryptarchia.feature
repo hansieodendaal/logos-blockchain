@@ -1,6 +1,13 @@
 Feature: Cryptarchia
 
   @cryptarchia_ci
+  Scenario: One node happy path
+    Given I have a cluster with capacity of 1 nodes
+    And I start node "NODE_1"
+    Then all nodes have at least 5 blocks and converged to within 1 blocks in 300 seconds
+    Then I stop all nodes
+
+  @cryptarchia_ci
   Scenario: Two nodes happy path
     Given I have a cluster with capacity of 2 nodes
     And I start node "NODE_1"
