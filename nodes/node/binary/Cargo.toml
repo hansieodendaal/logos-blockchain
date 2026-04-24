@@ -80,7 +80,7 @@ tower-http = { default-features = false, features = ["cors", "limit", "timeout",
 tikv-jemallocator = { optional = true, version = "0.6" }
 
 [dev-dependencies]
-rand             = { workspace = true }
+rand = { workspace = true }
 
 [features]
 config-gen      = ["lb-key-management-system-service/unsafe"]
