@@ -39,7 +39,7 @@ use crate::{
         fee_reserve::ScenarioFeeState,
         utils::{make_builder, shared_host_bin_path},
     },
-    non_zero,
+    cucumber_non_zero,
 };
 
 type ScenarioBuilderWith = ScenarioBuilder;
@@ -620,7 +620,7 @@ impl CucumberWorld {
     /// Configure the scenario topology (number of nodes and network layout).
     pub fn set_topology(&mut self, nodes: usize, network: NetworkKind) -> StepResult {
         self.spec.topology = Some(TopologySpec {
-            nodes: non_zero!("nodes", nodes)?,
+            nodes: cucumber_non_zero!("nodes", nodes)?,
             network,
             scenario_base_dir: self.scenario_base_dir.clone(),
         });
@@ -629,7 +629,7 @@ impl CucumberWorld {
 
     /// Configure the scenario run duration in seconds.
     pub fn set_run_duration(&mut self, seconds: u64) -> StepResult {
-        self.spec.duration_secs = Some(non_zero!("duration", seconds)?);
+        self.spec.duration_secs = Some(cucumber_non_zero!("duration", seconds)?);
         Ok(())
     }
 
@@ -637,7 +637,7 @@ impl CucumberWorld {
     pub fn set_wallets(&mut self, total_funds: u64, users: usize) -> StepResult {
         self.spec.wallets = Some(WalletSpec {
             total_funds,
-            users: non_zero!("wallet users", users)?,
+            users: cucumber_non_zero!("wallet users", users)?,
         });
         Ok(())
     }
@@ -656,9 +656,9 @@ impl CucumberWorld {
         }
 
         self.spec.transactions = Some(TransactionSpec {
-            rate_per_block: non_zero!("transactions rate", rate_per_block)?,
+            rate_per_block: cucumber_non_zero!("transactions rate", rate_per_block)?,
             users: match users {
-                Some(val) => Some(non_zero!("transactions users", val)?),
+                Some(val) => Some(cucumber_non_zero!("transactions users", val)?),
                 None => None,
             },
         });
@@ -679,7 +679,7 @@ impl CucumberWorld {
     /// satisfying the expectation.
     pub fn set_consensus_liveness_lag_allowance(&mut self, blocks: u64) -> StepResult {
         self.spec.consensus_liveness = Some(ConsensusLivenessSpec {
-            lag_allowance: Some(non_zero!("lag allowance", blocks)?),
+            lag_allowance: Some(cucumber_non_zero!("lag allowance", blocks)?),
         });
 
         Ok(())

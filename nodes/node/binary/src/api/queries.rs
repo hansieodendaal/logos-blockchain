@@ -32,12 +32,12 @@ pub struct BlockRangeQuery {
 pub struct BlocksStreamQuery {
     #[serde(default)]
     #[param(minimum = 1)]
-    pub number_of_blocks: Option<u64>,
+    pub number_of_blocks: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_blocks_to_header_id")]
     pub blocks_to: Option<HeaderId>,
     #[serde(default)]
     #[param(minimum = 1)]
-    pub chunk_size: Option<usize>,
+    pub server_batch_size: Option<usize>,
     #[serde(default)]
     pub immutable_only: Option<bool>,
 }

@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, num::NonZero, sync::Arc};
 
 use futures::{Stream, StreamExt as _};
 pub use lb_chain_broadcast_service::BlockInfo;
@@ -16,7 +16,7 @@ use lb_http_api_common::{
     },
     paths::{
         BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM, IMMUTABLE_BLOCKS,
-        MEMPOOL_ADD_TX,
+        MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE, MEMPOOL_ADD_TX,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
     settings::default_max_body_size,
@@ -262,10 +262,10 @@ impl CommonHttpClient {
     pub async fn get_blocks_stream_in_range(
         &self,
         base_url: Url,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        self.get_blocks_stream_in_range_with_chunk_size(
+        self.get_blocks_stream_in_range_with_server_batch_size(
             base_url,
             number_of_blocks,
             blocks_to,
@@ -275,28 +275,42 @@ impl CommonHttpClient {
         .await
     }
 
+    // Helper function to validate inputs for block streaming methods.
+    fn verify_inputs(
+        number_of_blocks: Option<NonZero<usize>>,
+        server_batch_size: Option<NonZero<usize>>,
+    ) -> Result<(), Error> {
+        if let Some(blocks) = number_of_blocks
+            && blocks.get() > MAX_BLOCKS_STREAM_BLOCKS
+        {
+            return Err(Error::Client(format!(
+                "'number_of_blocks' must be <= {MAX_BLOCKS_STREAM_BLOCKS}, got {blocks}"
+            )));
+        }
+        if let Some(size) = server_batch_size
+            && size.get() > MAX_BLOCKS_STREAM_CHUNK_SIZE
+        {
+            return Err(Error::Client(format!(
+                "'server_batch_size' must be <= {MAX_BLOCKS_STREAM_CHUNK_SIZE}, got {size}"
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Stream processed blocks ending at a specific header id.
     ///
-    /// `chunk_size` lets callers request smaller chunks; the server still
-    /// enforces its own upper bound.
-    pub async fn get_blocks_stream_in_range_with_chunk_size(
+    /// `server_batch_size` lets callers request smaller chunks; the server
+    /// still enforces its own upper bound.
+    pub async fn get_blocks_stream_in_range_with_server_batch_size(
         &self,
         base_url: Url,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
-        chunk_size: Option<u64>,
+        server_batch_size: Option<NonZero<usize>>,
         immutable_only: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        if number_of_blocks == Some(0) {
-            return Err(Error::Client(
-                "number_of_blocks must be greater than or equal to 1".to_owned(),
-            ));
-        }
-        if chunk_size == Some(0) {
-            return Err(Error::Client(
-                "chunk_size must be greater than or equal to 1".to_owned(),
-            ));
-        }
+        Self::verify_inputs(number_of_blocks, server_batch_size)?;
 
         let request_url = base_url
             .join(BLOCKS_STREAM.trim_start_matches('/'))
@@ -311,8 +325,8 @@ impl CommonHttpClient {
                 let blocks_to_hex = hex::encode(blocks_to.as_ref());
                 query.append_pair("blocks_to", &blocks_to_hex);
             }
-            if let Some(chunk_size) = chunk_size {
-                query.append_pair("chunk_size", &chunk_size.to_string());
+            if let Some(server_batch_size) = server_batch_size {
+                query.append_pair("server_batch_size", &server_batch_size.to_string());
             }
             if immutable_only == Some(true) {
                 query.append_pair("immutable_only", "true");

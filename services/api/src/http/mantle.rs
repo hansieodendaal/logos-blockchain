@@ -444,10 +444,13 @@ where
         }
 
         let Some(block) = storage_adapter.get_block(&current_id).await else {
-            return Ok(None);
+            return Err(format!(
+                "canonical chain inconsistency: missing block for canonical header {current_id}"
+            )
+            .into());
         };
-        let parent_id = block.header().parent_block();
 
+        let parent_id = block.header().parent_block();
         if parent_id == current_id || current_height == 1 {
             return Ok(None);
         }

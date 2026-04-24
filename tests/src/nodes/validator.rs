@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
     net::SocketAddr,
+    num::NonZero,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     str::FromStr as _,
@@ -443,7 +444,7 @@ impl Validator {
 
     pub async fn get_blocks_stream_in_range(
         &self,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
         self.get_blocks_stream_in_range_with_chunk_size(number_of_blocks, blocks_to, None, None)
@@ -452,13 +453,13 @@ impl Validator {
 
     pub async fn get_blocks_stream_in_range_with_chunk_size(
         &self,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
-        chunk_size: Option<u64>,
+        chunk_size: Option<NonZero<usize>>,
         immutable_only: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
         self.http_client
-            .get_blocks_stream_in_range_with_chunk_size(
+            .get_blocks_stream_in_range_with_server_batch_size(
                 Url::from_str(&format!("http://{}", self.addr))?,
                 number_of_blocks,
                 blocks_to,

@@ -68,3 +68,10 @@ pub mod enumerated {
         }
     }
 }
+
+#[macro_export]
+macro_rules! non_zero {
+    ($field:expr, $value:expr) => {
+        std::num::NonZero::new($value).ok_or_else(|| format!("'{}' must be > 0", $field))
+    };
+}

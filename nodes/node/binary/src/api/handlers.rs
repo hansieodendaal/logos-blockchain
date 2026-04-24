@@ -1,4 +1,7 @@
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    num::NonZero,
+};
 
 use ::libp2p::PeerId;
 use axum::{
@@ -33,6 +36,7 @@ use lb_http_api_common::{
         },
     },
     paths,
+    paths::{MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE},
 };
 use lb_libp2p::libp2p::bytes::Bytes;
 use lb_network_service::backends::libp2p::Libp2p as Libp2pNetworkBackend;
@@ -44,6 +48,7 @@ use lb_tx_service::{
     TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
 };
+use lb_utils::non_zero;
 use lb_wallet_service::api::{WalletApi, WalletServiceData};
 use overwatch::{
     overwatch::handle::OverwatchHandle,
@@ -61,113 +66,49 @@ use crate::api::{
     },
 };
 
-const BLOCKS_STREAM_CHUNK_SIZE: usize = 1_000;
-const DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS: u64 = 100;
+/// This is a safe default number of blocks to present the canonical chain
+/// at the tip but not too much to overburden a client.
+const DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM: usize = 100;
+const DEFAULT_BLOCKS_STREAM_CHUNK_SIZE: usize = 100;
 
 struct BlocksStreamRequest {
-    number_of_blocks: usize,
+    number_of_blocks: NonZero<usize>,
     blocks_to: Option<HeaderId>,
-    chunk_size: usize,
+    server_batch_size: NonZero<usize>,
     immutable_only: bool,
 }
 
-fn parse_blocks_stream_request(
-    query: &BlocksStreamQuery,
-) -> Result<BlocksStreamRequest, &'static str> {
-    if query.number_of_blocks == Some(0) {
-        return Err("number_of_blocks must be greater than or equal to 1");
+fn parse_blocks_stream_request(query: &BlocksStreamQuery) -> Result<BlocksStreamRequest, String> {
+    let number_of_blocks_raw = query
+        .number_of_blocks
+        .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
+
+    if number_of_blocks_raw > MAX_BLOCKS_STREAM_BLOCKS {
+        return Err(format!(
+            "'number_of_blocks' must be <= {MAX_BLOCKS_STREAM_BLOCKS}, got {number_of_blocks_raw}"
+        ));
     }
+
+    let number_of_blocks = non_zero!("number_of_blocks", number_of_blocks_raw)?;
+
+    let server_batch_size_raw = query
+        .server_batch_size
+        .unwrap_or(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE);
+
+    if server_batch_size_raw > MAX_BLOCKS_STREAM_CHUNK_SIZE {
+        return Err(format!(
+            "'server_batch_size' must be <= {MAX_BLOCKS_STREAM_CHUNK_SIZE}, got {server_batch_size_raw}"
+        ));
+    }
+
+    let server_batch_size = non_zero!("server_batch_size", server_batch_size_raw)?;
 
     Ok(BlocksStreamRequest {
-        number_of_blocks: usize::try_from(
-            query
-                .number_of_blocks
-                .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS),
-        )
-        .unwrap_or(usize::MAX),
+        number_of_blocks,
         blocks_to: query.blocks_to,
-        // Keep per-request chunk size bounded so clients cannot exceed server limits.
-        chunk_size: query
-            .chunk_size
-            .unwrap_or(BLOCKS_STREAM_CHUNK_SIZE)
-            .clamp(1, BLOCKS_STREAM_CHUNK_SIZE),
+        server_batch_size,
         immutable_only: query.immutable_only.unwrap_or_default(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_header_id(byte: u8) -> HeaderId {
-        HeaderId::from([byte; 32])
-    }
-
-    #[test]
-    fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: None,
-            blocks_to: None,
-            chunk_size: None,
-            immutable_only: None,
-        })
-        .expect("query without explicit range should parse");
-
-        assert_eq!(
-            request.number_of_blocks,
-            DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS as usize
-        );
-        assert_eq!(request.blocks_to, None);
-        assert_eq!(request.chunk_size, BLOCKS_STREAM_CHUNK_SIZE);
-        assert!(!request.immutable_only);
-    }
-
-    #[test]
-    fn blocks_stream_request_uses_tip_when_only_number_of_blocks_is_given() {
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: Some(7),
-            blocks_to: None,
-            chunk_size: None,
-            immutable_only: None,
-        })
-        .expect("query with explicit number_of_blocks should parse");
-
-        assert_eq!(request.number_of_blocks, 7);
-        assert_eq!(request.blocks_to, None);
-    }
-
-    #[test]
-    fn blocks_stream_request_defaults_to_100_blocks_when_only_blocks_to_is_given() {
-        let blocks_to = sample_header_id(7);
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: None,
-            blocks_to: Some(blocks_to),
-            chunk_size: None,
-            immutable_only: None,
-        })
-        .expect("query with explicit blocks_to should parse");
-
-        assert_eq!(
-            request.number_of_blocks,
-            DEFAULT_NUMBER_OF_BLOCKS_STREAM_BLOCKS as usize
-        );
-        assert_eq!(request.blocks_to, Some(blocks_to));
-    }
-
-    #[test]
-    fn blocks_stream_request_rejects_zero_blocks() {
-        let result = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: Some(0),
-            blocks_to: None,
-            chunk_size: None,
-            immutable_only: None,
-        });
-
-        assert_eq!(
-            result.err(),
-            Some("number_of_blocks must be greater than or equal to 1")
-        );
-    }
 }
 
 async fn fetch_blocks_stream_chunk<StorageBackend, RuntimeServiceId>(
@@ -908,6 +849,8 @@ where
     params(BlocksStreamQuery),
     responses(
         (status = 200, description = "Stream of processed blocks with chain state"),
+        (status = 400, description = "Invalid request parameters", body = String),
+        (status = 404, description = "Requested header not found on canonical chain", body = String),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
@@ -931,7 +874,7 @@ where
 {
     let request = match parse_blocks_stream_request(&query) {
         Ok(request) => request,
-        Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
 
     let chain_info = match consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await {
@@ -951,6 +894,13 @@ where
     {
         Ok(Some(height)) => height,
         Ok(None) => {
+            if request.blocks_to.is_some() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("Header '{blocks_to_header}' not found in canonical chain"),
+                )
+                    .into_response();
+            }
             let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
             return responses::ndjson::from_stream(empty);
         }
@@ -960,16 +910,11 @@ where
     };
 
     let blocks_from = blocks_to_height
-        .saturating_sub(request.number_of_blocks.saturating_sub(1))
+        .saturating_sub(request.number_of_blocks.get().saturating_sub(1))
         .max(1);
-    let capped_blocks_to = blocks_to_height;
-    if blocks_from > capped_blocks_to {
-        let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
-        return responses::ndjson::from_stream(empty);
-    }
 
-    let first_chunk_to =
-        capped_blocks_to.min(blocks_from.saturating_add(request.chunk_size.saturating_sub(1)));
+    let first_chunk_to = blocks_to_height
+        .min(blocks_from.saturating_add(request.server_batch_size.get().saturating_sub(1)));
 
     let first_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
         &handle,
@@ -991,8 +936,8 @@ where
         chain_info,
         first_chunk,
         first_chunk_to.saturating_add(1),
-        capped_blocks_to,
-        request.chunk_size,
+        blocks_to_height,
+        request.server_batch_size.get(),
         request.immutable_only,
     );
 
@@ -1310,5 +1255,83 @@ pub mod wallet {
             let sig = wallet.sign_tx_with_zk(req.tx_hash, req.pks).await?;
             Ok::<_, DynError>(WalletSignTxZkResponseBody { sig })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_header_id(byte: u8) -> HeaderId {
+        HeaderId::from([byte; 32])
+    }
+
+    #[test]
+    fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: None,
+            blocks_to: None,
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query without explicit range should parse");
+
+        assert_eq!(
+            request.number_of_blocks,
+            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
+        );
+        assert_eq!(request.blocks_to, None);
+        assert_eq!(
+            request.server_batch_size,
+            NonZero::new(MAX_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
+        );
+        assert!(!request.immutable_only);
+    }
+
+    #[test]
+    fn blocks_stream_request_uses_tip_when_only_number_of_blocks_is_given() {
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: Some(7),
+            blocks_to: None,
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit number_of_blocks should parse");
+
+        assert_eq!(request.number_of_blocks, NonZero::new(7).unwrap());
+        assert_eq!(request.blocks_to, None);
+    }
+
+    #[test]
+    fn blocks_stream_request_defaults_to_100_blocks_when_only_blocks_to_is_given() {
+        let blocks_to = sample_header_id(7);
+        let request = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: None,
+            blocks_to: Some(blocks_to),
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit blocks_to should parse");
+
+        assert_eq!(
+            request.number_of_blocks,
+            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
+        );
+        assert_eq!(request.blocks_to, Some(blocks_to));
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_zero_blocks() {
+        let result = parse_blocks_stream_request(&BlocksStreamQuery {
+            number_of_blocks: Some(0),
+            blocks_to: None,
+            server_batch_size: None,
+            immutable_only: None,
+        });
+
+        assert_eq!(
+            result.err(),
+            Some("number_of_blocks must be greater than or equal to 1".to_owned())
+        );
     }
 }

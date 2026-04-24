@@ -16,9 +16,9 @@ use tokio::time::timeout;
 const CHAIN_LENGTH_MULTIPLIER: u32 = 3;
 
 struct CanonicalChain {
-    ids_by_height: BTreeMap<u64, HeaderId>,
-    lib_height: u64,
-    tip_height: u64,
+    ids_by_height: BTreeMap<usize, HeaderId>,
+    lib_height: usize,
+    tip_height: usize,
 }
 
 async fn spawn_two_validators(test_name: &str) -> [Validator; 2] {
@@ -120,7 +120,7 @@ async fn canonical_chain(
 ) -> CanonicalChain {
     let mut ids_by_height = BTreeMap::new();
     let mut current_id = final_info.tip;
-    let mut current_height = final_info.height;
+    let mut current_height = usize::try_from(final_info.height).unwrap();
     let mut lib_height = None;
 
     while current_height >= 1 {
@@ -146,7 +146,7 @@ async fn canonical_chain(
     CanonicalChain {
         ids_by_height,
         lib_height: lib_height.expect("lib must be on the canonical chain"),
-        tip_height: final_info.height,
+        tip_height: usize::try_from(final_info.height).unwrap(),
     }
 }
 
@@ -159,9 +159,9 @@ async fn setup_nodes_and_chain(test_name: &str) -> ([Validator; 2], CanonicalCha
 
 async fn collect_stream_events(
     node: &Validator,
-    number_of_blocks: u64,
+    number_of_blocks: NonZero<usize>,
     blocks_to: HeaderId,
-    chunk_size: Option<u64>,
+    chunk_size: Option<NonZero<usize>>,
     immutable_only: bool,
 ) -> Vec<ProcessedBlockEvent> {
     let stream = node
@@ -181,9 +181,9 @@ async fn collect_stream_events(
 
 async fn request_stream_events(
     node: &Validator,
-    blocks_from: u64,
-    blocks_to: u64,
-    chunk_size: Option<u64>,
+    blocks_from: NonZero<usize>,
+    blocks_to: NonZero<usize>,
+    chunk_size: Option<NonZero<usize>>,
     immutable_only: bool,
 ) -> (CanonicalChain, Vec<ProcessedBlockEvent>) {
     let info = node.consensus_info(false).await;
@@ -215,11 +215,16 @@ fn assert_stream_integrity(chain: &CanonicalChain, events: &[ProcessedBlockEvent
     assert_eq!(chain_lib_header_id, events[0].lib);
 }
 
-fn blocks_request(chain: &CanonicalChain, from_height: u64, to_height: u64) -> (u64, HeaderId) {
-    let number_of_blocks = to_height - from_height + 1;
+fn blocks_request(
+    chain: &CanonicalChain,
+    from_height: NonZero<usize>,
+    to_height: NonZero<usize>,
+) -> (NonZero<usize>, HeaderId) {
+    let number_of_blocks =
+        NonZero::new(to_height.get() - from_height.get() + 1).expect("must be non-zero");
     let blocks_to = chain
         .ids_by_height
-        .get(&to_height)
+        .get(&to_height.get())
         .copied()
         .expect("expected height must exist on canonical chain");
     (number_of_blocks, blocks_to)
@@ -246,7 +251,7 @@ async fn test_blocks_streaming() {
     // case: single block below LIB
     println!("case: single block below LIB");
 
-    let target_height = chain.lib_height - 3;
+    let target_height = nz(chain.lib_height - 3);
     let (request_chain, events) =
         request_stream_events(&nodes[0], target_height, target_height, None, false).await;
 
@@ -256,7 +261,7 @@ async fn test_blocks_streaming() {
     // case: single block at LIB
     println!("case: single block at LIB");
 
-    let target_height = chain.lib_height;
+    let target_height = nz(chain.lib_height);
     let (request_chain, events) =
         request_stream_events(&nodes[0], target_height, target_height, None, false).await;
 
@@ -266,7 +271,7 @@ async fn test_blocks_streaming() {
     // case: single block above LIB
     println!("case: single block above LIB");
 
-    let target_height = chain.lib_height + 3;
+    let target_height = nz(chain.lib_height + 3);
     let (request_chain, events) =
         request_stream_events(&nodes[0], target_height, target_height, None, false).await;
     assert_stream_integrity(&request_chain, &events);
@@ -276,7 +281,7 @@ async fn test_blocks_streaming() {
     // case: single block above LIB (immutable only, should cap results at LIB)
     println!("case: single block above LIB (immutable only, should cap results at LIB)");
 
-    let target_height = chain.lib_height + 3;
+    let target_height = nz(chain.lib_height + 3);
     let (_, events) =
         request_stream_events(&nodes[0], target_height, target_height, None, true).await;
 
@@ -289,10 +294,10 @@ async fn test_blocks_streaming() {
     // case: three blocks up to LIB
     println!("case: three blocks up to LIB");
 
-    let blocks_from = chain.lib_height - 2;
-    let blocks_to = chain.lib_height;
+    let blocks_from = nz(chain.lib_height - 2);
+    let blocks_to = nz(chain.lib_height);
     let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(1), false).await;
+        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(1)), false).await;
     assert_stream_integrity(&request_chain, &events);
 
     assert_eq!(events.len(), 3);
@@ -300,8 +305,8 @@ async fn test_blocks_streaming() {
     // case: three blocks from LIB and up
     println!("case: three blocks from LIB and up");
 
-    let blocks_from = chain.lib_height;
-    let blocks_to = chain.lib_height + 2;
+    let blocks_from = nz(chain.lib_height);
+    let blocks_to = nz(chain.lib_height + 2);
     let (request_chain, events) =
         request_stream_events(&nodes[0], blocks_from, blocks_to, None, false).await;
     assert_stream_integrity(&request_chain, &events);
@@ -312,8 +317,8 @@ async fn test_blocks_streaming() {
     // LIB)
     println!("case: three blocks from LIB and up (immutable only, should cap results at LIB)");
 
-    let blocks_from = chain.lib_height;
-    let blocks_to = chain.lib_height + 2;
+    let blocks_from = nz(chain.lib_height);
+    let blocks_to = nz(chain.lib_height + 2);
     let (request_chain, events) =
         request_stream_events(&nodes[0], blocks_from, blocks_to, None, true).await;
     assert_stream_integrity(&request_chain, &events);
@@ -328,27 +333,31 @@ async fn test_blocks_streaming() {
     // case: all blocks, small chunked
     println!("case: all blocks, small chunked");
 
-    let blocks_from = 1;
-    let blocks_to = 13;
+    let blocks_from = nz(1);
+    let blocks_to = nz(13);
     let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(4), false).await;
+        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(4)), false).await;
     assert_stream_integrity(&request_chain, &events);
 
-    assert_eq!(events.len() as u64, blocks_to);
+    assert_eq!(events.len(), blocks_to.get());
 
     // case: all blocks, small chunked (immutable only, should cap results at LIB)
     println!("case: all blocks, small chunked (immutable only, should cap results at LIB)");
 
-    let blocks_from = 1;
-    let blocks_to = 13;
+    let blocks_from = nz(1);
+    let blocks_to = nz(13);
     let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(4), true).await;
+        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(4)), true).await;
     assert_stream_integrity(&request_chain, &events);
 
-    assert_eq!(events.len() as u64, request_chain.lib_height);
+    assert_eq!(events.len(), request_chain.lib_height);
     assert_eq!(
         events.last().unwrap().block.header.id,
         events[0].lib,
         "last block should be LIB when immutable_only=true"
     );
+}
+
+const fn nz(value: usize) -> NonZero<usize> {
+    NonZero::new(value).unwrap()
 }

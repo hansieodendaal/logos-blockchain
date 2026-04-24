@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, pin::Pin};
+use std::{net::SocketAddr, num::NonZero, pin::Pin};
 
 use common_http_client::{
     ApiBlock, BasicAuthCredentials, CommonHttpClient, Error, ProcessedBlockEvent,
@@ -107,23 +107,23 @@ impl NodeHttpClient {
 
     pub async fn blocks_stream_in_range(
         &self,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
     ) -> Result<Pin<Box<dyn Stream<Item = ProcessedBlockEvent> + Send + '_>>, Error> {
-        self.blocks_stream_in_range_with_chunk_size(number_of_blocks, blocks_to, None, None)
+        self.blocks_stream_in_range_with_server_batch_size(number_of_blocks, blocks_to, None, None)
             .await
     }
 
-    pub async fn blocks_stream_in_range_with_chunk_size(
+    pub async fn blocks_stream_in_range_with_server_batch_size(
         &self,
-        number_of_blocks: Option<u64>,
+        number_of_blocks: Option<NonZero<usize>>,
         blocks_to: Option<HeaderId>,
-        chunk_size: Option<u64>,
+        chunk_size: Option<NonZero<usize>>,
         immutable_only: Option<bool>,
     ) -> Result<Pin<Box<dyn Stream<Item = ProcessedBlockEvent> + Send + '_>>, Error> {
         let stream = self
             .http_client
-            .get_blocks_stream_in_range_with_chunk_size(
+            .get_blocks_stream_in_range_with_server_batch_size(
                 self.base_url.clone(),
                 number_of_blocks,
                 blocks_to,
