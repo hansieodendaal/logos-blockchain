@@ -429,17 +429,13 @@ impl Validator {
     pub async fn get_lib_stream(
         &self,
     ) -> Result<impl Stream<Item = BlockInfo>, lb_common_http_client::Error> {
-        self.http_client
-            .get_lib_stream(Url::from_str(&format!("http://{}", self.addr))?)
-            .await
+        self.http_client.get_lib_stream(self.base_url()?).await
     }
 
     pub async fn get_blocks_stream(
         &self,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
-        self.http_client
-            .get_blocks_stream(Url::from_str(&format!("http://{}", self.addr))?)
-            .await
+        self.http_client.get_blocks_stream(self.base_url()?).await
     }
 
     pub async fn get_blocks_stream_in_range(
@@ -460,7 +456,7 @@ impl Validator {
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
         self.http_client
             .get_blocks_stream_in_range_with_server_batch_size(
-                Url::from_str(&format!("http://{}", self.addr))?,
+                self.base_url()?,
                 number_of_blocks,
                 blocks_to,
                 chunk_size,
@@ -469,13 +465,15 @@ impl Validator {
             .await
     }
 
+    pub fn base_url(&self) -> Result<Url, lb_common_http_client::Error> {
+        Ok(Url::from_str(&format!("http://{}", self.addr))?)
+    }
+
     pub async fn get_api_block(
         &self,
         id: HeaderId,
     ) -> Result<Option<ApiBlock>, lb_common_http_client::Error> {
-        self.http_client
-            .get_block_by_id(Url::from_str(&format!("http://{}", self.addr))?, id)
-            .await
+        self.http_client.get_block_by_id(self.base_url()?, id).await
     }
 
     /// Wait for a list of transactions to be included in blocks

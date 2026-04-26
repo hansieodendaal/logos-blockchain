@@ -356,6 +356,70 @@ async fn test_blocks_streaming() {
         events[0].lib,
         "last block should be LIB when immutable_only=true"
     );
+
+    // case: invalid blocks_to (header not on canonical chain) should fail
+    println!("case: invalid blocks_to (header not on canonical chain) should fail");
+
+    let bogus_header = HeaderId::from([0xAB; 32]);
+    let result = nodes[0]
+        .get_blocks_stream_in_range_with_chunk_size(
+            Some(nz(1)),
+            Some(bogus_header),
+            None,
+            Some(false),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "request with non-canonical header should fail"
+    );
+    let err = result.err().unwrap();
+    println!("expected error: {err}");
+
+    // case: number_of_blocks=0 should fail (400) via raw HTTP query
+    println!("case: number_of_blocks=0 should fail (400) via raw HTTP query");
+
+    let tip = nodes[0].consensus_info(false).await.tip;
+    let client = reqwest::Client::new();
+
+    let mut url = nodes[0]
+        .base_url()
+        .expect("validator base URL should be available");
+    url.set_path("/cryptarchia/events/blocks/stream");
+    url.set_query(Some(&format!("number_of_blocks=0&blocks_to={tip}")));
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .expect("raw blocks/stream request should complete");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "number_of_blocks=0 must return 400"
+    );
+
+    let body = resp
+        .text()
+        .await
+        .expect("error response body should be readable");
+    assert!(
+        body.contains("number_of_blocks"),
+        "400 body should mention number_of_blocks, got: {body}"
+    );
+
+    // case: chunk size larger than requested range should still return exact range
+    // size
+    println!("case: chunk size larger than requested range should still return exact range size");
+
+    let blocks_from = nz(chain.lib_height.saturating_sub(1).max(1));
+    let blocks_to = nz(chain.lib_height);
+    let (request_chain, events) =
+        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(1000)), false).await;
+    assert_stream_integrity(&request_chain, &events);
+    assert_eq!(events.len(), 2);
 }
 
 const fn nz(value: usize) -> NonZero<usize> {
