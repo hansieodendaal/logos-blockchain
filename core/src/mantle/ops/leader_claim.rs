@@ -147,8 +147,8 @@ impl VoucherCm {
 pub enum LeaderClaimError {
     #[error("voucher nullifier already used")]
     DuplicatedVoucherNullifier,
-    #[error("voucher not found")]
-    VoucherNotFound,
+    #[error("vouchers merkle root mismatch")]
+    VouchersRootMismatch,
     #[error("Invalid Proof of Claim")]
     InvalidPoC,
 }
@@ -186,7 +186,7 @@ impl Operation for LeaderClaimOp {
 
         // Check that the voucher root is the same as in the ledger
         if ctx.claimable_vouchers_root != &self.rewards_root {
-            return Err(LeaderClaimError::VoucherNotFound);
+            return Err(LeaderClaimError::VouchersRootMismatch);
         }
 
         // Check the proof of claim
