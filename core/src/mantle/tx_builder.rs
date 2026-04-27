@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, ops::DerefMut as _};
+use std::{cmp::Ordering, collections::HashMap};
 
 use lb_key_management_system_keys::keys::ZkPublicKey;
 
@@ -68,7 +68,7 @@ impl MantleTxBuilder {
     #[must_use]
     pub fn extend_ledger_inputs(mut self, utxos: impl IntoIterator<Item = Utxo>) -> Self {
         for utxo in utxos {
-            self.pending_transfer.inputs.push(utxo.id());
+            self.pending_transfer.inputs.as_mut().push(utxo.id());
             self.ledger_inputs.push(utxo);
         }
         self
@@ -81,7 +81,7 @@ impl MantleTxBuilder {
 
     #[must_use]
     pub fn extend_ledger_outputs(mut self, notes: impl IntoIterator<Item = Note>) -> Self {
-        self.pending_transfer.outputs.deref_mut().extend(notes);
+        self.pending_transfer.outputs.as_mut().extend(notes);
         self
     }
 
@@ -178,8 +178,8 @@ impl MantleTxBuilder {
             .iter()
             .flat_map(|op| {
                 let inputs: &[NoteId] = match op {
-                    Op::Transfer(transfer) => &transfer.inputs,
-                    Op::ChannelDeposit(deposit) => &deposit.inputs,
+                    Op::Transfer(transfer) => transfer.inputs.as_ref(),
+                    Op::ChannelDeposit(deposit) => deposit.inputs.as_ref(),
                     _ => &[],
                 };
                 let locked = match op {
