@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _, future::join_all};
 use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use lb_chain_service::{
-    ConsensusMsg, CryptarchiaInfo, ProcessedBlockEvent, Slot,
+    ConsensusMsg, CryptarchiaInfo, Slot,
     storage::{StorageAdapter as _, adapters::StorageAdapter},
 };
 use lb_core::{
@@ -26,12 +26,13 @@ use lb_tx_service::{
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
     tx::service::openapi::Status,
 };
-use overwatch::services::{AsServiceId, ServiceData};
+use overwatch::services::AsServiceId;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
+use tracing::warn;
 
-use crate::http::consensus::{Cryptarchia, cryptarchia_info, cryptarchia_ledger_state};
+use crate::http::consensus::{Cryptarchia, cryptarchia_ledger_state};
 
 /// A block along with the current chain state (tip and LIB) at the time it was
 /// processed. This allows clients to track the canonical chain without needing
@@ -162,51 +163,52 @@ where
     Ok(stream)
 }
 
-pub async fn get_processed_blocks_event_stream<Transaction, Service, RuntimeServiceId>(
+async fn get_immutable_block_ids_in_slot_range<Backend, RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
-) -> Result<
-    impl Stream<Item = Result<ProcessedBlockEvent, crate::http::DynError>>
-    + Send
-    + Sync
-    + use<Transaction, Service, RuntimeServiceId>,
-    super::DynError,
->
+    slot_from: Slot,
+    slot_to: Slot,
+    limit: NonZeroUsize,
+    descending: bool,
+) -> Result<Vec<HeaderId>, super::DynError>
 where
-    Transaction: Send + 'static,
-    Service: ServiceData<Message = ConsensusMsg<Transaction>>,
-    RuntimeServiceId: Debug + Sync + Display + AsServiceId<Service>,
+    Backend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    RuntimeServiceId:
+        Debug + Sync + Display + AsServiceId<StorageService<Backend, RuntimeServiceId>>,
 {
     let relay = handle.relay().await?;
-    let (sender, receiver) = oneshot::channel();
+    let (response_tx, response_rx) = oneshot::channel();
+    let request = if descending {
+        ChainApiRequest::ScanImmutableBlockIdsReverse {
+            slot_range: RangeInclusive::new(slot_from, slot_to),
+            limit,
+            response_tx,
+        }
+    } else {
+        ChainApiRequest::ScanImmutableBlockIds {
+            slot_range: RangeInclusive::new(slot_from, slot_to),
+            limit,
+            response_tx,
+        }
+    };
 
     relay
-        .send(ConsensusMsg::NewBlockSubscribe { sender })
+        .send(StorageMsg::Api {
+            request: StorageApiRequest::Chain(request),
+        })
         .await
         .map_err(|(error, _)| error)?;
 
-    let new_blocks_receiver = receiver
+    response_rx
         .await
-        .map_err(|error| Box::new(error) as super::DynError)?;
-
-    let processed_blocks_stream = BroadcastStream::new(new_blocks_receiver)
-        .map(|item| item.map_err(|error| Box::new(error) as crate::http::DynError));
-
-    Ok(processed_blocks_stream)
+        .map_err(|error| Box::new(error) as super::DynError)
 }
 
-pub async fn get_new_blocks_stream<
-    Transaction,
-    StorageBackend,
-    ConsensusService,
-    RuntimeServiceId,
->(
-    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
-) -> Result<
-    impl Stream<Item = BlockWithChainState<Transaction>>
-    + Send
-    + use<Transaction, StorageBackend, ConsensusService, RuntimeServiceId>,
-    super::DynError,
->
+async fn load_blocks_with_chain_state_by_ids<Transaction, StorageBackend, RuntimeServiceId>(
+    storage_adapter: &StorageAdapter<StorageBackend, Transaction, RuntimeServiceId>,
+    header_ids: Vec<HeaderId>,
+    chain_info: &CryptarchiaInfo,
+    blocks_limit: usize,
+) -> Result<Vec<BlockWithChainState<Transaction>>, super::DynError>
 where
     Transaction: Clone
         + Eq
@@ -220,50 +222,70 @@ where
     <StorageBackend as StorageChainApi>::Block:
         TryFrom<Block<Transaction>> + TryInto<Block<Transaction>>,
     <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
-    ConsensusService: ServiceData<Message = ConsensusMsg<Transaction>>,
     RuntimeServiceId: Debug
+        + Send
         + Sync
         + Display
-        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
-        + AsServiceId<ConsensusService>,
+        + 'static
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let processed_blocks_stream =
-        get_processed_blocks_event_stream::<Transaction, ConsensusService, RuntimeServiceId>(
-            handle,
-        )
-        .await?;
-
-    let relay = handle
-        .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
-        .await?;
-    let storage_adapter =
-        StorageAdapter::<StorageBackend, Transaction, RuntimeServiceId>::new(relay).await;
-
-    let new_blocks_stream = processed_blocks_stream.filter_map(move |event| {
-        let storage_adapter = storage_adapter.clone();
-        async move {
-            let event = event.ok()?;
-            let block = storage_adapter.get_block(&event.block_id).await?;
-            Some(BlockWithChainState {
-                block,
-                tip: event.tip,
-                tip_slot: event.tip_slot,
-                lib: event.lib,
-                lib_slot: event.lib_slot,
-            })
+    let mut blocks = Vec::with_capacity(header_ids.len().min(blocks_limit));
+    for header_id in header_ids {
+        let Some(block) = storage_adapter.get_block(&header_id).await else {
+            warn!("missing block body for indexed header {header_id}, skipping");
+            continue;
+        };
+        blocks.push(BlockWithChainState {
+            block,
+            tip: chain_info.tip,
+            tip_slot: chain_info.slot,
+            lib: chain_info.lib,
+            lib_slot: chain_info.lib_slot,
+        });
+        if blocks.len() == blocks_limit {
+            break;
         }
-    });
+    }
 
-    Ok(new_blocks_stream)
+    Ok(blocks)
 }
 
-/// Fetch canonical blocks in the requested height range and annotate each block
-/// with a consistent chain snapshot (tip/LIB) taken at request time.
-pub async fn get_blocks_in_range<Transaction, StorageBackend, RuntimeServiceId>(
-    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
-    blocks_from: usize,
-    blocks_to: usize,
+fn validate_blocks_slot_range(
+    slot_from: Slot,
+    slot_to: Slot,
     immutable_only: bool,
+    chain_info: &CryptarchiaInfo,
+) -> Result<(), super::DynError> {
+    if slot_to < slot_from {
+        return Err("slot_to must be greater than or equal to slot_from".into());
+    }
+    if immutable_only {
+        if slot_to > chain_info.lib_slot {
+            return Err(format!(
+                "slot_to must be <= lib_slot when immutable_only=true, got slot_to={slot_to:?}, lib_slot={:?}",
+                chain_info.lib_slot
+            )
+            .into());
+        }
+    } else if slot_to > chain_info.slot {
+        return Err(format!(
+            "slot_to must be <= tip_slot, got slot_to={slot_to:?}, tip_slot={:?}",
+            chain_info.slot
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+async fn fetch_and_load_mutable_blocks<Transaction, StorageBackend, RuntimeServiceId>(
+    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+    storage_adapter: &StorageAdapter<StorageBackend, Transaction, RuntimeServiceId>,
+    chain_info: &CryptarchiaInfo,
+    slot_from: Slot,
+    slot_to: Slot,
+    remaining: usize,
+    descending: bool,
 ) -> Result<Vec<BlockWithChainState<Transaction>>, super::DynError>
 where
     Transaction: Clone
@@ -286,28 +308,117 @@ where
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
         + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    if blocks_from == 0 {
-        return Err("blocks_from must be greater than or equal to 1".into());
-    }
-    if blocks_to < blocks_from {
-        return Err("blocks_to must be greater than or equal to blocks_from".into());
+    let limit = remaining;
+    if limit == 0 {
+        return Ok(Vec::new());
     }
 
-    let chain_info = cryptarchia_info(handle).await?;
-    get_blocks_in_range_with_snapshot::<Transaction, StorageBackend, RuntimeServiceId>(
-        handle,
-        blocks_from,
-        blocks_to,
-        immutable_only,
-        &chain_info,
-    )
-    .await
+    let mut blocks = Vec::with_capacity(limit.min(1024));
+    let mut current_id = chain_info.tip;
+    let mut retried = false;
+
+    loop {
+        let Some(block) = storage_adapter.get_block(&current_id).await else {
+            if retried {
+                return Err(format!(
+                    "canonical chain inconsistency: missing block for canonical header {current_id}"
+                )
+                .into());
+            }
+
+            let refreshed_info =
+                crate::http::consensus::cryptarchia_info::<RuntimeServiceId>(handle).await?;
+            current_id = refreshed_info.tip;
+            retried = true;
+            blocks.clear();
+            continue;
+        };
+
+        let header = block.header();
+        let slot = header.slot();
+        let parent_id = header.parent_block();
+
+        if slot < slot_from {
+            break;
+        }
+
+        if slot <= slot_to {
+            blocks.push(BlockWithChainState {
+                block,
+                tip: chain_info.tip,
+                tip_slot: chain_info.slot,
+                lib: chain_info.lib,
+                lib_slot: chain_info.lib_slot,
+            });
+
+            if descending && blocks.len() == limit {
+                break;
+            }
+        }
+
+        if parent_id == current_id {
+            break;
+        }
+        current_id = parent_id;
+    }
+
+    if !descending {
+        blocks.reverse();
+        blocks.truncate(limit);
+    }
+
+    Ok(blocks)
 }
 
-pub async fn get_blocks_in_range_with_snapshot<Transaction, StorageBackend, RuntimeServiceId>(
+async fn fetch_and_load_immutable_blocks<Transaction, StorageBackend, RuntimeServiceId>(
     handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
-    blocks_from: usize,
-    blocks_to: usize,
+    storage_adapter: &StorageAdapter<StorageBackend, Transaction, RuntimeServiceId>,
+    chain_info: &CryptarchiaInfo,
+    slot_from: Slot,
+    immutable_slot_to: Slot,
+    remaining: usize,
+    descending: bool,
+) -> Result<Vec<BlockWithChainState<Transaction>>, super::DynError>
+where
+    Transaction: Clone
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static
+        + lb_core::mantle::Transaction<Hash = TxHash>,
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<Transaction>> + TryInto<Block<Transaction>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    RuntimeServiceId: Debug
+        + Send
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    let limit = NonZeroUsize::new(remaining.saturating_mul(2).max(1))
+        .expect("remaining is positive while fetching immutable blocks");
+    let header_ids = get_immutable_block_ids_in_slot_range::<StorageBackend, RuntimeServiceId>(
+        handle,
+        slot_from,
+        immutable_slot_to,
+        limit,
+        descending,
+    )
+    .await?;
+
+    load_blocks_with_chain_state_by_ids(storage_adapter, header_ids, chain_info, remaining).await
+}
+
+pub async fn get_blocks_in_slot_range_with_snapshot<Transaction, StorageBackend, RuntimeServiceId>(
+    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+    slot_from: Slot,
+    slot_to: Slot,
+    descending: bool,
+    blocks_limit: NonZeroUsize,
     immutable_only: bool,
     chain_info: &CryptarchiaInfo,
 ) -> Result<Vec<BlockWithChainState<Transaction>>, super::DynError>
@@ -332,18 +443,7 @@ where
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
         + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    if blocks_from == 0 {
-        return Err("blocks_from must be greater than or equal to 1".into());
-    }
-    if blocks_to < blocks_from {
-        return Err("blocks_to must be greater than or equal to blocks_from".into());
-    }
-
-    let tip_height = usize::try_from(chain_info.height).unwrap_or(usize::MAX);
-    let capped_to = blocks_to.min(tip_height);
-    if blocks_from > capped_to {
-        return Ok(Vec::new());
-    }
+    validate_blocks_slot_range(slot_from, slot_to, immutable_only, chain_info)?;
 
     let relay = handle
         .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
@@ -351,51 +451,80 @@ where
     let storage_adapter =
         StorageAdapter::<StorageBackend, Transaction, RuntimeServiceId>::new(relay).await;
 
-    let mut current_id = chain_info.tip;
-    let mut current_height = tip_height;
-    let mut lib_height = None;
-    let mut blocks = Vec::new();
-    loop {
-        let Some(block) = storage_adapter.get_block(&current_id).await else {
-            break;
-        };
+    let mut blocks = Vec::with_capacity(blocks_limit.get().min(1024));
+    let mut remaining = blocks_limit.get();
 
-        if current_id == chain_info.lib {
-            lib_height = Some(current_height);
+    let immutable_slot_to = slot_to.min(chain_info.lib_slot);
+    let has_immutable_range = slot_from <= immutable_slot_to;
+    // Mutable window starts strictly above LIB; LIB itself is served via immutable
+    // index.
+    let mutable_slot_from = (chain_info.lib_slot + 1).max(slot_from);
+    let has_mutable_range = !immutable_only && mutable_slot_from <= slot_to;
+
+    if descending {
+        if remaining > 0 && has_mutable_range {
+            let mutable_blocks =
+                fetch_and_load_mutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                    handle,
+                    &storage_adapter,
+                    chain_info,
+                    mutable_slot_from,
+                    slot_to,
+                    remaining,
+                    true,
+                )
+                .await?;
+            remaining = remaining.saturating_sub(mutable_blocks.len());
+            blocks.extend(mutable_blocks);
         }
 
-        if current_height < blocks_from {
-            break;
+        if remaining > 0 && has_immutable_range {
+            let immutable_blocks =
+                fetch_and_load_immutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                    handle,
+                    &storage_adapter,
+                    chain_info,
+                    slot_from,
+                    immutable_slot_to,
+                    remaining,
+                    true,
+                )
+                .await?;
+            blocks.extend(immutable_blocks);
+        }
+    } else {
+        if has_immutable_range {
+            let immutable_blocks =
+                fetch_and_load_immutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                    handle,
+                    &storage_adapter,
+                    chain_info,
+                    slot_from,
+                    immutable_slot_to,
+                    remaining,
+                    false,
+                )
+                .await?;
+            remaining = remaining.saturating_sub(immutable_blocks.len());
+            blocks.extend(immutable_blocks);
         }
 
-        let parent_id = block.header().parent_block();
-
-        let in_requested_range = current_height <= capped_to;
-        let in_immutable_range = if immutable_only {
-            lib_height.is_some()
-        } else {
-            true
-        };
-
-        if in_requested_range && in_immutable_range {
-            blocks.push(BlockWithChainState {
-                block,
-                tip: chain_info.tip,
-                tip_slot: chain_info.slot,
-                lib: chain_info.lib,
-                lib_slot: chain_info.lib_slot,
-            });
+        if remaining > 0 && has_mutable_range {
+            let mutable_blocks =
+                fetch_and_load_mutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                    handle,
+                    &storage_adapter,
+                    chain_info,
+                    mutable_slot_from,
+                    slot_to,
+                    remaining,
+                    false,
+                )
+                .await?;
+            blocks.extend(mutable_blocks);
         }
-
-        if parent_id == current_id {
-            break;
-        }
-
-        current_id = parent_id;
-        current_height = current_height.saturating_sub(1);
     }
 
-    blocks.reverse();
     Ok(blocks)
 }
 
@@ -429,7 +558,8 @@ where
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
         + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    let tip_height = usize::try_from(chain_info.height).unwrap_or(usize::MAX);
+    let tip_height = usize::try_from(chain_info.height)
+        .map_err(|_| format!("tip height {} does not fit into usize", chain_info.height))?;
     let relay = handle
         .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
         .await?;

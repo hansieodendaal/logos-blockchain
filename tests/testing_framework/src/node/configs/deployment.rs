@@ -12,11 +12,11 @@ use super::{
     wallet::{WalletConfig, WalletConfigError},
 };
 use crate::{
+    get_reserved_available_udp_port,
     node::{
         DeploymentPlan, NodePlan,
         configs::{Config, create_node_configs_from_ids, postprocess},
     },
-    try_get_reserved_available_udp_port,
 };
 
 pub type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -32,8 +32,8 @@ pub enum TopologyBuildError {
         expected: usize,
         actual: usize,
     },
-    #[error("failed to allocate blend UDP ports for topology: {0}")]
-    BlendPortAllocation(crate::ReservedPortError),
+    #[error("failed to allocate blend UDP ports for topology")]
+    BlendPortAllocation,
     #[error(transparent)]
     InvalidWallet(#[from] WalletConfigError),
 }
@@ -243,8 +243,9 @@ fn allocate_blend_ports(node_count: usize) -> Result<Vec<u16>, TopologyBuildErro
     let mut ports = Vec::with_capacity(node_count);
 
     for _ in 0..node_count {
-        let port = try_get_reserved_available_udp_port()
-            .map_err(TopologyBuildError::BlendPortAllocation)?;
+        let Some(port) = get_reserved_available_udp_port() else {
+            return Err(TopologyBuildError::BlendPortAllocation);
+        };
         ports.push(port);
     }
 

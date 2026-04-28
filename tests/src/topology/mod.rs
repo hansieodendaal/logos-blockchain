@@ -16,7 +16,7 @@ use lb_core::{
 use lb_key_management_system_service::keys::ZkKey;
 use lb_network_service::backends::libp2p::Libp2pInfo;
 use lb_node::config::{KmsConfig, kms::serde::PreloadKmsBackendSettings};
-use lb_testing_framework::try_get_reserved_available_udp_port;
+use lb_testing_framework::get_reserved_available_udp_port;
 use rand::{Rng as _, thread_rng};
 
 use crate::{
@@ -132,11 +132,7 @@ impl Topology {
         let mut blend_ports = vec![];
         for id in &mut ids {
             thread_rng().fill(id);
-            blend_ports.push(
-                try_get_reserved_available_udp_port().unwrap_or_else(|error| {
-                    panic!("failed to allocate blend UDP port for topology: {error}")
-                }),
-            );
+            blend_ports.push(get_reserved_available_udp_port().unwrap());
         }
 
         let (consensus_configs, genesis_block) =

@@ -293,7 +293,7 @@ where
 
         let app = app
             .route(
-                paths::IMMUTABLE_BLOCKS,
+                paths::BLOCKS,
                 routing::get(immutable_blocks::<BlockStorageBackend, RuntimeServiceId>),
             )
             .route(

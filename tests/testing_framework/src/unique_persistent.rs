@@ -11,7 +11,6 @@ use std::{
 };
 
 use lb_utils::net::{get_available_tcp_port, get_available_udp_port};
-use thiserror::Error;
 
 /// Total size of one reserved block per test process.
 ///
@@ -74,90 +73,29 @@ pub fn unique_test_context(test_context: Option<&str>) -> String {
 struct TestPortAllocator {
     // The lock file that proves this process owns its port block.
     claim_file: PathBuf,
-    // First TCP port in this process's reserved block.
-    tcp_start: u16,
     // Next TCP port candidate in this process's reserved block.
     tcp_next: u16,
     // Final TCP port in this process's reserved block.
     tcp_end: u16,
-    // First UDP port in this process's reserved block.
-    udp_start: u16,
     // Next UDP port candidate in this process's reserved block.
     udp_next: u16,
     // Final UDP port in this process's reserved block.
     udp_end: u16,
 }
 
-#[derive(Debug, Error)]
-pub enum ReservedPortError {
-    #[error("failed to acquire test port allocator: {0}")]
-    Initialization(#[from] TestPortAllocatorInitError),
-    #[error("test port allocator lock is poisoned")]
-    LockPoisoned,
-    #[error(
-        "no available TCP port in reserved range {range_start}-{range_end} and OS fallback returned none"
-    )]
-    NoTcpPort { range_start: u16, range_end: u16 },
-    #[error(
-        "no available UDP port in reserved range {range_start}-{range_end} and OS fallback returned none"
-    )]
-    NoUdpPort { range_start: u16, range_end: u16 },
-}
-
-#[derive(Debug, Error)]
-pub enum TestPortAllocatorInitError {
-    #[error("failed to create handshake directory {path}: {source}")]
-    CreateHandshakeDir {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("failed to open claim file {path}: {source}")]
-    OpenClaimFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("failed to write claim file {path}: {source}")]
-    WriteClaimFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error(
-        "no free port blocks available in {path} for range {range_start}-{range_end} with block size {block_size}"
-    )]
-    NoAvailableBlocks {
-        path: PathBuf,
-        range_start: u16,
-        range_end: u16,
-        block_size: u16,
-    },
-}
-
 impl TestPortAllocator {
-    fn new() -> Result<Self, TestPortAllocatorInitError> {
-        let handshake_dir = handshake_dir();
-        fs::create_dir_all(&handshake_dir).map_err(|source| {
-            TestPortAllocatorInitError::CreateHandshakeDir {
-                path: handshake_dir.clone(),
-                source,
-            }
-        })?;
+    fn new() -> Option<Self> {
+        fs::create_dir_all(handshake_dir()).ok()?;
 
         let owner = format!("process_start_nonce={}", process_start_nonce());
 
         // Example block starts for PORT_BLOCK_SIZE=256:
         // 20000, 20256, 20512, ...
-        let max_block_start = PORT_RANGE_END
-            .checked_sub(PORT_BLOCK_SIZE - 1)
-            .ok_or_else(|| TestPortAllocatorInitError::NoAvailableBlocks {
-                path: handshake_dir.clone(),
-                range_start: PORT_RANGE_START,
-                range_end: PORT_RANGE_END,
-                block_size: PORT_BLOCK_SIZE,
-            })?;
+        let max_block_start = PORT_RANGE_END.checked_sub(PORT_BLOCK_SIZE - 1)?;
 
         for block_start in (PORT_RANGE_START..=max_block_start).step_by(PORT_BLOCK_SIZE as usize) {
             let block_end = block_start + PORT_BLOCK_SIZE - 1;
-            let claim_file = handshake_dir.join(format!("{block_start}.lock"));
+            let claim_file = handshake_dir().join(format!("{block_start}.lock"));
 
             // First try to reap an obviously stale lock from a dead pid.
             if claim_file.exists() {
@@ -171,30 +109,18 @@ impl TestPortAllocator {
                 .open(&claim_file)
             {
                 Ok(mut file) => {
-                    if let Err(source) =
-                        write_port_claim_metadata(&mut file, &owner, block_start, block_end)
-                    {
-                        drop(fs::remove_file(&claim_file));
-                        return Err(TestPortAllocatorInitError::WriteClaimFile {
-                            path: claim_file,
-                            source,
-                        });
-                    }
+                    write_port_claim_metadata(&mut file, &owner, block_start, block_end).ok()?;
 
-                    let tcp_start = block_start;
-                    let tcp_next = tcp_start;
+                    let tcp_next = block_start;
                     let tcp_end = block_start + (PORT_BLOCK_SIZE / 2) - 1;
 
-                    let udp_start = tcp_end + 1;
-                    let udp_next = udp_start;
+                    let udp_next = tcp_end + 1;
                     let udp_end = block_end;
 
-                    return Ok(Self {
+                    return Some(Self {
                         claim_file,
-                        tcp_start,
                         tcp_next,
                         tcp_end,
-                        udp_start,
                         udp_next,
                         udp_end,
                     });
@@ -204,55 +130,41 @@ impl TestPortAllocator {
                     // or a race occurred while reaping/claiming. Try the next
                     // block.
                 }
-                Err(source) => {
-                    return Err(TestPortAllocatorInitError::OpenClaimFile {
-                        path: claim_file,
-                        source,
-                    });
+                Err(_) => {
+                    return None;
                 }
             }
         }
 
-        Err(TestPortAllocatorInitError::NoAvailableBlocks {
-            path: handshake_dir,
-            range_start: PORT_RANGE_START,
-            range_end: PORT_RANGE_END,
-            block_size: PORT_BLOCK_SIZE,
-        })
+        None
     }
 
     /// Returns an available TCP port from this allocator's reserved block.
-    fn next_tcp_port(&mut self) -> Result<u16, ReservedPortError> {
+    fn next_tcp_port(&mut self) -> Option<u16> {
         while self.tcp_next <= self.tcp_end {
             let port = self.tcp_next;
             self.tcp_next += 1;
 
             if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                return Ok(port);
+                return Some(port);
             }
         }
         // The persistent blocks may be exhausted, try global allocation (failsafe)
-        get_available_tcp_port().ok_or(ReservedPortError::NoTcpPort {
-            range_start: self.tcp_start,
-            range_end: self.tcp_end,
-        })
+        get_available_tcp_port()
     }
 
     /// Returns an available UDP port from this allocator's reserved block.
-    fn next_udp_port(&mut self) -> Result<u16, ReservedPortError> {
+    fn next_udp_port(&mut self) -> Option<u16> {
         while self.udp_next <= self.udp_end {
             let port = self.udp_next;
             self.udp_next += 1;
 
             if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
-                return Ok(port);
+                return Some(port);
             }
         }
         // The persistent blocks may be exhausted, try global allocation (failsafe)
-        get_available_udp_port().ok_or(ReservedPortError::NoUdpPort {
-            range_start: self.udp_start,
-            range_end: self.udp_end,
-        })
+        get_available_udp_port()
     }
 }
 
@@ -266,11 +178,9 @@ fn test_port_allocator_slot() -> &'static Mutex<Option<TestPortAllocator>> {
     TEST_PORT_ALLOCATOR.get_or_init(|| Mutex::new(None))
 }
 
-fn with_test_port_allocator<T>(
-    f: impl FnOnce(&mut TestPortAllocator) -> Result<T, ReservedPortError>,
-) -> Result<T, ReservedPortError> {
+fn with_test_port_allocator<T>(f: impl FnOnce(&mut TestPortAllocator) -> Option<T>) -> Option<T> {
     let slot = test_port_allocator_slot();
-    let mut guard = slot.lock().map_err(|_| ReservedPortError::LockPoisoned)?;
+    let mut guard = slot.lock().ok()?;
 
     if guard.is_none() {
         *guard = Some(TestPortAllocator::new()?);
@@ -383,22 +293,12 @@ fn try_reap_stale_port_claim_file(path: &Path) {
 /// Returns an available TCP port from this process's reserved port block.
 #[must_use]
 pub fn get_reserved_available_tcp_port() -> Option<u16> {
-    try_get_reserved_available_tcp_port().ok()
-}
-
-/// Returns an available TCP port from this process's reserved port block.
-pub fn try_get_reserved_available_tcp_port() -> Result<u16, ReservedPortError> {
     with_test_port_allocator(TestPortAllocator::next_tcp_port)
 }
 
 /// Returns an available UDP port from this process's reserved port block.
 #[must_use]
 pub fn get_reserved_available_udp_port() -> Option<u16> {
-    try_get_reserved_available_udp_port().ok()
-}
-
-/// Returns an available UDP port from this process's reserved port block.
-pub fn try_get_reserved_available_udp_port() -> Result<u16, ReservedPortError> {
     with_test_port_allocator(TestPortAllocator::next_udp_port)
 }
 

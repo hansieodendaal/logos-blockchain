@@ -210,6 +210,52 @@ impl StorageBackend for RocksBackend {
         Ok(values)
     }
 
+    async fn load_prefix_reverse(
+        &mut self,
+        prefix: &[u8],
+        start_key: Option<&[u8]>,
+        end_key: Option<&[u8]>,
+        limit: Option<NonZeroUsize>,
+    ) -> Result<Vec<Bytes>, <Self as StorageBackend>::Error> {
+        let mut values = Vec::new();
+
+        let start_key =
+            start_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
+        let end_key = end_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
+
+        let iter = self.rocks.iterator(IteratorMode::From(
+            end_key.as_ref().map_or(prefix, |to| to.as_slice()),
+            Direction::Reverse,
+        ));
+
+        for item in iter {
+            match item {
+                Ok((key, value)) => {
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+
+                    if let Some(start_key) = &start_key
+                        && key.as_ref() < start_key.as_slice()
+                    {
+                        break;
+                    }
+
+                    values.push(Bytes::from(value.to_vec()));
+
+                    if let Some(limit) = limit
+                        && values.len() == limit.get()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(values)
+    }
+
     async fn remove(
         &mut self,
         key: &[u8],
@@ -372,6 +418,47 @@ mod test {
                 Bytes::from("foo3"),
                 Bytes::from("foo4"),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_prefix_reverse_range_limit() {
+        let mut backend = RocksBackend::new(RocksBackendSettings {
+            db_path: TempDir::new().unwrap().path().to_path_buf(),
+            read_only: false,
+            column_family: None,
+        })
+        .unwrap();
+        backend.store("foo/0".into(), "foo0".into()).await.unwrap();
+        backend.store("foo/1".into(), "foo1".into()).await.unwrap();
+        backend.store("foo/3".into(), "foo3".into()).await.unwrap();
+        backend.store("foo/4".into(), "foo4".into()).await.unwrap();
+        backend.store("foo/9".into(), "foo9".into()).await.unwrap();
+
+        assert_eq!(
+            backend
+                .load_prefix_reverse(b"foo/", Some(b"1"), Some(b"9"), None)
+                .await
+                .unwrap(),
+            vec![
+                Bytes::from("foo9"),
+                Bytes::from("foo4"),
+                Bytes::from("foo3"),
+                Bytes::from("foo1")
+            ]
+        );
+
+        assert_eq!(
+            backend
+                .load_prefix_reverse(
+                    b"foo/",
+                    Some(b"1"),
+                    Some(b"9"),
+                    Some(NonZeroUsize::new(2).unwrap())
+                )
+                .await
+                .unwrap(),
+            vec![Bytes::from("foo9"), Bytes::from("foo4")]
         );
     }
 

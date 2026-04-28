@@ -1,20 +1,7 @@
-use lb_core::header::HeaderId;
+use lb_http_api_common::paths::{MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE};
 use serde::Deserialize;
 use utoipa::IntoParams;
-
-fn deserialize_blocks_to_header_id<'de, D>(deserializer: D) -> Result<Option<HeaderId>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?
-        .map(|value| {
-            let value = value.strip_prefix("0x").unwrap_or(value.as_str());
-            let mut bytes = [0u8; 32];
-            hex::decode_to_slice(value, &mut bytes).map_err(serde::de::Error::custom)?;
-            Ok(HeaderId::from(bytes))
-        })
-        .transpose()
-}
+use validator::Validate;
 
 #[derive(IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -26,25 +13,55 @@ pub struct BlockRangeQuery {
     pub slot_to: usize,
 }
 
-#[derive(IntoParams)]
+#[derive(IntoParams, Deserialize, Validate)]
 #[into_params(parameter_in = Query)]
-#[derive(Deserialize)]
 pub struct BlocksStreamQuery {
-    /// Number of blocks to return. Defaults to 100.
+    /// If omitted, the server chooses a default lower bound.
+    /// For descending streams this means no explicit lower bound.
+    /// For ascending streams ending above LIB, the lower bound may be estimated
+    /// from recent chain spacing and `blocks_limit`, so fewer than
+    /// `blocks_limit` blocks may be returned.
     #[serde(default)]
-    #[param(minimum = 1)]
-    pub number_of_blocks: Option<usize>,
-    /// Upper-bound canonical header (hex, with or without 0x).
-    /// If omitted, defaults to tip when `immutable_only=false`, or LIB when
+    #[param(minimum = 0)]
+    pub slot_from: Option<u64>,
+    /// Upper bound slot (inclusive). Defaults to tip slot, or LIB slot when
     /// `immutable_only=true`.
-    #[serde(default, deserialize_with = "deserialize_blocks_to_header_id")]
-    pub blocks_to: Option<HeaderId>,
-    /// Server chunk size hint for streamed delivery.
     #[serde(default)]
-    #[param(minimum = 1)]
+    #[param(minimum = 0)]
+    pub slot_to: Option<u64>,
+    /// Sort direction. Defaults to descending (`true`).
+    #[serde(default)]
+    pub descending: Option<bool>,
+    /// Maximum number of blocks to return. Defaults to `100`, maximum
+    /// `630_720_000`.
+    #[serde(default)]
+    #[validate(custom(function = "validate_blocks_limit"))]
+    #[param(minimum = 1, maximum = 630_720_000, default = 100, example = 100)]
+    pub blocks_limit: Option<usize>,
+    /// Server chunk size hint for streamed delivery. Defaults to `100` ,
+    /// maximum `1000`.
+    #[serde(default)]
+    #[validate(custom(function = "validate_server_batch_size"))]
+    #[param(minimum = 1, maximum = 1_000, default = 100, example = 100)]
     pub server_batch_size: Option<usize>,
     /// When true, include only immutable blocks.
-    /// If `blocks_to` is omitted, the default anchor is LIB.
+    /// If `slot_to` is omitted, the default anchor is LIB slot.
     #[serde(default)]
     pub immutable_only: Option<bool>,
+}
+
+fn validate_blocks_limit(v: usize) -> Result<(), validator::ValidationError> {
+    if v == 0 || v > MAX_BLOCKS_STREAM_BLOCKS {
+        return Err(validator::ValidationError::new("blocks_limit_out_of_range"));
+    }
+    Ok(())
+}
+
+fn validate_server_batch_size(v: usize) -> Result<(), validator::ValidationError> {
+    if v == 0 || v > MAX_BLOCKS_STREAM_CHUNK_SIZE {
+        return Err(validator::ValidationError::new(
+            "server_batch_size_out_of_range",
+        ));
+    }
+    Ok(())
 }

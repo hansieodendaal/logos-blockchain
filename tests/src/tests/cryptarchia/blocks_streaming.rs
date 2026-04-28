@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, num::NonZero, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::NonZero,
+    time::{Duration, Instant},
+};
 
 use futures::stream::{self, StreamExt as _};
 use lb_common_http_client::ProcessedBlockEvent;
@@ -17,10 +21,24 @@ use tokio::time::timeout;
 
 const CHAIN_LENGTH_MULTIPLIER: u32 = 3;
 
+#[derive(Clone)]
 struct CanonicalChain {
     ids_by_height: BTreeMap<usize, HeaderId>,
+    heights_by_slot: BTreeMap<u64, usize>,
     lib_height: usize,
+    lib_slot: u64,
     tip_height: usize,
+    tip_slot: u64,
+}
+
+impl CanonicalChain {
+    fn get_tip_id(&self) -> Option<HeaderId> {
+        self.ids_by_height.get(&self.tip_height).copied()
+    }
+
+    fn get_lib_id(&self) -> Option<HeaderId> {
+        self.ids_by_height.get(&self.lib_height).copied()
+    }
 }
 
 async fn spawn_two_validators(test_name: &str) -> [Validator; 2] {
@@ -121,9 +139,11 @@ async fn canonical_chain(
     final_info: &lb_chain_service::CryptarchiaInfo,
 ) -> CanonicalChain {
     let mut ids_by_height = BTreeMap::new();
+    let mut heights_by_slot = BTreeMap::new();
     let mut current_id = final_info.tip;
     let mut current_height = usize::try_from(final_info.height).unwrap();
     let mut lib_height = None;
+    let mut previous_slot = None;
 
     while current_height >= 1 {
         let block = node
@@ -132,6 +152,21 @@ async fn canonical_chain(
             .expect("canonical block request should succeed")
             .expect("canonical block should exist");
         ids_by_height.insert(current_height, block.header.id);
+        let slot = u64::from(block.header.slot);
+        let replaced = heights_by_slot.insert(slot, current_height);
+        assert!(
+            replaced.is_none(),
+            "pre-test invariant failed: duplicate canonical slot {slot} at heights {} and {current_height}",
+            replaced.unwrap_or_default()
+        );
+
+        if let Some(prev) = previous_slot {
+            assert!(
+                slot < prev,
+                "pre-test invariant failed: canonical slots must be strictly increasing by height; height {current_height} slot {slot} is not < next height slot {prev}",
+            );
+        }
+        previous_slot = Some(slot);
 
         if current_id == final_info.lib {
             lib_height = Some(current_height);
@@ -147,8 +182,11 @@ async fn canonical_chain(
 
     CanonicalChain {
         ids_by_height,
+        heights_by_slot,
         lib_height: lib_height.expect("lib must be on the canonical chain"),
-        tip_height: usize::try_from(final_info.height).unwrap(),
+        lib_slot: final_info.lib_slot.into_inner(),
+        tip_height: usize::try_from(final_info.height).expect("should fit in usize"),
+        tip_slot: final_info.slot.into_inner(),
     }
 }
 
@@ -159,83 +197,140 @@ async fn setup_nodes_and_chain(test_name: &str) -> ([Validator; 2], CanonicalCha
     (nodes, chain)
 }
 
-async fn collect_stream_events(
-    node: &Validator,
-    number_of_blocks: NonZero<usize>,
-    blocks_to: HeaderId,
-    chunk_size: Option<NonZero<usize>>,
-    immutable_only: bool,
-) -> Vec<ProcessedBlockEvent> {
-    let stream = node
-        .get_blocks_stream_in_range_with_chunk_size(
-            Some(number_of_blocks),
-            Some(blocks_to),
-            chunk_size,
-            Some(immutable_only),
-        )
-        .await
-        .expect("blocks stream request should succeed");
-
-    timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-        .await
-        .expect("timed out collecting blocks stream events")
+fn slot_for_height(chain: &CanonicalChain, height: usize) -> u64 {
+    *chain
+        .heights_by_slot
+        .iter()
+        .find_map(|(slot, h)| (*h == height).then_some(slot))
+        .expect("slot must exist for every canonical height")
 }
 
 async fn request_stream_events(
     node: &Validator,
-    blocks_from: NonZero<usize>,
-    blocks_to: NonZero<usize>,
+    blocks_limit: Option<NonZero<usize>>,
+    slot_from: Option<u64>,
+    slot_to: Option<u64>,
+    descending: Option<bool>,
     chunk_size: Option<NonZero<usize>>,
-    immutable_only: bool,
-) -> (CanonicalChain, Vec<ProcessedBlockEvent>) {
-    let info = node.consensus_info(false).await;
-    let chain = canonical_chain(node, &info).await;
-    let (number_of_blocks, blocks_to) = blocks_request(&chain, blocks_from, blocks_to);
-    let events = collect_stream_events(
-        node,
-        number_of_blocks,
-        blocks_to,
-        chunk_size,
-        immutable_only,
-    )
-    .await;
-    (chain, events)
+    immutable_only: Option<bool>,
+) -> Vec<ProcessedBlockEvent> {
+    let start = Instant::now();
+    print!(
+        "  request_stream_events: blocks_limit={blocks_limit:?}, slot_from={slot_from:?}, \
+        slot_to={slot_to:?}, descending={descending:?}, chunk_size={chunk_size:?}, \
+        immutable_only={immutable_only:?}"
+    );
+
+    let stream = node
+        .get_blocks_stream_in_range_with_chunk_size(
+            blocks_limit,
+            slot_from,
+            slot_to,
+            descending,
+            chunk_size,
+            immutable_only,
+        )
+        .await
+        .expect("blocks stream request should succeed");
+
+    let events = timeout(Duration::from_secs(15), stream.collect::<Vec<_>>())
+        .await
+        .expect("timed out collecting blocks stream events");
+    println!(
+        ", collected {} events in {:?}",
+        events.len(),
+        start.elapsed()
+    );
+
+    events
 }
 
-fn assert_stream_integrity(chain: &CanonicalChain, events: &[ProcessedBlockEvent]) {
-    let chain_lib_header_id = chain
-        .ids_by_height
-        .get(&chain.lib_height)
-        .copied()
-        .expect("chain should have at least one block");
-    let chain_tip_header_id = chain
-        .ids_by_height
-        .get(&chain.tip_height)
-        .copied()
-        .expect("chain should have at least one block");
-    assert_eq!(chain_tip_header_id, events[0].tip);
-    assert_eq!(chain_lib_header_id, events[0].lib);
+fn assert_stream_integrity(_chain: &CanonicalChain, events: &[ProcessedBlockEvent]) {
+    let first = events
+        .first()
+        .expect("stream should contain at least one event");
+    for event in events {
+        assert_eq!(event.tip, first.tip, "all events must share the same tip");
+        assert_eq!(
+            event.tip_slot, first.tip_slot,
+            "all events must share the same tip slot"
+        );
+        assert_eq!(event.lib, first.lib, "all events must share the same LIB");
+        assert_eq!(
+            event.lib_slot, first.lib_slot,
+            "all events must share the same LIB slot"
+        );
+    }
+    assert!(
+        u64::from(first.lib_slot) <= u64::from(first.tip_slot),
+        "LIB slot must not exceed tip slot"
+    );
+}
+
+async fn refresh_chain(node: &Validator, chain: &CanonicalChain) -> CanonicalChain {
+    let info = node.consensus_info(false).await;
+    if let Some(current_tip) = chain.get_tip_id()
+        && let Some(current_lib) = chain.get_lib_id()
+        && info.tip == current_tip
+        && info.lib == current_lib
+    {
+        return chain.clone();
+    }
+    canonical_chain(node, &info).await
 }
 
 fn blocks_request(
     chain: &CanonicalChain,
     from_height: NonZero<usize>,
     to_height: NonZero<usize>,
-) -> (NonZero<usize>, HeaderId) {
-    let number_of_blocks =
-        NonZero::new(to_height.get() - from_height.get() + 1).expect("must be non-zero");
-    let blocks_to = chain
-        .ids_by_height
-        .get(&to_height.get())
-        .copied()
-        .expect("expected height must exist on canonical chain");
-    (number_of_blocks, blocks_to)
+) -> (u64, u64) {
+    let slot_from = slot_for_height(chain, from_height.get());
+    let slot_to = slot_for_height(chain, to_height.get());
+    (slot_from, slot_to)
+}
+
+fn ids_in_slot_range(
+    chain: &CanonicalChain,
+    slot_from: u64,
+    slot_to: u64,
+    descending: bool,
+    blocks_limit: Option<NonZero<usize>>,
+) -> Vec<HeaderId> {
+    let blocks_limit = blocks_limit
+        .unwrap_or_else(|| NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap())
+        .get();
+    let iter: Box<dyn Iterator<Item = (&u64, &usize)>> = if descending {
+        Box::new(chain.heights_by_slot.range(slot_from..=slot_to).rev())
+    } else {
+        Box::new(chain.heights_by_slot.range(slot_from..=slot_to))
+    };
+
+    iter.take(blocks_limit)
+        .map(|(_, height)| {
+            *chain
+                .ids_by_height
+                .get(height)
+                .expect("slot-mapped height must exist in canonical chain")
+        })
+        .collect()
+}
+
+fn assert_event_order_matches_expected(events: &[ProcessedBlockEvent], expected_ids: &[HeaderId]) {
+    let actual_ids = events
+        .iter()
+        .map(|event| event.block.header.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_ids, expected_ids,
+        "streamed headers must match requested canonical order"
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn test_blocks_streaming() {
-    let (nodes, chain) = setup_nodes_and_chain("blocks_streaming_use_cases_share_one_setup").await;
+    let (nodes, mut chain) =
+        setup_nodes_and_chain("blocks_streaming_use_cases_share_one_setup").await;
     assert!(
         chain.lib_height > 1,
         "lib height must allow a block below LIB"
@@ -250,178 +345,383 @@ async fn test_blocks_streaming() {
         "tip height must allow streaming three blocks starting from LIB"
     );
 
-    // case: immutable_only=true with no blocks_to should anchor at LIB
-    println!("case: immutable_only=true without blocks_to anchors at LIB");
+    // ============== Happy path =============
 
-    let info = nodes[0].consensus_info(false).await;
-    let expected_chain = canonical_chain(&nodes[0], &info).await;
-    let expected_len = expected_chain
-        .lib_height
-        .min(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
-    assert!(expected_len > 0, "lib height must be > 0 for this case");
+    // case: immutable_only=true with no blocks_to should anchor at LIB, various
+    // chunk sizes
+    println!("case: immutable_only=true without blocks_to anchors at LIB, various chunk sizes");
 
-    let stream = nodes[0]
-        .get_blocks_stream_in_range_with_chunk_size(None, None, Some(nz(8)), Some(true))
-        .await
-        .expect("immutable-only default stream request should succeed");
+    let blocks_limit = None;
+    for chunk_size in [
+        None,
+        Some(nz(1)),
+        Some(nz(4)),
+        Some(nz(chain.lib_height)),
+        Some(nz(chain.tip_height + 10)),
+    ] {
+        for descending in [false, true] {
+            chain = refresh_chain(&nodes[0], &chain).await;
+            let events = request_stream_events(
+                &nodes[0],
+                blocks_limit,
+                None,
+                None,
+                Some(descending),
+                chunk_size,
+                Some(true),
+            )
+            .await;
 
-    let events = timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-        .await
-        .expect("timed out collecting immutable-only default events");
-
-    assert_eq!(
-        events.len(),
-        expected_len,
-        "immutable_only=true default should return recent immutable window"
-    );
-
-    assert_eq!(
-        events.last().unwrap().block.header.id,
-        events[0].lib,
-        "last block should be LIB for immutable_only=true default behavior"
-    );
-    assert_stream_integrity(&expected_chain, &events);
+            let expected_ids =
+                ids_in_slot_range(&chain, 0, chain.lib_slot, descending, blocks_limit);
+            assert_eq!(
+                events.len(),
+                expected_ids.len(),
+                "immutable_only=true default should return all immutable blocks up to LIB"
+            );
+            assert_event_order_matches_expected(&events, &expected_ids);
+            assert_stream_integrity(&chain, &events);
+        }
+    }
 
     // case: single block below LIB
     println!("case: single block below LIB");
 
+    chain = refresh_chain(&nodes[0], &chain).await;
     let target_height = nz(chain.lib_height - 3);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], target_height, target_height, None, false).await;
+    let (slot_from, slot_to) = blocks_request(&chain, target_height, target_height);
+    let events = request_stream_events(
+        &nodes[0],
+        None,
+        Some(slot_from),
+        Some(slot_to),
+        None,
+        None,
+        Some(false),
+    )
+    .await;
 
     assert_eq!(events.len(), 1);
-    assert_stream_integrity(&request_chain, &events);
+    let expected_id = *chain
+        .ids_by_height
+        .get(&target_height.get())
+        .expect("target height should exist on canonical chain");
+
+    assert_eq!(
+        events[0].block.header.id, expected_id,
+        "slot range should include requested header"
+    );
+
+    assert_stream_integrity(&chain, &events);
 
     // case: single block at LIB
     println!("case: single block at LIB");
 
+    chain = refresh_chain(&nodes[0], &chain).await;
     let target_height = nz(chain.lib_height);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], target_height, target_height, None, false).await;
+    let (slot_from, slot_to) = (chain.lib_slot, chain.lib_slot);
+    let events = request_stream_events(
+        &nodes[0],
+        None,
+        Some(slot_from),
+        Some(slot_to),
+        None,
+        None,
+        Some(false),
+    )
+    .await;
 
-    assert_eq!(events.len(), 1);
-    assert_stream_integrity(&request_chain, &events);
+    let expected_id = *chain
+        .ids_by_height
+        .get(&target_height.get())
+        .expect("target height should exist on canonical chain");
+
+    assert_eq!(
+        events[0].block.header.id, expected_id,
+        "slot range should include requested header"
+    );
+
+    assert_stream_integrity(&chain, &events);
 
     // case: single block above LIB
     println!("case: single block above LIB");
 
-    let target_height = nz(chain.lib_height + 3);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], target_height, target_height, None, false).await;
-    assert_stream_integrity(&request_chain, &events);
+    chain = refresh_chain(&nodes[0], &chain).await;
+    let target_height = nz(chain.lib_height + 1);
+    let (slot_from, slot_to) = blocks_request(&chain, target_height, target_height);
+    let events = request_stream_events(
+        &nodes[0],
+        None,
+        Some(slot_from),
+        Some(slot_to),
+        None,
+        None,
+        Some(false),
+    )
+    .await;
 
-    assert_eq!(events.len(), 1);
-
-    // case: single block above LIB (immutable only, should cap results at LIB)
-    println!("case: single block above LIB (immutable only, should cap results at LIB)");
-
-    let target_height = nz(chain.lib_height + 3);
-    let (_, events) =
-        request_stream_events(&nodes[0], target_height, target_height, None, true).await;
+    let expected_id = *chain
+        .ids_by_height
+        .get(&target_height.get())
+        .expect("target height should exist on canonical chain");
 
     assert_eq!(
-        events.len(),
-        0,
-        "single block above LIB (immutable only) should return at most one block"
+        events[0].block.header.id, expected_id,
+        "slot range should include requested header"
     );
+    assert_stream_integrity(&chain, &events);
 
-    // case: three blocks up to LIB
-    println!("case: three blocks up to LIB");
+    // case: three blocks up to LIB, various chunk sizes
+    println!("case: three blocks up to LIB, various chunk sizes");
 
-    let blocks_from = nz(chain.lib_height - 2);
-    let blocks_to = nz(chain.lib_height);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(1)), false).await;
-    assert_stream_integrity(&request_chain, &events);
+    let blocks_limit = None;
+    for chunk_size in [
+        None,
+        Some(nz(1)),
+        Some(nz(4)),
+        Some(nz(chain.lib_height)),
+        Some(nz(chain.tip_height + 10)),
+    ] {
+        for descending in [false, true] {
+            chain = refresh_chain(&nodes[0], &chain).await;
+            let blocks_from = nz(chain.lib_height - 2);
+            let blocks_to = nz(chain.lib_height);
+            let (slot_from, slot_to) = blocks_request(&chain, blocks_from, blocks_to);
+            let events = request_stream_events(
+                &nodes[0],
+                blocks_limit,
+                Some(slot_from),
+                Some(slot_to),
+                Some(descending),
+                chunk_size,
+                Some(false),
+            )
+            .await;
 
-    assert_eq!(events.len(), 3);
+            let expected_ids =
+                ids_in_slot_range(&chain, slot_from, slot_to, descending, blocks_limit);
+            assert_event_order_matches_expected(&events, &expected_ids);
+            assert_stream_integrity(&chain, &events);
+        }
+    }
 
-    // case: three blocks from LIB and up
-    println!("case: three blocks from LIB and up");
+    // case: three blocks from LIB and up, various chunk sizes
+    println!("case: three blocks from LIB and up, various chunk sizes");
 
-    let blocks_from = nz(chain.lib_height);
-    let blocks_to = nz(chain.lib_height + 2);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, None, false).await;
-    assert_stream_integrity(&request_chain, &events);
+    let blocks_limit = None;
+    for chunk_size in [
+        None,
+        Some(nz(1)),
+        Some(nz(4)),
+        Some(nz(chain.lib_height)),
+        Some(nz(chain.tip_height + 10)),
+    ] {
+        for descending in [false, true] {
+            chain = refresh_chain(&nodes[0], &chain).await;
+            let blocks_from = nz(chain.lib_height);
+            let blocks_to = nz(chain.lib_height + 2);
+            let (slot_from, slot_to) = blocks_request(&chain, blocks_from, blocks_to);
+            let events = request_stream_events(
+                &nodes[0],
+                blocks_limit,
+                Some(slot_from),
+                Some(slot_to),
+                Some(descending),
+                chunk_size,
+                Some(false),
+            )
+            .await;
 
-    assert_eq!(events.len(), 3);
+            let expected_ids =
+                ids_in_slot_range(&chain, slot_from, slot_to, descending, blocks_limit);
+            assert_event_order_matches_expected(&events, &expected_ids);
+            assert_stream_integrity(&chain, &events);
+        }
+    }
 
-    // case: three blocks from LIB and up (immutable only, should cap results at
-    // LIB)
-    println!("case: three blocks from LIB and up (immutable only, should cap results at LIB)");
+    // case: all blocks, various chunk sizes
+    println!("case: all blocks, various chunk sizes");
 
-    let blocks_from = nz(chain.lib_height);
-    let blocks_to = nz(chain.lib_height + 2);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, None, true).await;
-    assert_stream_integrity(&request_chain, &events);
+    let blocks_limit = None;
+    for chunk_size in [
+        None,
+        Some(nz(1)),
+        Some(nz(4)),
+        Some(nz(chain.lib_height)),
+        Some(nz(chain.tip_height + 10)),
+    ] {
+        for descending in [false, true] {
+            chain = refresh_chain(&nodes[0], &chain).await;
+            let (slot_from, slot_to) = (0, chain.tip_slot);
+            let events = request_stream_events(
+                &nodes[0],
+                blocks_limit,
+                Some(slot_from),
+                Some(slot_to),
+                Some(descending),
+                chunk_size,
+                Some(false),
+            )
+            .await;
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events.last().unwrap().block.header.id,
-        events[0].lib,
-        "last block should be LIB when immutable_only=true"
-    );
+            let expected_ids =
+                ids_in_slot_range(&chain, slot_from, slot_to, descending, blocks_limit);
+            assert_event_order_matches_expected(&events, &expected_ids);
+            assert_stream_integrity(&chain, &events);
+        }
+    }
 
-    // case: all blocks, small chunked
-    println!("case: all blocks, small chunked");
+    // case: limited blocks, various chunk sizes
+    println!("case: limited blocks, various chunk sizes");
 
-    let blocks_from = nz(1);
-    let blocks_to = nz(13);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(4)), false).await;
-    assert_stream_integrity(&request_chain, &events);
+    let blocks_limit = Some(nz(3));
+    for chunk_size in [
+        None,
+        Some(nz(1)),
+        Some(nz(4)),
+        Some(nz(chain.lib_height)),
+        Some(nz(chain.tip_height + 10)),
+    ] {
+        for descending in [false, true] {
+            chain = refresh_chain(&nodes[0], &chain).await;
+            let (slot_from, slot_to) = (0, chain.tip_slot);
+            let events = request_stream_events(
+                &nodes[0],
+                blocks_limit,
+                Some(slot_from),
+                Some(slot_to),
+                Some(descending),
+                chunk_size,
+                Some(false),
+            )
+            .await;
 
-    assert_eq!(events.len(), blocks_to.get());
+            let expected_ids =
+                ids_in_slot_range(&chain, slot_from, slot_to, descending, blocks_limit);
+            assert_event_order_matches_expected(&events, &expected_ids);
+            assert_stream_integrity(&chain, &events);
+        }
+    }
 
-    // case: all blocks, small chunked (immutable only, should cap results at LIB)
-    println!("case: all blocks, small chunked (immutable only, should cap results at LIB)");
+    // case: ascending above LIB without slot_from is best-effort bounded
+    println!("case: ascending above LIB without slot_from is best-effort bounded");
 
-    let blocks_from = nz(1);
-    let blocks_to = nz(13);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(4)), true).await;
-    assert_stream_integrity(&request_chain, &events);
-
-    assert_eq!(events.len(), request_chain.lib_height);
-    assert_eq!(
-        events.last().unwrap().block.header.id,
-        events[0].lib,
-        "last block should be LIB when immutable_only=true"
-    );
-
-    // case: invalid blocks_to (header not on canonical chain) should fail
-    println!("case: invalid blocks_to (header not on canonical chain) should fail");
-
-    let bogus_header = HeaderId::from([0xAB; 32]);
-    let result = nodes[0]
-        .get_blocks_stream_in_range_with_chunk_size(
-            Some(nz(1)),
-            Some(bogus_header),
-            None,
-            Some(false),
-        )
-        .await;
+    chain = refresh_chain(&nodes[0], &chain).await;
+    let tip_slot = chain.tip_slot;
+    let blocks_limit = 7;
+    let events = request_stream_events(
+        &nodes[0],
+        Some(nz(blocks_limit)),
+        None,
+        Some(tip_slot),
+        Some(false),
+        None,
+        Some(false),
+    )
+    .await;
 
     assert!(
-        result.is_err(),
-        "request with non-canonical header should fail"
+        !events.is_empty(),
+        "best-effort ascending request should still return some blocks"
     );
-    let err = result.err().unwrap();
-    println!("expected error: {err}");
+    assert!(
+        events.len() <= blocks_limit,
+        "best-effort ascending request must still respect blocks_limit"
+    );
+    assert!(
+        events.windows(2).all(|pair| {
+            u64::from(pair[0].block.header.slot) <= u64::from(pair[1].block.header.slot)
+        }),
+        "best-effort ascending request should preserve ascending order"
+    );
 
-    // case: number_of_blocks=0 should fail (400) via raw HTTP query
-    println!("case: number_of_blocks=0 should fail (400) via raw HTTP query");
+    // ============== Failure modes =============
 
-    let tip = nodes[0].consensus_info(false).await.tip;
+    // case: single block above LIB (immutable only, should fail)
+    println!("case: single block above LIB (immutable only, should fail)");
+
+    chain = refresh_chain(&nodes[0], &chain).await;
+    let target_height = nz(chain.lib_height + 3);
+    let (slot_from, slot_to) = blocks_request(&chain, target_height, target_height);
+    let Err(err) = nodes[0]
+        .get_blocks_stream_in_range_with_chunk_size(
+            None,
+            Some(slot_from),
+            Some(slot_to),
+            None,
+            None,
+            Some(true),
+        )
+        .await
+    else {
+        panic!("immutable-only request above LIB should fail");
+    };
+    assert!(
+        matches!(err, lb_common_http_client::Error::Server(ref message) if message.contains("lib_slot")),
+        "immutable-only request above LIB should mention lib_slot, got: {err}"
+    );
+
+    // case: three blocks from LIB and up (immutable only, should fail)
+    println!("case: three blocks from LIB and up (immutable only, should fail)");
+
+    chain = refresh_chain(&nodes[0], &chain).await;
+    let blocks_from = nz(chain.lib_height);
+    let blocks_to = nz(chain.lib_height + 2);
+    let (slot_from, slot_to) = blocks_request(&chain, blocks_from, blocks_to);
+    let Err(err) = nodes[0]
+        .get_blocks_stream_in_range_with_chunk_size(
+            None,
+            Some(slot_from),
+            Some(slot_to),
+            None,
+            None,
+            Some(true),
+        )
+        .await
+    else {
+        panic!("immutable-only request above LIB should fail");
+    };
+    assert!(
+        matches!(err, lb_common_http_client::Error::Server(ref message) if message.contains("lib_slot")),
+        "immutable-only request above LIB should mention lib_slot, got: {err}"
+    );
+
+    // case: all blocks, small chunked (immutable only, should fail above LIB)
+    println!("case: all blocks, small chunked (immutable only, should fail above LIB)");
+
+    chain = refresh_chain(&nodes[0], &chain).await;
+    let blocks_from = nz(1);
+    let blocks_to = nz(chain.tip_height);
+    let (slot_from, slot_to) = blocks_request(&chain, blocks_from, blocks_to);
+    let Err(err) = nodes[0]
+        .get_blocks_stream_in_range_with_chunk_size(
+            None,
+            Some(slot_from),
+            Some(slot_to),
+            None,
+            Some(nz(4)),
+            Some(true),
+        )
+        .await
+    else {
+        panic!("immutable-only request above LIB should fail");
+    };
+    assert!(
+        matches!(err, lb_common_http_client::Error::Server(ref message) if message.contains("lib_slot")),
+        "immutable-only request above LIB should mention lib_slot, got: {err}"
+    );
+
+    // case: blocks_limit=0 should fail (400) via raw HTTP query
+    println!("case: blocks_limit=0 should fail (400) via raw HTTP query");
+
+    let tip_slot = u64::from(nodes[0].consensus_info(false).await.slot);
     let client = reqwest::Client::new();
 
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");
     url.set_path(BLOCKS_STREAM);
-    url.set_query(Some(&format!("number_of_blocks=0&blocks_to={tip}")));
+    url.set_query(Some(&format!("blocks_limit=0&slot_to={tip_slot}")));
 
     let resp = client
         .get(url)
@@ -432,7 +732,7 @@ async fn test_blocks_streaming() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::BAD_REQUEST,
-        "number_of_blocks=0 must return 400"
+        "blocks_limit=0 must return 400"
     );
 
     let body = resp
@@ -440,20 +740,75 @@ async fn test_blocks_streaming() {
         .await
         .expect("error response body should be readable");
     assert!(
-        body.contains("number_of_blocks"),
-        "400 body should mention number_of_blocks, got: {body}"
+        body.contains("blocks_limit"),
+        "400 body should mention blocks_limit, got: {body}"
     );
 
-    // case: chunk size larger than requested range should still return exact range
-    // size
-    println!("case: chunk size larger than requested range should still return exact range size");
+    // case: slot_to above tip should fail (400)
+    println!("case: slot_to above tip should fail (400) via raw HTTP query");
 
-    let blocks_from = nz(chain.lib_height.saturating_sub(1).max(1));
-    let blocks_to = nz(chain.lib_height);
-    let (request_chain, events) =
-        request_stream_events(&nodes[0], blocks_from, blocks_to, Some(nz(1000)), false).await;
-    assert_stream_integrity(&request_chain, &events);
-    assert_eq!(events.len(), 2);
+    let mut url = nodes[0]
+        .base_url()
+        .expect("validator base URL should be available");
+    url.set_path(BLOCKS_STREAM);
+    url.set_query(Some(&format!("slot_to={}", tip_slot + 1)));
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .expect("raw blocks/stream request should complete");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "slot_to above tip must return 400"
+    );
+
+    let body = resp
+        .text()
+        .await
+        .expect("error response body should be readable");
+    assert!(
+        body.contains("tip_slot"),
+        "400 body should mention tip_slot, got: {body}"
+    );
+
+    // case: immutable_only=true with slot_to above LIB should fail (400)
+    println!(
+        "case: immutable_only=true with slot_to above LIB should fail (400) via raw HTTP query"
+    );
+
+    let lib_slot = u64::from(nodes[0].consensus_info(false).await.lib_slot);
+    let mut url = nodes[0]
+        .base_url()
+        .expect("validator base URL should be available");
+    url.set_path(BLOCKS_STREAM);
+    url.set_query(Some(&format!(
+        "slot_to={}&immutable_only=true",
+        lib_slot + 1
+    )));
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .expect("raw blocks/stream request should complete");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "immutable_only=true with slot_to above LIB must return 400"
+    );
+
+    let body = resp
+        .text()
+        .await
+        .expect("error response body should be readable");
+    assert!(
+        body.contains("lib_slot"),
+        "400 body should mention lib_slot, got: {body}"
+    );
 }
 
 const fn nz(value: usize) -> NonZero<usize> {

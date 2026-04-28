@@ -130,9 +130,11 @@ where
 }
 
 #[macro_export]
-macro_rules! cucumber_non_zero {
+macro_rules! non_zero {
     ($field:expr, $value:expr) => {
-        ::lb_utils::non_zero!($field, $value).map_err(|e| StepError::InvalidArgument { message: e })
+        std::num::NonZero::new($value).ok_or_else(|| StepError::InvalidArgument {
+            message: format!("'{}' must be > 0", $field),
+        })
     };
 }
 

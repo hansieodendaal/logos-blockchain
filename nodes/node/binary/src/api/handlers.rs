@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Display},
-    num::NonZero,
+    num::{NonZero, NonZeroUsize},
 };
 
 use ::libp2p::PeerId;
@@ -8,7 +8,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse as _, Response},
+    response::{IntoResponse, Response},
 };
 use futures::FutureExt as _;
 use lb_api_service::http::{
@@ -19,6 +19,7 @@ use lb_api_service::http::{
 };
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
+use lb_chain_service::Slot;
 use lb_core::{
     block::Block,
     header::HeaderId,
@@ -36,7 +37,6 @@ use lb_http_api_common::{
         },
     },
     paths,
-    paths::{MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE},
 };
 use lb_libp2p::libp2p::bytes::Bytes;
 use lb_network_service::backends::libp2p::Libp2p as Libp2pNetworkBackend;
@@ -48,13 +48,14 @@ use lb_tx_service::{
     TxMempoolService, backend::Mempool,
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
 };
-use lb_utils::non_zero;
 use lb_wallet_service::api::{WalletApi, WalletServiceData};
 use overwatch::{
     overwatch::handle::OverwatchHandle,
     services::{AsServiceId, ServiceData},
 };
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+use validator::Validate as _;
 
 use crate::api::{
     openapi::schema,
@@ -66,56 +67,148 @@ use crate::api::{
     },
 };
 
+#[derive(Debug, thiserror::Error)]
+enum BlocksStreamRequestError {
+    #[error("invalid query: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+    #[error("'slot_from' must be <= 'slot_to', got slot_from={slot_from}, slot_to={slot_to}")]
+    InvalidSlotRange { slot_from: u64, slot_to: u64 },
+}
+
+impl IntoResponse for BlocksStreamRequestError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+    }
+}
+
 /// This is a safe default number of blocks to present the canonical chain
 /// at the tip but not too much to overburden a client.
 pub const DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM: usize = 100;
 const DEFAULT_BLOCKS_STREAM_CHUNK_SIZE: usize = 100;
 
 struct BlocksStreamRequest {
-    number_of_blocks: NonZero<usize>,
-    blocks_to: Option<HeaderId>,
+    slot_from: Option<u64>,
+    slot_to: Option<u64>,
+    descending: bool,
+    blocks_limit: NonZero<usize>,
     server_batch_size: NonZero<usize>,
     immutable_only: bool,
 }
 
-fn parse_blocks_stream_request(query: &BlocksStreamQuery) -> Result<BlocksStreamRequest, String> {
-    let number_of_blocks_raw = query
-        .number_of_blocks
+struct ResolvedBlocksStreamWindow {
+    slot_from: Slot,
+    slot_to: Slot,
+}
+
+fn parse_blocks_stream_request(
+    query: &BlocksStreamQuery,
+) -> Result<BlocksStreamRequest, BlocksStreamRequestError> {
+    query.validate()?;
+
+    let blocks_limit_raw = query
+        .blocks_limit
         .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
-
-    if number_of_blocks_raw > MAX_BLOCKS_STREAM_BLOCKS {
-        return Err(format!(
-            "'number_of_blocks' must be <= {MAX_BLOCKS_STREAM_BLOCKS}, got {number_of_blocks_raw}"
-        ));
-    }
-
-    let number_of_blocks = non_zero!("number_of_blocks", number_of_blocks_raw)?;
+    let blocks_limit =
+        NonZeroUsize::new(blocks_limit_raw).expect("'blocks_limit' is always >= 1 in schema");
 
     let server_batch_size_raw = query
         .server_batch_size
         .unwrap_or(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE);
+    let server_batch_size = NonZeroUsize::new(server_batch_size_raw)
+        .expect("'server_batch_size' is always >= 1 in schema");
 
-    if server_batch_size_raw > MAX_BLOCKS_STREAM_CHUNK_SIZE {
-        return Err(format!(
-            "'server_batch_size' must be <= {MAX_BLOCKS_STREAM_CHUNK_SIZE}, got {server_batch_size_raw}"
-        ));
+    if let (Some(slot_from), Some(slot_to)) = (query.slot_from, query.slot_to)
+        && slot_from > slot_to
+    {
+        return Err(BlocksStreamRequestError::InvalidSlotRange { slot_from, slot_to });
     }
 
-    let server_batch_size = non_zero!("server_batch_size", server_batch_size_raw)?;
-
     Ok(BlocksStreamRequest {
-        number_of_blocks,
-        blocks_to: query.blocks_to,
+        slot_from: query.slot_from,
+        slot_to: query.slot_to,
+        descending: query.descending.unwrap_or(true),
+        blocks_limit,
         server_batch_size,
         immutable_only: query.immutable_only.unwrap_or_default(),
     })
 }
 
+fn next_blocks_stream_cursor(
+    descending: bool,
+    slot_from: Slot,
+    slot_to: Slot,
+    boundary_slot: Slot,
+) -> Option<Slot> {
+    if descending {
+        if boundary_slot <= slot_from {
+            None
+        } else {
+            Some(boundary_slot.saturating_sub(Slot::new(1)))
+        }
+    } else if boundary_slot >= slot_to {
+        None
+    } else {
+        Some(boundary_slot + 1)
+    }
+}
+
+fn resolve_blocks_stream_window(
+    request: &BlocksStreamRequest,
+    chain_info: &lb_chain_service::CryptarchiaInfo,
+) -> Result<ResolvedBlocksStreamWindow, String> {
+    let max_slot_to = if request.immutable_only {
+        chain_info.lib_slot
+    } else {
+        chain_info.slot
+    };
+    let slot_to = request.slot_to.map_or(max_slot_to, Slot::new);
+    if slot_to > max_slot_to {
+        let anchor = if request.immutable_only {
+            "lib_slot"
+        } else {
+            "tip_slot"
+        };
+        return Err(format!(
+            "'slot_to' must be <= {anchor}, got slot_to={}, {anchor}={}",
+            slot_to.into_inner(),
+            max_slot_to.into_inner()
+        ));
+    }
+
+    let slot_from = request.slot_from.map_or_else(
+        || {
+            if request.descending || request.immutable_only || slot_to <= chain_info.lib_slot {
+                Slot::new(0)
+            } else {
+                let average_slots_per_block = chain_info
+                    .slot
+                    .into_inner()
+                    .div_ceil(chain_info.height.max(1));
+                let estimated_slot_span = (request.blocks_limit.get() as u64)
+                    .saturating_mul(average_slots_per_block.max(1));
+                slot_to.saturating_sub(Slot::new(estimated_slot_span))
+            }
+        },
+        Slot::new,
+    );
+    if slot_from > slot_to {
+        return Err(format!(
+            "'slot_from' must be <= 'slot_to', got slot_from={}, slot_to={}",
+            slot_from.into_inner(),
+            slot_to.into_inner()
+        ));
+    }
+
+    Ok(ResolvedBlocksStreamWindow { slot_from, slot_to })
+}
+
 async fn fetch_blocks_stream_chunk<StorageBackend, RuntimeServiceId>(
     handle: &OverwatchHandle<RuntimeServiceId>,
     chain_info: &lb_chain_service::CryptarchiaInfo,
-    from: usize,
-    to: usize,
+    slot_from: Slot,
+    slot_to: Slot,
+    descending: bool,
+    blocks_limit: NonZeroUsize,
     immutable_only: bool,
 ) -> Result<Vec<ApiProcessedBlockEvent>, DynError>
 where
@@ -132,10 +225,12 @@ where
         + AsServiceId<Cryptarchia<RuntimeServiceId>>
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let chunk = mantle::get_blocks_in_range_with_snapshot::<_, _, RuntimeServiceId>(
+    let chunk = mantle::get_blocks_in_slot_range_with_snapshot::<_, _, RuntimeServiceId>(
         handle,
-        from,
-        to,
+        slot_from,
+        slot_to,
+        descending,
+        blocks_limit,
         immutable_only,
         chain_info,
     )
@@ -147,12 +242,16 @@ where
         .collect())
 }
 
+#[expect(clippy::too_many_arguments, reason = "Need all args")]
 fn build_blocks_stream<StorageBackend, RuntimeServiceId>(
     handle: OverwatchHandle<RuntimeServiceId>,
     chain_info: lb_chain_service::CryptarchiaInfo,
     first_chunk: Vec<ApiProcessedBlockEvent>,
-    next_from: usize,
-    blocks_to: usize,
+    slot_from: Slot,
+    slot_to: Slot,
+    descending: bool,
+    next_cursor: Option<Slot>,
+    remaining: usize,
     chunk_size: usize,
     immutable_only: bool,
 ) -> impl futures::Stream<Item = ApiProcessedBlockEvent>
@@ -173,8 +272,11 @@ where
     futures::stream::unfold(
         (
             first_chunk.into_iter(),
-            next_from,
-            blocks_to,
+            slot_from,
+            slot_to,
+            descending,
+            next_cursor,
+            remaining,
             chunk_size,
             immutable_only,
             chain_info,
@@ -182,8 +284,11 @@ where
         ),
         async |(
             mut buffered,
-            mut next_from,
-            blocks_to,
+            slot_from,
+            slot_to,
+            descending,
+            mut next_cursor,
+            mut remaining,
             chunk_size,
             immutable_only,
             chain_info,
@@ -195,8 +300,11 @@ where
                         item,
                         (
                             buffered,
-                            next_from,
-                            blocks_to,
+                            slot_from,
+                            slot_to,
+                            descending,
+                            next_cursor,
+                            remaining,
                             chunk_size,
                             immutable_only,
                             chain_info,
@@ -205,25 +313,51 @@ where
                     ));
                 }
 
-                if next_from > blocks_to {
+                if remaining == 0 || next_cursor.is_none() {
                     return None;
                 }
 
-                let chunk_to =
-                    blocks_to.min(next_from.saturating_add(chunk_size.saturating_sub(1)));
-                let Ok(next_chunk) = fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
-                    &handle,
-                    &chain_info,
-                    next_from,
-                    chunk_to,
-                    immutable_only,
-                )
-                .await
-                else {
-                    return None;
+                let request_limit = NonZeroUsize::new(chunk_size.min(remaining))
+                    .expect("remaining and chunk size are non-zero");
+                let cursor = next_cursor.expect("checked above");
+                let (chunk_from, chunk_to) = if descending {
+                    (slot_from, cursor)
+                } else {
+                    (cursor, slot_to)
                 };
 
-                next_from = chunk_to.saturating_add(1);
+                let next_chunk =
+                    match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+                        &handle,
+                        &chain_info,
+                        chunk_from,
+                        chunk_to,
+                        descending,
+                        request_limit,
+                        immutable_only,
+                    )
+                    .await
+                    {
+                        Ok(next_chunk) => next_chunk,
+                        Err(error) => {
+                            warn!("blocks stream chunk fetch failed: {error}");
+                            return None;
+                        }
+                    };
+
+                if next_chunk.is_empty() {
+                    return None;
+                }
+
+                let boundary_slot = next_chunk
+                    .last()
+                    .map(|event| event.block.header().slot())
+                    .expect("non-empty chunk has a last element");
+
+                next_cursor =
+                    next_blocks_stream_cursor(descending, slot_from, slot_to, boundary_slot);
+
+                remaining = remaining.saturating_sub(next_chunk.len());
                 buffered = next_chunk.into_iter();
             }
         },
@@ -779,7 +913,7 @@ where
 
 #[utoipa::path(
     get,
-    path = paths::IMMUTABLE_BLOCKS,
+    path = paths::BLOCKS,
     params(BlockRangeQuery),
     responses(
         (status = 200, description = "Get blocks"),
@@ -848,9 +982,8 @@ where
     path = paths::BLOCKS_STREAM,
     params(BlocksStreamQuery),
     responses(
-        (status = 200, description = "Stream of processed blocks with chain state. When immutable_only=true and blocks_to is omitted, the stream anchors at LIB by default."),
+        (status = 200, description = "Stream of processed blocks with chain state in slot order. When immutable_only=true and slot_to is omitted, the stream anchors at LIB slot by default."),
         (status = 400, description = "Invalid request parameters", body = String),
-        (status = 404, description = "Requested header not found on canonical chain", body = String),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
@@ -874,7 +1007,7 @@ where
 {
     let request = match parse_blocks_stream_request(&query) {
         Ok(request) => request,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(err) => return err.into_response(),
     };
 
     let chain_info = match consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await {
@@ -884,48 +1017,28 @@ where
         }
     };
 
-    let default_blocks_to_header = if request.immutable_only {
-        chain_info.lib
-    } else {
-        chain_info.tip
+    let resolved_window = match resolve_blocks_stream_window(&request, &chain_info) {
+        Ok(window) => window,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let blocks_to_header = request.blocks_to.unwrap_or(default_blocks_to_header);
-    let blocks_to_height = match mantle::find_canonical_height_by_header_with_snapshot::<
-        _,
-        _,
-        RuntimeServiceId,
-    >(&handle, blocks_to_header, &chain_info)
-    .await
-    {
-        Ok(Some(height)) => height,
-        Ok(None) => {
-            if request.blocks_to.is_some() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    format!("Header '{blocks_to_header}' not found in canonical chain"),
-                )
-                    .into_response();
-            }
-            let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
-            return responses::ndjson::from_stream(empty);
-        }
-        Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
-        }
-    };
+    let slot_from = resolved_window.slot_from;
+    let slot_to = resolved_window.slot_to;
 
-    let blocks_from = blocks_to_height
-        .saturating_sub(request.number_of_blocks.get().saturating_sub(1))
-        .max(1);
-
-    let first_chunk_to = blocks_to_height
-        .min(blocks_from.saturating_add(request.server_batch_size.get().saturating_sub(1)));
+    let first_chunk_limit = NonZeroUsize::new(
+        request
+            .server_batch_size
+            .get()
+            .min(request.blocks_limit.get()),
+    )
+    .expect("chunk size min blocks limit should be non-zero");
 
     let first_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
         &handle,
         &chain_info,
-        blocks_from,
-        first_chunk_to,
+        slot_from,
+        slot_to,
+        request.descending,
+        first_chunk_limit,
         request.immutable_only,
     )
     .await
@@ -936,12 +1049,30 @@ where
         }
     };
 
+    if first_chunk.is_empty() {
+        let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
+        return responses::ndjson::from_stream(empty);
+    }
+
+    let consumed = first_chunk.len();
+    let remaining = request.blocks_limit.get().saturating_sub(consumed);
+    let boundary_slot = first_chunk
+        .last()
+        .map(|event| event.block.header().slot())
+        .expect("non-empty chunk has a last element");
+
+    let next_cursor =
+        next_blocks_stream_cursor(request.descending, slot_from, slot_to, boundary_slot);
+
     let stream = build_blocks_stream::<StorageBackend, RuntimeServiceId>(
         handle,
         chain_info,
         first_chunk,
-        first_chunk_to.saturating_add(1),
-        blocks_to_height,
+        slot_from,
+        slot_to,
+        request.descending,
+        next_cursor,
+        remaining,
         request.server_batch_size.get(),
         request.immutable_only,
     );
@@ -1267,25 +1398,25 @@ pub mod wallet {
 mod tests {
     use super::*;
 
-    fn sample_header_id(byte: u8) -> HeaderId {
-        HeaderId::from([byte; 32])
-    }
-
     #[test]
     fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
         let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: None,
-            blocks_to: None,
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: None,
             server_batch_size: None,
             immutable_only: None,
         })
         .expect("query without explicit range should parse");
 
         assert_eq!(
-            request.number_of_blocks,
+            request.blocks_limit,
             NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
         );
-        assert_eq!(request.blocks_to, None);
+        assert_eq!(request.slot_from, None);
+        assert_eq!(request.slot_to, None);
+        assert!(request.descending);
         assert_eq!(
             request.server_batch_size,
             NonZero::new(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
@@ -1294,49 +1425,90 @@ mod tests {
     }
 
     #[test]
-    fn blocks_stream_request_uses_tip_when_only_number_of_blocks_is_given() {
+    fn blocks_stream_request_accepts_blocks_limit_only() {
         let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: Some(7),
-            blocks_to: None,
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: Some(7),
             server_batch_size: None,
             immutable_only: None,
         })
-        .expect("query with explicit number_of_blocks should parse");
+        .expect("query with explicit blocks_limit should parse");
 
-        assert_eq!(request.number_of_blocks, NonZero::new(7).unwrap());
-        assert_eq!(request.blocks_to, None);
+        assert_eq!(request.blocks_limit, NonZero::new(7).unwrap());
+        assert_eq!(request.slot_to, None);
     }
 
     #[test]
-    fn blocks_stream_request_defaults_to_preset_when_only_blocks_to_is_given() {
-        let blocks_to = sample_header_id(7);
+    fn blocks_stream_request_accepts_slot_range() {
         let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: None,
-            blocks_to: Some(blocks_to),
+            slot_from: Some(10),
+            slot_to: Some(20),
+            descending: Some(true),
+            blocks_limit: None,
             server_batch_size: None,
             immutable_only: None,
         })
-        .expect("query with explicit blocks_to should parse");
+        .expect("query with explicit slot range should parse");
 
         assert_eq!(
-            request.number_of_blocks,
+            request.blocks_limit,
             NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
         );
-        assert_eq!(request.blocks_to, Some(blocks_to));
+        assert_eq!(request.slot_from, Some(10));
+        assert_eq!(request.slot_to, Some(20));
+        assert!(request.descending);
     }
 
     #[test]
-    fn blocks_stream_request_rejects_zero_blocks() {
+    fn blocks_stream_request_rejects_zero_limit() {
         let result = parse_blocks_stream_request(&BlocksStreamQuery {
-            number_of_blocks: Some(0),
-            blocks_to: None,
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: Some(0),
             server_batch_size: None,
             immutable_only: None,
         });
 
-        assert_eq!(
-            result.err(),
-            Some("'number_of_blocks' must be > 0".to_owned())
-        );
+        match result.err() {
+            Some(BlocksStreamRequestError::Validation { .. }) => {}
+            _ => panic!("Expected validation error for 'blocks_limit'"),
+        }
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_zero_batch_size() {
+        let result = parse_blocks_stream_request(&BlocksStreamQuery {
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: None,
+            server_batch_size: Some(0),
+            immutable_only: None,
+        });
+
+        match result.err() {
+            Some(BlocksStreamRequestError::Validation { .. }) => {}
+            _ => panic!("Expected validation error for 'server_batch_size'"),
+        }
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_invalid_slot_range() {
+        let result = parse_blocks_stream_request(&BlocksStreamQuery {
+            slot_from: Some(9),
+            slot_to: Some(7),
+            descending: None,
+            blocks_limit: None,
+            server_batch_size: None,
+            immutable_only: None,
+        });
+
+        match result.err() {
+            Some(BlocksStreamRequestError::InvalidSlotRange { .. }) => {}
+            _ => panic!("Expected validation error for 'slot_from' > 'slot_to'"),
+        }
     }
 }

@@ -15,7 +15,7 @@ use lb_http_api_common::{
         transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
     },
     paths::{
-        BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM, IMMUTABLE_BLOCKS,
+        BLOCKS, BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM,
         MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE, MEMPOOL_ADD_TX,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
@@ -240,7 +240,7 @@ impl CommonHttpClient {
         slot_to: u64,
     ) -> Result<Vec<ApiBlock>, Error> {
         let mut request_url = base_url
-            .join(IMMUTABLE_BLOCKS.trim_start_matches('/'))
+            .join(BLOCKS.trim_start_matches('/'))
             .map_err(Error::Url)?;
         request_url
             .query_pairs_mut()
@@ -255,20 +255,25 @@ impl CommonHttpClient {
         &self,
         base_url: Url,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        self.get_blocks_stream_in_range(base_url, None, None).await
+        self.get_blocks_stream_in_range(base_url, None, None, None, None)
+            .await
     }
 
-    /// Stream processed blocks ending at a specific header id.
+    /// Stream processed blocks within a slot range.
     pub async fn get_blocks_stream_in_range(
         &self,
         base_url: Url,
-        number_of_blocks: Option<NonZero<usize>>,
-        blocks_to: Option<HeaderId>,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
         self.get_blocks_stream_in_range_with_server_batch_size(
             base_url,
-            number_of_blocks,
-            blocks_to,
+            blocks_limit,
+            slot_from,
+            slot_to,
+            descending,
             None,
             None,
         )
@@ -277,14 +282,16 @@ impl CommonHttpClient {
 
     // Helper function to validate inputs for block streaming methods.
     fn verify_inputs(
-        number_of_blocks: Option<NonZero<usize>>,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
         server_batch_size: Option<NonZero<usize>>,
     ) -> Result<(), Error> {
-        if let Some(blocks) = number_of_blocks
+        if let Some(blocks) = blocks_limit
             && blocks.get() > MAX_BLOCKS_STREAM_BLOCKS
         {
             return Err(Error::Client(format!(
-                "'number_of_blocks' must be <= {MAX_BLOCKS_STREAM_BLOCKS}, got {blocks}"
+                "'blocks_limit' must be <= {MAX_BLOCKS_STREAM_BLOCKS}, got {blocks}"
             )));
         }
         if let Some(size) = server_batch_size
@@ -294,23 +301,33 @@ impl CommonHttpClient {
                 "'server_batch_size' must be <= {MAX_BLOCKS_STREAM_CHUNK_SIZE}, got {size}"
             )));
         }
+        if let (Some(slot_from), Some(slot_to)) = (slot_from, slot_to)
+            && slot_from > slot_to
+        {
+            return Err(Error::Client(format!(
+                "'slot_from' must be <= 'slot_to', got slot_from={slot_from}, slot_to={slot_to}"
+            )));
+        }
 
         Ok(())
     }
 
-    /// Stream processed blocks ending at a specific header id.
+    /// Stream processed blocks in a slot-bounded window.
     ///
     /// `server_batch_size` lets callers request smaller chunks; the server
     /// still enforces its own upper bound.
+    #[expect(clippy::too_many_arguments, reason = "Need all args")]
     pub async fn get_blocks_stream_in_range_with_server_batch_size(
         &self,
         base_url: Url,
-        number_of_blocks: Option<NonZero<usize>>,
-        blocks_to: Option<HeaderId>,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: Option<bool>,
         server_batch_size: Option<NonZero<usize>>,
         immutable_only: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        Self::verify_inputs(number_of_blocks, server_batch_size)?;
+        Self::verify_inputs(blocks_limit, slot_from, slot_to, server_batch_size)?;
 
         let request_url = base_url
             .join(BLOCKS_STREAM.trim_start_matches('/'))
@@ -318,12 +335,17 @@ impl CommonHttpClient {
         let mut request_url = request_url;
         {
             let mut query = request_url.query_pairs_mut();
-            if let Some(number_of_blocks) = number_of_blocks {
-                query.append_pair("number_of_blocks", &number_of_blocks.to_string());
+            if let Some(blocks_limit) = blocks_limit {
+                query.append_pair("blocks_limit", &blocks_limit.to_string());
             }
-            if let Some(blocks_to) = blocks_to {
-                let blocks_to_hex = hex::encode(blocks_to.as_ref());
-                query.append_pair("blocks_to", &blocks_to_hex);
+            if let Some(slot_from) = slot_from {
+                query.append_pair("slot_from", &slot_from.to_string());
+            }
+            if let Some(slot_to) = slot_to {
+                query.append_pair("slot_to", &slot_to.to_string());
+            }
+            if let Some(descending) = descending {
+                query.append_pair("descending", &descending.to_string());
             }
             if let Some(server_batch_size) = server_batch_size {
                 query.append_pair("server_batch_size", &server_batch_size.to_string());

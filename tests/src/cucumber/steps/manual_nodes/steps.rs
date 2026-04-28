@@ -39,7 +39,7 @@ use crate::{
             PublicCryptarchiaEndpointPeer,
         },
     },
-    cucumber_non_zero,
+    non_zero,
 };
 
 const PUBLIC_CRYPTARCHIA_ENDPOINT: &str = "public_cryptarchia_endpoint";
@@ -117,8 +117,8 @@ fn step_sponsored_genesis_fee_account(
 ) -> StepResult {
     ensure_fee_sponsorship_and_fork_groups_are_not_mixed(world, step.value.as_str())?;
 
-    let token_count = cucumber_non_zero!("genesis fee token count", token_count)?;
-    let token_value = cucumber_non_zero!("genesis fee token value", token_value)?;
+    let token_count = non_zero!("genesis fee token count", token_count)?;
+    let token_value = non_zero!("genesis fee token value", token_value)?;
 
     world
         .fee_state

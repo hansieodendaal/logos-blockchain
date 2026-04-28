@@ -102,22 +102,33 @@ impl NodeHttpClient {
     pub async fn blocks_stream(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = ProcessedBlockEvent> + Send + '_>>, Error> {
-        self.blocks_stream_in_range(None, None).await
+        self.blocks_stream_in_range(None, None, None, None).await
     }
 
     pub async fn blocks_stream_in_range(
         &self,
-        number_of_blocks: Option<NonZero<usize>>,
-        blocks_to: Option<HeaderId>,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: Option<bool>,
     ) -> Result<Pin<Box<dyn Stream<Item = ProcessedBlockEvent> + Send + '_>>, Error> {
-        self.blocks_stream_in_range_with_server_batch_size(number_of_blocks, blocks_to, None, None)
-            .await
+        self.blocks_stream_in_range_with_server_batch_size(
+            blocks_limit,
+            slot_from,
+            slot_to,
+            descending,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn blocks_stream_in_range_with_server_batch_size(
         &self,
-        number_of_blocks: Option<NonZero<usize>>,
-        blocks_to: Option<HeaderId>,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: Option<bool>,
         chunk_size: Option<NonZero<usize>>,
         immutable_only: Option<bool>,
     ) -> Result<Pin<Box<dyn Stream<Item = ProcessedBlockEvent> + Send + '_>>, Error> {
@@ -125,8 +136,10 @@ impl NodeHttpClient {
             .http_client
             .get_blocks_stream_in_range_with_server_batch_size(
                 self.base_url.clone(),
-                number_of_blocks,
-                blocks_to,
+                blocks_limit,
+                slot_from,
+                slot_to,
+                descending,
                 chunk_size,
                 immutable_only,
             )

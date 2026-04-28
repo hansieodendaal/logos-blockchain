@@ -53,6 +53,12 @@ pub trait StorageChainApi {
         limit: NonZeroUsize,
     ) -> Result<Vec<HeaderId>, Self::Error>;
 
+    async fn scan_immutable_block_ids_reverse(
+        &mut self,
+        slot_range: RangeInclusive<Slot>,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<HeaderId>, Self::Error>;
+
     async fn store_transactions(
         &mut self,
         transactions: HashMap<TxHash, Self::Tx>,

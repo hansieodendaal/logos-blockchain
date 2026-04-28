@@ -14,7 +14,7 @@ pub const SDP_POST_ACTIVITY: &str = "/sdp/activity";
 pub const SDP_POST_WITHDRAWAL: &str = "/sdp/withdrawal";
 pub const LEADER_CLAIM: &str = "/leader/claim";
 
-pub const IMMUTABLE_BLOCKS: &str = "/cryptarchia/immutable_blocks";
+pub const BLOCKS: &str = "/cryptarchia/blocks";
 pub const BLOCKS_DETAIL: &str = "/cryptarchia/blocks/:id";
 pub const BLOCKS_STREAM: &str = "/cryptarchia/events/blocks/stream";
 
