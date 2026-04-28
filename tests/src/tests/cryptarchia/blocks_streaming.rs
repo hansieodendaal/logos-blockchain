@@ -9,7 +9,7 @@ use logos_blockchain_tests::{
     common::time::max_block_propagation_time,
     nodes::{Validator, create_validator_config},
     topology::configs::{
-        create_general_configs, deployment::e2e_deployment_settings_with_genesis_tx,
+        create_general_configs, deployment::e2e_deployment_settings_with_genesis_block,
     },
 };
 use serial_test::serial;
@@ -24,8 +24,8 @@ struct CanonicalChain {
 }
 
 async fn spawn_two_validators(test_name: &str) -> [Validator; 2] {
-    let (configs, genesis_tx) = create_general_configs(2, Some(test_name));
-    let deployment_settings = e2e_deployment_settings_with_genesis_tx(genesis_tx);
+    let (configs, genesis_block) = create_general_configs(2, Some(test_name));
+    let deployment_settings = e2e_deployment_settings_with_genesis_block(&genesis_block);
 
     let configs = configs
         .into_iter()
