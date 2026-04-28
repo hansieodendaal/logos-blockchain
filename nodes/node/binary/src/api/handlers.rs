@@ -68,7 +68,7 @@ use crate::api::{
 
 /// This is a safe default number of blocks to present the canonical chain
 /// at the tip but not too much to overburden a client.
-const DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM: usize = 100;
+pub const DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM: usize = 100;
 const DEFAULT_BLOCKS_STREAM_CHUNK_SIZE: usize = 100;
 
 struct BlocksStreamRequest {
@@ -848,7 +848,7 @@ where
     path = paths::BLOCKS_STREAM,
     params(BlocksStreamQuery),
     responses(
-        (status = 200, description = "Stream of processed blocks with chain state"),
+        (status = 200, description = "Stream of processed blocks with chain state. When immutable_only=true and blocks_to is omitted, the stream anchors at LIB by default."),
         (status = 400, description = "Invalid request parameters", body = String),
         (status = 404, description = "Requested header not found on canonical chain", body = String),
         (status = 500, description = "Internal server error", body = String),
@@ -884,7 +884,12 @@ where
         }
     };
 
-    let blocks_to_header = request.blocks_to.unwrap_or(chain_info.tip);
+    let default_blocks_to_header = if request.immutable_only {
+        chain_info.lib
+    } else {
+        chain_info.tip
+    };
+    let blocks_to_header = request.blocks_to.unwrap_or(default_blocks_to_header);
     let blocks_to_height = match mantle::find_canonical_height_by_header_with_snapshot::<
         _,
         _,
@@ -1283,7 +1288,7 @@ mod tests {
         assert_eq!(request.blocks_to, None);
         assert_eq!(
             request.server_batch_size,
-            NonZero::new(MAX_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
+            NonZero::new(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
         );
         assert!(!request.immutable_only);
     }
@@ -1303,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_stream_request_defaults_to_100_blocks_when_only_blocks_to_is_given() {
+    fn blocks_stream_request_defaults_to_preset_when_only_blocks_to_is_given() {
         let blocks_to = sample_header_id(7);
         let request = parse_blocks_stream_request(&BlocksStreamQuery {
             number_of_blocks: None,
@@ -1331,7 +1336,7 @@ mod tests {
 
         assert_eq!(
             result.err(),
-            Some("number_of_blocks must be greater than or equal to 1".to_owned())
+            Some("'number_of_blocks' must be > 0".to_owned())
         );
     }
 }

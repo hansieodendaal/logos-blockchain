@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, num::NonZero, time::Duration};
 use futures::stream::{self, StreamExt as _};
 use lb_common_http_client::ProcessedBlockEvent;
 use lb_core::header::HeaderId;
+use lb_http_api_common::paths::BLOCKS_STREAM;
+use lb_node::api::handlers::DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM;
 use logos_blockchain_tests::{
     common::time::max_block_propagation_time,
     nodes::{Validator, create_validator_config},
@@ -248,6 +250,38 @@ async fn test_blocks_streaming() {
         "tip height must allow streaming three blocks starting from LIB"
     );
 
+    // case: immutable_only=true with no blocks_to should anchor at LIB
+    println!("case: immutable_only=true without blocks_to anchors at LIB");
+
+    let info = nodes[0].consensus_info(false).await;
+    let expected_chain = canonical_chain(&nodes[0], &info).await;
+    let expected_len = expected_chain
+        .lib_height
+        .min(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
+    assert!(expected_len > 0, "lib height must be > 0 for this case");
+
+    let stream = nodes[0]
+        .get_blocks_stream_in_range_with_chunk_size(None, None, Some(nz(8)), Some(true))
+        .await
+        .expect("immutable-only default stream request should succeed");
+
+    let events = timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .expect("timed out collecting immutable-only default events");
+
+    assert_eq!(
+        events.len(),
+        expected_len,
+        "immutable_only=true default should return recent immutable window"
+    );
+
+    assert_eq!(
+        events.last().unwrap().block.header.id,
+        events[0].lib,
+        "last block should be LIB for immutable_only=true default behavior"
+    );
+    assert_stream_integrity(&expected_chain, &events);
+
     // case: single block below LIB
     println!("case: single block below LIB");
 
@@ -386,7 +420,7 @@ async fn test_blocks_streaming() {
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");
-    url.set_path("/cryptarchia/events/blocks/stream");
+    url.set_path(BLOCKS_STREAM);
     url.set_query(Some(&format!("number_of_blocks=0&blocks_to={tip}")));
 
     let resp = client

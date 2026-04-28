@@ -30,14 +30,21 @@ pub struct BlockRangeQuery {
 #[into_params(parameter_in = Query)]
 #[derive(Deserialize)]
 pub struct BlocksStreamQuery {
+    /// Number of blocks to return. Defaults to 100.
     #[serde(default)]
     #[param(minimum = 1)]
     pub number_of_blocks: Option<usize>,
+    /// Upper-bound canonical header (hex, with or without 0x).
+    /// If omitted, defaults to tip when `immutable_only=false`, or LIB when
+    /// `immutable_only=true`.
     #[serde(default, deserialize_with = "deserialize_blocks_to_header_id")]
     pub blocks_to: Option<HeaderId>,
+    /// Server chunk size hint for streamed delivery.
     #[serde(default)]
     #[param(minimum = 1)]
     pub server_batch_size: Option<usize>,
+    /// When true, include only immutable blocks.
+    /// If `blocks_to` is omitted, the default anchor is LIB.
     #[serde(default)]
     pub immutable_only: Option<bool>,
 }
