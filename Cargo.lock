@@ -5333,6 +5333,7 @@ version = "0.1.2"
 dependencies = [
  "logos-blockchain-core",
  "logos-blockchain-cryptarchia-engine",
+ "logos-blockchain-groth16",
  "logos-blockchain-key-management-system-keys",
  "logos-blockchain-ledger",
  "logos-blockchain-mmr",
