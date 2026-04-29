@@ -528,68 +528,6 @@ where
     Ok(blocks)
 }
 
-pub async fn find_canonical_height_by_header_with_snapshot<
-    Transaction,
-    StorageBackend,
-    RuntimeServiceId,
->(
-    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
-    header_id: HeaderId,
-    chain_info: &CryptarchiaInfo,
-) -> Result<Option<usize>, super::DynError>
-where
-    Transaction: Clone
-        + Eq
-        + Serialize
-        + DeserializeOwned
-        + Send
-        + Sync
-        + 'static
-        + lb_core::mantle::Transaction<Hash = TxHash>,
-    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
-    <StorageBackend as StorageChainApi>::Block:
-        TryFrom<Block<Transaction>> + TryInto<Block<Transaction>>,
-    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
-    RuntimeServiceId: Debug
-        + Send
-        + Sync
-        + Display
-        + 'static
-        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
-        + AsServiceId<Cryptarchia<RuntimeServiceId>>,
-{
-    let tip_height = usize::try_from(chain_info.height)
-        .map_err(|_| format!("tip height {} does not fit into usize", chain_info.height))?;
-    let relay = handle
-        .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
-        .await?;
-    let storage_adapter =
-        StorageAdapter::<StorageBackend, Transaction, RuntimeServiceId>::new(relay).await;
-
-    let mut current_id = chain_info.tip;
-    let mut current_height = tip_height;
-    loop {
-        if current_id == header_id {
-            return Ok(Some(current_height));
-        }
-
-        let Some(block) = storage_adapter.get_block(&current_id).await else {
-            return Err(format!(
-                "canonical chain inconsistency: missing block for canonical header {current_id}"
-            )
-            .into());
-        };
-
-        let parent_id = block.header().parent_block();
-        if parent_id == current_id || current_height == 1 {
-            return Ok(None);
-        }
-
-        current_id = parent_id;
-        current_height = current_height.saturating_sub(1);
-    }
-}
-
 /// Fetch immutable block header ids in range.
 ///
 /// # Arguments

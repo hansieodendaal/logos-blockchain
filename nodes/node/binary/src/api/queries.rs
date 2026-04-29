@@ -1,4 +1,11 @@
-use lb_http_api_common::paths::{MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE};
+use std::num::{NonZero, NonZeroUsize};
+
+use axum::response::{IntoResponse, Response};
+use http::StatusCode;
+use lb_http_api_common::{
+    DEFAULT_BLOCKS_STREAM_CHUNK_SIZE, DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM, MAX_BLOCKS_STREAM_BLOCKS,
+    MAX_BLOCKS_STREAM_CHUNK_SIZE,
+};
 use serde::Deserialize;
 use utoipa::IntoParams;
 use validator::Validate;
@@ -52,16 +59,214 @@ pub struct BlocksStreamQuery {
 
 fn validate_blocks_limit(v: usize) -> Result<(), validator::ValidationError> {
     if v == 0 || v > MAX_BLOCKS_STREAM_BLOCKS {
-        return Err(validator::ValidationError::new("blocks_limit_out_of_range"));
+        let mut err = validator::ValidationError::new("out_of_range");
+        err.message =
+            Some(format!("'blocks_limit' must be in [1, {MAX_BLOCKS_STREAM_BLOCKS}]").into());
+        err.add_param("field".into(), &"blocks_limit");
+        err.add_param("min".into(), &1);
+        err.add_param("max".into(), &MAX_BLOCKS_STREAM_BLOCKS);
+        err.add_param("value".into(), &v);
+        return Err(err);
     }
     Ok(())
 }
 
 fn validate_server_batch_size(v: usize) -> Result<(), validator::ValidationError> {
     if v == 0 || v > MAX_BLOCKS_STREAM_CHUNK_SIZE {
-        return Err(validator::ValidationError::new(
-            "server_batch_size_out_of_range",
-        ));
+        let mut err = validator::ValidationError::new("out_of_range");
+        err.message = Some(
+            format!("'server_batch_size' must be in [1, {MAX_BLOCKS_STREAM_CHUNK_SIZE}]").into(),
+        );
+        err.add_param("field".into(), &"server_batch_size");
+        err.add_param("min".into(), &1);
+        err.add_param("max".into(), &MAX_BLOCKS_STREAM_CHUNK_SIZE);
+        err.add_param("value".into(), &v);
+        return Err(err);
     }
     Ok(())
+}
+
+impl TryFrom<BlocksStreamQuery> for BlocksStreamRequest {
+    type Error = BlocksStreamRequestError;
+
+    // Parse and validate the query parameters for the blocks stream endpoint,
+    // applying defaults where necessary.
+    fn try_from(query: BlocksStreamQuery) -> Result<Self, Self::Error> {
+        query.validate()?;
+
+        let blocks_limit = query
+            .blocks_limit
+            .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
+
+        let server_batch_size = query
+            .server_batch_size
+            .unwrap_or(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE);
+
+        if let (Some(slot_from), Some(slot_to)) = (query.slot_from, query.slot_to)
+            && slot_from > slot_to
+        {
+            return Err(BlocksStreamRequestError::InvalidSlotRange { slot_from, slot_to });
+        }
+
+        Ok(Self {
+            slot_from: query.slot_from,
+            slot_to: query.slot_to,
+            descending: query.descending.unwrap_or(true),
+            blocks_limit: NonZeroUsize::new(blocks_limit)
+                .expect("'blocks_limit' is always >= 1 in schema"),
+            server_batch_size: NonZeroUsize::new(server_batch_size)
+                .expect("'server_batch_size' is always >= 1 in schema"),
+            immutable_only: query.immutable_only.unwrap_or_default(),
+        })
+    }
+}
+
+/// This is a processed `BlocksStreamQuery` with all defaults applied and
+/// validated, ready to be used for fetching blocks.
+pub struct BlocksStreamRequest {
+    /// An optional lower bound slot.
+    pub slot_from: Option<u64>,
+    /// An optional upper bound slot (inclusive).
+    pub slot_to: Option<u64>,
+    /// Sort direction, either descending or the opposite.
+    pub descending: bool,
+    /// Maximum number of blocks to return.
+    pub blocks_limit: NonZero<usize>,
+    /// Server chunk size hint for streamed delivery.
+    pub server_batch_size: NonZero<usize>,
+    /// When true, include only immutable blocks.
+    pub immutable_only: bool,
+}
+
+impl IntoResponse for BlocksStreamRequestError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlocksStreamRequestError {
+    #[error("invalid query: {0}")]
+    Validation(#[from] validator::ValidationErrors),
+    #[error("'slot_from' must be <= 'slot_to', got slot_from={slot_from}, slot_to={slot_to}")]
+    InvalidSlotRange { slot_from: u64, slot_to: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
+        let request = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: None,
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query without explicit range should parse");
+
+        assert_eq!(
+            request.blocks_limit,
+            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
+        );
+        assert_eq!(request.slot_from, None);
+        assert_eq!(request.slot_to, None);
+        assert!(request.descending);
+        assert_eq!(
+            request.server_batch_size,
+            NonZero::new(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
+        );
+        assert!(!request.immutable_only);
+    }
+
+    #[test]
+    fn blocks_stream_request_accepts_blocks_limit_only() {
+        let request = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: Some(7),
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit blocks_limit should parse");
+
+        assert_eq!(request.blocks_limit, NonZero::new(7).unwrap());
+        assert_eq!(request.slot_to, None);
+    }
+
+    #[test]
+    fn blocks_stream_request_accepts_slot_range() {
+        let request = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: Some(10),
+            slot_to: Some(20),
+            descending: Some(true),
+            blocks_limit: None,
+            server_batch_size: None,
+            immutable_only: None,
+        })
+        .expect("query with explicit slot range should parse");
+
+        assert_eq!(
+            request.blocks_limit,
+            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
+        );
+        assert_eq!(request.slot_from, Some(10));
+        assert_eq!(request.slot_to, Some(20));
+        assert!(request.descending);
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_zero_limit() {
+        let result = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: Some(0),
+            server_batch_size: None,
+            immutable_only: None,
+        });
+
+        match result.err() {
+            Some(BlocksStreamRequestError::Validation { .. }) => {}
+            _ => panic!("Expected validation error for 'blocks_limit'"),
+        }
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_zero_batch_size() {
+        let result = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: None,
+            slot_to: None,
+            descending: None,
+            blocks_limit: None,
+            server_batch_size: Some(0),
+            immutable_only: None,
+        });
+
+        match result.err() {
+            Some(BlocksStreamRequestError::Validation { .. }) => {}
+            _ => panic!("Expected validation error for 'server_batch_size'"),
+        }
+    }
+
+    #[test]
+    fn blocks_stream_request_rejects_invalid_slot_range() {
+        let result = BlocksStreamRequest::try_from(BlocksStreamQuery {
+            slot_from: Some(9),
+            slot_to: Some(7),
+            descending: None,
+            blocks_limit: None,
+            server_batch_size: None,
+            immutable_only: None,
+        });
+
+        match result.err() {
+            Some(BlocksStreamRequestError::InvalidSlotRange { .. }) => {}
+            _ => panic!("Expected validation error for 'slot_from' > 'slot_to'"),
+        }
+    }
 }

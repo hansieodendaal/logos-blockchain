@@ -1,29 +1,36 @@
-use std::{collections::VecDeque, num::NonZero, sync::Arc};
+use std::{num::NonZero, sync::Arc};
 
-use futures::{Stream, StreamExt as _};
+use futures::{Stream, StreamExt as _, TryStreamExt as _};
 pub use lb_chain_broadcast_service::BlockInfo;
 pub use lb_chain_service::{CryptarchiaInfo, Slot, State};
 use lb_core::{
+    block::MAX_BLOCK_SIZE,
     header::{ContentId, HeaderId},
     mantle::SignedMantleTx,
     proofs::leader_proof::Groth16LeaderProof,
 };
 use lb_groth16::fr_to_bytes;
 use lb_http_api_common::{
+    MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE,
     bodies::wallet::{
         balance::WalletBalanceResponseBody,
         transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
     },
     paths::{
         BLOCKS, BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM,
-        MAX_BLOCKS_STREAM_BLOCKS, MAX_BLOCKS_STREAM_CHUNK_SIZE, MEMPOOL_ADD_TX,
+        MEMPOOL_ADD_TX,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
     settings::default_max_body_size,
 };
 use lb_key_management_system_keys::keys::ZkPublicKey;
+use log::warn;
 use reqwest::{Client, ClientBuilder, RequestBuilder, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio_util::{
+    codec::{FramedRead, LinesCodec},
+    io::StreamReader,
+};
 
 /// Client-side header representation matching the server's
 /// `ApiHeaderSerializer`.
@@ -77,6 +84,41 @@ impl BasicAuthCredentials {
     #[must_use]
     pub const fn new(username: String, password: Option<String>) -> Self {
         Self { username, password }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+struct BlocksStreamQueryParams {
+    blocks_limit: Option<NonZero<usize>>,
+    slot_from: Option<u64>,
+    slot_to: Option<u64>,
+    descending: Option<bool>,
+    server_batch_size: Option<NonZero<usize>>,
+    immutable_only: Option<bool>,
+}
+
+impl BlocksStreamQueryParams {
+    fn append_to_url(&self, request_url: &mut Url) {
+        let mut query = request_url.query_pairs_mut();
+
+        if let Some(blocks_limit) = self.blocks_limit {
+            query.append_pair("blocks_limit", &blocks_limit.to_string());
+        }
+        if let Some(slot_from) = self.slot_from {
+            query.append_pair("slot_from", &slot_from.to_string());
+        }
+        if let Some(slot_to) = self.slot_to {
+            query.append_pair("slot_to", &slot_to.to_string());
+        }
+        if let Some(descending) = self.descending {
+            query.append_pair("descending", &descending.to_string());
+        }
+        if let Some(server_batch_size) = self.server_batch_size {
+            query.append_pair("server_batch_size", &server_batch_size.to_string());
+        }
+        if self.immutable_only == Some(true) {
+            query.append_pair("immutable_only", "true");
+        }
     }
 }
 
@@ -249,35 +291,60 @@ impl CommonHttpClient {
         self.get::<(), Vec<ApiBlock>>(request_url, None).await
     }
 
+    fn build_blocks_stream_request_url(
+        base_url: &Url,
+        params: &BlocksStreamQueryParams,
+    ) -> Result<Url, Error> {
+        let mut request_url = base_url
+            .join(BLOCKS_STREAM.trim_start_matches('/'))
+            .map_err(Error::Url)?;
+        params.append_to_url(&mut request_url);
+        Ok(request_url)
+    }
+
+    fn apply_basic_auth(&self, mut request: RequestBuilder) -> RequestBuilder {
+        if let Some(basic_auth) = &self.basic_auth {
+            request = request.basic_auth(&basic_auth.username, basic_auth.password.as_deref());
+        }
+        request
+    }
+
+    async fn send_blocks_stream_request(
+        &self,
+        request_url: Url,
+    ) -> Result<reqwest::Response, Error> {
+        let request = self.client.get(request_url);
+        let request = self.apply_basic_auth(request);
+
+        let response = request.send().await.map_err(Error::Request)?;
+        let status = response.status();
+        let response_url = response.url().clone();
+
+        if status != StatusCode::OK {
+            let body = response.text().await.map_err(Error::Request)?;
+            return match status {
+                StatusCode::INTERNAL_SERVER_ERROR => {
+                    Err(Error::Server(format!("{body} [{response_url}]")))
+                }
+                _ => Err(Error::Server(format!(
+                    "Unexpected response [{status}] at [{response_url}]: {body}"
+                ))),
+            };
+        }
+
+        Ok(response)
+    }
+
     /// Subscribe to the processed blocks stream.
     /// Each event contains the block, current tip, and current LIB.
     pub async fn get_blocks_stream(
         &self,
         base_url: Url,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        self.get_blocks_stream_in_range(base_url, None, None, None, None)
-            .await
-    }
-
-    /// Stream processed blocks within a slot range.
-    pub async fn get_blocks_stream_in_range(
-        &self,
-        base_url: Url,
-        blocks_limit: Option<NonZero<usize>>,
-        slot_from: Option<u64>,
-        slot_to: Option<u64>,
-        descending: Option<bool>,
-    ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
-        self.get_blocks_stream_in_range_with_server_batch_size(
-            base_url,
-            blocks_limit,
-            slot_from,
-            slot_to,
-            descending,
-            None,
-            None,
-        )
-        .await
+        let params = BlocksStreamQueryParams::default();
+        let request_url = Self::build_blocks_stream_request_url(&base_url, &params)?;
+        let response = self.send_blocks_stream_request(request_url).await?;
+        Ok(Self::parse_processed_block_events_stream(response))
     }
 
     // Helper function to validate inputs for block streaming methods.
@@ -312,6 +379,74 @@ impl CommonHttpClient {
         Ok(())
     }
 
+    // /// Stream processed blocks in a slot-bounded window.
+    // ///
+    // /// `server_batch_size` lets callers request smaller chunks; the server
+    // /// still enforces its own upper bound.
+    // #[expect(clippy::too_many_arguments, reason = "Need all args")]
+    // pub async fn get_blocks_stream_in_range_with_server_batch_size(
+    //     &self,
+    //     base_url: Url,
+    //     blocks_limit: Option<NonZero<usize>>,
+    //     slot_from: Option<u64>,
+    //     slot_to: Option<u64>,
+    //     descending: Option<bool>,
+    //     server_batch_size: Option<NonZero<usize>>,
+    //     immutable_only: Option<bool>,
+    // ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
+    //     Self::verify_inputs(blocks_limit, slot_from, slot_to,
+    // server_batch_size)?;
+    //
+    //     let request_url = base_url
+    //         .join(BLOCKS_STREAM.trim_start_matches('/'))
+    //         .map_err(Error::Url)?;
+    //     let mut request_url = request_url;
+    //     {
+    //         let mut query = request_url.query_pairs_mut();
+    //         if let Some(blocks_limit) = blocks_limit {
+    //             query.append_pair("blocks_limit", &blocks_limit.to_string());
+    //         }
+    //         if let Some(slot_from) = slot_from {
+    //             query.append_pair("slot_from", &slot_from.to_string());
+    //         }
+    //         if let Some(slot_to) = slot_to {
+    //             query.append_pair("slot_to", &slot_to.to_string());
+    //         }
+    //         if let Some(descending) = descending {
+    //             query.append_pair("descending", &descending.to_string());
+    //         }
+    //         if let Some(server_batch_size) = server_batch_size {
+    //             query.append_pair("server_batch_size",
+    // &server_batch_size.to_string());         }
+    //         if immutable_only == Some(true) {
+    //             query.append_pair("immutable_only", "true");
+    //         }
+    //     }
+    //     let mut request = self.client.get(request_url);
+    //
+    //     if let Some(basic_auth) = &self.basic_auth {
+    //         request = request.basic_auth(&basic_auth.username,
+    // basic_auth.password.as_deref());     }
+    //
+    //     let response = request.send().await.map_err(Error::Request)?;
+    //     let status = response.status();
+    //     let response_url = response.url().clone();
+    //
+    //     if status != StatusCode::OK {
+    //         let body = response.text().await.map_err(Error::Request)?;
+    //         return match status {
+    //             StatusCode::INTERNAL_SERVER_ERROR => {
+    //                 Err(Error::Server(format!("{body} [{response_url}]")))
+    //             }
+    //             _ => Err(Error::Server(format!(
+    //                 "Unexpected response [{status}] at [{response_url}]: {body}"
+    //             ))),
+    //         };
+    //     }
+    //
+    //     Ok(Self::parse_processed_block_events_stream(response))
+    // }
+
     /// Stream processed blocks in a slot-bounded window.
     ///
     /// `server_batch_size` lets callers request smaller chunks; the server
@@ -329,97 +464,100 @@ impl CommonHttpClient {
     ) -> Result<impl Stream<Item = ProcessedBlockEvent> + use<>, Error> {
         Self::verify_inputs(blocks_limit, slot_from, slot_to, server_batch_size)?;
 
-        let request_url = base_url
-            .join(BLOCKS_STREAM.trim_start_matches('/'))
-            .map_err(Error::Url)?;
-        let mut request_url = request_url;
-        {
-            let mut query = request_url.query_pairs_mut();
-            if let Some(blocks_limit) = blocks_limit {
-                query.append_pair("blocks_limit", &blocks_limit.to_string());
-            }
-            if let Some(slot_from) = slot_from {
-                query.append_pair("slot_from", &slot_from.to_string());
-            }
-            if let Some(slot_to) = slot_to {
-                query.append_pair("slot_to", &slot_to.to_string());
-            }
-            if let Some(descending) = descending {
-                query.append_pair("descending", &descending.to_string());
-            }
-            if let Some(server_batch_size) = server_batch_size {
-                query.append_pair("server_batch_size", &server_batch_size.to_string());
-            }
-            if immutable_only == Some(true) {
-                query.append_pair("immutable_only", "true");
-            }
-        }
-        let mut request = self.client.get(request_url);
+        let params = BlocksStreamQueryParams {
+            blocks_limit,
+            slot_from,
+            slot_to,
+            descending,
+            server_batch_size,
+            immutable_only,
+        };
 
-        if let Some(basic_auth) = &self.basic_auth {
-            request = request.basic_auth(&basic_auth.username, basic_auth.password.as_deref());
-        }
+        let request_url = Self::build_blocks_stream_request_url(&base_url, &params)?;
+        let response = self.send_blocks_stream_request(request_url).await?;
+        Ok(Self::parse_processed_block_events_stream(response))
+    }
 
-        let response = request.send().await.map_err(Error::Request)?;
-        let status = response.status();
-        let response_url = response.url().clone();
+    // fn parse_processed_block_events_stream_(
+    //     response: reqwest::Response,
+    // ) -> impl Stream<Item = ProcessedBlockEvent> {
+    //     futures::stream::unfold(
+    //         (
+    //             response.bytes_stream(),
+    //             Vec::<u8>::new(),
+    //             VecDeque::<ProcessedBlockEvent>::new(),
+    //         ),
+    //         async |(mut byte_stream, mut buffer, mut pending)| {
+    //             loop {
+    //                 if let Some(event) = pending.pop_front() {
+    //                     return Some((event, (byte_stream, buffer, pending)));
+    //                 }
+    //
+    //                 if let Some(Ok(bytes)) = byte_stream.next().await {
+    //                     buffer.extend_from_slice(&bytes);
+    //
+    //                     while let Some(newline_pos) = buffer.iter().position(|&b|
+    // b == b'\n') {                         let line =
+    // buffer.drain(..=newline_pos).collect::<Vec<_>>();
+    // let json_line = &line[..line.len().saturating_sub(1)];
+    // if json_line.is_empty() {                             continue;
+    //                         }
+    //                         if let Ok(event) =
+    //
+    // serde_json::from_slice::<ProcessedBlockEvent>(json_line)
+    // {                             pending.push_back(event);
+    //                         }
+    //                     }
+    //                 } else {
+    //                     if !buffer.is_empty()
+    //                         && let Ok(event) =
+    //
+    // serde_json::from_slice::<ProcessedBlockEvent>(&buffer)
+    // {                         pending.push_back(event);
+    //                     }
+    //
+    //                     if let Some(event) = pending.pop_front() {
+    //                         return Some((event, (byte_stream, Vec::new(),
+    // pending)));                     }
+    //                     return None;
+    //                 }
+    //             }
+    //         },
+    //     )
+    // }
 
-        if status != StatusCode::OK {
-            let body = response.text().await.map_err(Error::Request)?;
-            return match status {
-                StatusCode::INTERNAL_SERVER_ERROR => {
-                    Err(Error::Server(format!("{body} [{response_url}]")))
+    fn parse_processed_block_events_stream(
+        response: reqwest::Response,
+    ) -> impl Stream<Item = ProcessedBlockEvent> {
+        // NDJSON event upper bound; margin above max serialized single event line
+        const MAX_NDJSON_LINE_BYTES: usize = MAX_BLOCK_SIZE * 3 / 2;
+        const LOG_LINE_PREVIEW_CHARS: usize = 256;
+
+        let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
+        let reader = StreamReader::new(byte_stream);
+        let codec = LinesCodec::new_with_max_length(MAX_NDJSON_LINE_BYTES);
+        let lines = FramedRead::new(reader, codec);
+
+        lines.filter_map(async |line_result| match line_result {
+            Ok(line) => {
+                if line.is_empty() {
+                    return None;
                 }
-                _ => Err(Error::Server(format!(
-                    "Unexpected response [{status}] at [{response_url}]: {body}"
-                ))),
-            };
-        }
 
-        let blocks_stream = futures::stream::unfold(
-            (
-                response.bytes_stream(),
-                Vec::<u8>::new(),
-                VecDeque::<ProcessedBlockEvent>::new(),
-            ),
-            async |(mut byte_stream, mut buffer, mut pending)| {
-                loop {
-                    if let Some(event) = pending.pop_front() {
-                        return Some((event, (byte_stream, buffer, pending)));
-                    }
-
-                    if let Some(Ok(bytes)) = byte_stream.next().await {
-                        buffer.extend_from_slice(&bytes);
-
-                        while let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
-                            let line = buffer.drain(..=newline_pos).collect::<Vec<_>>();
-                            let json_line = &line[..line.len().saturating_sub(1)];
-                            if json_line.is_empty() {
-                                continue;
-                            }
-                            if let Ok(event) =
-                                serde_json::from_slice::<ProcessedBlockEvent>(json_line)
-                            {
-                                pending.push_back(event);
-                            }
-                        }
-                    } else {
-                        if !buffer.is_empty()
-                            && let Ok(event) =
-                                serde_json::from_slice::<ProcessedBlockEvent>(&buffer)
-                        {
-                            pending.push_back(event);
-                        }
-
-                        if let Some(event) = pending.pop_front() {
-                            return Some((event, (byte_stream, Vec::new(), pending)));
-                        }
-                        return None;
+                match serde_json::from_str::<ProcessedBlockEvent>(&line) {
+                    Ok(event) => Some(event),
+                    Err(err) => {
+                        let preview: String = line.chars().take(LOG_LINE_PREVIEW_CHARS).collect();
+                        warn!("blocks stream JSON decode failed: {err}; line_preview={preview:?}");
+                        None
                     }
                 }
-            },
-        );
-        Ok(blocks_stream)
+            }
+            Err(err) => {
+                warn!("blocks stream line decode failed: {err}");
+                None
+            }
+        })
     }
 
     /// Get the balance for a specific `ZkPublicKey`.

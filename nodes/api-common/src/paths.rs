@@ -30,9 +30,3 @@ pub mod wallet {
 // testing paths
 pub const UPDATE_MEMBERSHIP: &str = "/test/membership/update";
 pub const DIAL_PEER: &str = "/test/network/dial_peer";
-
-/// This maximum blocks stream chunk size is a happy medium between performance
-/// and memory use
-pub const MAX_BLOCKS_STREAM_CHUNK_SIZE: usize = 1_000;
-/// 200 years worth of blocks if 1 is produced every 10s
-pub const MAX_BLOCKS_STREAM_BLOCKS: usize = 630_720_000;

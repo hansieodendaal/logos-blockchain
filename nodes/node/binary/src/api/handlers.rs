@@ -1,6 +1,6 @@
 use std::{
     fmt::{Debug, Display},
-    num::{NonZero, NonZeroUsize},
+    num::NonZeroUsize,
 };
 
 use ::libp2p::PeerId;
@@ -54,12 +54,10 @@ use overwatch::{
     services::{AsServiceId, ServiceData},
 };
 use serde::{Deserialize, Serialize};
-use tracing::warn;
-use validator::Validate as _;
 
 use crate::api::{
     openapi::schema,
-    queries::{BlockRangeQuery, BlocksStreamQuery},
+    queries::{BlockRangeQuery, BlocksStreamQuery, BlocksStreamRequest},
     responses::{self, overwatch::get_relay_or_500},
     serializers::{
         blocks::{ApiBlock, ApiProcessedBlockEvent},
@@ -67,70 +65,9 @@ use crate::api::{
     },
 };
 
-#[derive(Debug, thiserror::Error)]
-enum BlocksStreamRequestError {
-    #[error("invalid query: {0}")]
-    Validation(#[from] validator::ValidationErrors),
-    #[error("'slot_from' must be <= 'slot_to', got slot_from={slot_from}, slot_to={slot_to}")]
-    InvalidSlotRange { slot_from: u64, slot_to: u64 },
-}
-
-impl IntoResponse for BlocksStreamRequestError {
-    fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
-    }
-}
-
-/// This is a safe default number of blocks to present the canonical chain
-/// at the tip but not too much to overburden a client.
-pub const DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM: usize = 100;
-const DEFAULT_BLOCKS_STREAM_CHUNK_SIZE: usize = 100;
-
-struct BlocksStreamRequest {
-    slot_from: Option<u64>,
-    slot_to: Option<u64>,
-    descending: bool,
-    blocks_limit: NonZero<usize>,
-    server_batch_size: NonZero<usize>,
-    immutable_only: bool,
-}
-
 struct ResolvedBlocksStreamWindow {
     slot_from: Slot,
     slot_to: Slot,
-}
-
-fn parse_blocks_stream_request(
-    query: &BlocksStreamQuery,
-) -> Result<BlocksStreamRequest, BlocksStreamRequestError> {
-    query.validate()?;
-
-    let blocks_limit_raw = query
-        .blocks_limit
-        .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
-    let blocks_limit =
-        NonZeroUsize::new(blocks_limit_raw).expect("'blocks_limit' is always >= 1 in schema");
-
-    let server_batch_size_raw = query
-        .server_batch_size
-        .unwrap_or(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE);
-    let server_batch_size = NonZeroUsize::new(server_batch_size_raw)
-        .expect("'server_batch_size' is always >= 1 in schema");
-
-    if let (Some(slot_from), Some(slot_to)) = (query.slot_from, query.slot_to)
-        && slot_from > slot_to
-    {
-        return Err(BlocksStreamRequestError::InvalidSlotRange { slot_from, slot_to });
-    }
-
-    Ok(BlocksStreamRequest {
-        slot_from: query.slot_from,
-        slot_to: query.slot_to,
-        descending: query.descending.unwrap_or(true),
-        blocks_limit,
-        server_batch_size,
-        immutable_only: query.immutable_only.unwrap_or_default(),
-    })
 }
 
 fn next_blocks_stream_cursor(
@@ -242,6 +179,19 @@ where
         .collect())
 }
 
+struct BlocksStreamState<RuntimeServiceId> {
+    buffered: std::vec::IntoIter<ApiProcessedBlockEvent>,
+    slot_from: Slot,
+    slot_to: Slot,
+    descending: bool,
+    next_cursor: Option<Slot>,
+    remaining: usize,
+    chunk_size: usize,
+    immutable_only: bool,
+    chain_info: lb_chain_service::CryptarchiaInfo,
+    handle: OverwatchHandle<RuntimeServiceId>,
+}
+
 #[expect(clippy::too_many_arguments, reason = "Need all args")]
 fn build_blocks_stream<StorageBackend, RuntimeServiceId>(
     handle: OverwatchHandle<RuntimeServiceId>,
@@ -254,7 +204,7 @@ fn build_blocks_stream<StorageBackend, RuntimeServiceId>(
     remaining: usize,
     chunk_size: usize,
     immutable_only: bool,
-) -> impl futures::Stream<Item = ApiProcessedBlockEvent>
+) -> impl futures::Stream<Item = Result<ApiProcessedBlockEvent, DynError>>
 where
     StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
     StorageBackend::Block: Serialize,
@@ -269,99 +219,78 @@ where
         + AsServiceId<Cryptarchia<RuntimeServiceId>>
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    futures::stream::unfold(
-        (
-            first_chunk.into_iter(),
-            slot_from,
-            slot_to,
-            descending,
-            next_cursor,
-            remaining,
-            chunk_size,
-            immutable_only,
-            chain_info,
-            handle,
-        ),
-        async |(
-            mut buffered,
-            slot_from,
-            slot_to,
-            descending,
-            mut next_cursor,
-            mut remaining,
-            chunk_size,
-            immutable_only,
-            chain_info,
-            handle,
-        )| {
-            loop {
-                if let Some(item) = buffered.next() {
-                    return Some((
-                        item,
-                        (
-                            buffered,
-                            slot_from,
-                            slot_to,
-                            descending,
-                            next_cursor,
-                            remaining,
-                            chunk_size,
-                            immutable_only,
-                            chain_info,
-                            handle,
-                        ),
-                    ));
-                }
+    let state = BlocksStreamState {
+        buffered: first_chunk.into_iter(),
+        slot_from,
+        slot_to,
+        descending,
+        next_cursor,
+        remaining,
+        chunk_size,
+        immutable_only,
+        chain_info,
+        handle,
+    };
 
-                if remaining == 0 || next_cursor.is_none() {
-                    return None;
-                }
-
-                let request_limit = NonZeroUsize::new(chunk_size.min(remaining))
-                    .expect("remaining and chunk size are non-zero");
-                let cursor = next_cursor.expect("checked above");
-                let (chunk_from, chunk_to) = if descending {
-                    (slot_from, cursor)
-                } else {
-                    (cursor, slot_to)
-                };
-
-                let next_chunk =
-                    match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
-                        &handle,
-                        &chain_info,
-                        chunk_from,
-                        chunk_to,
-                        descending,
-                        request_limit,
-                        immutable_only,
-                    )
-                    .await
-                    {
-                        Ok(next_chunk) => next_chunk,
-                        Err(error) => {
-                            warn!("blocks stream chunk fetch failed: {error}");
-                            return None;
-                        }
-                    };
-
-                if next_chunk.is_empty() {
-                    return None;
-                }
-
-                let boundary_slot = next_chunk
-                    .last()
-                    .map(|event| event.block.header().slot())
-                    .expect("non-empty chunk has a last element");
-
-                next_cursor =
-                    next_blocks_stream_cursor(descending, slot_from, slot_to, boundary_slot);
-
-                remaining = remaining.saturating_sub(next_chunk.len());
-                buffered = next_chunk.into_iter();
+    futures::stream::unfold(state, async |mut state| {
+        loop {
+            if let Some(item) = state.buffered.next() {
+                return Some((Ok(item), state));
             }
-        },
-    )
+
+            let cursor = match state.next_cursor {
+                Some(cursor) if state.remaining > 0 => cursor,
+                _ => return None,
+            };
+
+            let request_limit = NonZeroUsize::new(state.chunk_size.min(state.remaining))
+                .expect("remaining and chunk size are non-zero");
+            let (chunk_from, chunk_to) = if state.descending {
+                (state.slot_from, cursor)
+            } else {
+                (cursor, state.slot_to)
+            };
+
+            let next_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+                &state.handle,
+                &state.chain_info,
+                chunk_from,
+                chunk_to,
+                state.descending,
+                request_limit,
+                state.immutable_only,
+            )
+            .await
+            {
+                Ok(next_chunk) => next_chunk,
+                Err(error) => {
+                    // Terminal error: avoid re-emitting the same error forever.
+                    state.remaining = 0;
+                    state.next_cursor = None;
+                    return Some((Err(error), state));
+                }
+            };
+
+            if next_chunk.is_empty() {
+                return None;
+            }
+
+            let boundary_slot = next_chunk
+                .last()
+                .map(|event| event.block.header().slot())
+                .expect("non-empty chunk has a last element");
+
+            state.next_cursor = next_blocks_stream_cursor(
+                state.descending,
+                state.slot_from,
+                state.slot_to,
+                boundary_slot,
+            );
+
+            state.remaining = state.remaining.saturating_sub(next_chunk.len());
+            state.buffered = next_chunk.into_iter();
+        }
+    })
 }
 
 #[macro_export]
@@ -977,6 +906,31 @@ where
     }
 }
 
+/// Error type for blocks stream handler. We need a custom error type to
+/// distinguish between different error cases and return appropriate HTTP status
+/// codes.
+#[derive(Debug, thiserror::Error)]
+pub enum BlocksStreamHandlerError {
+    #[error(transparent)]
+    Query(#[from] crate::api::queries::BlocksStreamRequestError),
+    #[error("{0}")]
+    InvalidWindow(String),
+    #[error(transparent)]
+    Internal(#[from] DynError),
+}
+
+impl IntoResponse for BlocksStreamHandlerError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Query(err) => err.into_response(), // typically 400
+            Self::InvalidWindow(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+            Self::Internal(err) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+            }
+        }
+    }
+}
+
 #[utoipa::path(
     get,
     path = paths::BLOCKS_STREAM,
@@ -990,7 +944,7 @@ where
 pub async fn blocks_stream<StorageBackend, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Query(query): Query<BlocksStreamQuery>,
-) -> Response
+) -> Result<Response, BlocksStreamHandlerError>
 where
     StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
     StorageBackend::Block: Serialize,
@@ -1005,22 +959,12 @@ where
         + AsServiceId<Cryptarchia<RuntimeServiceId>>
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
 {
-    let request = match parse_blocks_stream_request(&query) {
-        Ok(request) => request,
-        Err(err) => return err.into_response(),
-    };
+    let request = BlocksStreamRequest::try_from(query)?;
 
-    let chain_info = match consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await {
-        Ok(info) => info,
-        Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
-        }
-    };
+    let chain_info = consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await?;
 
-    let resolved_window = match resolve_blocks_stream_window(&request, &chain_info) {
-        Ok(window) => window,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
+    let resolved_window = resolve_blocks_stream_window(&request, &chain_info)
+        .map_err(BlocksStreamHandlerError::InvalidWindow)?;
     let slot_from = resolved_window.slot_from;
     let slot_to = resolved_window.slot_to;
 
@@ -1032,7 +976,7 @@ where
     )
     .expect("chunk size min blocks limit should be non-zero");
 
-    let first_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+    let first_chunk = fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
         &handle,
         &chain_info,
         slot_from,
@@ -1041,17 +985,11 @@ where
         first_chunk_limit,
         request.immutable_only,
     )
-    .await
-    {
-        Ok(events) => events,
-        Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
-        }
-    };
+    .await?;
 
     if first_chunk.is_empty() {
         let empty = futures::stream::empty::<ApiProcessedBlockEvent>();
-        return responses::ndjson::from_stream(empty);
+        return Ok(responses::ndjson::from_stream(empty));
     }
 
     let consumed = first_chunk.len();
@@ -1077,7 +1015,7 @@ where
         request.immutable_only,
     );
 
-    responses::ndjson::from_stream(stream)
+    Ok(responses::ndjson::from_stream_result(stream))
 }
 
 #[utoipa::path(
@@ -1391,124 +1329,5 @@ pub mod wallet {
             let sig = wallet.sign_tx_with_zk(req.tx_hash, req.pks).await?;
             Ok::<_, DynError>(WalletSignTxZkResponseBody { sig })
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn blocks_stream_request_defaults_to_recent_blocks_from_tip() {
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: None,
-            slot_to: None,
-            descending: None,
-            blocks_limit: None,
-            server_batch_size: None,
-            immutable_only: None,
-        })
-        .expect("query without explicit range should parse");
-
-        assert_eq!(
-            request.blocks_limit,
-            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
-        );
-        assert_eq!(request.slot_from, None);
-        assert_eq!(request.slot_to, None);
-        assert!(request.descending);
-        assert_eq!(
-            request.server_batch_size,
-            NonZero::new(DEFAULT_BLOCKS_STREAM_CHUNK_SIZE).unwrap()
-        );
-        assert!(!request.immutable_only);
-    }
-
-    #[test]
-    fn blocks_stream_request_accepts_blocks_limit_only() {
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: None,
-            slot_to: None,
-            descending: None,
-            blocks_limit: Some(7),
-            server_batch_size: None,
-            immutable_only: None,
-        })
-        .expect("query with explicit blocks_limit should parse");
-
-        assert_eq!(request.blocks_limit, NonZero::new(7).unwrap());
-        assert_eq!(request.slot_to, None);
-    }
-
-    #[test]
-    fn blocks_stream_request_accepts_slot_range() {
-        let request = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: Some(10),
-            slot_to: Some(20),
-            descending: Some(true),
-            blocks_limit: None,
-            server_batch_size: None,
-            immutable_only: None,
-        })
-        .expect("query with explicit slot range should parse");
-
-        assert_eq!(
-            request.blocks_limit,
-            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
-        );
-        assert_eq!(request.slot_from, Some(10));
-        assert_eq!(request.slot_to, Some(20));
-        assert!(request.descending);
-    }
-
-    #[test]
-    fn blocks_stream_request_rejects_zero_limit() {
-        let result = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: None,
-            slot_to: None,
-            descending: None,
-            blocks_limit: Some(0),
-            server_batch_size: None,
-            immutable_only: None,
-        });
-
-        match result.err() {
-            Some(BlocksStreamRequestError::Validation { .. }) => {}
-            _ => panic!("Expected validation error for 'blocks_limit'"),
-        }
-    }
-
-    #[test]
-    fn blocks_stream_request_rejects_zero_batch_size() {
-        let result = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: None,
-            slot_to: None,
-            descending: None,
-            blocks_limit: None,
-            server_batch_size: Some(0),
-            immutable_only: None,
-        });
-
-        match result.err() {
-            Some(BlocksStreamRequestError::Validation { .. }) => {}
-            _ => panic!("Expected validation error for 'server_batch_size'"),
-        }
-    }
-
-    #[test]
-    fn blocks_stream_request_rejects_invalid_slot_range() {
-        let result = parse_blocks_stream_request(&BlocksStreamQuery {
-            slot_from: Some(9),
-            slot_to: Some(7),
-            descending: None,
-            blocks_limit: None,
-            server_batch_size: None,
-            immutable_only: None,
-        });
-
-        match result.err() {
-            Some(BlocksStreamRequestError::InvalidSlotRange { .. }) => {}
-            _ => panic!("Expected validation error for 'slot_from' > 'slot_to'"),
-        }
     }
 }

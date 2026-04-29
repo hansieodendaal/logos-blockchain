@@ -7,8 +7,7 @@ use std::{
 use futures::stream::{self, StreamExt as _};
 use lb_common_http_client::ProcessedBlockEvent;
 use lb_core::header::HeaderId;
-use lb_http_api_common::paths::BLOCKS_STREAM;
-use lb_node::api::handlers::DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM;
+use lb_http_api_common::{DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM, paths::BLOCKS_STREAM};
 use logos_blockchain_tests::{
     common::time::max_block_propagation_time,
     nodes::{Validator, create_validator_config},
