@@ -7,7 +7,7 @@ use std::{
 use futures::stream::{self, StreamExt as _};
 use lb_common_http_client::ProcessedBlockEvent;
 use lb_core::header::HeaderId;
-use lb_http_api_common::{DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM, paths::BLOCKS_STREAM};
+use lb_http_api_common::{DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM, paths::BLOCKS_RANGE_STREAM};
 use logos_blockchain_tests::{
     common::time::max_block_propagation_time,
     nodes::{Validator, create_validator_config},
@@ -719,7 +719,7 @@ async fn test_blocks_streaming() {
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");
-    url.set_path(BLOCKS_STREAM);
+    url.set_path(BLOCKS_RANGE_STREAM);
     url.set_query(Some(&format!("blocks_limit=0&slot_to={tip_slot}")));
 
     let resp = client
@@ -749,7 +749,7 @@ async fn test_blocks_streaming() {
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");
-    url.set_path(BLOCKS_STREAM);
+    url.set_path(BLOCKS_RANGE_STREAM);
     url.set_query(Some(&format!("slot_to={}", tip_slot + 1)));
 
     let resp = client
@@ -782,7 +782,7 @@ async fn test_blocks_streaming() {
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");
-    url.set_path(BLOCKS_STREAM);
+    url.set_path(BLOCKS_RANGE_STREAM);
     url.set_query(Some(&format!(
         "slot_to={}&immutable_only=true",
         lib_slot + 1

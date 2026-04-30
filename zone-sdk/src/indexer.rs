@@ -143,6 +143,8 @@ fn should_skip(message: &ZoneMessage, slot: Slot, skip_until: &mut Option<(MsgId
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
     use async_trait::async_trait;
     use lb_common_http_client::{ApiBlock, BlockInfo, CryptarchiaInfo, ProcessedBlockEvent};
     use lb_core::{
@@ -152,7 +154,7 @@ mod tests {
     use lb_groth16::Fr;
 
     use super::*;
-    use crate::{Deposit, ZoneBlock};
+    use crate::{Deposit, ZoneBlock, adapter::BoxStream};
 
     #[tokio::test]
     async fn next_messages_empty() {
@@ -377,13 +379,23 @@ mod tests {
 
         async fn block_stream(
             &self,
-        ) -> Result<adapter::BoxStream<ProcessedBlockEvent>, lb_common_http_client::Error> {
+        ) -> Result<BoxStream<ProcessedBlockEvent>, lb_common_http_client::Error> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
-        async fn lib_stream(
+        async fn blocks_range_stream(
             &self,
-        ) -> Result<adapter::BoxStream<BlockInfo>, lb_common_http_client::Error> {
+            _blocks_limit: Option<NonZero<usize>>,
+            _slot_from: Option<u64>,
+            _slot_to: Option<u64>,
+            _descending: Option<bool>,
+            _server_batch_size: Option<NonZero<usize>>,
+            _immutable_only: Option<bool>,
+        ) -> Result<BoxStream<ProcessedBlockEvent>, lb_common_http_client::Error> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn lib_stream(&self) -> Result<BoxStream<BlockInfo>, lb_common_http_client::Error> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -394,7 +406,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn blocks(
+        async fn immutable_blocks(
             &self,
             _slot_from: Slot,
             _slot_to: Slot,
@@ -406,7 +418,7 @@ mod tests {
             &self,
             _id: HeaderId,
             _channel_id: ChannelId,
-        ) -> Result<adapter::BoxStream<ZoneMessage>, lb_common_http_client::Error> {
+        ) -> Result<BoxStream<ZoneMessage>, lb_common_http_client::Error> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
@@ -415,7 +427,7 @@ mod tests {
             slot_from: Slot,
             slot_to: Slot,
             _channel_id: ChannelId,
-        ) -> Result<adapter::BoxStream<(ZoneMessage, Slot)>, lb_common_http_client::Error> {
+        ) -> Result<BoxStream<(ZoneMessage, Slot)>, lb_common_http_client::Error> {
             let msgs: Vec<_> = self
                 .messages
                 .iter()

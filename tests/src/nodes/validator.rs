@@ -443,8 +443,24 @@ impl Validator {
 
     pub async fn get_blocks_stream(
         &self,
+        blocks_limit: Option<NonZero<usize>>,
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: Option<bool>,
+        server_batch_size: Option<NonZero<usize>>,
+        immutable_only: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
-        self.http_client.get_blocks_stream(self.base_url()?).await
+        self.http_client
+            .get_blocks_range_stream(
+                self.base_url()?,
+                blocks_limit,
+                slot_from,
+                slot_to,
+                descending,
+                server_batch_size,
+                immutable_only,
+            )
+            .await
     }
 
     pub async fn get_blocks_stream_in_range(
@@ -475,7 +491,7 @@ impl Validator {
         immutable_only: Option<bool>,
     ) -> Result<impl Stream<Item = ProcessedBlockEvent>, lb_common_http_client::Error> {
         self.http_client
-            .get_blocks_stream_in_range_with_server_batch_size(
+            .get_blocks_range_stream(
                 self.base_url()?,
                 blocks_limit,
                 slot_from,

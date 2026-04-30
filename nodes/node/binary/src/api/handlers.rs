@@ -19,7 +19,7 @@ use lb_api_service::http::{
 };
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
-use lb_chain_service::Slot;
+use lb_chain_service::{ConsensusMsg, Slot};
 use lb_core::{
     block::Block,
     header::HeaderId,
@@ -54,6 +54,7 @@ use overwatch::{
     services::{AsServiceId, ServiceData},
 };
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt as _;
 
 use crate::api::{
     openapi::schema,
@@ -906,6 +907,40 @@ where
     }
 }
 
+#[utoipa::path(
+    get,
+    path = paths::BLOCKS_STREAM,
+    responses(
+        (status = 200, description = "Stream of processed blocks with chain state"),
+        (status = 500, description = "Internal server error", body = String),
+    )
+)]
+pub async fn blocks_stream<StorageBackend, ConsensusService, RuntimeServiceId>(
+    State(handle): State<OverwatchHandle<RuntimeServiceId>>,
+) -> Response
+where
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    StorageBackend::Block: Serialize,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<SignedMantleTx>> + TryInto<Block<SignedMantleTx>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    ConsensusService: ServiceData<Message = ConsensusMsg<SignedMantleTx>> + 'static,
+    RuntimeServiceId: Debug
+        + Sync
+        + Display
+        + 'static
+        + AsServiceId<ConsensusService>
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>,
+{
+    let stream = mantle::get_new_blocks_stream::<_, _, ConsensusService, _>(&handle)
+        .await
+        .map(|stream| stream.map(ApiProcessedBlockEvent::from));
+    match stream {
+        Ok(stream) => responses::ndjson::from_stream(stream),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 /// Error type for blocks stream handler. We need a custom error type to
 /// distinguish between different error cases and return appropriate HTTP status
 /// codes.
@@ -936,12 +971,14 @@ impl IntoResponse for BlocksStreamHandlerError {
     path = paths::BLOCKS_STREAM,
     params(BlocksStreamQuery),
     responses(
-        (status = 200, description = "Stream of processed blocks with chain state in slot order. When immutable_only=true and slot_to is omitted, the stream anchors at LIB slot by default."),
+        (status = 200, description = "Stream of processed blocks with chain state in slot order. \
+            When immutable_only=true and slot_to is omitted, the stream anchors at LIB slot by \
+            default."),
         (status = 400, description = "Invalid request parameters", body = String),
         (status = 500, description = "Internal server error", body = String),
     )
 )]
-pub async fn blocks_stream<StorageBackend, RuntimeServiceId>(
+pub async fn blocks_range_stream<StorageBackend, RuntimeServiceId>(
     State(handle): State<OverwatchHandle<RuntimeServiceId>>,
     Query(query): Query<BlocksStreamQuery>,
 ) -> Result<Response, BlocksStreamHandlerError>

@@ -17,8 +17,8 @@ use lb_http_api_common::{
         transfer_funds::{WalletTransferFundsRequestBody, WalletTransferFundsResponseBody},
     },
     paths::{
-        BLOCKS, BLOCKS_DETAIL, BLOCKS_STREAM, CRYPTARCHIA_INFO, CRYPTARCHIA_LIB_STREAM,
-        MEMPOOL_ADD_TX,
+        BLOCKS, BLOCKS_DETAIL, BLOCKS_RANGE_STREAM, BLOCKS_STREAM, CRYPTARCHIA_INFO,
+        CRYPTARCHIA_LIB_STREAM, MEMPOOL_ADD_TX,
         wallet::{BALANCE, TRANSACTIONS_TRANSFER_FUNDS},
     },
     settings::default_max_body_size,
@@ -274,7 +274,7 @@ impl CommonHttpClient {
         self.get::<(), CryptarchiaInfo>(request_url, None).await
     }
 
-    /// Get blocks in a slot range.
+    /// Get immutable blocks in a slot range.
     pub async fn get_immutable_blocks(
         &self,
         base_url: Url,
@@ -320,30 +320,25 @@ impl CommonHttpClient {
         }
     }
 
-    fn build_blocks_stream_request_url(
+    fn build_blocks_range_stream_request_url(
         base_url: &Url,
         params: &BlocksStreamQueryParams,
     ) -> Result<Url, Error> {
         let mut request_url = base_url
-            .join(BLOCKS_STREAM.trim_start_matches('/'))
+            .join(BLOCKS_RANGE_STREAM.trim_start_matches('/'))
             .map_err(Error::Url)?;
         params.append_to_url(&mut request_url);
         Ok(request_url)
     }
 
-    fn apply_basic_auth(&self, mut request: RequestBuilder) -> RequestBuilder {
-        if let Some(basic_auth) = &self.basic_auth {
-            request = request.basic_auth(&basic_auth.username, basic_auth.password.as_deref());
-        }
-        request
-    }
-
-    async fn send_blocks_stream_request(
+    async fn send_blocks_range_stream_request(
         &self,
         request_url: Url,
     ) -> Result<reqwest::Response, Error> {
-        let request = self.client.get(request_url);
-        let request = self.apply_basic_auth(request);
+        let mut request = self.client.get(request_url);
+        if let Some(basic_auth) = &self.basic_auth {
+            request = request.basic_auth(&basic_auth.username, basic_auth.password.as_deref());
+        }
 
         let response = request.send().await.map_err(Error::Request)?;
         let status = response.status();
@@ -401,7 +396,7 @@ impl CommonHttpClient {
     /// `server_batch_size` lets callers request smaller chunks; the server
     /// still enforces its own upper bound.
     #[expect(clippy::too_many_arguments, reason = "Need all args")]
-    pub async fn get_blocks_stream_in_range_with_server_batch_size(
+    pub async fn get_blocks_range_stream(
         &self,
         base_url: Url,
         blocks_limit: Option<NonZero<usize>>,
@@ -422,12 +417,12 @@ impl CommonHttpClient {
             immutable_only,
         };
 
-        let request_url = Self::build_blocks_stream_request_url(&base_url, &params)?;
-        let response = self.send_blocks_stream_request(request_url).await?;
-        Ok(Self::parse_processed_block_events_stream(response))
+        let request_url = Self::build_blocks_range_stream_request_url(&base_url, &params)?;
+        let response = self.send_blocks_range_stream_request(request_url).await?;
+        Ok(Self::parse_processed_blocks_range_event_stream(response))
     }
 
-    fn parse_processed_block_events_stream(
+    fn parse_processed_blocks_range_event_stream(
         response: reqwest::Response,
     ) -> impl Stream<Item = ProcessedBlockEvent> {
         // NDJSON event upper bound; margin above max serialized single event line

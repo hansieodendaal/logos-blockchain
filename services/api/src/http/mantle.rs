@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _, future::join_all};
 use lb_chain_broadcast_service::{BlockBroadcastMsg, BlockBroadcastService, BlockInfo};
 use lb_chain_service::{
-    ConsensusMsg, CryptarchiaInfo, Slot,
+    ConsensusMsg, CryptarchiaInfo, ProcessedBlockEvent, Slot,
     storage::{StorageAdapter as _, adapters::StorageAdapter},
 };
 use lb_core::{
@@ -26,7 +26,7 @@ use lb_tx_service::{
     network::adapters::libp2p::Libp2pAdapter as MempoolNetworkAdapter,
     tx::service::openapi::Status,
 };
-use overwatch::services::AsServiceId;
+use overwatch::services::{AsServiceId, ServiceData};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
@@ -161,6 +161,101 @@ where
         .map(|result| result.map_err(|e| Box::new(e) as crate::http::DynError));
 
     Ok(stream)
+}
+
+pub async fn get_processed_blocks_event_stream<Transaction, Service, RuntimeServiceId>(
+    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+) -> Result<
+    impl Stream<Item = Result<ProcessedBlockEvent, crate::http::DynError>>
+    + Send
+    + Sync
+    + use<Transaction, Service, RuntimeServiceId>,
+    super::DynError,
+>
+where
+    Transaction: Send + 'static,
+    Service: ServiceData<Message = ConsensusMsg<Transaction>>,
+    RuntimeServiceId: Debug + Sync + Display + AsServiceId<Service>,
+{
+    let relay = handle.relay().await?;
+    let (sender, receiver) = oneshot::channel();
+
+    relay
+        .send(ConsensusMsg::NewBlockSubscribe { sender })
+        .await
+        .map_err(|(error, _)| error)?;
+
+    let new_blocks_receiver = receiver
+        .await
+        .map_err(|error| Box::new(error) as super::DynError)?;
+
+    let processed_blocks_stream = BroadcastStream::new(new_blocks_receiver)
+        .map(|item| item.map_err(|error| Box::new(error) as crate::http::DynError));
+
+    Ok(processed_blocks_stream)
+}
+
+pub async fn get_new_blocks_stream<
+    Transaction,
+    StorageBackend,
+    ConsensusService,
+    RuntimeServiceId,
+>(
+    handle: &overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+) -> Result<
+    impl Stream<Item = BlockWithChainState<Transaction>>
+    + Send
+    + use<Transaction, StorageBackend, ConsensusService, RuntimeServiceId>,
+    super::DynError,
+>
+where
+    Transaction: Clone
+        + Eq
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + 'static
+        + lb_core::mantle::Transaction<Hash = TxHash>,
+    StorageBackend: lb_storage_service::backends::StorageBackend + Send + Sync + 'static,
+    <StorageBackend as StorageChainApi>::Block:
+        TryFrom<Block<Transaction>> + TryInto<Block<Transaction>>,
+    <StorageBackend as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
+    ConsensusService: ServiceData<Message = ConsensusMsg<Transaction>>,
+    RuntimeServiceId: Debug
+        + Sync
+        + Display
+        + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
+        + AsServiceId<ConsensusService>,
+{
+    let processed_blocks_stream =
+        get_processed_blocks_event_stream::<Transaction, ConsensusService, RuntimeServiceId>(
+            handle,
+        )
+        .await?;
+
+    let relay = handle
+        .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
+        .await?;
+    let storage_adapter =
+        StorageAdapter::<StorageBackend, Transaction, RuntimeServiceId>::new(relay).await;
+
+    let new_blocks_stream = processed_blocks_stream.filter_map(move |event| {
+        let storage_adapter = storage_adapter.clone();
+        async move {
+            let event = event.ok()?;
+            let block = storage_adapter.get_block(&event.block_id).await?;
+            Some(BlockWithChainState {
+                block,
+                tip: event.tip,
+                tip_slot: event.tip_slot,
+                lib: event.lib,
+                lib_slot: event.lib_slot,
+            })
+        }
+    });
+
+    Ok(new_blocks_stream)
 }
 
 async fn get_immutable_block_ids_in_slot_range<Backend, RuntimeServiceId>(

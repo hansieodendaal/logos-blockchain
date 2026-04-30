@@ -16,6 +16,7 @@ use axum::{
 use lb_api_service::{Backend, http::consensus::Cryptarchia};
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
+use lb_chain_service::CryptarchiaConsensus;
 use lb_core::{
     header::HeaderId,
     mantle::{SignedMantleTx, Transaction},
@@ -39,9 +40,9 @@ use utoipa::OpenApi as _;
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::handlers::{
-    add_tx, blend_info, block, blocks_stream, cryptarchia_headers, cryptarchia_info,
-    cryptarchia_lib_stream, immutable_blocks, libp2p_info, mantle_metrics, mantle_status,
-    transaction, wallet,
+    add_tx, blend_info, block, blocks_range_stream, blocks_stream, cryptarchia_headers,
+    cryptarchia_info, cryptarchia_lib_stream, immutable_blocks, libp2p_info, mantle_metrics,
+    mantle_status, transaction, wallet,
 };
 use crate::{
     BlendBroadcastSettings, BlendService, WalletService,
@@ -288,7 +289,18 @@ where
 
         let app = app.route(
             paths::BLOCKS_STREAM,
-            routing::get(blocks_stream::<BlockStorageBackend, RuntimeServiceId>),
+            routing::get(
+                blocks_stream::<
+                    BlockStorageBackend,
+                    CryptarchiaConsensus<_, _, _, _>,
+                    RuntimeServiceId,
+                >,
+            ),
+        );
+
+        let app = app.route(
+            paths::BLOCKS_RANGE_STREAM,
+            routing::get(blocks_range_stream::<BlockStorageBackend, RuntimeServiceId>),
         );
 
         let app = app

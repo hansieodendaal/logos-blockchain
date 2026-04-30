@@ -15,6 +15,7 @@ pub const SDP_POST_WITHDRAWAL: &str = "/sdp/withdrawal";
 pub const LEADER_CLAIM: &str = "/leader/claim";
 
 pub const BLOCKS: &str = "/cryptarchia/blocks";
+pub const BLOCKS_RANGE_STREAM: &str = "/cryptarchia/blocks_range";
 pub const BLOCKS_DETAIL: &str = "/cryptarchia/blocks/:id";
 pub const BLOCKS_STREAM: &str = "/cryptarchia/events/blocks/stream";
 
