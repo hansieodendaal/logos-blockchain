@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-config"
-version = "0.1.2"
+version = "0.1.3-rc.4"
 dependencies = [
  "hex",
  "logos-blockchain-core",
@@ -4704,14 +4704,14 @@ dependencies = [
 
 [[package]]
 name = "logos-blockchain-log-targets"
-version = "0.1.2"
+version = "0.1.3-rc.4"
 dependencies = [
  "logos-blockchain-log-targets-macros",
 ]
 
 [[package]]
 name = "logos-blockchain-log-targets-macros"
-version = "0.1.2"
+version = "0.1.3-rc.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8113,7 +8113,7 @@ dependencies = [
 
 [[package]]
 name = "testing-framework"
-version = "0.1.2"
+version = "0.1.3-rc.4"
 dependencies = [
  "anyhow",
  "async-trait",
