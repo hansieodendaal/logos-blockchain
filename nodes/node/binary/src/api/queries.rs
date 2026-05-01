@@ -39,8 +39,11 @@ pub struct BlocksStreamQuery {
     /// Sort direction. Defaults to descending (`true`).
     #[serde(default)]
     pub descending: Option<bool>,
-    /// Maximum number of blocks to return. Defaults to `100`, maximum
-    /// `630_720_000`.
+    /// The maximum number of actual blocks to return. If omitted:
+    /// - explicit bounded slot range (`slot_from` and `slot_to`) defaults to
+    ///   the server maximum
+    /// - otherwise defaults to `100`
+    ///   Maximum `630_720_000`.
     #[serde(default)]
     #[validate(custom(function = "validate_blocks_limit"))]
     #[param(minimum = 1, maximum = 630_720_000, default = 100, example = 100)]
@@ -94,9 +97,13 @@ impl TryFrom<BlocksStreamQuery> for BlocksStreamRequest {
     fn try_from(query: BlocksStreamQuery) -> Result<Self, Self::Error> {
         query.validate()?;
 
-        let blocks_limit = query
-            .blocks_limit
-            .unwrap_or(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM);
+        let blocks_limit = query.blocks_limit.unwrap_or_else(|| {
+            if query.slot_from.is_some() && query.slot_to.is_some() {
+                MAX_BLOCKS_STREAM_BLOCKS
+            } else {
+                DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM
+            }
+        });
 
         let server_batch_size = query
             .server_batch_size
@@ -212,7 +219,7 @@ mod tests {
 
         assert_eq!(
             request.blocks_limit,
-            NonZero::new(DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM).unwrap()
+            NonZero::new(MAX_BLOCKS_STREAM_BLOCKS).unwrap()
         );
         assert_eq!(request.slot_from, Some(10));
         assert_eq!(request.slot_to, Some(20));
