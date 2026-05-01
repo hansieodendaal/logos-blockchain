@@ -41,9 +41,8 @@ pub struct BlocksStreamQuery {
     pub descending: Option<bool>,
     /// The maximum number of actual blocks to return. If omitted:
     /// - explicit bounded slot range (`slot_from` and `slot_to`) defaults to
-    ///   the server maximum
-    /// - otherwise defaults to `100`
-    ///   Maximum `630_720_000`.
+    ///   the server maximum (`630_720_000`);
+    /// - otherwise defaults to `100`.
     #[serde(default)]
     #[validate(custom(function = "validate_blocks_limit"))]
     #[param(minimum = 1, maximum = 630_720_000, default = 100, example = 100)]
