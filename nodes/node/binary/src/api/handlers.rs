@@ -66,6 +66,7 @@ use crate::api::{
     },
 };
 
+#[derive(Debug)]
 struct ResolvedBlocksStreamWindow {
     slot_from: Slot,
     slot_to: Slot,
@@ -94,6 +95,9 @@ fn resolve_blocks_stream_window(
     request: &BlocksStreamRequest,
     chain_info: &lb_chain_service::CryptarchiaInfo,
 ) -> Result<ResolvedBlocksStreamWindow, String> {
+    const ASCENDING_ESTIMATED_WINDOW_NOM: u64 = 2;
+    const ASCENDING_ESTIMATED_WINDOW_DEM: u64 = 3;
+
     let max_slot_to = if request.immutable_only {
         chain_info.lib_slot
     } else {
@@ -115,15 +119,22 @@ fn resolve_blocks_stream_window(
 
     let slot_from = request.slot_from.map_or_else(
         || {
-            if request.descending || request.immutable_only || slot_to <= chain_info.lib_slot {
+            if request.descending {
                 Slot::new(0)
             } else {
                 let average_slots_per_block = chain_info
                     .slot
                     .into_inner()
                     .div_ceil(chain_info.height.max(1));
+
+                // For ascending streams without an explicit slot_from, estimate a narrow
+                // window ending near slot_to. This prioritizes ending close to slot_to over
+                // guaranteeing blocks_limit returned blocks.
                 let estimated_slot_span = (request.blocks_limit.get() as u64)
-                    .saturating_mul(average_slots_per_block.max(1));
+                    .saturating_mul(average_slots_per_block.max(1))
+                    .saturating_mul(ASCENDING_ESTIMATED_WINDOW_NOM)
+                    / ASCENDING_ESTIMATED_WINDOW_DEM;
+
                 slot_to.saturating_sub(Slot::new(estimated_slot_span))
             }
         },
@@ -1366,5 +1377,197 @@ pub mod wallet {
             let sig = wallet.sign_tx_with_zk(req.tx_hash, req.pks).await?;
             Ok::<_, DynError>(WalletSignTxZkResponseBody { sig })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use lb_chain_service::{CryptarchiaInfo, Slot};
+    use lb_core::header::HeaderId;
+    use lb_cryptarchia_engine::State;
+
+    use crate::api::{handlers::resolve_blocks_stream_window, queries::BlocksStreamRequest};
+
+    const TIP_SLOT: u64 = 100_000;
+    const LIB_SLOT: u64 = 80_000;
+    const HEIGHT: u64 = 500;
+    const DEFAULT_LIMIT: usize = 100;
+    const DEFAULT_BATCH_SIZE: usize = 100;
+
+    fn chain_info() -> CryptarchiaInfo {
+        CryptarchiaInfo {
+            lib: HeaderId::from([2; 32]),
+            slot: Slot::new(TIP_SLOT),
+            lib_slot: Slot::new(LIB_SLOT),
+            height: HEIGHT,
+            tip: HeaderId::from([3; 32]),
+            mode: State::Online,
+        }
+    }
+
+    fn small_chain() -> CryptarchiaInfo {
+        CryptarchiaInfo {
+            lib: HeaderId::from([2; 32]),
+            slot: Slot::new(100),
+            lib_slot: Slot::new(0),
+            height: 1,
+            tip: HeaderId::from([3; 32]),
+            mode: State::Online,
+        }
+    }
+
+    fn request(
+        slot_from: Option<u64>,
+        slot_to: Option<u64>,
+        descending: bool,
+        blocks_limit: usize,
+        immutable_only: bool,
+    ) -> BlocksStreamRequest {
+        BlocksStreamRequest {
+            slot_from,
+            slot_to,
+            descending,
+            blocks_limit: NonZeroUsize::new(blocks_limit).unwrap(),
+            server_batch_size: NonZeroUsize::new(DEFAULT_BATCH_SIZE).unwrap(),
+            immutable_only,
+        }
+    }
+
+    #[test]
+    fn default_slot_to_is_tip() {
+        let window = resolve_blocks_stream_window(
+            &request(None, None, true, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_to, Slot::new(TIP_SLOT));
+    }
+
+    #[test]
+    fn immutable_only_default_slot_to_is_lib() {
+        let window = resolve_blocks_stream_window(
+            &request(None, None, true, DEFAULT_LIMIT, true),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_to, Slot::new(LIB_SLOT));
+    }
+
+    #[test]
+    fn rejects_slot_to_above_tip() {
+        let err = resolve_blocks_stream_window(
+            &request(None, Some(TIP_SLOT + 1), true, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("'slot_to' must be <= tip_slot"));
+    }
+
+    #[test]
+    fn rejects_slot_to_above_lib_when_immutable_only() {
+        let err = resolve_blocks_stream_window(
+            &request(None, Some(LIB_SLOT + 1), true, DEFAULT_LIMIT, true),
+            &chain_info(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("'slot_to' must be <= lib_slot"));
+    }
+
+    #[test]
+    fn accepts_slot_to_equal_to_tip() {
+        assert!(
+            resolve_blocks_stream_window(
+                &request(None, Some(TIP_SLOT), true, DEFAULT_LIMIT, false),
+                &chain_info()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_slot_to_equal_to_lib_when_immutable_only() {
+        assert!(
+            resolve_blocks_stream_window(
+                &request(None, Some(LIB_SLOT), true, DEFAULT_LIMIT, true),
+                &chain_info()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn descending_without_slot_from_defaults_to_zero() {
+        let window = resolve_blocks_stream_window(
+            &request(None, None, true, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_from, Slot::new(0));
+    }
+
+    #[test]
+    fn explicit_slot_from_is_used_for_descending() {
+        let window = resolve_blocks_stream_window(
+            &request(Some(2_000), Some(9_000), true, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_from, Slot::new(2_000));
+        assert_eq!(window.slot_to, Slot::new(9_000));
+    }
+
+    #[test]
+    fn explicit_slot_from_is_used_for_ascending() {
+        let window = resolve_blocks_stream_window(
+            &request(Some(3_000), Some(9_000), false, 50, false),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_from, Slot::new(3_000));
+        assert_eq!(window.slot_to, Slot::new(9_000));
+    }
+
+    #[test]
+    fn ascending_without_slot_from_estimates_lower_bound_from_slot_to() {
+        let average_slots_per_block = TIP_SLOT.div_ceil(500); // 200
+        // The explicit `2 / 3` locks the behaviour in.
+        let estimated_span = DEFAULT_LIMIT as u64 * average_slots_per_block * 2 / 3; // 13_333
+        let slot_from = TIP_SLOT - estimated_span; // 86_667
+        let window = resolve_blocks_stream_window(
+            &request(None, Some(TIP_SLOT), false, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap();
+
+        assert_eq!(window.slot_from, Slot::new(slot_from));
+        assert_eq!(window.slot_to, Slot::new(TIP_SLOT));
+    }
+
+    #[test]
+    fn ascending_without_slot_from_estimate_saturates_to_zero() {
+        let request = request(None, Some(50), false, 1_000, false);
+        let window = resolve_blocks_stream_window(&request, &small_chain()).unwrap();
+
+        assert_eq!(window.slot_from, Slot::new(0));
+    }
+
+    #[test]
+    fn rejects_explicit_slot_from_above_slot_to() {
+        let err = resolve_blocks_stream_window(
+            &request(Some(9_000), Some(8_000), true, DEFAULT_LIMIT, false),
+            &chain_info(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("'slot_from' must be <= 'slot_to'"));
     }
 }

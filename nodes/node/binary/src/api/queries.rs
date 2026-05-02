@@ -24,10 +24,11 @@ pub struct BlockRangeQuery {
 #[into_params(parameter_in = Query)]
 pub struct BlocksStreamQuery {
     /// If omitted, the server chooses a default lower bound.
-    /// For descending streams this means no explicit lower bound.
-    /// For ascending streams ending above LIB, the lower bound may be estimated
-    /// from recent chain spacing and `blocks_limit`, so fewer than
-    /// `blocks_limit` blocks may be returned.
+    /// For descending streams this is `slot 0` (bounded by `blocks_limit`).
+    /// For ascending streams, `slot_from` is estimated from the average
+    /// slots-per-block and `blocks_limit`, biased so the stream ends near
+    /// `slot_to`. This may return fewer than `blocks_limit` blocks; callers
+    /// can refine by specifying `slot_from` explicitly.
     #[serde(default)]
     #[param(minimum = 0)]
     pub slot_from: Option<u64>,
