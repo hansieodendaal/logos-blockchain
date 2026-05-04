@@ -689,7 +689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core 0.4.5",
+ "axum-core",
  "bytes",
  "futures-util",
  "http 1.4.0",
@@ -698,7 +698,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.7.3",
+ "matchit",
  "memchr",
  "mime",
  "percent-encoding",
@@ -708,36 +708,6 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tower 0.5.3",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
-name = "axum"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
-dependencies = [
- "axum-core 0.5.6",
- "bytes",
- "futures-util",
- "http 1.4.0",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "itoa",
- "matchit 0.8.4",
- "memchr",
- "mime",
- "percent-encoding",
- "pin-project-lite",
- "serde_core",
- "serde_json",
- "serde_path_to_error",
  "sync_wrapper",
  "tokio",
  "tower 0.5.3",
@@ -760,24 +730,6 @@ dependencies = [
  "mime",
  "pin-project-lite",
  "rustversion",
- "sync_wrapper",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
-name = "axum-core"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
-dependencies = [
- "bytes",
- "futures-core",
- "http 1.4.0",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
  "sync_wrapper",
  "tower-layer",
  "tower-service",
@@ -989,7 +941,6 @@ version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "befbfd072a8e81c02f8c507aefce431fe5e7d051f83d48a23ffc9b9fe5a11799"
 dependencies = [
- "clap",
  "heck",
  "indexmap 2.14.0",
  "log",
@@ -1061,7 +1012,7 @@ version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-blockchain-testing.git?tag=dev_snapshot_2026_04_23_4854942d#4854942dcedd226f6adbe9970afc4661dfdb1e6d"
 dependencies = [
  "anyhow",
- "axum 0.7.9",
+ "axum",
  "cfgsync-artifacts",
  "reqwest",
  "serde",
@@ -3411,7 +3362,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower 0.5.3",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
 ]
 
@@ -3465,22 +3416,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "lb_config"
-version = "0.1.2"
-dependencies = [
- "hex",
- "logos-blockchain-core",
- "logos-blockchain-groth16",
- "logos-blockchain-key-management-system-service",
- "logos-blockchain-libp2p",
- "logos-blockchain-node",
- "logos-blockchain-utils",
- "num-bigint",
- "rand 0.8.6",
- "time",
-]
 
 [[package]]
 name = "leb128fmt"
@@ -4057,7 +3992,7 @@ name = "logos-blockchain-api-service"
 version = "0.1.2"
 dependencies = [
  "async-trait",
- "axum 0.7.9",
+ "axum",
  "bytes",
  "futures",
  "hyper",
@@ -4241,7 +4176,7 @@ dependencies = [
  "serde_with",
  "tempfile",
  "test-log",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4273,11 +4208,11 @@ dependencies = [
 name = "logos-blockchain-cfgsync"
 version = "0.1.2"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "blake2",
  "clap",
  "hex",
- "lb_config",
+ "logos-blockchain-config",
  "logos-blockchain-core",
  "logos-blockchain-groth16",
  "logos-blockchain-key-management-system-service",
@@ -4336,7 +4271,7 @@ dependencies = [
  "overwatch",
  "rand 0.8.6",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -4364,7 +4299,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_with",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4399,7 +4334,7 @@ dependencies = [
  "serde_with",
  "strum",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -4452,8 +4387,24 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "url",
+]
+
+[[package]]
+name = "logos-blockchain-config"
+version = "0.1.2"
+dependencies = [
+ "hex",
+ "logos-blockchain-core",
+ "logos-blockchain-groth16",
+ "logos-blockchain-key-management-system-service",
+ "logos-blockchain-libp2p",
+ "logos-blockchain-node",
+ "logos-blockchain-utils",
+ "num-bigint",
+ "rand 0.8.6",
+ "time",
 ]
 
 [[package]]
@@ -4531,7 +4482,7 @@ name = "logos-blockchain-demo-archiver"
 version = "0.1.2"
 dependencies = [
  "async-stream",
- "axum 0.8.9",
+ "axum",
  "clap",
  "futures",
  "hex",
@@ -4548,7 +4499,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tower-http 0.6.8",
+ "tower-http",
  "url",
 ]
 
@@ -4556,7 +4507,7 @@ dependencies = [
 name = "logos-blockchain-demo-sequencer"
 version = "0.1.2"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "hex",
  "logos-blockchain-common-http-client",
  "logos-blockchain-core",
@@ -4570,7 +4521,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
@@ -4579,7 +4530,7 @@ dependencies = [
 name = "logos-blockchain-faucet"
 version = "0.1.2"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "clap",
  "hex",
  "logos-blockchain-common-http-client",
@@ -4614,7 +4565,7 @@ dependencies = [
 name = "logos-blockchain-http-api-common"
 version = "0.1.2"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "logos-blockchain-core",
  "logos-blockchain-key-management-system-keys",
  "logos-blockchain-tracing",
@@ -4808,7 +4759,7 @@ name = "logos-blockchain-node"
 version = "0.1.2"
 dependencies = [
  "async-trait",
- "axum 0.7.9",
+ "axum",
  "cfg-if",
  "clap",
  "color-eyre",
@@ -4859,7 +4810,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower 0.4.13",
- "tower-http 0.5.2",
+ "tower-http",
  "tracing",
  "url",
  "utoipa",
@@ -4954,7 +4905,7 @@ dependencies = [
  "overwatch-derive",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -4973,7 +4924,7 @@ dependencies = [
  "rocksdb",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -5000,12 +4951,12 @@ dependencies = [
  "futures",
  "futures-util",
  "hex",
- "lb_config",
  "libp2p",
  "logos-blockchain-api-service",
  "logos-blockchain-chain-broadcast-service",
  "logos-blockchain-chain-service",
  "logos-blockchain-common-http-client",
+ "logos-blockchain-config",
  "logos-blockchain-core",
  "logos-blockchain-cryptarchia-engine",
  "logos-blockchain-groth16",
@@ -5032,9 +4983,9 @@ dependencies = [
  "strum",
  "strum_macros",
  "tempfile",
+ "testing-framework",
  "testing-framework-core",
  "testing-framework-runner-local",
- "testing_framework",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -5155,7 +5106,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -5249,7 +5200,7 @@ dependencies = [
  "logos-blockchain-wallet",
  "overwatch",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -5354,12 +5305,6 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "matchit"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "matrixmultiply"
@@ -7120,7 +7065,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower 0.5.3",
- "tower-http 0.6.8",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -7683,9 +7628,6 @@ version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
 dependencies = [
- "futures-executor",
- "futures-util",
- "log",
  "once_cell",
  "parking_lot",
  "scc",
@@ -8178,6 +8120,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "testing-framework"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cfgsync-adapter",
+ "cfgsync-artifacts",
+ "futures",
+ "hex",
+ "logos-blockchain-blend-service",
+ "logos-blockchain-chain-leader-service",
+ "logos-blockchain-chain-network-service",
+ "logos-blockchain-chain-service",
+ "logos-blockchain-common-http-client",
+ "logos-blockchain-config",
+ "logos-blockchain-core",
+ "logos-blockchain-cryptarchia-engine",
+ "logos-blockchain-cryptarchia-sync",
+ "logos-blockchain-groth16",
+ "logos-blockchain-http-api-common",
+ "logos-blockchain-key-management-system-service",
+ "logos-blockchain-ledger",
+ "logos-blockchain-libp2p",
+ "logos-blockchain-network-service",
+ "logos-blockchain-node",
+ "logos-blockchain-time-service",
+ "logos-blockchain-tx-service",
+ "logos-blockchain-utils",
+ "num-bigint",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sysinfo",
+ "tempfile",
+ "testing-framework-core",
+ "testing-framework-runner-compose",
+ "testing-framework-runner-k8s",
+ "testing-framework-runner-local",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "testing-framework-core"
 version = "0.1.0"
 source = "git+https://github.com/logos-blockchain/logos-blockchain-testing.git?tag=dev_snapshot_2026_04_23_4854942d#4854942dcedd226f6adbe9970afc4661dfdb1e6d"
@@ -8261,54 +8251,6 @@ dependencies = [
  "tokio-retry",
  "tracing",
  "which 6.0.3",
-]
-
-[[package]]
-name = "testing_framework"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "cfgsync-adapter",
- "cfgsync-artifacts",
- "futures",
- "hex",
- "lb_config",
- "logos-blockchain-blend-service",
- "logos-blockchain-chain-leader-service",
- "logos-blockchain-chain-network-service",
- "logos-blockchain-chain-service",
- "logos-blockchain-common-http-client",
- "logos-blockchain-core",
- "logos-blockchain-cryptarchia-engine",
- "logos-blockchain-cryptarchia-sync",
- "logos-blockchain-groth16",
- "logos-blockchain-http-api-common",
- "logos-blockchain-key-management-system-service",
- "logos-blockchain-ledger",
- "logos-blockchain-libp2p",
- "logos-blockchain-network-service",
- "logos-blockchain-node",
- "logos-blockchain-time-service",
- "logos-blockchain-tx-service",
- "logos-blockchain-utils",
- "num-bigint",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sysinfo",
- "tempfile",
- "testing-framework-core",
- "testing-framework-runner-compose",
- "testing-framework-runner-k8s",
- "testing-framework-runner-local",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -8626,7 +8568,7 @@ checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
 dependencies = [
  "async-stream",
  "async-trait",
- "axum 0.7.9",
+ "axum",
  "base64 0.22.1",
  "bytes",
  "h2",
@@ -8726,24 +8668,6 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e9cd434a998747dd2c4276bc96ee2e0c7a2eadf3cae88e52be55a05fa9053f5"
-dependencies = [
- "bitflags 2.11.1",
- "bytes",
- "http 1.4.0",
- "http-body",
- "http-body-util",
- "pin-project-lite",
- "tokio",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "tower-http"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
@@ -8754,9 +8678,11 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body",
+ "http-body-util",
  "iri-string",
  "mime",
  "pin-project-lite",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -9127,7 +9053,7 @@ version = "7.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "943e0ff606c6d57d410fd5663a4d7c074ab2c5f14ab903b9514565e59fa1189e"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "mime_guess",
  "regex",
  "reqwest",
