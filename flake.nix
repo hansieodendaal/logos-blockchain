@@ -55,7 +55,7 @@
           commonArgs = {
             pname = "logos-blockchain-c";
             cargoExtraArgs = "-p logos-blockchain-c";
-            version = "0.1.2";
+            version = "0.1.3-rc.5";
 
             inherit src;
 
