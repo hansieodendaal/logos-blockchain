@@ -1,7 +1,5 @@
 use std::num::{NonZero, NonZeroUsize};
 
-use axum::response::{IntoResponse, Response};
-use http::StatusCode;
 use lb_http_api_common::{
     DEFAULT_BLOCKS_STREAM_CHUNK_SIZE, DEFAULT_NUMBER_OF_BLOCKS_TO_STREAM, MAX_BLOCKS_STREAM_BLOCKS,
     MAX_BLOCKS_STREAM_CHUNK_SIZE,
@@ -9,6 +7,8 @@ use lb_http_api_common::{
 use serde::Deserialize;
 use utoipa::IntoParams;
 use validator::Validate;
+
+use crate::api::errors::BlocksStreamRequestError;
 
 #[derive(IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -20,6 +20,9 @@ pub struct BlockRangeQuery {
     pub slot_to: usize,
 }
 
+/// Query parameters for the blocks stream endpoint, with validation and
+/// `OpenAPI` schema generation. Note: Literals in `param` are duplicated due to
+/// utoipa attribute limitations.
 #[derive(IntoParams, Deserialize, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct BlocksStreamQuery {
@@ -143,20 +146,6 @@ pub struct BlocksStreamRequest {
     pub server_batch_size: NonZero<usize>,
     /// When true, include only immutable blocks.
     pub immutable_only: bool,
-}
-
-impl IntoResponse for BlocksStreamRequestError {
-    fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BlocksStreamRequestError {
-    #[error("invalid query: {0}")]
-    Validation(#[from] validator::ValidationErrors),
-    #[error("'slot_from' must be <= 'slot_to', got slot_from={slot_from}, slot_to={slot_to}")]
-    InvalidSlotRange { slot_from: u64, slot_to: u64 },
 }
 
 #[cfg(test)]

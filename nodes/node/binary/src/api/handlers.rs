@@ -8,7 +8,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
 use futures::FutureExt as _;
 use lb_api_service::http::{
@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt as _;
 
 use crate::api::{
+    errors::{BlocksStreamHandlerError, BlocksStreamWindowError},
     openapi::schema,
     queries::{BlockRangeQuery, BlocksStreamQuery, BlocksStreamRequest},
     responses::{self, overwatch::get_relay_or_500},
@@ -94,10 +95,7 @@ fn next_blocks_stream_cursor(
 fn resolve_blocks_stream_window(
     request: &BlocksStreamRequest,
     chain_info: &lb_chain_service::CryptarchiaInfo,
-) -> Result<ResolvedBlocksStreamWindow, String> {
-    const ASCENDING_ESTIMATED_WINDOW_NOM: u64 = 2;
-    const ASCENDING_ESTIMATED_WINDOW_DEM: u64 = 3;
-
+) -> Result<ResolvedBlocksStreamWindow, BlocksStreamWindowError> {
     let max_slot_to = if request.immutable_only {
         chain_info.lib_slot
     } else {
@@ -110,45 +108,53 @@ fn resolve_blocks_stream_window(
         } else {
             "tip_slot"
         };
-        return Err(format!(
-            "'slot_to' must be <= {anchor}, got slot_to={}, {anchor}={}",
-            slot_to.into_inner(),
-            max_slot_to.into_inner()
-        ));
+        return Err(BlocksStreamWindowError::SlotToAboveAnchor {
+            anchor,
+            slot_to: slot_to.into_inner(),
+            max_slot_to: max_slot_to.into_inner(),
+        });
     }
 
     let slot_from = request.slot_from.map_or_else(
-        || {
-            if request.descending {
-                Slot::new(0)
-            } else {
-                let average_slots_per_block = chain_info
-                    .slot
-                    .into_inner()
-                    .div_ceil(chain_info.height.max(1));
-
-                // For ascending streams without an explicit slot_from, estimate a narrow
-                // window ending near slot_to. This prioritizes ending close to slot_to over
-                // guaranteeing blocks_limit returned blocks.
-                let estimated_slot_span = (request.blocks_limit.get() as u64)
-                    .saturating_mul(average_slots_per_block.max(1))
-                    .saturating_mul(ASCENDING_ESTIMATED_WINDOW_NOM)
-                    / ASCENDING_ESTIMATED_WINDOW_DEM;
-
-                slot_to.saturating_sub(Slot::new(estimated_slot_span))
-            }
-        },
+        || default_slot_from_for_blocks_stream(request, chain_info, slot_to),
         Slot::new,
     );
     if slot_from > slot_to {
-        return Err(format!(
-            "'slot_from' must be <= 'slot_to', got slot_from={}, slot_to={}",
-            slot_from.into_inner(),
-            slot_to.into_inner()
-        ));
+        return Err(BlocksStreamWindowError::SlotFromAboveSlotTo {
+            slot_from: slot_from.into_inner(),
+            slot_to: slot_to.into_inner(),
+        });
     }
 
     Ok(ResolvedBlocksStreamWindow { slot_from, slot_to })
+}
+
+fn default_slot_from_for_blocks_stream(
+    request: &BlocksStreamRequest,
+    chain_info: &lb_chain_service::CryptarchiaInfo,
+    slot_to: Slot,
+) -> Slot {
+    const ASCENDING_ESTIMATED_WINDOW_NOMINATOR: u64 = 2;
+    const ASCENDING_ESTIMATED_WINDOW_DENOMINATOR: u64 = 3;
+
+    if request.descending {
+        return Slot::new(0);
+    }
+
+    let average_slots_per_block = chain_info
+        .slot
+        .into_inner()
+        .div_ceil(chain_info.height.max(1));
+
+    // For ascending streams without an explicit slot_from, estimate a narrow
+    // window ending near slot_to. This prioritizes ending close to slot_to over
+    // guaranteeing blocks_limit returned blocks.
+    let estimated_slot_span = (request.blocks_limit.get() as u64)
+        .saturating_mul(average_slots_per_block.max(1))
+        .saturating_mul(ASCENDING_ESTIMATED_WINDOW_NOMINATOR)
+        / ASCENDING_ESTIMATED_WINDOW_DENOMINATOR;
+
+    slot_to.saturating_sub(Slot::new(estimated_slot_span))
 }
 
 async fn fetch_blocks_stream_chunk<StorageBackend, RuntimeServiceId>(
@@ -263,7 +269,7 @@ where
                 (cursor, state.slot_to)
             };
 
-            let next_chunk = match fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
+            let fetched_blocks = fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
                 &state.handle,
                 &state.chain_info,
                 chunk_from,
@@ -272,8 +278,8 @@ where
                 request_limit,
                 state.immutable_only,
             )
-            .await
-            {
+            .await;
+            let next_chunk = match fetched_blocks {
                 Ok(next_chunk) => next_chunk,
                 Err(error) => {
                     // Terminal error: avoid re-emitting the same error forever.
@@ -952,31 +958,6 @@ where
     }
 }
 
-/// Error type for blocks stream handler. We need a custom error type to
-/// distinguish between different error cases and return appropriate HTTP status
-/// codes.
-#[derive(Debug, thiserror::Error)]
-pub enum BlocksStreamHandlerError {
-    #[error(transparent)]
-    Query(#[from] crate::api::queries::BlocksStreamRequestError),
-    #[error("{0}")]
-    InvalidWindow(String),
-    #[error(transparent)]
-    Internal(#[from] DynError),
-}
-
-impl IntoResponse for BlocksStreamHandlerError {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Query(err) => err.into_response(), // typically 400
-            Self::InvalidWindow(message) => (StatusCode::BAD_REQUEST, message).into_response(),
-            Self::Internal(err) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        }
-    }
-}
-
 #[utoipa::path(
     get,
     path = paths::BLOCKS_STREAM,
@@ -1011,8 +992,7 @@ where
 
     let chain_info = consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await?;
 
-    let resolved_window = resolve_blocks_stream_window(&request, &chain_info)
-        .map_err(BlocksStreamHandlerError::InvalidWindow)?;
+    let resolved_window = resolve_blocks_stream_window(&request, &chain_info)?;
     let slot_from = resolved_window.slot_from;
     let slot_to = resolved_window.slot_to;
 
@@ -1388,7 +1368,10 @@ mod tests {
     use lb_core::header::HeaderId;
     use lb_cryptarchia_engine::State;
 
-    use crate::api::{handlers::resolve_blocks_stream_window, queries::BlocksStreamRequest};
+    use crate::api::{
+        errors::BlocksStreamWindowError, handlers::resolve_blocks_stream_window,
+        queries::BlocksStreamRequest,
+    };
 
     const TIP_SLOT: u64 = 100_000;
     const LIB_SLOT: u64 = 80_000;
@@ -1465,7 +1448,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("'slot_to' must be <= tip_slot"));
+        assert!(matches!(
+            err,
+            BlocksStreamWindowError::SlotToAboveAnchor { .. }
+        ));
     }
 
     #[test]
@@ -1476,7 +1462,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("'slot_to' must be <= lib_slot"));
+        assert!(matches!(
+            err,
+            BlocksStreamWindowError::SlotToAboveAnchor { .. }
+        ));
     }
 
     #[test]
@@ -1568,6 +1557,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("'slot_from' must be <= 'slot_to'"));
+        assert!(matches!(
+            err,
+            BlocksStreamWindowError::SlotFromAboveSlotTo { .. }
+        ));
     }
 }

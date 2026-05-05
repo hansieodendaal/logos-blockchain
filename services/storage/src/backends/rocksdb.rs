@@ -6,6 +6,7 @@ use rocksdb::{DB, Direction, Error, IteratorMode, Options};
 use serde::{Deserialize, Serialize};
 
 use super::{StorageBackend, StorageTransaction};
+use crate::api::backend::rocksdb::utils::key_bytes_raw;
 
 /// Rocks backend setting
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,9 +168,8 @@ impl StorageBackend for RocksBackend {
         // upper bound manually.
 
         // Prepare the optional start and end keys by appending them to the prefix.
-        let start_key =
-            start_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
-        let end_key = end_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
+        let start_key = start_key.map(|k| key_bytes_raw(prefix, k));
+        let end_key = end_key.map(|k| key_bytes_raw(prefix, k));
 
         // Create an iterator starting from the prefix or the start key if provided.
         let iter = self.rocks.iterator(IteratorMode::From(
@@ -219,9 +219,8 @@ impl StorageBackend for RocksBackend {
     ) -> Result<Vec<Bytes>, <Self as StorageBackend>::Error> {
         let mut values = Vec::new();
 
-        let start_key =
-            start_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
-        let end_key = end_key.map(|k| prefix.iter().chain(k.iter()).copied().collect::<Vec<_>>());
+        let start_key = start_key.map(|k| key_bytes_raw(prefix, k));
+        let end_key = end_key.map(|k| key_bytes_raw(prefix, k));
 
         let iter = self.rocks.iterator(IteratorMode::From(
             end_key.as_ref().map_or(prefix, |to| to.as_slice()),

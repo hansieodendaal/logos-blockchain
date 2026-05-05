@@ -72,8 +72,8 @@ utoipa-swagger-ui = { features = ["axum", "vendored"], workspace = true }
 # axum related dependencies
 axum       = { features = ["http1", "http2", "json", "query", "tokio"], workspace = true }
 time       = { workspace = true }
-tower      = { default-features = false, features = ["limit"], version = "0.4" }
-tower-http = { default-features = false, features = ["cors", "limit", "timeout", "trace"], version = "0.5" }
+tower      = { features = ["limit"], workspace = true }
+tower-http = { features = ["cors", "limit", "timeout", "trace"], workspace = true }
 validator  = { features = ["derive"], version = "0.20.0" }
 
 # Jemalloc

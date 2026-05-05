@@ -32,7 +32,10 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
 
-use crate::http::consensus::{Cryptarchia, cryptarchia_ledger_state};
+use crate::http::{
+    consensus::{Cryptarchia, cryptarchia_ledger_state},
+    errors::BlockSlotRangeError,
+};
 
 /// A block along with the current chain state (tip and LIB) at the time it was
 /// processed. This allows clients to track the canonical chain without needing
@@ -350,24 +353,22 @@ fn validate_blocks_slot_range(
     slot_to: Slot,
     immutable_only: bool,
     chain_info: &CryptarchiaInfo,
-) -> Result<(), super::DynError> {
+) -> Result<(), BlockSlotRangeError> {
     if slot_to < slot_from {
-        return Err("slot_to must be greater than or equal to slot_from".into());
+        return Err(BlockSlotRangeError::InvalidRange { slot_from, slot_to });
     }
     if immutable_only {
         if slot_to > chain_info.lib_slot {
-            return Err(format!(
-                "slot_to must be <= lib_slot when immutable_only=true, got slot_to={slot_to:?}, lib_slot={:?}",
-                chain_info.lib_slot
-            )
-            .into());
+            return Err(BlockSlotRangeError::SlotToExceedsLibSlot {
+                slot_to,
+                lib_slot: chain_info.lib_slot,
+            });
         }
     } else if slot_to > chain_info.slot {
-        return Err(format!(
-            "slot_to must be <= tip_slot, got slot_to={slot_to:?}, tip_slot={:?}",
-            chain_info.slot
-        )
-        .into());
+        return Err(BlockSlotRangeError::SlotToExceedsTipSlot {
+            slot_to,
+            tip_slot: chain_info.slot,
+        });
     }
 
     Ok(())
@@ -538,7 +539,8 @@ where
         + AsServiceId<StorageService<StorageBackend, RuntimeServiceId>>
         + AsServiceId<Cryptarchia<RuntimeServiceId>>,
 {
-    validate_blocks_slot_range(slot_from, slot_to, immutable_only, chain_info)?;
+    validate_blocks_slot_range(slot_from, slot_to, immutable_only, chain_info)
+        .map_err(|e| Box::new(e) as super::DynError)?;
 
     let relay = handle
         .relay::<StorageService<StorageBackend, RuntimeServiceId>>()
@@ -556,66 +558,58 @@ where
     let mutable_slot_from = (chain_info.lib_slot + 1).max(slot_from);
     let has_mutable_range = !immutable_only && mutable_slot_from <= slot_to;
 
+    let fetch_mutable = |remaining: usize, descending: bool| {
+        let storage_adapter = storage_adapter.clone();
+        async move {
+            fetch_and_load_mutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                handle,
+                &storage_adapter,
+                chain_info,
+                mutable_slot_from,
+                slot_to,
+                remaining,
+                descending,
+            )
+            .await
+        }
+    };
+
+    let fetch_immutable = |remaining: usize, descending: bool| {
+        let storage_adapter = storage_adapter.clone();
+        async move {
+            fetch_and_load_immutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
+                handle,
+                &storage_adapter,
+                chain_info,
+                slot_from,
+                immutable_slot_to,
+                remaining,
+                descending,
+            )
+            .await
+        }
+    };
+
     if descending {
         if remaining > 0 && has_mutable_range {
-            let mutable_blocks =
-                fetch_and_load_mutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
-                    handle,
-                    &storage_adapter,
-                    chain_info,
-                    mutable_slot_from,
-                    slot_to,
-                    remaining,
-                    true,
-                )
-                .await?;
+            let mutable_blocks = fetch_mutable(remaining, true).await?;
             remaining = remaining.saturating_sub(mutable_blocks.len());
             blocks.extend(mutable_blocks);
         }
 
         if remaining > 0 && has_immutable_range {
-            let immutable_blocks =
-                fetch_and_load_immutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
-                    handle,
-                    &storage_adapter,
-                    chain_info,
-                    slot_from,
-                    immutable_slot_to,
-                    remaining,
-                    true,
-                )
-                .await?;
+            let immutable_blocks = fetch_immutable(remaining, true).await?;
             blocks.extend(immutable_blocks);
         }
     } else {
-        if has_immutable_range {
-            let immutable_blocks =
-                fetch_and_load_immutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
-                    handle,
-                    &storage_adapter,
-                    chain_info,
-                    slot_from,
-                    immutable_slot_to,
-                    remaining,
-                    false,
-                )
-                .await?;
+        if remaining > 0 && has_immutable_range {
+            let immutable_blocks = fetch_immutable(remaining, false).await?;
             remaining = remaining.saturating_sub(immutable_blocks.len());
             blocks.extend(immutable_blocks);
         }
 
         if remaining > 0 && has_mutable_range {
-            let mutable_blocks =
-                fetch_and_load_mutable_blocks::<Transaction, StorageBackend, RuntimeServiceId>(
-                    handle,
-                    &storage_adapter,
-                    chain_info,
-                    mutable_slot_from,
-                    slot_to,
-                    remaining,
-                    false,
-                )
-                .await?;
+            let mutable_blocks = fetch_mutable(remaining, false).await?;
             blocks.extend(mutable_blocks);
         }
     }
