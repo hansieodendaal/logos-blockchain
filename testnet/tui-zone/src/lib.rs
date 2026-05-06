@@ -117,12 +117,8 @@ async fn handle_event(
         } => {
             debug!("Inscription published, checkpoint saved");
             if let Some(msg) = AppMessage::from_bytes(&payload) {
-                // Our own publish — mark as ours and apply optimistically.
-                let owned = AppMessage {
-                    is_ours: true,
-                    ..msg
-                };
-                state.apply(owned);
+                state.mark_ours(msg.tx_uuid);
+                state.apply(msg);
                 ui::render_state(state);
                 ui::prompt();
             }
