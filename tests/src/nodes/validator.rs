@@ -28,8 +28,10 @@ use lb_node::{
         ApiConfig, CryptarchiaConfig, RunConfig, SdpConfig, StorageConfig, WalletConfig,
         api::serde::AxumBackendSettings,
         cryptarchia::serde::RequiredValues as CryptarchiaConfigRequiredValues,
-        deployment::DeploymentSettings, sdp::serde::RequiredValues as SdpConfigRequiredValues,
-        state::Config as StateConfig, tracing::serde as tracing,
+        deployment::DeploymentSettings,
+        sdp::serde::RequiredValues as SdpConfigRequiredValues,
+        state::Config as StateConfig,
+        tracing::serde::{self as tracing, logger::AppenderType},
         wallet::serde::RequiredValues as WalletConfigRequiredValues,
     },
 };
@@ -214,6 +216,7 @@ impl Validator {
                 file: Some(tracing::logger::FileConfig {
                     directory: dir.path().to_owned(),
                     prefix: Some(LOGS_PREFIX.into()),
+                    appender_type: AppenderType::Rolling,
                 }),
                 loki: None,
                 gelf: None,
@@ -300,7 +303,7 @@ impl Validator {
             loop {
                 let info = self.consensus_info(false).await;
                 println!("{info:?}");
-                if info.height >= target_height {
+                if info.cryptarchia_info.height >= target_height {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -423,7 +426,7 @@ impl Validator {
         res.unwrap().json::<Vec<HeaderId>>().await.unwrap()
     }
 
-    pub async fn consensus_info(&self, print: bool) -> CryptarchiaInfo {
+    pub async fn consensus_info(&self, print: bool) -> ChainServiceInfo {
         let res = self.get(CRYPTARCHIA_INFO).await;
         if print {
             println!("{res:?}");

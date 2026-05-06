@@ -46,16 +46,13 @@ const SIZES: &[usize] = &[
 // Helper fn to create an inscription `MantleTx`, no ledger inputs ot outputs.
 fn make_inscription_tx(payload_size: usize) -> MantleTx {
     let signing_key = Ed25519Key::from_bytes(&[1; 32]);
-    MantleTx {
-        ops: vec![Op::ChannelInscribe(InscriptionOp {
-            channel_id: ChannelId::from([0xAA; 32]),
-            inscription: vec![0xAB; payload_size],
-            parent: MsgId::from([0xBB; 32]),
-            signer: signing_key.public_key(),
-        })],
-        execution_gas_price: 100.into(),
-        storage_gas_price: 50.into(),
-    }
+    vec![Op::ChannelInscribe(InscriptionOp {
+        channel_id: ChannelId::from([0xAA; 32]),
+        inscription: vec![0xAB; payload_size],
+        parent: MsgId::from([0xBB; 32]),
+        signer: signing_key.public_key(),
+    })]
+    .into()
 }
 
 // Helper fn to create a `SignedMantleTx`.
@@ -133,7 +130,7 @@ fn bench_sign_b_zk_key_multi_sign_no_keys(bencher: Bencher) {
             let tx = make_inscription_tx(1);
             tx.hash()
         })
-        .bench_values(|txhash: TxHash| black_box(ZkKey::multi_sign(&[], &txhash.0).unwrap()));
+        .bench_values(|txhash: TxHash| black_box(ZkKey::multi_sign(&[], &txhash.to_fr()).unwrap()));
 }
 
 // Verify ops proofs

@@ -3,7 +3,7 @@ use std::{num::NonZero, pin::Pin};
 use async_trait::async_trait;
 use futures::{Stream, stream};
 use lb_common_http_client::{
-    ApiBlock, BlockInfo, CommonHttpClient, CryptarchiaInfo, Error, ProcessedBlockEvent, Slot,
+    ApiBlock, BlockInfo, ChainServiceInfo, CommonHttpClient, Error, ProcessedBlockEvent, Slot,
 };
 use lb_core::{
     header::HeaderId,
@@ -18,7 +18,7 @@ pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
 #[async_trait]
 pub trait Node {
-    async fn consensus_info(&self) -> Result<CryptarchiaInfo, Error>;
+    async fn consensus_info(&self) -> Result<ChainServiceInfo, Error>;
 
     async fn block_stream(&self) -> Result<BoxStream<ProcessedBlockEvent>, Error>;
 
@@ -73,7 +73,7 @@ impl NodeHttpClient {
 
 #[async_trait]
 impl Node for NodeHttpClient {
-    async fn consensus_info(&self) -> Result<CryptarchiaInfo, Error> {
+    async fn consensus_info(&self) -> Result<ChainServiceInfo, Error> {
         self.client.consensus_info(self.base_url.clone()).await
     }
 
@@ -143,7 +143,7 @@ impl Node for NodeHttpClient {
         Ok(Box::pin(stream::iter(
             transactions
                 .into_iter()
-                .flat_map(|tx| tx.mantle_tx.ops)
+                .flat_map(|tx| tx.mantle_tx.0)
                 .filter_map(move |op| op_to_zone_message(&op, channel_id)),
         )))
     }
@@ -169,7 +169,7 @@ impl Node for NodeHttpClient {
                 block
                     .transactions
                     .into_iter()
-                    .flat_map(|tx| tx.mantle_tx.ops)
+                    .flat_map(|tx| tx.mantle_tx.0)
                     .filter_map(move |op| op_to_zone_message(&op, channel_id))
                     .map(move |msg| (msg, slot))
             },

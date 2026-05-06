@@ -6,8 +6,7 @@ use crate::{
     block::Block,
     header::Header,
     mantle::{
-        MantleTx, Note, Op, OpProof, SignedMantleTx,
-        gas::GasPrice,
+        Note, Op, OpProof, SignedMantleTx,
         genesis_tx::{self, GenesisTx},
         ledger::{Inputs, Outputs},
         ops::{channel::inscribe::InscriptionOp, sdp::SDPDeclareOp, transfer::TransferOp},
@@ -1095,11 +1094,7 @@ impl GenesisBlockBuilder<WithAll> {
         .collect();
         let n = ops.len();
         let signed_tx = SignedMantleTx::new_unverified(
-            MantleTx {
-                ops,
-                execution_gas_price: GasPrice::new(0),
-                storage_gas_price: GasPrice::new(0),
-            },
+            ops.into(),
             vec![OpProof::Ed25519Sig(Ed25519Signature::zero()); n],
         );
         Ok(GenesisBlock::genesis(GenesisTx::from_tx(signed_tx)?))
@@ -1202,11 +1197,7 @@ mod tests {
         ops.extend(extra_ops);
         let n = ops.len();
         SignedMantleTx::new_unverified(
-            MantleTx {
-                ops,
-                execution_gas_price: GasPrice::new(0),
-                storage_gas_price: GasPrice::new(0),
-            },
+            ops.into(),
             vec![OpProof::Ed25519Sig(Ed25519Signature::from_bytes(&[0u8; 64])); n],
         )
     }
@@ -1512,7 +1503,7 @@ mod tests {
             .unwrap();
 
         let tx = block.transactions().next().unwrap();
-        let ops = &tx.mantle_tx().ops;
+        let ops = tx.mantle_tx().ops();
         assert!(matches!(ops[0], Op::Transfer(_)));
         assert!(matches!(ops[1], Op::ChannelInscribe(_)));
         assert!(matches!(ops[2], Op::SDPDeclare(_)));

@@ -583,7 +583,10 @@ impl TxState {
 
 #[cfg(test)]
 mod tests {
-    use lb_core::mantle::{MantleTx, Transaction as _};
+    use lb_core::mantle::{
+        MantleTx, Op::ChannelInscribe, Transaction as _, ops::channel::inscribe::InscriptionOp,
+    };
+    use lb_key_management_system_service::keys::Ed25519PublicKey;
 
     use super::*;
 
@@ -594,11 +597,12 @@ mod tests {
     }
 
     fn make_dummy_tx(data: u8) -> SignedMantleTx {
-        let mantle_tx = MantleTx {
-            ops: vec![],
-            storage_gas_price: 0.into(),
-            execution_gas_price: u64::from(data).into(),
-        };
+        let mantle_tx = MantleTx(vec![ChannelInscribe(InscriptionOp {
+            channel_id: [0u8; 32].into(),
+            inscription: vec![data],
+            parent: [0u8; 32].into(),
+            signer: Ed25519PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+        })]);
         SignedMantleTx {
             ops_proofs: vec![],
             mantle_tx,

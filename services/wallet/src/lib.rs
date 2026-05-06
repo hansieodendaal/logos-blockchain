@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _};
 use lb_chain_service::{
-    Epoch, LibUpdate, Slot,
+    ChainServiceInfo, Epoch, LibUpdate, Slot,
     api::{CryptarchiaServiceApi, CryptarchiaServiceData},
     storage::{StorageAdapter as _, adapters::StorageAdapter},
 };
@@ -314,12 +314,14 @@ where
             StorageAdapter::<Storage, Tx, RuntimeServiceId>::new(storage_relay).await;
 
         // Query chain service for current state using the API
-        let chain_info = cryptarchia_api.info().await?;
+        let ChainServiceInfo {
+            cryptarchia_info, ..
+        } = cryptarchia_api.info().await?;
 
         info!(
-            tip = ?chain_info.tip,
-            lib = ?chain_info.lib,
-            slot = ?chain_info.slot,
+            tip = ?cryptarchia_info.tip,
+            lib = ?cryptarchia_info.lib,
+            slot = ?cryptarchia_info.slot,
             "Wallet connecting to chain"
         );
 
@@ -336,7 +338,7 @@ where
         };
 
         // Initialize wallet from LIB and LIB LedgerState
-        let lib = chain_info.lib;
+        let lib = cryptarchia_info.lib;
 
         // Fetch the ledger state at LIB using the API
         let lib_ledger = cryptarchia_api
@@ -354,7 +356,7 @@ where
         let voucher_master_key_id = settings.voucher_master_key_id;
 
         Self::backfill_missing_blocks(
-            chain_info.tip,
+            cryptarchia_info.tip,
             &mut state,
             &storage_adapter,
             &cryptarchia_api,
@@ -400,8 +402,10 @@ where
         if let Some(tip) = msg_tip {
             Ok(tip)
         } else {
-            let info = cryptarchia.info().await?;
-            Ok(info.tip)
+            let ChainServiceInfo {
+                cryptarchia_info, ..
+            } = cryptarchia.info().await?;
+            Ok(cryptarchia_info.tip)
         }
     }
 
@@ -748,7 +752,7 @@ where
         let tx_hash = mantle_tx.hash();
 
         let mut ops_proofs = Vec::new();
-        for (i, op) in mantle_tx.ops.iter().enumerate() {
+        for (i, op) in mantle_tx.ops().iter().enumerate() {
             let proof = match op {
                 Op::ChannelInscribe(inscribe_op) => {
                     Self::sign_inscription(tx_hash, inscribe_op, kms).await?
@@ -836,7 +840,7 @@ where
             .map(|pk| hex::encode(lb_groth16::fr_to_bytes(&pk.into_inner())))
             .collect();
 
-        let payload = PayloadEncoding::Zk(tx_hash.into());
+        let payload = PayloadEncoding::Zk(tx_hash.to_fr());
         let signature = kms
             .sign_multiple(key_ids, payload)
             .await
@@ -877,7 +881,7 @@ where
         Ok(Groth16LeaderClaimProof::prove(LeaderClaimPrivate::new(
             LeaderClaimPublic {
                 voucher_root: rewards_root.into(),
-                mantle_tx_hash: tx_hash.into(),
+                mantle_tx_hash: tx_hash.to_fr(),
             },
             path,
             voucher_secret,

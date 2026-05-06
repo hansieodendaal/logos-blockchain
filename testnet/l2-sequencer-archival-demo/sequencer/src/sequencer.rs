@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fs, io, path::Path, time::Duration};
 
-use lb_common_http_client::CommonHttpClient;
+use lb_common_http_client::{ChainServiceInfo, CommonHttpClient};
 use lb_core::{
     header::HeaderId,
     mantle::{
@@ -165,11 +165,7 @@ impl Sequencer {
             signer: verifying_key,
         };
 
-        let inscribe_tx = MantleTx {
-            ops: vec![Op::ChannelInscribe(inscribe_op)],
-            storage_gas_price: 0.into(),
-            execution_gas_price: 0.into(),
-        };
+        let inscribe_tx = MantleTx(vec![Op::ChannelInscribe(inscribe_op)]);
 
         let tx_hash = inscribe_tx.hash();
         let signature_bytes = self
@@ -206,7 +202,7 @@ impl Sequencer {
         block_id: HeaderId,
     ) -> bool {
         for tx in &block.transactions {
-            for op in &tx.mantle_tx.ops {
+            for op in tx.mantle_tx.ops() {
                 if let Op::ChannelInscribe(inscribe) = op {
                     tracing::debug!(
                         "Found inscription: channel={}, parent={}",
@@ -273,7 +269,7 @@ impl Sequencer {
     fn get_expected_inscription(tx: &SignedMantleTx) -> &InscriptionOp {
         let expected_op = tx
             .mantle_tx
-            .ops
+            .ops()
             .first()
             .expect("transaction should have at least one op");
 
@@ -289,19 +285,21 @@ impl Sequencer {
         expected: &InscriptionOp,
         checked_blocks: &mut HashSet<HeaderId>,
     ) -> Result<bool> {
-        let info = self
+        let ChainServiceInfo {
+            cryptarchia_info, ..
+        } = self
             .http_client
             .consensus_info(self.node_url.clone())
             .await?;
 
         tracing::debug!(
             "Polling: tip={}, height={}, checked_blocks={}",
-            info.tip,
-            info.height,
+            cryptarchia_info.tip,
+            cryptarchia_info.height,
             checked_blocks.len()
         );
 
-        self.check_blocks_for_inscription(expected, checked_blocks, info.tip)
+        self.check_blocks_for_inscription(expected, checked_blocks, cryptarchia_info.tip)
             .await
     }
 
@@ -513,7 +511,7 @@ impl Sequencer {
         let parent = self.get_last_msg_id().await?;
         let tx = self.create_inscribe_tx(inscription_data, parent);
 
-        let new_msg_id = match tx.mantle_tx.ops.first() {
+        let new_msg_id = match tx.mantle_tx.ops().first() {
             Some(Op::ChannelInscribe(inscribe)) => inscribe.id(),
             _ => panic!("Expected ChannelInscribe op"),
         };

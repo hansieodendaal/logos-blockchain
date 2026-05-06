@@ -253,7 +253,7 @@ mod tests {
 
     use lb_core::mantle::{
         ops::channel::{ChannelId, ChannelKeyIndex},
-        tx::MantleTxGasContext,
+        tx::{GasPrices, MantleTxGasContext},
     };
     use overwatch::services::state::{NoOperator, NoState};
     use tokio::sync::mpsc;
@@ -294,6 +294,7 @@ mod tests {
         let expected_block_id = HeaderId::from([7u8; 32]);
         let expected_channel_id = ChannelId::from([9u8; 32]);
         let expected_threshold: ChannelKeyIndex = 2;
+        let expected_gas_prices = GasPrices::new(3, 7);
 
         let (msg_sender, mut msg_receiver) = mpsc::channel(1);
         tokio::spawn(async move {
@@ -303,6 +304,7 @@ mod tests {
                     let context = MantleTxContext {
                         gas_context: MantleTxGasContext::new(
                             std::iter::once((expected_channel_id, expected_threshold)).collect(),
+                            expected_gas_prices,
                         ),
                         leader_reward_amount: 0,
                     };

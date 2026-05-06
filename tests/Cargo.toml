@@ -34,7 +34,6 @@ lb-chain-service                 = { workspace = true }
 lb-common-http-client            = { workspace = true }
 lb-config                        = { workspace = true }
 lb-core                          = { workspace = true }
-lb-cryptarchia-engine            = { workspace = true }
 lb-groth16                       = { workspace = true }
 lb-http-api-common               = { workspace = true }
 lb-key-management-system-service = { workspace = true }
@@ -85,6 +84,10 @@ path = "src/tests/cli/restart.rs"
 [[test]]
 name = "test_cryptarchia_blocks_streaming"
 path = "src/tests/cryptarchia/blocks_streaming.rs"
+
+[[test]]
+name = "test_mantle_chain_start"
+path = "src/tests/mantle/chain_start.rs"
 
 [[test]]
 name = "test_mantle_channel"

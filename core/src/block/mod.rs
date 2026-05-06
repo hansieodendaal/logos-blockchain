@@ -240,7 +240,6 @@ impl<Tx: Clone + Eq + Serialize + DeserializeOwned> TryFrom<Block<Tx>> for Bytes
 mod tests {
     use std::iter;
 
-    use ark_ff::Field as _;
     use lb_groth16::Fr;
     use lb_key_management_system_keys::keys::UnsecuredZkKey;
     use lb_pol::LotteryConstants;
@@ -324,13 +323,7 @@ mod tests {
     }
 
     fn create_tx(count: usize) -> Vec<MantleTx> {
-        iter::repeat_with(|| MantleTx {
-            ops: vec![],
-            execution_gas_price: 0.into(),
-            storage_gas_price: 0.into(),
-        })
-        .take(count)
-        .collect()
+        iter::repeat_with(|| MantleTx(vec![])).take(count).collect()
     }
 
     #[test]
@@ -406,11 +399,11 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     pub struct TestMantleTx;
     impl Transaction for TestMantleTx {
-        const HASHER: TransactionHasher<Self> = |_tx| TxHash(Fr::ZERO);
+        const HASHER: TransactionHasher<Self> = |_tx| TxHash::from([0u8; 32]);
         type Hash = TxHash;
 
-        fn as_signing_frs(&self) -> Vec<Fr> {
-            vec![Fr::ZERO]
+        fn as_signing(&self) -> Vec<u8> {
+            vec![0u8]
         }
     }
 

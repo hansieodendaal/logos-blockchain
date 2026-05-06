@@ -8,7 +8,9 @@ use std::{
 use lb_core::{
     mantle::{
         GenesisTx as _, MantleTx, NoteId, OpProof, SignedMantleTx, Transaction as _, Utxo,
-        genesis_tx::GENESIS_STORAGE_GAS_PRICE, ops::Op, tx::MantleTxGasContext,
+        genesis_tx::GENESIS_STORAGE_GAS_PRICE,
+        ops::Op,
+        tx::{GasPrices, MantleTxGasContext},
         tx_builder::MantleTxBuilder,
     },
     sdp::{Declaration, DeclarationMessage, Locator, ServiceType, WithdrawMessage},
@@ -116,11 +118,11 @@ async fn sdp_ops_e2e() {
     );
     let declare_zk_sig = ZkKey::multi_sign(
         &[spare_note_secret_key.clone(), provider_zk_key.clone()],
-        declare_hash.as_ref(),
+        &declare_hash.to_fr(),
     )
     .expect("SDP declare zk proof should build");
     let declare_transfer_proof = OpProof::ZkSig(
-        ZkKey::multi_sign(&declare_signing_keys, declare_hash.as_ref())
+        ZkKey::multi_sign(&declare_signing_keys, &declare_hash.to_fr())
             .expect("transfer proof should build"),
     );
     let declare_tx = SignedMantleTx::new(
@@ -180,12 +182,12 @@ async fn sdp_ops_e2e() {
     let withdraw_hash = withdraw_mantle_tx.hash();
     let withdraw_zk_sig = ZkKey::multi_sign(
         &[spare_note_secret_key.clone(), provider_zk_key.clone()],
-        withdraw_hash.as_ref(),
+        &withdraw_hash.to_fr(),
     )
     .expect("SDP withdraw zk proof should build");
 
     let withdraw_transfer_proof = OpProof::ZkSig(
-        ZkKey::multi_sign(&withdraw_signing_keys, withdraw_hash.as_ref())
+        ZkKey::multi_sign(&withdraw_signing_keys, &withdraw_hash.to_fr())
             .expect("transfer proof should build"),
     );
 
@@ -464,15 +466,18 @@ async fn fund_sdp_transaction(
     let funding_public_key = funding_secret_key.to_public_key();
     let funding_utxos = current_utxos_for_public_key(node, genesis_utxos, funding_public_key).await;
 
-    let empty_context = MantleTxGasContext::new(HashMap::new());
+    let empty_context = MantleTxGasContext::new(
+        HashMap::new(),
+        GasPrices {
+            execution_base_gas_price: 0.into(),
+            storage_gas_price: GENESIS_STORAGE_GAS_PRICE,
+        },
+    );
     let tx_context = lb_core::mantle::tx::MantleTxContext {
         gas_context: empty_context,
         leader_reward_amount: 0,
     };
-    let tx_builder = MantleTxBuilder::new(tx_context)
-        .push_op(extra_op)
-        .set_storage_gas_price(GENESIS_STORAGE_GAS_PRICE)
-        .set_execution_gas_price(0.into());
+    let tx_builder = MantleTxBuilder::new(tx_context).push_op(extra_op);
 
     let funded_builder =
         fund_transfer_builder_from_utxos(funding_utxos, &tx_builder, funding_public_key)
