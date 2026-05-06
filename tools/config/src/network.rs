@@ -43,6 +43,8 @@ pub fn create_network_configs(
                 port: get_reserved_available_udp_port().unwrap(),
                 chain_sync: network::chainsync::Config {
                     peer_response_timeout: CHAIN_SYNC_PEER_RESPONSE_TIMEOUT,
+                    incoming_request_queue_timeout: network::chainsync::Config::default()
+                        .incoming_request_queue_timeout,
                 },
                 ..default_swarm_config()
             }

@@ -11,12 +11,17 @@ pub struct Config {
     /// with a message.
     #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub peer_response_timeout: Duration,
+    /// The maximum time an inbound request can remain queued locally
+    /// before it is dropped.
+    #[serde_as(as = "DurationMilliSeconds<u64>")]
+    pub incoming_request_queue_timeout: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             peer_response_timeout: Duration::from_secs(5),
+            incoming_request_queue_timeout: Duration::from_secs(2),
         }
     }
 }

@@ -121,16 +121,13 @@ where
         }
     }
 
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
-    pub fn enqueue_orphan(
-        &mut self,
-        block_id: HeaderId,
-        current_tip: HeaderId,
-        lib: HeaderId,
-    ) -> Result<(), OrphanEnqueueError> {
+    fn wake_if_registered(&self) {
+        if let Some(waker) = &self.waker {
+            waker.wake_by_ref();
+        }
+    }
+
+    fn validate_enqueue_request(&self, block_id: HeaderId) -> Result<(), OrphanEnqueueError> {
         if self.pending_orphans_queue.len() >= self.max_pending_orphans.get() {
             warn!(
                 target: LOG_TARGET,
@@ -158,6 +155,17 @@ where
             return Err(OrphanEnqueueError::AlreadyInQueue);
         }
 
+        Ok(())
+    }
+
+    pub fn enqueue_orphan(
+        &mut self,
+        block_id: HeaderId,
+        current_tip: HeaderId,
+        lib: HeaderId,
+    ) -> Result<(), OrphanEnqueueError> {
+        self.validate_enqueue_request(block_id)?;
+
         self.pending_orphans_queue
             .insert(block_id, OrphanInfo::new(block_id, current_tip, lib));
         debug!(
@@ -169,9 +177,7 @@ where
         metrics::orphan_blocks_enqueued_total();
         metrics::orphan_blocks_pending(self.pending_orphans_queue.len());
 
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref();
-        }
+        self.wake_if_registered();
         Ok(())
     }
 
@@ -262,9 +268,7 @@ where
             metrics::orphan_blocks_pending(self.pending_orphans_queue.len());
         }
 
-        if let Some(waker) = &self.waker {
-            waker.wake_by_ref();
-        }
+        self.wake_if_registered();
     }
 
     pub fn should_poll(&self) -> bool {
@@ -283,8 +287,163 @@ where
             return Some((orphan_info, HashSet::from([last_block_id])));
         }
 
-        self.dequeue_next_orphan()
-            .map(|orphan_info| (orphan_info, HashSet::new()))
+        self.dequeue_next_orphan().map(|orphan_info| {
+            let known_blocks = HashSet::from([orphan_info.tip, orphan_info.lib]);
+            (orphan_info, known_blocks)
+        })
+    }
+
+    fn poll_idle_state(&mut self, cx: &Context<'_>) -> Poll<Option<NetAdapter::Block>> {
+        let Some((orphan_info, known_blocks)) = self.get_next_stream_input() else {
+            return Poll::Pending;
+        };
+
+        debug!(target: LOG_TARGET, ?orphan_info, ?known_blocks, "Starting new orphan block download");
+        let request_blocks_stream_fut = Self::request_blocks_stream(
+            self.network_adapter.clone(),
+            orphan_info,
+            known_blocks,
+            Instant::now(),
+        );
+
+        self.state = DownloaderState::Requesting(Box::pin(request_blocks_stream_fut));
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn poll_requesting_state(
+        &mut self,
+        mut request: PendingNetworkRequest<NetAdapter::Block>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<NetAdapter::Block>> {
+        match request.as_mut().poll(cx) {
+            Poll::Ready(Ok(download)) => {
+                self.state = DownloaderState::Downloading(download);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => {
+                error!(target: LOG_TARGET, "Error while starting download: {e}");
+                self.state = DownloaderState::Idle;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Pending => {
+                self.state = DownloaderState::Requesting(request);
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_downloading_state(
+        &mut self,
+        mut download: ActiveDownload<NetAdapter::Block>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<NetAdapter::Block>> {
+        let Some(block_stream) = download.block_stream.as_mut() else {
+            self.state = DownloaderState::Idle;
+            return Poll::Pending;
+        };
+
+        match block_stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok((block_id, block)))) => {
+                self.handle_downloaded_block(download, block_id, block, cx)
+            }
+            Poll::Ready(Some(Err(e))) => self.handle_download_stream_error(&e, cx),
+            Poll::Ready(None) => self.handle_download_stream_finished(download, cx),
+            Poll::Pending => {
+                self.state = DownloaderState::Downloading(download);
+                Poll::Pending
+            }
+        }
+    }
+
+    fn handle_downloaded_block(
+        &mut self,
+        mut download: ActiveDownload<NetAdapter::Block>,
+        block_id: HeaderId,
+        block: NetAdapter::Block,
+        cx: &Context<'_>,
+    ) -> Poll<Option<NetAdapter::Block>> {
+        download.last_block_id = Some(block_id);
+        download.total_blocks_received = download
+            .total_blocks_received
+            .checked_add(1)
+            .expect("Block count overflow");
+
+        metrics::orphan_blocks_received_total();
+
+        if download.orphan_info.orphan_id == block_id {
+            debug!(
+                target: LOG_TARGET,
+                ?block_id,
+                total_blocks_received = download.total_blocks_received,
+                "Sync for orphan block completed"
+            );
+            metrics::orphan_observe_parent_fetch_ok(download.download_started_at.elapsed());
+            self.state = DownloaderState::Idle;
+        } else {
+            self.state = DownloaderState::Downloading(download);
+        }
+
+        self.remove_orphan(&block_id);
+        cx.waker().wake_by_ref();
+        Poll::Ready(Some(block))
+    }
+
+    fn handle_download_stream_error(
+        &mut self,
+        err: &DynError,
+        cx: &Context<'_>,
+    ) -> Poll<Option<NetAdapter::Block>> {
+        error!(target: LOG_TARGET, "Error while fetching blocks: {err}");
+        self.state = DownloaderState::Idle;
+        metrics::orphan_blocks_fetch_failed_total();
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn handle_download_stream_finished(
+        &mut self,
+        mut download: ActiveDownload<NetAdapter::Block>,
+        cx: &Context<'_>,
+    ) -> Poll<Option<NetAdapter::Block>> {
+        download.block_stream = None;
+
+        if let Some(last_block_id) = download.last_block_id {
+            let orphan_info = download.orphan_info.clone();
+            let known_blocks = HashSet::from([last_block_id]);
+            let download_started_at = download.download_started_at;
+
+            debug!(
+                target: LOG_TARGET, ?orphan_info, ?known_blocks,
+                "Previous stream ended, requesting next stream for remaining blocks"
+            );
+
+            let request_blocks_stream_fut = Self::request_blocks_stream(
+                self.network_adapter.clone(),
+                orphan_info,
+                known_blocks,
+                download_started_at,
+            );
+
+            self.state = DownloaderState::Requesting(Box::pin(request_blocks_stream_fut));
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        debug!(
+            target: LOG_TARGET,
+            orphan_info = ?download.orphan_info,
+            "No blocks received for this orphan, ending sync"
+        );
+        let orphan_id = download.orphan_block_id();
+        self.remove_orphan(&orphan_id);
+
+        self.state = DownloaderState::Idle;
+        metrics::orphan_blocks_fetch_failed_total();
+        metrics::orphan_blocks_pending(self.pending_orphans_queue.len());
+        Poll::Pending
     }
 }
 
@@ -296,138 +455,14 @@ where
 {
     type Item = NetAdapter::Block;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "state machine logic kept in one place for readability; refactor can follow separately"
-    )]
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.waker = Some(cx.waker().clone());
+        let state = std::mem::replace(&mut self.state, DownloaderState::Idle);
 
-        match &mut self.state {
-            DownloaderState::Idle => {
-                let Some((orphan_info, known_blocks)) = self.get_next_stream_input() else {
-                    return Poll::Pending;
-                };
-
-                debug!(target: LOG_TARGET, ?orphan_info, ?known_blocks, "Starting new orphan block download");
-                let request_blocks_stream_fut = Self::request_blocks_stream(
-                    self.network_adapter.clone(),
-                    orphan_info,
-                    known_blocks,
-                    Instant::now(),
-                );
-
-                self.state = DownloaderState::Requesting(Box::pin(request_blocks_stream_fut));
-
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            DownloaderState::Requesting(request) => match request.as_mut().poll(cx) {
-                Poll::Ready(Ok(download)) => {
-                    self.state = DownloaderState::Downloading(download);
-
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Poll::Ready(Err(e)) => {
-                    error!(target: LOG_TARGET, "Error while starting download: {e}");
-                    self.state = DownloaderState::Idle;
-
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            DownloaderState::Downloading(download) => {
-                let Some(block_stream) = download.block_stream.as_mut() else {
-                    self.state = DownloaderState::Idle;
-                    return Poll::Pending;
-                };
-
-                match block_stream.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok((block_id, block)))) => {
-                        download.last_block_id = Some(block_id);
-                        download.total_blocks_received = download
-                            .total_blocks_received
-                            .checked_add(1)
-                            .expect("Block count overflow");
-
-                        metrics::orphan_blocks_received_total();
-
-                        if download.orphan_info.orphan_id == block_id {
-                            debug!(
-                                target: LOG_TARGET,
-                                ?block_id,
-                                total_blocks_received = download.total_blocks_received,
-                                "Sync for orphan block completed"
-                            );
-                            metrics::orphan_observe_parent_fetch_ok(
-                                download.download_started_at.elapsed(),
-                            );
-                            self.state = DownloaderState::Idle;
-                        }
-
-                        self.remove_orphan(&block_id);
-
-                        cx.waker().wake_by_ref();
-                        Poll::Ready(Some(block))
-                    }
-                    Poll::Ready(Some(Err(e))) => {
-                        error!(target: LOG_TARGET, "Error while fetching blocks: {e}");
-
-                        self.state = DownloaderState::Idle;
-                        metrics::orphan_blocks_fetch_failed_total();
-
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                    Poll::Ready(None) => {
-                        download.block_stream = None;
-
-                        if let Some(last_block_id) = download.last_block_id {
-                            let orphan_info = download.orphan_info.clone();
-                            let known_blocks = HashSet::from([last_block_id]);
-                            let download_started_at = download.download_started_at;
-
-                            debug!(
-                                target: LOG_TARGET, ?orphan_info, ?known_blocks,
-                                "Previous stream ended, requesting next stream for remaining blocks"
-                            );
-
-                            let request_blocks_stream_fut = Self::request_blocks_stream(
-                                self.network_adapter.clone(),
-                                orphan_info,
-                                known_blocks,
-                                download_started_at,
-                            );
-
-                            self.state =
-                                DownloaderState::Requesting(Box::pin(request_blocks_stream_fut));
-
-                            cx.waker().wake_by_ref();
-                        } else {
-                            debug!(
-                                target: LOG_TARGET,
-                                orphan_info = ?download.orphan_info,
-                                "No blocks received for this orphan, ending sync"
-                            );
-                            let orphan_id = download.orphan_block_id();
-                            self.remove_orphan(&orphan_id);
-
-                            self.state = DownloaderState::Idle;
-                            metrics::orphan_blocks_fetch_failed_total();
-                            metrics::orphan_blocks_pending(self.pending_orphans_queue.len());
-                        }
-
-                        Poll::Pending
-                    }
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+        match state {
+            DownloaderState::Idle => self.poll_idle_state(cx),
+            DownloaderState::Requesting(request) => self.poll_requesting_state(request, cx),
+            DownloaderState::Downloading(download) => self.poll_downloading_state(download, cx),
         }
     }
 }
@@ -493,13 +528,18 @@ mod tests {
 
             for (i, responses) in response_sequences.iter().enumerate() {
                 let block_results = responses.clone().into_block_result(chain);
-                let known_block = if i == 0 { None } else { last_block_id };
+                let additional_blocks = if i == 0 {
+                    HashSet::from([HeaderId::from(TEST_TIP), HeaderId::from(TEST_LIB)])
+                } else {
+                    HashSet::from([last_block_id
+                        .expect("a continuation request must have a previous block id")])
+                };
 
                 let next_last_block_id = block_results
                     .last()
                     .and_then(|result| result.as_ref().map_or(None, |block| Some(*block)));
 
-                network = network.with_stream(orphan_id, known_block, block_results);
+                network = network.with_stream(orphan_id, &additional_blocks, block_results);
 
                 last_block_id = next_last_block_id;
             }
@@ -565,7 +605,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct ResponseKey {
         orphan_id: HeaderId,
-        known_block: Option<HeaderId>,
+        additional_blocks: Vec<HeaderId>,
     }
 
     #[derive(Clone)]
@@ -587,16 +627,22 @@ mod tests {
         fn with_stream(
             self,
             orphan_id: HeaderId,
-            known_block: Option<HeaderId>,
+            additional_blocks: &HashSet<HeaderId>,
             responses: Vec<Result<TestBlock, String>>,
         ) -> Self {
             let key = ResponseKey {
                 orphan_id,
-                known_block,
+                additional_blocks: canonical_additional_blocks(additional_blocks),
             };
             self.responses.lock().unwrap().insert(key, responses);
             self
         }
+    }
+
+    fn canonical_additional_blocks(additional_blocks: &HashSet<HeaderId>) -> Vec<HeaderId> {
+        let mut blocks = additional_blocks.iter().copied().collect::<Vec<_>>();
+        blocks.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        blocks
     }
 
     #[async_trait::async_trait]
@@ -657,7 +703,7 @@ mod tests {
 
             let key = ResponseKey {
                 orphan_id: target_block,
-                known_block: additional_blocks.iter().next().copied(),
+                additional_blocks: canonical_additional_blocks(&additional_blocks),
             };
 
             self.responses.lock().unwrap().remove(&key).map_or_else(
@@ -760,6 +806,25 @@ mod tests {
                 .iter()
                 .any(|(key, _)| *key == extra_orphan)
         );
+    }
+
+    #[test]
+    fn test_new_orphan_stream_input_seeds_tip_and_lib() {
+        let mut downloader = create_downloader();
+        let orphan_id = HeaderId::from([1u8; 32]);
+        let tip = HeaderId::from(TEST_TIP);
+        let lib = HeaderId::from(TEST_LIB);
+
+        downloader.enqueue_orphan(orphan_id, tip, lib).unwrap();
+
+        let Some((orphan_info, known_blocks)) = downloader.get_next_stream_input() else {
+            panic!("expected queued orphan to be available");
+        };
+
+        assert_eq!(orphan_info.orphan_id, orphan_id);
+        assert!(known_blocks.contains(&tip));
+        assert!(known_blocks.contains(&lib));
+        assert_eq!(known_blocks.len(), 2);
     }
 
     #[tokio::test]

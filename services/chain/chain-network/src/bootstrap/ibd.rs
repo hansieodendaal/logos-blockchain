@@ -19,7 +19,7 @@ use crate::{
     Error as ChainError, IbdConfig,
     bootstrap::download::{Delay, Download, Downloads, DownloadsOutput},
     mempool::adapter::MempoolAdapter,
-    network::NetworkAdapter,
+    network::{BoxedStream, NetworkAdapter},
 };
 
 pub trait IbdBlockProcessor<B> {
@@ -109,6 +109,88 @@ where
     BlockProcessor: IbdBlockProcessor<NetAdapter::Block> + Sync,
     RuntimeServiceId: Sync,
 {
+    async fn resolve_peer_target(&self, peer: NetAdapter::PeerId) -> Result<HeaderId, Error> {
+        // Get the most recent peer's tip.
+        let tip_response = self
+            .network
+            .request_tip(peer)
+            .await
+            .map_err(Error::BlockProvider)?;
+
+        // Use the peer's tip as the target for the download.
+        match tip_response {
+            GetTipResponse::Tip { tip, .. } => Ok(tip),
+            GetTipResponse::Failure(reason) => Err(Error::BlockProvider(DynError::from(reason))),
+        }
+    }
+
+    async fn request_peer_blocks_stream(
+        &self,
+        peer: NetAdapter::PeerId,
+        target: HeaderId,
+        local_tip: HeaderId,
+        local_lib: HeaderId,
+        latest_downloaded_block: Option<HeaderId>,
+    ) -> Result<BoxedStream<Result<(HeaderId, NetAdapter::Block), DynError>>, Error> {
+        self.network
+            .request_blocks_from_peer(
+                peer,
+                target,
+                local_tip,
+                local_lib,
+                latest_downloaded_block.map_or_else(HashSet::new, |id| HashSet::from([id])),
+            )
+            .await
+            .inspect_err(|_e| {
+                crate::metrics::chainsync_observe_download_blocks_err();
+            })
+            .map_err(Error::BlockProvider)
+    }
+
+    async fn should_skip_download(
+        &mut self,
+        peer: NetAdapter::PeerId,
+        target: HeaderId,
+    ) -> Result<bool, Error> {
+        if self.block_processor.has_processed_block(target).await? {
+            debug!(
+                "No download needed for {peer:?} as target block already exists locally: {target:?}"
+            );
+            self.synced_peers.insert(peer);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    async fn create_download(
+        &self,
+        peer: NetAdapter::PeerId,
+        target: HeaderId,
+        latest_downloaded_block: Option<HeaderId>,
+    ) -> Result<Download<NetAdapter::PeerId, NetAdapter::Block>, Error> {
+        let initial_cryptarchia_info = self.block_processor.info().await?;
+
+        // Request a block stream.
+        debug!(
+            ?target, local_tip = ?initial_cryptarchia_info.tip, local_tip_height = initial_cryptarchia_info.height,
+            local_lib = ?initial_cryptarchia_info.lib, ?peer,
+            "requesting blocks from peer",
+        );
+        let stream = self
+            .request_peer_blocks_stream(
+                peer,
+                target,
+                initial_cryptarchia_info.tip,
+                initial_cryptarchia_info.lib,
+                latest_downloaded_block,
+            )
+            .await?;
+        debug!(?peer, ?target, "a download initiated");
+
+        Ok(Download::new(peer, target, stream))
+    }
+
     /// Runs IBD with the configured peers.
     ///
     /// It downloads blocks from the peers, and applies them to the
@@ -172,63 +254,19 @@ where
     /// download for the tip, no download is initiated and [`None`] is returned.
     ///
     /// If communication fails, an [`Error`] is returned.
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
     async fn initiate_download(
         &mut self,
         peer: NetAdapter::PeerId,
         latest_downloaded_block: Option<HeaderId>,
     ) -> Result<Option<Download<NetAdapter::PeerId, NetAdapter::Block>>, Error> {
-        // Get the most recent peer's tip.
-        let tip_response = self
-            .network
-            .request_tip(peer)
-            .await
-            .map_err(Error::BlockProvider)?;
-
-        // Use the peer's tip as the target for the download.
-        let target = match tip_response {
-            GetTipResponse::Tip { tip, .. } => tip,
-            GetTipResponse::Failure(reason) => {
-                return Err(Error::BlockProvider(DynError::from(reason)));
-            }
-        };
-
-        if self.block_processor.has_processed_block(target).await? {
-            debug!(
-                "No download needed for {peer:?} as target block already exists locally: {target:?}"
-            );
-            self.synced_peers.insert(peer);
+        let target = self.resolve_peer_target(peer).await?;
+        if self.should_skip_download(peer, target).await? {
             return Ok(None);
         }
 
-        let initial_cryptarchia_info = self.block_processor.info().await?;
-
-        // Request a block stream.
-        debug!(
-            ?target, local_tip = ?initial_cryptarchia_info.tip, local_tip_height = initial_cryptarchia_info.height,
-            local_lib = ?initial_cryptarchia_info.lib, ?peer,
-            "requesting blocks from peer",
-        );
-        let stream = self
-            .network
-            .request_blocks_from_peer(
-                peer,
-                target,
-                initial_cryptarchia_info.tip,
-                initial_cryptarchia_info.lib,
-                latest_downloaded_block.map_or_else(HashSet::new, |id| HashSet::from([id])),
-            )
+        self.create_download(peer, target, latest_downloaded_block)
             .await
-            .inspect_err(|_e| {
-                crate::metrics::chainsync_observe_download_blocks_err();
-            })
-            .map_err(Error::BlockProvider)?;
-        debug!(?peer, ?target, "a download initiated");
-
-        Ok(Some(Download::new(peer, target, stream)))
+            .map(Some)
     }
 
     /// Proceeds [`Downloads`] by reading/processing blocks.
@@ -448,7 +486,6 @@ mod tests {
     use tokio_stream::wrappers::BroadcastStream;
 
     use super::*;
-    use crate::network::BoxedStream;
 
     #[tokio::test]
     async fn no_peers_configured() {

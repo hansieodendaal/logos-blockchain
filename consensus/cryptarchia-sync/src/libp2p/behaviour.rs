@@ -1,7 +1,8 @@
 use core::future::ready;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{AsyncWriteExt as _, FutureExt as _, StreamExt as _, future::BoxFuture};
@@ -17,7 +18,7 @@ use libp2p::{
 };
 use libp2p_stream::{Behaviour as StreamBehaviour, Control, IncomingStreams};
 use tokio::sync::{mpsc, mpsc::Sender, oneshot};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     BlocksResponse, DownloadBlocksRequest, TipResponse,
@@ -31,7 +32,9 @@ use crate::{
     messages::{GetTipResponse, SerialisedBlock},
 };
 
-const MAX_INCOMING_REQUESTS: usize = 4;
+pub const MAX_ACTIVE_INCOMING_REQUESTS: usize = 4;
+pub const MAX_QUEUED_INCOMING_REQUESTS: usize = 32;
+pub const MAX_QUEUED_INCOMING_REQUESTS_PER_PEER: usize = 8;
 
 type SendingBlocksRequestsFuture = BoxFuture<'static, Result<BlocksRequestStream, ChainSyncError>>;
 
@@ -46,6 +49,12 @@ type SendingBlocksResponsesFuture = BoxFuture<'static, Result<(), ChainSyncError
 type SendingTipResponsesFuture = BoxFuture<'static, Result<(), ChainSyncError>>;
 
 type ReceivingRequestsFuture = BoxFuture<'static, Result<ReceivingRequestStream, ChainSyncError>>;
+
+struct PendingIncomingStream {
+    peer_id: PeerId,
+    stream: Libp2pStream,
+    enqueued_at: Instant,
+}
 
 pub type BoxedStream<T> = Box<dyn futures::Stream<Item = T> + Send + Unpin>;
 
@@ -145,6 +154,11 @@ pub struct Behaviour {
     /// Futures for closing incoming streams that were rejected due to excess
     /// requests.
     incoming_streams_to_close: FuturesUnordered<BoxFuture<'static, ()>>,
+    /// Bounded FIFO queue for inbound streams waiting for active capacity.
+    pending_incoming_streams: VecDeque<PendingIncomingStream>,
+    /// Per-peer queue occupancy used to prevent one peer from monopolizing
+    /// pending slots.
+    queued_incoming_streams_per_peer: HashMap<PeerId, usize>,
     /// Waker to notify the behaviour when `request_tip` or
     /// `start_blocks_download` is called.
     waker: Option<std::task::Waker>,
@@ -170,6 +184,8 @@ impl Behaviour {
             sending_block_responses: FuturesUnordered::new(),
             receiving_requests: FuturesUnordered::new(),
             incoming_streams_to_close: FuturesUnordered::new(),
+            pending_incoming_streams: VecDeque::new(),
+            queued_incoming_streams_per_peer: HashMap::new(),
             sending_block_requests: FuturesUnordered::new(),
             sending_tip_requests: FuturesUnordered::new(),
             receiving_tip_responses: FuturesUnordered::new(),
@@ -281,25 +297,103 @@ impl Behaviour {
         }))
     }
 
-    fn handle_incoming_stream(&self, peer_id: PeerId, mut stream: Libp2pStream) {
-        let concurrent_requests = self.receiving_requests.len()
-            + self.sending_block_responses.len()
-            + self.sending_tip_responses.len();
+    fn handle_incoming_stream(&mut self, peer_id: PeerId, mut stream: Libp2pStream) {
+        if self.active_incoming_request_count() < MAX_ACTIVE_INCOMING_REQUESTS {
+            self.receiving_requests
+                .push(Provider::process_request(peer_id, stream).boxed());
+            self.try_notify_waker();
+            return;
+        }
 
-        if concurrent_requests >= MAX_INCOMING_REQUESTS {
+        if self.pending_incoming_streams.len() >= MAX_QUEUED_INCOMING_REQUESTS {
             self.incoming_streams_to_close.push(
                 async move {
                     drop(stream.close().await);
                 }
                 .boxed(),
             );
-            error!("Rejected excess pending incoming request");
-        } else {
-            self.receiving_requests
-                .push(Provider::process_request(peer_id, stream).boxed());
+            warn!("Dropped incoming request because pending queue is full");
+            self.try_notify_waker();
+            return;
         }
 
+        let per_peer_queued = self
+            .queued_incoming_streams_per_peer
+            .get(&peer_id)
+            .copied()
+            .unwrap_or_default();
+        if per_peer_queued >= MAX_QUEUED_INCOMING_REQUESTS_PER_PEER {
+            self.incoming_streams_to_close.push(
+                async move {
+                    drop(stream.close().await);
+                }
+                .boxed(),
+            );
+            warn!(peer = %peer_id, "Dropped incoming request because peer queue cap was reached");
+            self.try_notify_waker();
+            return;
+        }
+
+        self.pending_incoming_streams
+            .push_back(PendingIncomingStream {
+                peer_id,
+                stream,
+                enqueued_at: Instant::now(),
+            });
+        *self
+            .queued_incoming_streams_per_peer
+            .entry(peer_id)
+            .or_default() += 1;
+
         self.try_notify_waker();
+    }
+
+    fn active_incoming_request_count(&self) -> usize {
+        self.receiving_requests.len()
+            + self.sending_block_responses.len()
+            + self.sending_tip_responses.len()
+    }
+
+    fn on_pending_stream_dequeued(&mut self, peer_id: PeerId) {
+        if let Some(per_peer_queued) = self.queued_incoming_streams_per_peer.get_mut(&peer_id) {
+            *per_peer_queued = per_peer_queued.saturating_sub(1);
+            if *per_peer_queued == 0 {
+                self.queued_incoming_streams_per_peer.remove(&peer_id);
+            }
+        }
+    }
+
+    fn expire_queued_incoming_streams(&mut self) {
+        let mut retained = VecDeque::with_capacity(self.pending_incoming_streams.len());
+        while let Some(mut pending_stream) = self.pending_incoming_streams.pop_front() {
+            if pending_stream.enqueued_at.elapsed() >= self.config.incoming_request_queue_timeout {
+                let peer_id = pending_stream.peer_id;
+                self.on_pending_stream_dequeued(peer_id);
+                self.incoming_streams_to_close.push(
+                    async move {
+                        drop(pending_stream.stream.close().await);
+                    }
+                    .boxed(),
+                );
+                warn!(peer = %peer_id, "Dropped queued incoming request after queue timeout");
+            } else {
+                retained.push_back(pending_stream);
+            }
+        }
+        self.pending_incoming_streams = retained;
+    }
+
+    fn promote_queued_incoming_streams(&mut self) {
+        while self.active_incoming_request_count() < MAX_ACTIVE_INCOMING_REQUESTS {
+            let Some(pending_stream) = self.pending_incoming_streams.pop_front() else {
+                break;
+            };
+
+            self.on_pending_stream_dequeued(pending_stream.peer_id);
+            self.receiving_requests.push(
+                Provider::process_request(pending_stream.peer_id, pending_stream.stream).boxed(),
+            );
+        }
     }
 
     fn handle_tip_request_available(&self, request_stream: TipRequestStream) {
@@ -349,6 +443,118 @@ impl Behaviour {
         if let Some(waker) = &self.waker {
             waker.wake_by_ref();
         }
+    }
+
+    fn poll_outbound_request_tasks(&mut self, cx: &mut Context<'_>) -> Option<Poll<ToSwarmEvent>> {
+        if let Poll::Ready(Some(result)) = self.sending_block_requests.poll_next_unpin(cx) {
+            match result {
+                Ok(request_stream) => {
+                    self.handle_blocks_request_available(request_stream);
+                }
+                Err(e) => {
+                    error!("Error while processing block download request: {}", e);
+                }
+            }
+
+            return Some(Poll::Pending);
+        }
+
+        if let Poll::Ready(Some(result)) = self.sending_tip_requests.poll_next_unpin(cx) {
+            match result {
+                Ok(request_stream) => {
+                    self.handle_tip_request_available(request_stream);
+                }
+                Err(e) => {
+                    error!("Error while processing tip request: {}", e);
+                }
+            }
+
+            return Some(Poll::Pending);
+        }
+
+        None
+    }
+
+    fn poll_response_tasks(&mut self, cx: &mut Context<'_>) -> Option<Poll<ToSwarmEvent>> {
+        if let Poll::Ready(Some(_)) = self.receiving_block_responses.poll_next_unpin(cx) {
+            return Some(Poll::Pending);
+        }
+
+        if let Poll::Ready(Some(_)) = self.receiving_tip_responses.poll_next_unpin(cx) {
+            return Some(Poll::Pending);
+        }
+
+        if let Poll::Ready(Some(result)) = self.sending_block_responses.poll_next_unpin(cx) {
+            if let Err(e) = result {
+                error!("Sending response failed: {}", e);
+            }
+
+            self.try_notify_waker();
+            return Some(Poll::Pending);
+        }
+
+        if let Poll::Ready(Some(result)) = self.sending_tip_responses.poll_next_unpin(cx) {
+            if let Err(e) = result {
+                error!("Sending response failed: {}", e);
+            }
+
+            self.try_notify_waker();
+            return Some(Poll::Pending);
+        }
+
+        None
+    }
+
+    fn poll_incoming_tasks(&mut self, cx: &mut Context<'_>) -> Option<Poll<ToSwarmEvent>> {
+        if let Poll::Ready(Some(result)) = self.receiving_requests.poll_next_unpin(cx) {
+            match result {
+                Ok(request_stream) => return Some(self.handle_request_ready(request_stream)),
+                Err(e) => {
+                    error!("Error while processing incoming request: {}", e);
+                }
+            }
+        }
+
+        if let Poll::Ready(Some((peer_id, stream))) = self.incoming_streams.poll_next_unpin(cx) {
+            self.handle_incoming_stream(peer_id, stream);
+            return Some(Poll::Pending);
+        }
+
+        None
+    }
+
+    fn poll_stream_behaviour_dial(&mut self, cx: &mut Context<'_>) -> Option<Poll<ToSwarmEvent>> {
+        if let Poll::Ready(ToSwarm::Dial { opts }) = self.stream_behaviour.poll(cx) {
+            // If we dial, some outgoing task is created, poll again.
+            self.try_notify_waker();
+            return Some(Poll::Ready(ToSwarm::Dial { opts }));
+        }
+
+        None
+    }
+
+    fn poll_ready_work(&mut self, cx: &mut Context<'_>) -> Option<Poll<ToSwarmEvent>> {
+        if self.incoming_streams_to_close.poll_next_unpin(cx) == Poll::Ready(Some(())) {
+            debug!("Incoming stream closed");
+        }
+
+        if let Some(outcome) = self.poll_outbound_request_tasks(cx) {
+            return Some(outcome);
+        }
+
+        if let Some(outcome) = self.poll_response_tasks(cx) {
+            return Some(outcome);
+        }
+
+        if let Some(outcome) = self.poll_incoming_tasks(cx) {
+            return Some(outcome);
+        }
+
+        if let Some(outcome) = self.poll_stream_behaviour_dial(cx) {
+            return Some(outcome);
+        }
+
+        None
     }
 }
 
@@ -431,92 +637,19 @@ impl NetworkBehaviour for Behaviour {
             .on_connection_handler_event(peer_id, conn_id, event);
     }
 
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         self.waker = Some(cx.waker().clone());
 
-        if self.incoming_streams_to_close.poll_next_unpin(cx) == Poll::Ready(Some(())) {
-            debug!("Incoming stream closed");
-        }
+        // Apply inbound backpressure in order: expire stale queued streams first,
+        // then promote queued streams into active slots.
+        self.expire_queued_incoming_streams();
+        self.promote_queued_incoming_streams();
 
-        if let Poll::Ready(Some(result)) = self.sending_block_requests.poll_next_unpin(cx) {
-            match result {
-                Ok(request_stream) => {
-                    self.handle_blocks_request_available(request_stream);
-                }
-                Err(e) => {
-                    error!("Error while processing block download request: {}", e);
-                }
-            }
-
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(result)) = self.sending_tip_requests.poll_next_unpin(cx) {
-            match result {
-                Ok(request_stream) => {
-                    self.handle_tip_request_available(request_stream);
-                }
-                Err(e) => {
-                    error!("Error while processing tip request: {}", e);
-                }
-            }
-
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(_)) = self.receiving_block_responses.poll_next_unpin(cx) {
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(_)) = self.receiving_tip_responses.poll_next_unpin(cx) {
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(result)) = self.sending_block_responses.poll_next_unpin(cx) {
-            if let Err(e) = result {
-                error!("Sending response failed: {}", e);
-            }
-
-            self.try_notify_waker();
-
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(result)) = self.sending_tip_responses.poll_next_unpin(cx) {
-            if let Err(e) = result {
-                error!("Sending response failed: {}", e);
-            }
-
-            self.try_notify_waker();
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(Some(result)) = self.receiving_requests.poll_next_unpin(cx) {
-            match result {
-                Ok(request_stream) => return self.handle_request_ready(request_stream),
-                Err(e) => {
-                    error!("Error while processing incoming request: {}", e);
-                }
-            }
-        }
-
-        if let Poll::Ready(Some((peer_id, stream))) = self.incoming_streams.poll_next_unpin(cx) {
-            self.handle_incoming_stream(peer_id, stream);
-
-            return Poll::Pending;
-        }
-
-        if let Poll::Ready(ToSwarm::Dial { opts }) = self.stream_behaviour.poll(cx) {
-            // If we dial, some outgoing task is created, poll again.
-            self.try_notify_waker();
-            return Poll::Ready(ToSwarm::Dial { opts });
+        if let Some(outcome) = self.poll_ready_work(cx) {
+            return outcome;
         }
 
         Poll::Pending
@@ -541,7 +674,10 @@ mod tests {
         ProviderResponse, TipResponse,
         config::Config,
         libp2p::{
-            behaviour::{Behaviour, BoxedStream, Event, MAX_INCOMING_REQUESTS},
+            behaviour::{
+                Behaviour, BoxedStream, Event, MAX_ACTIVE_INCOMING_REQUESTS,
+                MAX_QUEUED_INCOMING_REQUESTS_PER_PEER,
+            },
             errors::{ChainSyncError, ChainSyncErrorKind},
             provider::MAX_ADDITIONAL_BLOCKS,
         },
@@ -571,12 +707,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reject_excess_download_requests() {
-        let (mut downloader_swarm, provider_peer_id) = start_provider_and_downloader(1).await;
+    async fn test_queue_download_requests_when_active_capacity_is_full() {
+        let (mut downloader_swarm, provider_peer_id) =
+            start_delayed_provider_and_downloader(1, Duration::from_millis(250)).await;
 
         let streams = request_download(
             &mut downloader_swarm,
-            MAX_INCOMING_REQUESTS + 1,
+            MAX_ACTIVE_INCOMING_REQUESTS + 1,
             HeaderId::from([0; 32]),
             HeaderId::from([0; 32]),
             HeaderId::from([0; 32]),
@@ -586,10 +723,158 @@ mod tests {
 
         tokio::spawn(async move { downloader_swarm.loop_on_next().await });
 
-        let (blocks, errors) = wait_block_messages(streams).await;
+        let (blocks, errors) =
+            tokio::time::timeout(Duration::from_secs(5), wait_block_messages(streams))
+                .await
+                .expect("queued request should be promoted and completed in time");
 
-        assert_eq!(blocks.len(), MAX_INCOMING_REQUESTS);
-        assert_eq!(errors.len(), 1);
+        assert_eq!(blocks.len(), MAX_ACTIVE_INCOMING_REQUESTS + 1);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_drop_only_after_global_incoming_queue_is_exhausted() {
+        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm();
+        tokio::spawn(run_provider(
+            provider_swarm,
+            DelayedProvider {
+                blocks_count: 1,
+                response_delay: Duration::from_millis(20),
+            },
+        ));
+
+        let mut downloader_a = setup_downloader_and_connect(provider_addr.clone()).await;
+        let mut downloader_b = setup_downloader_and_connect(provider_addr.clone()).await;
+        let mut downloader_c = setup_downloader_and_connect(provider_addr.clone()).await;
+        let mut downloader_d = setup_downloader_and_connect(provider_addr.clone()).await;
+        let mut downloader_e = setup_downloader_and_connect(provider_addr).await;
+
+        let requests_per_peer = MAX_QUEUED_INCOMING_REQUESTS_PER_PEER;
+        let streams_a = request_download(
+            &mut downloader_a,
+            requests_per_peer,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+        let streams_b = request_download(
+            &mut downloader_b,
+            requests_per_peer,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+        let streams_c = request_download(
+            &mut downloader_c,
+            requests_per_peer,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+        let streams_d = request_download(
+            &mut downloader_d,
+            requests_per_peer,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+        let streams_e = request_download(
+            &mut downloader_e,
+            requests_per_peer,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+
+        tokio::spawn(async move { downloader_a.loop_on_next().await });
+        tokio::spawn(async move { downloader_b.loop_on_next().await });
+        tokio::spawn(async move { downloader_c.loop_on_next().await });
+        tokio::spawn(async move { downloader_d.loop_on_next().await });
+        tokio::spawn(async move { downloader_e.loop_on_next().await });
+
+        let all_streams = streams_a
+            .into_iter()
+            .chain(streams_b)
+            .chain(streams_c)
+            .chain(streams_d)
+            .chain(streams_e)
+            .collect::<Vec<_>>();
+
+        let outcomes = futures::future::join_all(all_streams.into_iter().map(async |receiver| {
+            let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(5), receiver).await
+            else {
+                return true;
+            };
+
+            let mut stream = stream;
+            match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+                Ok(Some(Ok(_))) => false,
+                Ok(Some(Err(_)) | None) | Err(_) => true,
+            }
+        }))
+        .await;
+
+        assert!(outcomes.into_iter().any(|is_failed| is_failed));
+    }
+
+    #[tokio::test]
+    async fn test_drop_when_peer_pending_queue_cap_is_exhausted() {
+        let (mut downloader_swarm, provider_peer_id) =
+            start_delayed_provider_and_downloader(1, Duration::from_millis(500)).await;
+
+        let streams = request_download(
+            &mut downloader_swarm,
+            MAX_ACTIVE_INCOMING_REQUESTS + MAX_QUEUED_INCOMING_REQUESTS_PER_PEER + 1,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+
+        tokio::spawn(async move { downloader_swarm.loop_on_next().await });
+
+        let (_blocks, errors) =
+            tokio::time::timeout(Duration::from_secs(10), wait_block_messages(streams))
+                .await
+                .expect("backpressure results should be available in time");
+
+        assert!(!errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_queued_incoming_request_timeout_closes_stream() {
+        let (mut downloader_swarm, provider_peer_id) =
+            start_delayed_provider_and_downloader(1, Duration::from_secs(2)).await;
+
+        let streams = request_download(
+            &mut downloader_swarm,
+            MAX_ACTIVE_INCOMING_REQUESTS + 1,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+
+        tokio::spawn(async move { downloader_swarm.loop_on_next().await });
+
+        let (_blocks, errors) =
+            tokio::time::timeout(Duration::from_secs(10), wait_block_messages(streams))
+                .await
+                .expect("queued timeout should resolve in time");
+
+        assert!(!errors.is_empty());
     }
 
     #[tokio::test]
@@ -755,6 +1040,10 @@ mod tests {
     trait ProviderBehavior: Send + 'static {
         fn handle_tip_request(&self) -> TipResponse;
         fn handle_blocks_request(&self, blocks_count: usize) -> BlocksResponse;
+
+        fn response_delay(&self) -> Duration {
+            Duration::from_millis(100)
+        }
     }
 
     struct StandardProvider {
@@ -802,6 +1091,11 @@ mod tests {
         success_count: usize,
     }
 
+    struct DelayedProvider {
+        blocks_count: usize,
+        response_delay: Duration,
+    }
+
     impl ProviderBehavior for ErrorStreamProvider {
         fn handle_tip_request(&self) -> TipResponse {
             ProviderResponse::Available(Tip {
@@ -827,6 +1121,31 @@ mod tests {
         }
     }
 
+    impl ProviderBehavior for DelayedProvider {
+        fn handle_tip_request(&self) -> TipResponse {
+            ProviderResponse::Available(Tip {
+                tip: HeaderId::from([0; 32]),
+                slot: Slot::from(0),
+                height: 0,
+            })
+        }
+
+        fn handle_blocks_request(&self, _requested: usize) -> BlocksResponse {
+            ProviderResponse::Available(
+                futures::stream::iter(
+                    iter::repeat_with(|| Bytes::from_static(&[0; 32]))
+                        .take(self.blocks_count)
+                        .map(Ok),
+                )
+                .boxed(),
+            )
+        }
+
+        fn response_delay(&self) -> Duration {
+            self.response_delay
+        }
+    }
+
     async fn run_provider<B: ProviderBehavior>(mut provider_swarm: Swarm<Behaviour>, behavior: B) {
         while let Some(event) = provider_swarm.next().await {
             match event {
@@ -838,8 +1157,9 @@ mod tests {
                 }
                 SwarmEvent::Behaviour(Event::ProvideBlocksRequest { reply_sender, .. }) => {
                     let response = behavior.handle_blocks_request(0);
+                    let response_delay = behavior.response_delay();
                     tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(response_delay).await;
                         reply_sender.send(response).await.unwrap();
                     });
                 }
@@ -854,6 +1174,24 @@ mod tests {
         tokio::spawn(run_provider(
             provider_swarm,
             StandardProvider { blocks_count },
+        ));
+
+        let downloader_swarm = setup_downloader_and_connect(provider_addr).await;
+        (downloader_swarm, provider_peer_id)
+    }
+
+    async fn start_delayed_provider_and_downloader(
+        blocks_count: usize,
+        response_delay: Duration,
+    ) -> (Swarm<Behaviour>, PeerId) {
+        let (provider_swarm, provider_peer_id, provider_addr) = setup_provider_swarm();
+
+        tokio::spawn(run_provider(
+            provider_swarm,
+            DelayedProvider {
+                blocks_count,
+                response_delay,
+            },
         ));
 
         let downloader_swarm = setup_downloader_and_connect(provider_addr).await;
@@ -925,10 +1263,10 @@ mod tests {
     async fn wait_block_messages(
         streams: Vec<oneshot::Receiver<BoxedStream<Result<SerialisedBlock, ChainSyncError>>>>,
     ) -> (Vec<SerialisedBlock>, Vec<ChainSyncError>) {
-        let mut blocks = Vec::new();
-        let mut errors = Vec::new();
+        let results = futures::future::join_all(streams.into_iter().map(async |receiver| {
+            let mut blocks = Vec::new();
+            let mut errors = Vec::new();
 
-        for receiver in streams {
             let mut stream = match receiver.await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -936,25 +1274,35 @@ mod tests {
                         peer: PeerId::random(),
                         kind: ChainSyncErrorKind::ChannelReceiveError(e.to_string()),
                     });
-                    continue;
+                    return (blocks, errors);
                 }
             };
 
             while let Some(result) = stream.next().await {
                 match result {
-                    Ok(block) => {
-                        blocks.push(block);
-                    }
+                    Ok(block) => blocks.push(block),
                     Err(e) => errors.push(e),
                 }
             }
-        }
-        (blocks, errors)
+
+            (blocks, errors)
+        }))
+        .await;
+
+        results.into_iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut all_blocks, mut all_errors), (blocks, errors)| {
+                all_blocks.extend(blocks);
+                all_errors.extend(errors);
+                (all_blocks, all_errors)
+            },
+        )
     }
 
     fn new_swarm_with_quic() -> Swarm<Behaviour> {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
+            incoming_request_queue_timeout: Duration::from_millis(300),
         };
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -966,5 +1314,31 @@ mod tests {
             .unwrap()
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(10)))
             .build()
+    }
+
+    #[tokio::test]
+    async fn test_expire_queued_request_before_promotion_when_capacity_frees() {
+        let (mut downloader_swarm, provider_peer_id) =
+            start_delayed_provider_and_downloader(1, Duration::from_millis(600)).await;
+
+        let streams = request_download(
+            &mut downloader_swarm,
+            MAX_ACTIVE_INCOMING_REQUESTS + 1,
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            HeaderId::from([0; 32]),
+            &HashSet::new(),
+            provider_peer_id,
+        );
+
+        tokio::spawn(async move { downloader_swarm.loop_on_next().await });
+
+        let (blocks, errors) =
+            tokio::time::timeout(Duration::from_secs(10), wait_block_messages(streams))
+                .await
+                .expect("queued timeout should resolve in time");
+
+        assert_eq!(blocks.len(), MAX_ACTIVE_INCOMING_REQUESTS);
+        assert_eq!(errors.len(), 1);
     }
 }
