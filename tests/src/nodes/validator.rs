@@ -10,7 +10,7 @@ use std::{
 
 use futures::Stream;
 use lb_chain_broadcast_service::BlockInfo;
-use lb_chain_service::CryptarchiaInfo;
+use lb_chain_service::ChainServiceInfo;
 use lb_common_http_client::{ApiBlock, CommonHttpClient, ProcessedBlockEvent};
 use lb_config::kms::key_id_for_preload_backend;
 use lb_core::{

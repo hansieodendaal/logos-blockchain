@@ -424,7 +424,7 @@ where
 
             let refreshed_info =
                 crate::http::consensus::cryptarchia_info::<RuntimeServiceId>(handle).await?;
-            current_id = refreshed_info.tip;
+            current_id = refreshed_info.cryptarchia_info.tip;
             retried = true;
             blocks.clear();
             continue;

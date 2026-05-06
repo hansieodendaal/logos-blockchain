@@ -91,6 +91,7 @@ async fn wait_for_lib_and_tip(nodes: &[Validator; 2]) -> lb_chain_service::Crypt
         () = async { loop {
                 let infos = stream::iter(nodes)
                     .then(async |n| n.consensus_info(tick == 0).await)
+                    .map(|v|v.cryptarchia_info)
                     .collect::<Vec<_>>()
                     .await;
 
@@ -123,14 +124,14 @@ async fn wait_for_lib_and_tip(nodes: &[Validator; 2]) -> lb_chain_service::Crypt
     // Print final stats
     let final_infos = stream::iter(nodes)
         .then(async |n| {
-            let info = n.consensus_info(false).await;
+            let info = n.consensus_info(false).await.cryptarchia_info;
             format!("{}/{:?}/{:?}", info.height, info.slot, info.lib_slot)
         })
         .collect::<Vec<_>>()
         .await;
     println!("final: {}", final_infos.join(" | "));
 
-    nodes[0].consensus_info(false).await
+    nodes[0].consensus_info(false).await.cryptarchia_info
 }
 
 async fn canonical_chain(
@@ -267,7 +268,7 @@ fn assert_stream_integrity(_chain: &CanonicalChain, events: &[ProcessedBlockEven
 }
 
 async fn refresh_chain(node: &Validator, chain: &CanonicalChain) -> CanonicalChain {
-    let info = node.consensus_info(false).await;
+    let info = node.consensus_info(false).await.cryptarchia_info;
     if let Some(current_tip) = chain.get_tip_id()
         && let Some(current_lib) = chain.get_lib_id()
         && info.tip == current_tip
@@ -713,7 +714,7 @@ async fn test_blocks_streaming() {
     // case: blocks_limit=0 should fail (400) via raw HTTP query
     println!("case: blocks_limit=0 should fail (400) via raw HTTP query");
 
-    let tip_slot = u64::from(nodes[0].consensus_info(false).await.slot);
+    let tip_slot = u64::from(nodes[0].consensus_info(false).await.cryptarchia_info.slot);
     let client = reqwest::Client::new();
 
     let mut url = nodes[0]
@@ -778,7 +779,13 @@ async fn test_blocks_streaming() {
         "case: immutable_only=true with slot_to above LIB should fail (400) via raw HTTP query"
     );
 
-    let lib_slot = u64::from(nodes[0].consensus_info(false).await.lib_slot);
+    let lib_slot = u64::from(
+        nodes[0]
+            .consensus_info(false)
+            .await
+            .cryptarchia_info
+            .lib_slot,
+    );
     let mut url = nodes[0]
         .base_url()
         .expect("validator base URL should be available");

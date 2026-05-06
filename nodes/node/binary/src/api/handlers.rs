@@ -992,7 +992,7 @@ where
 
     let chain_info = consensus::cryptarchia_info::<RuntimeServiceId>(&handle).await?;
 
-    let resolved_window = resolve_blocks_stream_window(&request, &chain_info)?;
+    let resolved_window = resolve_blocks_stream_window(&request, &chain_info.cryptarchia_info)?;
     let slot_from = resolved_window.slot_from;
     let slot_to = resolved_window.slot_to;
 
@@ -1006,7 +1006,7 @@ where
 
     let first_chunk = fetch_blocks_stream_chunk::<StorageBackend, RuntimeServiceId>(
         &handle,
-        &chain_info,
+        &chain_info.cryptarchia_info,
         slot_from,
         slot_to,
         request.descending,
@@ -1032,7 +1032,7 @@ where
 
     let stream = build_blocks_stream::<StorageBackend, RuntimeServiceId>(
         handle,
-        chain_info,
+        chain_info.cryptarchia_info,
         first_chunk,
         slot_from,
         slot_to,
@@ -1366,7 +1366,6 @@ mod tests {
 
     use lb_chain_service::{CryptarchiaInfo, Slot};
     use lb_core::header::HeaderId;
-    use lb_cryptarchia_engine::State;
 
     use crate::api::{
         errors::BlocksStreamWindowError, handlers::resolve_blocks_stream_window,
@@ -1386,7 +1385,6 @@ mod tests {
             lib_slot: Slot::new(LIB_SLOT),
             height: HEIGHT,
             tip: HeaderId::from([3; 32]),
-            mode: State::Online,
         }
     }
 
@@ -1397,7 +1395,6 @@ mod tests {
             lib_slot: Slot::new(0),
             height: 1,
             tip: HeaderId::from([3; 32]),
-            mode: State::Online,
         }
     }
 
