@@ -29,7 +29,10 @@ use lb_chain_broadcast_service::{
 use lb_core::{
     block::{Block, genesis::GenesisBlock},
     header::HeaderId,
-    mantle::{AuthenticatedMantleTx, Transaction, TxHash, gas::MainnetGasConstants, tx::GasPrices},
+    mantle::{
+        AuthenticatedMantleTx, GenesisTx as _, Transaction, TxHash, gas::MainnetGasConstants,
+        tx::GasPrices,
+    },
     sdp::{Declaration, DeclarationId, ProviderId, ProviderInfo, ServiceType},
 };
 use lb_cryptarchia_engine::{Branch, PrunedBlocks, ReorgedBlocks};
@@ -53,6 +56,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_with::serde_as;
 use strum::IntoEnumIterator as _;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
     time::Instant,
@@ -111,7 +115,7 @@ pub enum Error {
 #[derivative(Debug)]
 pub enum ConsensusMsg<Tx> {
     Info {
-        tx: oneshot::Sender<CryptarchiaInfo>,
+        reply_channel: oneshot::Sender<ChainServiceInfo>,
     },
     NewBlockSubscribe {
         sender: oneshot::Sender<broadcast::Receiver<ProcessedBlockEvent>>,
@@ -123,21 +127,21 @@ pub enum ConsensusMsg<Tx> {
         from_descendant: Option<HeaderId>,
         to_ancestor: Option<HeaderId>,
         #[derivative(Debug = "ignore")]
-        tx: oneshot::Sender<HeaderIdStream>,
+        reply_channel: oneshot::Sender<HeaderIdStream>,
     },
     GetLedgerState {
         block_id: HeaderId,
-        tx: oneshot::Sender<Option<LedgerState>>,
+        reply_channel: oneshot::Sender<Option<LedgerState>>,
     },
     GetSdpDeclarations {
-        tx: oneshot::Sender<Vec<(DeclarationId, Declaration)>>,
+        reply_channel: oneshot::Sender<Vec<(DeclarationId, Declaration)>>,
     },
     GetEpochState {
         slot: Slot,
-        tx: oneshot::Sender<Result<EpochState, Error>>,
+        reply_channel: oneshot::Sender<Result<EpochState, Error>>,
     },
     GetEpochConfig {
-        tx: oneshot::Sender<(
+        reply_channel: oneshot::Sender<(
             lb_cryptarchia_engine::EpochConfig,
             lb_cryptarchia_engine::Config,
         )>,
@@ -146,7 +150,7 @@ pub enum ConsensusMsg<Tx> {
     /// and return the tip and reorged txs if successful.
     ApplyBlock {
         block: Box<Block<Tx>>,
-        tx: oneshot::Sender<Result<(HeaderId, Vec<Tx>), Error>>,
+        reply_channel: oneshot::Sender<Result<(HeaderId, Vec<Tx>), Error>>,
     },
     /// Forward chain sync events from the network to chain-service.
     /// Chain-service will handle these directly and respond via the embedded
@@ -168,6 +172,20 @@ pub enum ConsensusMsg<Tx> {
 pub(crate) type HeaderIdStream =
     Pin<Box<dyn Stream<Item = Result<HeaderId, Error>> + Send + 'static>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChainServiceMode {
+    AwaitingStart,
+    Started(State),
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ChainServiceInfo {
+    pub cryptarchia_info: CryptarchiaInfo,
+    pub mode: ChainServiceMode,
+}
+
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -177,7 +195,6 @@ pub struct CryptarchiaInfo {
     pub tip: HeaderId,
     pub slot: Slot,
     pub height: u64,
-    pub mode: State,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,7 +283,6 @@ impl Cryptarchia {
             tip: tip_branch.id(),
             slot: tip_branch.slot(),
             height: tip_branch.length(),
-            mode: *self.consensus.state(),
         }
     }
 
@@ -404,7 +420,7 @@ impl Cryptarchia {
         (cryptarchia, pruned_blocks)
     }
 
-    const fn is_boostrapping(&self) -> bool {
+    const fn is_bootstrapping(&self) -> bool {
         self.consensus.state().is_bootstrapping()
     }
 
@@ -563,6 +579,7 @@ where
         let CryptarchiaSettings {
             config: ledger_config,
             bootstrap: bootstrap_config,
+            starting_state,
             ..
         } = self
             .service_resources_handle
@@ -601,6 +618,25 @@ where
         let sync_blocks_provider: BlockProvider<_, _> =
             BlockProvider::new(relays.storage_adapter().storage_relay.clone());
 
+        // Chain start timer will prevent the chain service to process and produce
+        // blocks if the starting state is GenesisBlock and has chain start time
+        // set in future.
+        let mut chain_start_timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
+
+        if let StartingState::Genesis { genesis_block } = starting_state {
+            let genesis_time = genesis_block
+                .genesis_tx()
+                .cryptarchia_parameter()
+                .genesis_time;
+            let now = OffsetDateTime::now_utc();
+
+            if genesis_time > now {
+                let delay = (genesis_time - now).try_into().unwrap_or_default();
+                info!("Chain configured to start in the future: {genesis_time}");
+                chain_start_timer = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+        }
+
         // The prolonged bootstrap timer will be started when chain-network notifies us
         // that IBD has completed. This ensures we don't transition to Online mode
         // before the node has caught up with the network.
@@ -622,7 +658,18 @@ where
         let async_loop = async {
             loop {
                 tokio::select! {
-                    () = async { prolonged_bootstrap_timer.as_mut().unwrap().as_mut().await }, if prolonged_bootstrap_timer.is_some() && cryptarchia.is_boostrapping() => {
+                    () = async { if let Some(timer) = chain_start_timer.as_mut() { timer.await; } }, if chain_start_timer.is_some() => {
+                        info!("Genesis time reached. Chain is now starting...");
+                        chain_start_timer = None;
+
+                        // Just like in the Ibd case, the bootstrap timer is started after the chain
+                        // start time began.
+                        prolonged_bootstrap_timer = Some(Box::pin(tokio::time::sleep_until(
+                            Instant::now() + bootstrap_config.prolonged_bootstrap_period,
+                        )));
+                    }
+
+                    () = async { prolonged_bootstrap_timer.as_mut().unwrap().as_mut().await }, if prolonged_bootstrap_timer.is_some() && cryptarchia.is_bootstrapping() => {
                         info!("Prolonged Bootstrap Period has passed. Switching to Online.");
                         (cryptarchia, storage_blocks_to_remove) = Self::switch_to_online(
                             cryptarchia,
@@ -641,13 +688,16 @@ where
                         // Handle ApplyBlock, ChainSync, and IbdCompleted separately since they need async context
                         match msg {
                             ConsensusMsg::IbdCompleted => {
-                                info!("Received IBD completion notification. Starting prolonged bootstrap timer.");
-                                // Start the prolonged bootstrap timer now that IBD is complete
-                                prolonged_bootstrap_timer = Some(Box::pin(tokio::time::sleep_until(
-                                    Instant::now() + bootstrap_config.prolonged_bootstrap_period,
-                                )));
+                                if chain_start_timer.is_none() {
+                                    info!("Received IBD completion notification. Starting prolonged bootstrap timer.");
+                                    // Start the prolonged bootstrap timer now that IBD is complete
+                                    prolonged_bootstrap_timer = Some(Box::pin(tokio::time::sleep_until(
+                                        Instant::now() + bootstrap_config.prolonged_bootstrap_period,
+                                    )));
+                                }
                             }
-                            ConsensusMsg::ApplyBlock { block, tx } => {
+                            // Blocks will be applied if chain start time didn't begin yet.
+                            ConsensusMsg::ApplyBlock { block, reply_channel } if chain_start_timer.is_none() => {
                                 // TODO: move this into the process_message() function after making the process_message async.
                                 match Self::process_block_and_update_state(
                                         &mut cryptarchia,
@@ -661,14 +711,14 @@ where
                                     ).await {
                                     Ok((new_storage_blocks_to_remove, reorged_txs)) => {
                                         storage_blocks_to_remove = new_storage_blocks_to_remove;
-                                        tx.send(Ok((cryptarchia.tip(), reorged_txs))).unwrap_or_else(|_| {
+                                        reply_channel.send(Ok((cryptarchia.tip(), reorged_txs))).unwrap_or_else(|_| {
                                             error!("Could not send process block result through channel");
                                         });
                                     }
                                     Err(e) => {
                                         let error_msg = format!("Failed to process block: {e:?}");
                                         error!(target: LOG_TARGET, "{}", error_msg);
-                                        tx.send(Err(e)).unwrap_or_else(|_| {
+                                        reply_channel.send(Err(e)).unwrap_or_else(|_| {
                                             error!("Could not send process block error through channel");
                                         });
                                     }
@@ -680,6 +730,16 @@ where
                                 } else {
                                     Self::reject_chain_sync_event(event).await;
                                 }
+                            }
+                            ConsensusMsg::Info { reply_channel } => {
+                                let cryptarchia_info = cryptarchia.info();
+                                let mode = match chain_start_timer {
+                                    Some(_) => ChainServiceMode::AwaitingStart,
+                                    None => ChainServiceMode::Started(*cryptarchia.state()),
+                                };
+                                reply_channel.send(ChainServiceInfo{cryptarchia_info, mode}).unwrap_or_else(|e| {
+                                    error!("Could not send consensus info through channel: {:?}", e);
+                                });
                             }
                             msg => {
                                 Self::process_message(&cryptarchia, &self.new_block_subscription_sender, &self.lib_subscription_sender, &chain_online_notifier, msg, relays.storage_adapter());
@@ -782,11 +842,6 @@ where
         storage_adapter: &StorageAdapter<Storage, Tx, RuntimeServiceId>,
     ) {
         match msg {
-            ConsensusMsg::Info { tx } => {
-                tx.send(cryptarchia.info()).unwrap_or_else(|e| {
-                    error!("Could not send consensus info through channel: {:?}", e);
-                });
-            }
             ConsensusMsg::NewBlockSubscribe { sender } => {
                 sender
                     .send(new_block_channel.subscribe())
@@ -802,7 +857,7 @@ where
             ConsensusMsg::GetHeaders {
                 from_descendant,
                 to_ancestor,
-                tx,
+                reply_channel,
             } => {
                 // default to tip block if not present
                 let from_descendant = from_descendant.unwrap_or_else(|| cryptarchia.tip());
@@ -815,16 +870,20 @@ where
                     cryptarchia,
                     storage_adapter.clone(),
                 );
-                tx.send(stream)
+                reply_channel
+                    .send(stream)
                     .unwrap_or_else(|_| error!("could not send block stream through channel"));
             }
-            ConsensusMsg::GetLedgerState { block_id, tx } => {
+            ConsensusMsg::GetLedgerState {
+                block_id,
+                reply_channel,
+            } => {
                 let ledger_state = cryptarchia.ledger.state(&block_id).cloned();
-                tx.send(ledger_state).unwrap_or_else(|_| {
+                reply_channel.send(ledger_state).unwrap_or_else(|_| {
                     error!("Could not send ledger state through channel");
                 });
             }
-            ConsensusMsg::GetSdpDeclarations { tx } => {
+            ConsensusMsg::GetSdpDeclarations { reply_channel } => {
                 let tip = cryptarchia.tip();
                 let declarations = cryptarchia
                     .ledger
@@ -832,22 +891,32 @@ where
                     .map(LedgerState::sdp_declarations)
                     .unwrap_or_default();
 
-                tx.send(declarations).unwrap_or_else(|_| {
+                reply_channel.send(declarations).unwrap_or_else(|_| {
                     error!("Could not send SDP declarations through channel");
                 });
             }
-            ConsensusMsg::GetEpochState { slot, tx } => {
+            ConsensusMsg::GetEpochState {
+                slot,
+                reply_channel,
+            } => {
                 let result = cryptarchia.epoch_state_for_slot(slot);
-                tx.send(result).unwrap_or_else(|_| {
+                reply_channel.send(result).unwrap_or_else(|_| {
                     error!("Could not send epoch state through channel");
                 });
             }
-            ConsensusMsg::GetEpochConfig { tx } => {
+            ConsensusMsg::GetEpochConfig { reply_channel } => {
                 let config = cryptarchia.ledger.config();
-                tx.send((config.epoch_config, config.consensus_config.clone()))
+                reply_channel
+                    .send((config.epoch_config, config.consensus_config.clone()))
                     .unwrap_or_else(|_| {
                         error!("Could not send epoch config through channel");
                     });
+            }
+            ConsensusMsg::Info { .. } => {
+                // Info is handled separately in the run loop where we have async
+                // context. This should never be reached since we filter it out
+                // before calling process_message.
+                panic!("Info should be handled in the run loop, not in process_message");
             }
             ConsensusMsg::ApplyBlock { .. } => {
                 // ApplyBlock is handled separately in the run loop where we have async
