@@ -75,7 +75,7 @@ axum       = { features = ["http1", "http2", "json", "query", "tokio"], workspac
 time       = { workspace = true }
 tower      = { features = ["limit"], workspace = true }
 tower-http = { features = ["cors", "limit", "timeout", "trace"], workspace = true }
-validator  = { features = ["derive"], version = "0.20.0" }
+validator  = { features = ["derive"], workspace = true }
 
 # Jemalloc
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
