@@ -17,6 +17,9 @@ Feature: Manual control of transactions
   #   VERIFY_MAX, wallet '<wallet_name>', wallet_state_type 'on-chain'/'encumbered'/'available', outputs <count>, value 14000, time_out <duration_seconds>
   #   VERIFY_MIN, wallet '<wallet_name>', wallet_state_type 'on-chain'/'encumbered'/'available', outputs <count>, value 14000, time_out <duration_seconds>
   #   CONTINUOUS_USER_WALLETS, coin_split_outputs <count>, coin_split_value <amount>, transactions <count>, value <amount>, cycles <count>
+  #   COIN_SPLIT_ALL_USER_WALLETS, splits_per_wallet <count>, outputs <count>, value <amount>
+  #   VERIFY_MIN_ON_CHAIN_OUTPUTS_ALL_USER_WALLETS, min_outputs <count>, timeout_seconds <duration_seconds>
+  #   STRESS_CONTINUOUS_NEXT_WALLET_CYCLES, cycles <count>, transactions_per_wallet <count>, value <amount>
   #   CONTINUOUS_FUNDING_WALLETS, coin_split_outputs <count>, coin_split_value <amount>, transactions <count>, value <amount>, cycles <count>
   #   FAUCET_ALL_USER_WALLETS, rounds <count>
   #   FAUCET_ALL_FUNDING_WALLETS, rounds <count>

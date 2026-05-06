@@ -48,6 +48,20 @@ pub enum ManualCommand {
         value: u64,
         cycles: usize,
     },
+    CoinSplitAllUserWallets {
+        splits_per_wallet: usize,
+        outputs: usize,
+        value: u64,
+    },
+    VerifyMinOnChainOutputsAllUserWallets {
+        min_outputs: usize,
+        timeout_seconds: u64,
+    },
+    StressContinuousNextWalletCycles {
+        cycles: usize,
+        transactions_per_wallet: usize,
+        value: u64,
+    },
     FaucetFundsAllUserWallets {
         rounds: usize,
     },
@@ -150,6 +164,11 @@ fn parse_manual_command(raw: &str) -> Result<ManualCommand, StepError> {
 
     let binding = action.to_ascii_uppercase();
     let command = binding.as_str();
+
+    if let Some(parsed) = parse_extended_manual_command(command, &parts)? {
+        return Ok(parsed);
+    }
+
     match command {
         "CREATE_BLOCKCHAIN_SNAPSHOT_ALL_NODES" => {
             Ok(ManualCommand::CreateBlockchainSnapshotAllNodes {
@@ -232,6 +251,35 @@ fn parse_manual_command(raw: &str) -> Result<ManualCommand, StepError> {
             message: format!("Unknown manual command: '{action}' in '{raw}'"),
         }),
     }
+}
+
+fn parse_extended_manual_command(
+    command: &str,
+    parts: &[String],
+) -> Result<Option<ManualCommand>, StepError> {
+    let parsed = match command {
+        "COIN_SPLIT_ALL_USER_WALLETS" => Some(ManualCommand::CoinSplitAllUserWallets {
+            splits_per_wallet: parse_usize_field(parts, "splits_per_wallet")?,
+            outputs: parse_usize_field(parts, "outputs")?,
+            value: parse_u64_field(parts, "value")?,
+        }),
+        "VERIFY_MIN_ON_CHAIN_OUTPUTS_ALL_USER_WALLETS" => {
+            Some(ManualCommand::VerifyMinOnChainOutputsAllUserWallets {
+                min_outputs: parse_usize_field(parts, "min_outputs")?,
+                timeout_seconds: parse_u64_field(parts, "timeout_seconds")?,
+            })
+        }
+        "STRESS_CONTINUOUS_NEXT_WALLET_CYCLES" => {
+            Some(ManualCommand::StressContinuousNextWalletCycles {
+                cycles: parse_usize_field(parts, "cycles")?,
+                transactions_per_wallet: parse_usize_field(parts, "transactions_per_wallet")?,
+                value: parse_u64_field(parts, "value")?,
+            })
+        }
+        _ => None,
+    };
+
+    Ok(parsed)
 }
 
 fn parse_quoted_field(parts: &[String], key: &str) -> Result<String, StepError> {
@@ -501,6 +549,49 @@ mod tests {
         ));
     }
 
+    fn assert_coin_split_all_user_wallets_command() {
+        let command =
+            parse_ok("COIN_SPLIT_ALL_USER_WALLETS, splits_per_wallet 3, outputs 10, value 100");
+
+        assert!(matches!(
+            command,
+            ManualCommand::CoinSplitAllUserWallets {
+                splits_per_wallet,
+                outputs,
+                value,
+            } if splits_per_wallet == 3 && outputs == 10 && value == 100
+        ));
+    }
+
+    fn assert_verify_min_on_chain_outputs_all_user_wallets_command() {
+        let command = parse_ok(
+            "VERIFY_MIN_ON_CHAIN_OUTPUTS_ALL_USER_WALLETS, min_outputs 30, timeout_seconds 300",
+        );
+
+        assert!(matches!(
+            command,
+            ManualCommand::VerifyMinOnChainOutputsAllUserWallets {
+                min_outputs,
+                timeout_seconds,
+            } if min_outputs == 30 && timeout_seconds == 300
+        ));
+    }
+
+    fn assert_stress_continuous_next_wallet_cycles_command() {
+        let command = parse_ok(
+            "STRESS_CONTINUOUS_NEXT_WALLET_CYCLES, cycles 3, transactions_per_wallet 30, value 100",
+        );
+
+        assert!(matches!(
+            command,
+            ManualCommand::StressContinuousNextWalletCycles {
+                cycles,
+                transactions_per_wallet,
+                value,
+            } if cycles == 3 && transactions_per_wallet == 30 && value == 100
+        ));
+    }
+
     fn assert_cryptarchia_info_all_nodes_command() {
         let command = parse_ok("CRYPTARCHIA_INFO_ALL_NODES");
         assert!(matches!(command, ManualCommand::CryptarchiaInfoAllNodes));
@@ -568,6 +659,20 @@ mod tests {
                 transactions: 0,
                 value: 0,
                 cycles: 0,
+            },
+            ManualCommand::CoinSplitAllUserWallets {
+                splits_per_wallet: 0,
+                outputs: 0,
+                value: 0,
+            },
+            ManualCommand::VerifyMinOnChainOutputsAllUserWallets {
+                min_outputs: 0,
+                timeout_seconds: 0,
+            },
+            ManualCommand::StressContinuousNextWalletCycles {
+                cycles: 0,
+                transactions_per_wallet: 0,
+                value: 0,
             },
             ManualCommand::FaucetFundsAllUserWallets { rounds: 0 },
             ManualCommand::FaucetFundsAllFundingWallets { rounds: 0 },
@@ -645,6 +750,18 @@ mod tests {
                 }
                 ManualCommand::ContinuousUserWallets { .. } => {
                     assert_continuous_user_wallets_command();
+                    visited += 1;
+                }
+                ManualCommand::CoinSplitAllUserWallets { .. } => {
+                    assert_coin_split_all_user_wallets_command();
+                    visited += 1;
+                }
+                ManualCommand::VerifyMinOnChainOutputsAllUserWallets { .. } => {
+                    assert_verify_min_on_chain_outputs_all_user_wallets_command();
+                    visited += 1;
+                }
+                ManualCommand::StressContinuousNextWalletCycles { .. } => {
+                    assert_stress_continuous_next_wallet_cycles_command();
                     visited += 1;
                 }
                 ManualCommand::FaucetFundsAllUserWallets { .. } => {

@@ -1,38 +1,44 @@
-// External command controller:
-//   1) Set CUCUMBER_MANUAL_COMMAND_FILE=/tmp/cucumber-manual-commands.txt
-//   2) Start the scenario
-//   3) Prepare the command file beforehand or add commands on-the-fly while the
-//      test is running.
-// Supported commands (one per line):
-//   COIN_SPLIT, wallet '<wallet_name>', outputs <count>, value <amount>
-//   VERIFY, wallet '<wallet_name>', outputs <count>, time_out
-//     <duration_seconds>   BALANCE, wallet '<wallet_name>'
-//   BALANCE_ALL_WALLETS
-//   BALANCE_ALL_USER_WALLETS
-//   BALANCE_ALL_FUNDING_WALLETS
-//   CLEAR_ENCUMBRANCES, wallet '<wallet_name>'
-//   CLEAR_ENCUMBRANCES_ALL_WALLETS
-//   SEND, transactions <count>, value <amount>, from '<wallet_name>', to
-//     '<wallet_name>'
-//   VERIFY_MAX, wallet '<wallet_name>', wallet_state_type
-//     'on-chain'/'encumbered'/'available', outputs <count>, value 14000,
-//     time_out <duration_seconds>
-//   VERIFY_MIN, wallet '<wallet_name>', wallet_state_type
-//     'on-chain'/'encumbered'/'available', outputs <count>,
-//     value 14000, time_out <duration_seconds>
-//   CONTINUOUS_USER_WALLETS, coin_split_outputs <count>, coin_split_value
-//     <amount>, transactions <count>, value <amount>, cycles <count>
-//   CONTINUOUS_FUNDING_WALLETS, coin_split_outputs <count>, coin_split_value
-//     <amount>, transactions <count>, value <amount>, cycles <count>
-//   FAUCET_ALL_USER_WALLETS, rounds <count>
-//   FAUCET_ALL_FUNDING_WALLETS, rounds <count>
-//   CREATE_BLOCKCHAIN_SNAPSHOT_ALL_NODES, snapshot_name '<snapshot_name>'
-//   CREATE_BLOCKCHAIN_SNAPSHOT_NODE, snapshot_name '<snapshot_name>',
-//     node_name '<node_name>'
-//   RESTART_NODE, node_name '<node_name>'
-//   CRYPTARCHIA_INFO_ALL_NODES
-//   WAIT_ALL_NODES_SYNCED_TO_CHAIN
-//   STOP
+/// External command controller:
+///   1) Set CUCUMBER_MANUAL_COMMAND_FILE=/tmp/cucumber-manual-commands.txt
+///   2) Start the scenario
+///   3) Prepare the command file beforehand or add commands on-the-fly while the
+///      test is running.
+/// Supported commands (one per line):
+///   COIN_SPLIT, wallet '<wallet_name>', outputs <count>, value <amount>
+///   VERIFY, wallet '<wallet_name>', outputs <count>, time_out
+///     <duration_seconds>   BALANCE, wallet '<wallet_name>'
+///   BALANCE_ALL_WALLETS
+///   BALANCE_ALL_USER_WALLETS
+///   BALANCE_ALL_FUNDING_WALLETS
+///   CLEAR_ENCUMBRANCES, wallet '<wallet_name>'
+///   CLEAR_ENCUMBRANCES_ALL_WALLETS
+///   SEND, transactions <count>, value <amount>, from '<wallet_name>', to
+///     '<wallet_name>'
+///   VERIFY_MAX, wallet '<wallet_name>', wallet_state_type
+///     'on-chain'/'encumbered'/'available', outputs <count>, value 14000,
+///     time_out <duration_seconds>
+///   VERIFY_MIN, wallet '<wallet_name>', wallet_state_type
+///     'on-chain'/'encumbered'/'available', outputs <count>,
+///     value 14000, time_out <duration_seconds>
+///   CONTINUOUS_USER_WALLETS, coin_split_outputs <count>, coin_split_value
+///     <amount>, transactions <count>, value <amount>, cycles <count>
+///   COIN_SPLIT_ALL_USER_WALLETS, splits_per_wallet <count>, outputs <count>,
+///     value <amount>
+///   VERIFY_MIN_ON_CHAIN_OUTPUTS_ALL_USER_WALLETS, min_outputs <count>,
+///     timeout_seconds <duration_seconds>
+///   STRESS_CONTINUOUS_NEXT_WALLET_CYCLES, cycles <count>,
+///     transactions_per_wallet <count>, value <amount>
+///   CONTINUOUS_FUNDING_WALLETS, coin_split_outputs <count>, coin_split_value
+///     <amount>, transactions <count>, value <amount>, cycles <count>
+///   FAUCET_ALL_USER_WALLETS, rounds <count>
+///   FAUCET_ALL_FUNDING_WALLETS, rounds <count>
+///   CREATE_BLOCKCHAIN_SNAPSHOT_ALL_NODES, snapshot_name '<snapshot_name>'
+///   CREATE_BLOCKCHAIN_SNAPSHOT_NODE, snapshot_name '<snapshot_name>',
+///     node_name '<node_name>'
+///   RESTART_NODE, node_name '<node_name>'
+///   CRYPTARCHIA_INFO_ALL_NODES
+///   WAIT_ALL_NODES_SYNCED_TO_CHAIN
+///   STOP
 
 use std::{env, num::NonZero, path::Path, time::Duration};
 
@@ -75,11 +81,277 @@ pub(crate) async fn execute_manual_command(
     Ok(false)
 }
 
+pub(crate) async fn execute_continuous_user_wallets(
+    world: &mut CucumberWorld,
+    step: &str,
+    coin_split_outputs: usize,
+    coin_split_value: u64,
+    transactions: usize,
+    value: u64,
+    cycles: usize,
+) -> Result<(), StepError> {
+    let command = ManualCommand::ContinuousUserWallets {
+        coin_split_outputs,
+        coin_split_value,
+        transactions,
+        value,
+        cycles,
+    };
+
+    execute_non_stop_manual_command(world, step, &command).await
+}
+
+pub(crate) async fn execute_coin_splits_all_user_wallets(
+    world: &mut CucumberWorld,
+    step: &str,
+    splits_per_wallet: usize,
+    outputs: usize,
+    value: u64,
+) -> Result<(), StepError> {
+    let mut wallet_names: Vec<_> = world
+        .all_user_wallets()
+        .iter()
+        .map(|w| w.wallet_name.clone())
+        .collect();
+    if wallet_names.len() < 2 {
+        return Err(StepError::InvalidArgument {
+            message: "coin split for all user wallets requires at least two wallets".to_owned(),
+        });
+    }
+    wallet_names.sort();
+
+    for wallet_name in &wallet_names {
+        for _ in 0..splits_per_wallet {
+            let best_node_info = get_best_node_info(world, wallet_name).await?;
+            execute_coin_split(
+                world,
+                step,
+                wallet_name,
+                outputs,
+                value,
+                Some(&best_node_info),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn verify_min_on_chain_outputs_all_user_wallets(
+    world: &mut CucumberWorld,
+    step: &str,
+    min_outputs: usize,
+    timeout_seconds: u64,
+) -> Result<(), StepError> {
+    let mut wallet_names: Vec<_> = world
+        .all_user_wallets()
+        .iter()
+        .map(|w| w.wallet_name.clone())
+        .collect();
+    wallet_names.sort();
+
+    for wallet_name in &wallet_names {
+        utils::wait_for_wallet_or_encumbered_state(
+            world,
+            step,
+            wallet_name.clone(),
+            Some(&min_outputs),
+            None,
+            None,
+            None,
+            timeout_seconds,
+            WalletStateType::OnChain,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn execute_stress_continuous_next_wallet_cycles(
+    world: &mut CucumberWorld,
+    step: &str,
+    cycles: usize,
+    transactions_per_wallet: usize,
+    value: u64,
+) -> Result<(), StepError> {
+    let wallet_names = sorted_user_wallet_names_with_min(world, 2, "stress continuous cycles")?;
+
+    let required_value = transactions_per_wallet as u64 * value;
+    for cycle in 0..cycles {
+        execute_single_stress_cycle(
+            world,
+            step,
+            cycle,
+            &wallet_names,
+            transactions_per_wallet,
+            value,
+            required_value,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn execute_single_stress_cycle(
+    world: &mut CucumberWorld,
+    step: &str,
+    cycle: usize,
+    wallet_names: &[String],
+    transactions_per_wallet: usize,
+    value: u64,
+    required_value: u64,
+) -> Result<(), StepError> {
+    info!(
+        target: TARGET,
+        "STRESS CONTINUOUS cycle {} A: Send transactions to next wallet",
+        cycle + 1
+    );
+    execute_ring_send_round(world, step, wallet_names, transactions_per_wallet, value).await?;
+
+    info!(
+        target: TARGET,
+        "STRESS CONTINUOUS cycle {} B: Verify available funds reverse order",
+        cycle + 1
+    );
+    verify_reverse_wallet_available_value(world, step, wallet_names, required_value, 300).await?;
+
+    info!(
+        target: TARGET,
+        "STRESS CONTINUOUS cycle {} C: Refresh user wallet balances",
+        cycle + 1
+    );
+    utils::update_wallet_balance_all_user_wallets(world, step, None).await?;
+
+    Ok(())
+}
+
+fn sorted_user_wallet_names_with_min(
+    world: &CucumberWorld,
+    minimum_wallets: usize,
+    context: &str,
+) -> Result<Vec<String>, StepError> {
+    let mut wallet_names: Vec<_> = world
+        .all_user_wallets()
+        .iter()
+        .map(|w| w.wallet_name.clone())
+        .collect();
+    if wallet_names.len() < minimum_wallets {
+        return Err(StepError::InvalidArgument {
+            message: format!(
+                "{context} requires at least {minimum_wallets} user wallets (found {})",
+                wallet_names.len()
+            ),
+        });
+    }
+    wallet_names.sort();
+    Ok(wallet_names)
+}
+
+async fn execute_ring_send_round(
+    world: &mut CucumberWorld,
+    step: &str,
+    wallet_names: &[String],
+    transactions_per_wallet: usize,
+    value: u64,
+) -> Result<(), StepError> {
+    let required_value = transactions_per_wallet as u64 * value;
+    let per_tx_fee_headroom = 1u64;
+    let fee_headroom = (transactions_per_wallet as u64).saturating_mul(per_tx_fee_headroom);
+    let min_available = required_value.saturating_add(fee_headroom);
+    let max_encumbered = 0u64;
+
+    for i in 0..wallet_names.len() {
+        let from = &wallet_names[i];
+        let to = &wallet_names[(i + 1) % wallet_names.len()];
+
+        wait_wallet_send_ready(world, from, min_available, max_encumbered, 120).await?;
+
+        let best_node_info = get_best_node_info(world, from).await?;
+        execute_send(
+            world,
+            step,
+            transactions_per_wallet,
+            value,
+            from,
+            to,
+            Some(&best_node_info),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn wait_wallet_send_ready(
+    world: &mut CucumberWorld,
+    wallet_name: &str,
+    min_available: u64,
+    max_encumbered: u64,
+    timeout_seconds: u64,
+) -> Result<(), StepError> {
+    let start = Instant::now();
+    let mut last_available = 0u64;
+    let mut last_encumbered = 0u64;
+
+    while start.elapsed() < Duration::from_secs(timeout_seconds) {
+        let (_, available_value) = utils::get_wallet_balances(
+            world,
+            "wait_wallet_send_ready",
+            wallet_name,
+            WalletStateType::Available,
+        )
+        .await?;
+        let (_, encumbered_value) = utils::get_wallet_balances(
+            world,
+            "wait_wallet_send_ready",
+            wallet_name,
+            WalletStateType::Encumbered,
+        )
+        .await?;
+
+        last_available = available_value;
+        last_encumbered = encumbered_value;
+
+        if available_value >= min_available && encumbered_value <= max_encumbered {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    Err(StepError::StepFail {
+        message: format!(
+            "Timed out waiting for wallet '{wallet_name}' send readiness: required available >= {min_available}, required encumbered <= {max_encumbered}, last available={last_available}, last encumbered={last_encumbered}"
+        ),
+    })
+}
+
+async fn verify_reverse_wallet_available_value(
+    world: &mut CucumberWorld,
+    step: &str,
+    wallet_names: &[String],
+    required_value: u64,
+    timeout_seconds: u64,
+) -> Result<(), StepError> {
+    for wallet_name in wallet_names.iter().rev() {
+        wait_for_available_value(world, step, wallet_name, required_value, timeout_seconds).await?;
+    }
+
+    Ok(())
+}
+
 async fn execute_non_stop_manual_command(
     world: &mut CucumberWorld,
     step: &str,
     command: &ManualCommand,
 ) -> Result<(), StepError> {
+    if let Some(result) = execute_scenario_parity_manual_command(world, step, command).await {
+        return result;
+    }
+
     match command {
         ManualCommand::CreateBlockchainSnapshotAllNodes { snapshot_name } => {
             execute_create_blockchain_snapshot_all_nodes(world, snapshot_name)
@@ -155,7 +427,56 @@ async fn execute_non_stop_manual_command(
         ManualCommand::WaitAllNodesSyncedToChain => {
             wait_for_all_nodes_to_be_synced_to_chain(world, step).await
         }
+        ManualCommand::CoinSplitAllUserWallets { .. }
+        | ManualCommand::VerifyMinOnChainOutputsAllUserWallets { .. }
+        | ManualCommand::StressContinuousNextWalletCycles { .. } => {
+            unreachable!("Scenario parity commands are handled before this match")
+        }
         ManualCommand::Stop => Ok(()),
+    }
+}
+
+async fn execute_scenario_parity_manual_command(
+    world: &mut CucumberWorld,
+    step: &str,
+    command: &ManualCommand,
+) -> Option<Result<(), StepError>> {
+    match command {
+        ManualCommand::CoinSplitAllUserWallets {
+            splits_per_wallet,
+            outputs,
+            value,
+        } => Some(
+            execute_coin_splits_all_user_wallets(world, step, *splits_per_wallet, *outputs, *value)
+                .await,
+        ),
+        ManualCommand::VerifyMinOnChainOutputsAllUserWallets {
+            min_outputs,
+            timeout_seconds,
+        } => Some(
+            verify_min_on_chain_outputs_all_user_wallets(
+                world,
+                step,
+                *min_outputs,
+                *timeout_seconds,
+            )
+            .await,
+        ),
+        ManualCommand::StressContinuousNextWalletCycles {
+            cycles,
+            transactions_per_wallet,
+            value,
+        } => Some(
+            execute_stress_continuous_next_wallet_cycles(
+                world,
+                step,
+                *cycles,
+                *transactions_per_wallet,
+                *value,
+            )
+            .await,
+        ),
+        _ => None,
     }
 }
 
