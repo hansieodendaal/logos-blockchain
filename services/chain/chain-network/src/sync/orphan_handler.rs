@@ -283,8 +283,10 @@ where
             return Some((orphan_info, HashSet::from([last_block_id])));
         }
 
-        self.dequeue_next_orphan()
-            .map(|orphan_info| (orphan_info, HashSet::new()))
+        self.dequeue_next_orphan().map(|orphan_info| {
+            let known_blocks = HashSet::from([orphan_info.tip, orphan_info.lib]);
+            (orphan_info, known_blocks)
+        })
     }
 }
 
@@ -493,13 +495,18 @@ mod tests {
 
             for (i, responses) in response_sequences.iter().enumerate() {
                 let block_results = responses.clone().into_block_result(chain);
-                let known_block = if i == 0 { None } else { last_block_id };
+                let additional_blocks = if i == 0 {
+                    HashSet::from([HeaderId::from(TEST_TIP), HeaderId::from(TEST_LIB)])
+                } else {
+                    HashSet::from([last_block_id
+                        .expect("a continuation request must have a previous block id")])
+                };
 
                 let next_last_block_id = block_results
                     .last()
                     .and_then(|result| result.as_ref().map_or(None, |block| Some(*block)));
 
-                network = network.with_stream(orphan_id, known_block, block_results);
+                network = network.with_stream(orphan_id, &additional_blocks, block_results);
 
                 last_block_id = next_last_block_id;
             }
@@ -565,7 +572,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     struct ResponseKey {
         orphan_id: HeaderId,
-        known_block: Option<HeaderId>,
+        additional_blocks: Vec<HeaderId>,
     }
 
     #[derive(Clone)]
@@ -587,16 +594,22 @@ mod tests {
         fn with_stream(
             self,
             orphan_id: HeaderId,
-            known_block: Option<HeaderId>,
+            additional_blocks: &HashSet<HeaderId>,
             responses: Vec<Result<TestBlock, String>>,
         ) -> Self {
             let key = ResponseKey {
                 orphan_id,
-                known_block,
+                additional_blocks: canonical_additional_blocks(additional_blocks),
             };
             self.responses.lock().unwrap().insert(key, responses);
             self
         }
+    }
+
+    fn canonical_additional_blocks(additional_blocks: &HashSet<HeaderId>) -> Vec<HeaderId> {
+        let mut blocks = additional_blocks.iter().copied().collect::<Vec<_>>();
+        blocks.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+        blocks
     }
 
     #[async_trait::async_trait]
@@ -657,7 +670,7 @@ mod tests {
 
             let key = ResponseKey {
                 orphan_id: target_block,
-                known_block: additional_blocks.iter().next().copied(),
+                additional_blocks: canonical_additional_blocks(&additional_blocks),
             };
 
             self.responses.lock().unwrap().remove(&key).map_or_else(
@@ -760,6 +773,25 @@ mod tests {
                 .iter()
                 .any(|(key, _)| *key == extra_orphan)
         );
+    }
+
+    #[test]
+    fn test_new_orphan_stream_input_seeds_tip_and_lib() {
+        let mut downloader = create_downloader();
+        let orphan_id = HeaderId::from([1u8; 32]);
+        let tip = HeaderId::from(TEST_TIP);
+        let lib = HeaderId::from(TEST_LIB);
+
+        downloader.enqueue_orphan(orphan_id, tip, lib).unwrap();
+
+        let Some((orphan_info, known_blocks)) = downloader.get_next_stream_input() else {
+            panic!("expected queued orphan to be available");
+        };
+
+        assert_eq!(orphan_info.orphan_id, orphan_id);
+        assert!(known_blocks.contains(&tip));
+        assert!(known_blocks.contains(&lib));
+        assert_eq!(known_blocks.len(), 2);
     }
 
     #[tokio::test]

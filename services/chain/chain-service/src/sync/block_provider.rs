@@ -708,6 +708,43 @@ mod tests {
         .await;
     }
 
+    // Demonstrates "orphan recovery stalls" if orphan recovery sends
+    // `known_blocks = {}`. The server returns `StartBlockNotFound` in that case,
+    // which is what cause orphan recovery stalls.
+    #[tokio::test]
+    async fn test_empty_known_blocks_returns_start_block_not_found() {
+        let mut env = TestEnv::new().await;
+        let ids = env.setup_chain_with_blocks(5).await;
+
+        let target_block = ids[4];
+
+        env.test_error_scenario(
+            target_block,
+            &HashSet::new(),
+            BlocksUnavailableReason::StartBlockNotFound,
+        )
+        .await;
+    }
+
+    // Demonstrates that the provider can serve blocks even if the tip is unknown to
+    // the provider, as long as the lib is known and valid. This is important
+    // for orphan recovery, where the tip is unknown to the provider but the lib
+    // is known and valid.
+    #[tokio::test]
+    async fn test_known_blocks_with_unknown_tip_and_known_lib_succeeds() {
+        let mut env = TestEnv::new().await;
+        let ids = env.setup_chain_with_blocks(5).await;
+
+        // Simulate request anchors where tip is unknown to the provider but lib is
+        // valid.
+        let known_blocks = HashSet::from([HeaderId::from([201u8; 32]), ids[0]]);
+        let target_block = ids[4];
+        let expected = ids[1..=4].to_vec();
+
+        env.retrieve_and_validate_blocks(target_block, &known_blocks, &expected)
+            .await;
+    }
+
     #[tokio::test]
     async fn test_error_all_blocks_nonexistent() {
         let env = TestEnv::new().await;
