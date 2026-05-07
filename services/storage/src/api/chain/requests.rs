@@ -13,7 +13,13 @@ use tokio::sync::oneshot::Sender;
 
 use crate::{
     StorageMsg, StorageServiceError,
-    api::{StorageApiRequest, StorageBackendApi, StorageOperation, chain::StorageChainApi},
+    api::{
+        StorageApiRequest, StorageBackendApi, StorageOperation,
+        backend::rocksdb::chain::{
+            streamed_immutable_block_ids_reverse_vec, streamed_immutable_block_ids_vec,
+        },
+        chain::StorageChainApi,
+    },
     backends::StorageBackend,
 };
 
@@ -232,10 +238,7 @@ async fn handle_scan_immutable_block_ids<Backend: StorageBackend>(
     limit: NonZeroUsize,
     response_tx: Sender<Vec<HeaderId>>,
 ) -> Result<(), StorageServiceError> {
-    let result = backend
-        .scan_immutable_block_ids(slot_range, limit)
-        .await
-        .map_err(|e| StorageServiceError::BackendError(e.into()))?;
+    let result = streamed_immutable_block_ids_vec(backend, slot_range, limit).await?;
 
     if response_tx.send(result).is_err() {
         return Err(StorageServiceError::ReplyError {
@@ -245,17 +248,13 @@ async fn handle_scan_immutable_block_ids<Backend: StorageBackend>(
 
     Ok(())
 }
-
 async fn handle_scan_immutable_block_ids_reverse<Backend: StorageBackend>(
     backend: &mut Backend,
     slot_range: RangeInclusive<Slot>,
     limit: NonZeroUsize,
     response_tx: Sender<Vec<HeaderId>>,
 ) -> Result<(), StorageServiceError> {
-    let result = backend
-        .scan_immutable_block_ids_reverse(slot_range, limit)
-        .await
-        .map_err(|e| StorageServiceError::BackendError(e.into()))?;
+    let result = streamed_immutable_block_ids_reverse_vec(backend, slot_range, limit).await?;
 
     if response_tx.send(result).is_err() {
         return Err(StorageServiceError::ReplyError {
