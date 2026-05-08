@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+
+use lb_key_management_system_service::keys::Ed25519PublicKey;
 use lb_zone_sdk::{sequencer::SequencerCheckpoint, state::InscriptionInfo};
 use uuid::Uuid;
 
@@ -8,14 +11,15 @@ use crate::message::AppMessage;
 /// The sequencer surfaces chain events (reorgs, finalization); the application
 /// maintains its own view of the world by implementing this trait.
 ///
+/// Ownership of an inscription is determined by comparing the SDK-supplied
+/// `signer` field on each `InscriptionInfo` against our own signing key's
+/// public key — no app-side tracking is required.
+///
 /// A production implementation might use a database. This demo uses in-memory
 /// vecs.
 pub trait ZoneState {
     /// Apply a message to the canonical (unfinalized) state.
     fn apply(&mut self, msg: AppMessage);
-
-    /// Revert a message from canonical state (orphaned by reorg).
-    fn revert(&mut self, tx_uuid: &Uuid);
 
     /// Check if a message with this `tx_uuid` exists in canonical or finalized
     /// state.
@@ -66,10 +70,6 @@ impl ZoneState for InMemoryZoneState {
         }
     }
 
-    fn revert(&mut self, tx_uuid: &Uuid) {
-        self.canonical.retain(|m| &m.tx_uuid != tx_uuid);
-    }
-
     fn contains(&self, tx_uuid: &Uuid) -> bool {
         self.canonical.iter().any(|m| &m.tx_uuid == tx_uuid)
             || self.finalized.iter().any(|m| &m.tx_uuid == tx_uuid)
@@ -110,33 +110,28 @@ impl ZoneState for InMemoryZoneState {
 
 /// Process a channel update event.
 ///
-/// 1. Revert `orphaned` from state.
-/// 2. Apply `adopted` to state.
-/// 3. Re-publish each `invalidated` entry that is ours, not currently in state,
-///    and not in `pending`.
+/// State here represents "messages that have been published" (ours via
+/// `Event::Published` optimistic apply, others' via `adopted`) — it does NOT
+/// track current canonical membership. Once a message is added it stays;
+/// there is no revert. Reorgs and bouncing don't change what was published,
+/// only where it lives on chain.
+///
+/// 1. Apply adopted to state (others' new inscriptions).
+/// 2. Iterate orphaned and return entries not in `pending` — those are
+///    republish candidates the user must decide on.
 pub fn resolve_conflicts(
     state: &mut InMemoryZoneState,
     orphaned: &[InscriptionInfo],
     adopted: &[InscriptionInfo],
     pending: &[InscriptionInfo],
-    invalidated: &[InscriptionInfo],
+    my_signer: &Ed25519PublicKey,
 ) -> Vec<AppMessage> {
-    // Capture our messages from `invalidated` BEFORE reverting orphans —
-    // `is_ours` lives on the stored AppMessage and revert removes it.
-    let mut ours: Vec<AppMessage> = Vec::new();
-    for inv in invalidated {
-        if let Some(decoded) = AppMessage::from_bytes(&inv.payload)
-            && let Some(stored) = state.get(&decoded.tx_uuid)
-            && stored.is_ours
-        {
-            ours.push(stored.clone());
-        }
-    }
-
+    // SDK contract: every entry in `orphaned` is one of our own pending items.
     for inv in orphaned {
-        if let Some(msg) = AppMessage::from_bytes(&inv.payload) {
-            state.revert(&msg.tx_uuid);
-        }
+        debug_assert_eq!(
+            &inv.signer, my_signer,
+            "orphaned entry signer mismatch - SDK should only surface our own pending"
+        );
     }
 
     for adp in adopted {
@@ -150,7 +145,9 @@ pub fn resolve_conflicts(
         .filter_map(|inv| AppMessage::from_bytes(&inv.payload).map(|m| m.tx_uuid))
         .collect();
 
-    ours.into_iter()
-        .filter(|m| !state.contains(&m.tx_uuid) && !pending_uuids.contains(&m.tx_uuid))
+    orphaned
+        .iter()
+        .filter_map(|inv| AppMessage::from_bytes(&inv.payload))
+        .filter(|m| !pending_uuids.contains(&m.tx_uuid))
         .collect()
 }

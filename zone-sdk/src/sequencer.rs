@@ -91,20 +91,39 @@ pub enum Event {
     },
     /// Channel state changed.
     ///
+    /// Emitted when at least one of `orphaned` or `adopted` is non-empty.
+    /// `safe → pending` transitions whose original signed tx is still valid
+    /// (parent unchanged on the new branch) are not surfaced — the SDK
+    /// keeps retrying them internally.
+    ///
+    /// `orphaned` contains only items the SDK has given up on: our own
+    /// pending whose original signed tx is permanently invalid because a
+    /// competing inscription claimed the parent slot (or because the parent
+    /// is now off the canonical chain transitively). These need a user
+    /// decision — re-creation requires your signing key.
+    ///
+    /// `adopted` is the block-delta of inscriptions newly on the canonical
+    /// branch, filtered to **exclude items signed by us**. Consumers learn
+    /// about their own publishes via `Event::Published` (optimistic apply
+    /// pattern) — those don't need to be re-surfaced here.
+    ///
     /// Consumer pattern:
-    /// 1. Apply `orphaned` and `adopted` to state (revert / add).
-    /// 2. For each entry in `invalidated`, decide whether to republish.
+    /// 1. On `Event::Published`: optimistically apply your own inscription to
+    ///    local state.
+    /// 2. On `ChannelUpdate`: apply `adopted` (others' new inscriptions) to
+    ///    local state, revert `orphaned` (yours that can no longer land).
+    /// 3. For each entry in `orphaned` not in `pending`, decide whether to
+    ///    republish (with a fresh parent — SDK handles parent selection).
     ChannelUpdate {
-        /// Removed from the canonical branch (revert from state).
+        /// Our pending whose original signed tx is permanently invalid
+        /// (parent slot claimed by something in `adopted`, or parent
+        /// transitively off canonical). Need user decision to re-create.
         orphaned: Vec<InscriptionInfo>,
-        /// Added to the canonical branch (apply to state).
+        /// Others' inscriptions newly on the canonical branch (block-delta,
+        /// excluding our own — see `Event::Published` for those).
         adopted: Vec<InscriptionInfo>,
-        /// Pending tx on this branch.
+        /// Our pending still valid on the new tip — SDK is retrying.
         pending: Vec<InscriptionInfo>,
-        /// Submitted tx that is not valid on this branch anymore.
-        invalidated: Vec<InscriptionInfo>,
-        /// The new channel tip `MsgId`.
-        new_channel_tip: MsgId,
     },
     /// Batch of finalized inscriptions discovered during backfill catch-up.
     /// Emitted incrementally when the sequencer catches up from a checkpoint.
@@ -468,6 +487,7 @@ where
                             inscribe.parent,
                             inscribe.id(),
                             inscribe.inscription.clone(),
+                            inscribe.signer,
                         );
                         is_inscription = true;
                         break;
@@ -837,13 +857,16 @@ where
         }
     }
 
-    /// Build the `ChannelUpdate` event. `invalidated` = orphaned blocks ∪
-    /// pending shed because lineage no longer reaches the new channel tip.
-    /// Shed runs here (only when there's a canonical change) — pre-event
-    /// state is preserved so shed can correctly identify what just went
-    /// off-branch.
+    /// Build the `ChannelUpdate` event. `orphaned` contains only our own
+    /// pending whose original signed tx is permanently invalid — items the
+    /// SDK has given up on (parent slot claimed by a competing inscription,
+    /// or parent transitively off canonical). Block-delta orphans whose
+    /// original tx is still valid (the SDK keeps retrying them) are not
+    /// surfaced. `adopted` is filtered to exclude inscriptions signed by us
+    /// — consumers learn about their own publishes via `Event::Published`
+    /// (optimistic apply pattern).
     fn build_channel_event(&mut self, u: crate::state::ChannelUpdateInfo) -> Event {
-        let shed = match (self.state.as_mut(), self.current_tip) {
+        let orphaned = match (self.state.as_mut(), self.current_tip) {
             (Some(s), Some(tip)) => s.shed_off_branch_pending(tip),
             _ => Vec::new(),
         };
@@ -852,13 +875,12 @@ where
             _ => Vec::new(),
         };
 
-        let orphaned_hashes: std::collections::HashSet<TxHash> =
-            u.orphaned.iter().map(|i| i.tx_hash).collect();
-        let mut invalidated = u.orphaned.clone();
-        invalidated.extend(
-            shed.into_iter()
-                .filter(|i| !orphaned_hashes.contains(&i.tx_hash)),
-        );
+        let my_signer = self.signing_key.public_key();
+        let adopted: Vec<InscriptionInfo> = u
+            .adopted
+            .into_iter()
+            .filter(|i| i.signer != my_signer)
+            .collect();
 
         for inv in &pending {
             debug!(
@@ -869,9 +891,9 @@ where
                 inv.parent_msg,
             );
         }
-        for inv in &invalidated {
+        for inv in &orphaned {
             debug!(
-                "  invalidated: payload={:?}, tx={:?}, msg_id={:?}",
+                "  orphaned: payload={:?}, tx={:?}, msg_id={:?}",
                 String::from_utf8_lossy(&inv.payload),
                 inv.tx_hash,
                 inv.this_msg,
@@ -879,11 +901,9 @@ where
         }
 
         Event::ChannelUpdate {
-            orphaned: u.orphaned,
-            adopted: u.adopted,
+            orphaned,
+            adopted,
             pending,
-            invalidated,
-            new_channel_tip: u.new_channel_tip,
         }
     }
 
@@ -955,7 +975,13 @@ where
             String::from_utf8_lossy(&data),
         );
 
-        s.submit_inscription(signed_tx.clone(), parent, new_msg_id, data.clone());
+        s.submit_inscription(
+            signed_tx.clone(),
+            parent,
+            new_msg_id,
+            data.clone(),
+            self.signing_key.public_key(),
+        );
         self.last_msg_id = new_msg_id;
 
         // Post to network (best effort, resubmit timer retries if needed)
@@ -1364,6 +1390,7 @@ fn extract_inscriptions(txs: &[SignedMantleTx], channel_id: ChannelId) -> Vec<In
                         parent_msg: inscribe.parent,
                         this_msg: inscribe.id(),
                         payload: inscribe.inscription.clone(),
+                        signer: inscribe.signer,
                     })
                 } else {
                     None
