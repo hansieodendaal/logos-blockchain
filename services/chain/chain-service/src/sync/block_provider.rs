@@ -708,9 +708,6 @@ mod tests {
         .await;
     }
 
-    // Demonstrates "orphan recovery stalls" if orphan recovery sends
-    // `known_blocks = {}`. The server returns `StartBlockNotFound` in that case,
-    // which is what cause orphan recovery stalls.
     #[tokio::test]
     async fn test_empty_known_blocks_returns_start_block_not_found() {
         let mut env = TestEnv::new().await;
@@ -726,10 +723,6 @@ mod tests {
         .await;
     }
 
-    // Demonstrates that the provider can serve blocks even if the tip is unknown to
-    // the provider, as long as the lib is known and valid. This is important
-    // for orphan recovery, where the tip is unknown to the provider but the lib
-    // is known and valid.
     #[tokio::test]
     async fn test_known_blocks_with_unknown_tip_and_known_lib_succeeds() {
         let mut env = TestEnv::new().await;

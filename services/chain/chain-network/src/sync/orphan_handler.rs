@@ -283,10 +283,8 @@ where
             return Some((orphan_info, HashSet::from([last_block_id])));
         }
 
-        self.dequeue_next_orphan().map(|orphan_info| {
-            let known_blocks = HashSet::from([orphan_info.tip, orphan_info.lib]);
-            (orphan_info, known_blocks)
-        })
+        self.dequeue_next_orphan()
+            .map(|orphan_info| (orphan_info, HashSet::new()))
     }
 }
 
@@ -773,25 +771,6 @@ mod tests {
                 .iter()
                 .any(|(key, _)| *key == extra_orphan)
         );
-    }
-
-    #[test]
-    fn test_new_orphan_stream_input_seeds_tip_and_lib() {
-        let mut downloader = create_downloader();
-        let orphan_id = HeaderId::from([1u8; 32]);
-        let tip = HeaderId::from(TEST_TIP);
-        let lib = HeaderId::from(TEST_LIB);
-
-        downloader.enqueue_orphan(orphan_id, tip, lib).unwrap();
-
-        let Some((orphan_info, known_blocks)) = downloader.get_next_stream_input() else {
-            panic!("expected queued orphan to be available");
-        };
-
-        assert_eq!(orphan_info.orphan_id, orphan_id);
-        assert!(known_blocks.contains(&tip));
-        assert!(known_blocks.contains(&lib));
-        assert_eq!(known_blocks.len(), 2);
     }
 
     #[tokio::test]
