@@ -143,11 +143,9 @@ fn should_skip(message: &ZoneMessage, slot: Slot, skip_until: &mut Option<(MsgId
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
-
     use async_trait::async_trait;
     use lb_common_http_client::{
-        ApiBlock, BlockInfo, ChainServiceInfo, ChainServiceMode, CryptarchiaInfo,
+        BlockInfo, BlocksRangeStreamParams, ChainServiceInfo, ChainServiceMode, CryptarchiaInfo,
         ProcessedBlockEvent, State,
     };
     use lb_core::{
@@ -390,33 +388,13 @@ mod tests {
 
         async fn blocks_range_stream(
             &self,
-            _blocks_limit: Option<NonZero<usize>>,
-            _slot_from: Option<u64>,
-            _slot_to: Option<u64>,
-            _descending: Option<bool>,
-            _server_batch_size: Option<NonZero<usize>>,
-            _immutable_only: Option<bool>,
+            _params: BlocksRangeStreamParams,
         ) -> Result<BoxStream<ProcessedBlockEvent>, lb_common_http_client::Error> {
             Ok(Box::pin(futures::stream::empty()))
         }
 
         async fn lib_stream(&self) -> Result<BoxStream<BlockInfo>, lb_common_http_client::Error> {
             Ok(Box::pin(futures::stream::empty()))
-        }
-
-        async fn block(
-            &self,
-            _id: HeaderId,
-        ) -> Result<Option<ApiBlock>, lb_common_http_client::Error> {
-            Ok(None)
-        }
-
-        async fn immutable_blocks(
-            &self,
-            _slot_from: Slot,
-            _slot_to: Slot,
-        ) -> Result<Vec<ApiBlock>, lb_common_http_client::Error> {
-            Ok(Vec::new())
         }
 
         async fn zone_messages_in_block(

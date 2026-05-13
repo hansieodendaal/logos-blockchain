@@ -1,9 +1,10 @@
-use std::{num::NonZero, pin::Pin};
+use std::pin::Pin;
 
 use async_trait::async_trait;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt as _, stream};
 use lb_common_http_client::{
-    ApiBlock, BlockInfo, ChainServiceInfo, CommonHttpClient, Error, ProcessedBlockEvent, Slot,
+    BlockFilter, BlockInfo, BlockSortOrder, BlocksRangeStreamParams, ChainServiceInfo,
+    CommonHttpClient, Error, ProcessedBlockEvent, Slot,
 };
 use lb_core::{
     header::HeaderId,
@@ -24,23 +25,10 @@ pub trait Node {
 
     async fn blocks_range_stream(
         &self,
-        blocks_limit: Option<NonZero<usize>>,
-        slot_from: Option<u64>,
-        slot_to: Option<u64>,
-        descending: Option<bool>,
-        server_batch_size: Option<NonZero<usize>>,
-        immutable_only: Option<bool>,
+        params: BlocksRangeStreamParams,
     ) -> Result<BoxStream<ProcessedBlockEvent>, Error>;
 
     async fn lib_stream(&self) -> Result<BoxStream<BlockInfo>, Error>;
-
-    async fn block(&self, id: HeaderId) -> Result<Option<ApiBlock>, Error>;
-
-    async fn immutable_blocks(
-        &self,
-        slot_from: Slot,
-        slot_to: Slot,
-    ) -> Result<Vec<ApiBlock>, Error>;
 
     async fn zone_messages_in_block(
         &self,
@@ -84,24 +72,11 @@ impl Node for NodeHttpClient {
 
     async fn blocks_range_stream(
         &self,
-        blocks_limit: Option<NonZero<usize>>,
-        slot_from: Option<u64>,
-        slot_to: Option<u64>,
-        descending: Option<bool>,
-        server_batch_size: Option<NonZero<usize>>,
-        immutable_only: Option<bool>,
+        params: BlocksRangeStreamParams,
     ) -> Result<BoxStream<ProcessedBlockEvent>, Error> {
         let stream = self
             .client
-            .get_blocks_range_stream(
-                self.base_url.clone(),
-                blocks_limit,
-                slot_from,
-                slot_to,
-                descending,
-                server_batch_size,
-                immutable_only,
-            )
+            .get_blocks_range_stream(self.base_url.clone(), params)
             .await?;
         Ok(Box::pin(stream))
     }
@@ -109,24 +84,6 @@ impl Node for NodeHttpClient {
     async fn lib_stream(&self) -> Result<BoxStream<BlockInfo>, Error> {
         let stream = self.client.get_lib_stream(self.base_url.clone()).await?;
         Ok(Box::pin(stream))
-    }
-
-    async fn block(&self, id: HeaderId) -> Result<Option<ApiBlock>, Error> {
-        self.client.get_block_by_id(self.base_url.clone(), id).await
-    }
-
-    async fn immutable_blocks(
-        &self,
-        slot_from: Slot,
-        slot_to: Slot,
-    ) -> Result<Vec<ApiBlock>, Error> {
-        self.client
-            .get_immutable_blocks(
-                self.base_url.clone(),
-                slot_from.into_inner(),
-                slot_to.into_inner(),
-            )
-            .await
     }
 
     async fn zone_messages_in_block(
@@ -154,26 +111,30 @@ impl Node for NodeHttpClient {
         slot_to: Slot,
         channel_id: ChannelId,
     ) -> Result<BoxStream<(ZoneMessage, Slot)>, Error> {
-        let blocks = self
-            .client
-            .get_immutable_blocks(
-                self.base_url.clone(),
-                slot_from.into_inner(),
-                slot_to.into_inner(),
-            )
-            .await?;
+        let messages = self
+            .blocks_range_stream(BlocksRangeStreamParams {
+                slot_from: Some(slot_from.into_inner()),
+                slot_to: Some(slot_to.into_inner()),
+                order: Some(BlockSortOrder::Ascending),
+                blocks_limit: None,
+                server_batch_size: None,
+                block_filter: Some(BlockFilter::ImmutableOnly),
+            })
+            .await?
+            .flat_map(move |event| {
+                let slot = event.block.header.slot;
+                stream::iter(
+                    event
+                        .block
+                        .transactions
+                        .into_iter()
+                        .flat_map(|tx| tx.mantle_tx.0)
+                        .filter_map(move |op| op_to_zone_message(&op, channel_id))
+                        .map(move |msg| (msg, slot)),
+                )
+            });
 
-        Ok(Box::pin(stream::iter(blocks.into_iter().flat_map(
-            move |block| {
-                let slot = block.header.slot;
-                block
-                    .transactions
-                    .into_iter()
-                    .flat_map(|tx| tx.mantle_tx.0)
-                    .filter_map(move |op| op_to_zone_message(&op, channel_id))
-                    .map(move |msg| (msg, slot))
-            },
-        ))))
+        Ok(Box::pin(messages))
     }
 
     async fn post_transaction(&self, tx: SignedMantleTx) -> Result<(), Error> {
