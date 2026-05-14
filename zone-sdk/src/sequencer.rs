@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant, SystemTime},
+};
 
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use lb_common_http_client::{ChainServiceInfo, ProcessedBlockEvent, Slot};
@@ -6,7 +9,7 @@ use lb_core::{
     header::HeaderId,
     mantle::{
         MantleTx, SignedMantleTx, Transaction as _,
-        channel::{SlotTimeframe, SlotTimeout},
+        channel::{ChannelState, SlotTimeframe, SlotTimeout},
         ops::{
             Op, OpProof,
             channel::{
@@ -19,7 +22,7 @@ use lb_core::{
     proofs::channel_multi_sig_proof::{ChannelMultiSigProof, IndexedSignature},
 };
 use lb_key_management_system_service::keys::{Ed25519Key, Ed25519Signature};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -27,6 +30,8 @@ use crate::{
     adapter::BoxStream,
     state::{InscriptionInfo, TxState},
 };
+
+const TARGET: &str = "zone_sdk::sequencer";
 
 const DEFAULT_RESUBMIT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -64,6 +69,10 @@ pub struct SequencerConfig {
     pub resubmit_interval: Duration,
     pub reconnect_delay: Duration,
     pub publish_channel_capacity: usize,
+    pub slot_duration: Duration,
+    pub chain_start_time: Option<SystemTime>,
+    pub min_slots_remaining_in_turn: u64,
+    pub auto_requeue_orphaned: bool,
 }
 
 impl Default for SequencerConfig {
@@ -72,8 +81,131 @@ impl Default for SequencerConfig {
             resubmit_interval: DEFAULT_RESUBMIT_INTERVAL,
             reconnect_delay: DEFAULT_RECONNECT_DELAY,
             publish_channel_capacity: DEFAULT_PUBLISH_CHANNEL_CAPACITY,
+            slot_duration: Duration::from_secs(1),
+            chain_start_time: None,
+            min_slots_remaining_in_turn: 1,
+            auto_requeue_orphaned: false,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct SlotClock {
+    slot_duration: Duration,
+    chain_start_time: SystemTime,
+    last_observed_slot: Slot,
+    last_observed_at: Instant,
+}
+
+impl SlotClock {
+    #[must_use]
+    pub fn from_chain_start_time(chain_start_time: SystemTime, slot_duration: Duration) -> Self {
+        let current_slot = slot_from_u64(
+            SystemTime::now()
+                .duration_since(chain_start_time)
+                .ok()
+                .map_or(0, |elapsed| slots_from_duration(elapsed, slot_duration)),
+        );
+
+        Self {
+            slot_duration,
+            chain_start_time,
+            last_observed_slot: current_slot,
+            last_observed_at: Instant::now(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_observed_slot(observed_slot: Slot, slot_duration: Duration) -> Self {
+        let chain_start_time = SystemTime::now()
+            .checked_sub(duration_mul(slot_duration, slot_to_u64(observed_slot)))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        Self {
+            slot_duration,
+            chain_start_time,
+            last_observed_slot: observed_slot,
+            last_observed_at: Instant::now(),
+        }
+    }
+
+    pub fn observe_slot(&mut self, observed_slot: Slot) {
+        self.chain_start_time = SystemTime::now()
+            .checked_sub(duration_mul(self.slot_duration, slot_to_u64(observed_slot)))
+            .unwrap_or(self.chain_start_time);
+        self.last_observed_slot = observed_slot;
+        self.last_observed_at = Instant::now();
+    }
+
+    #[must_use]
+    pub fn current_slot(&self) -> Slot {
+        let from_chain_start = SystemTime::now()
+            .duration_since(self.chain_start_time)
+            .ok()
+            .map_or(0, |elapsed| {
+                slots_from_duration(elapsed, self.slot_duration)
+            });
+        let from_anchor = slot_to_u64(self.last_observed_slot).saturating_add(slots_from_duration(
+            self.last_observed_at.elapsed(),
+            self.slot_duration,
+        ));
+
+        slot_from_u64(from_chain_start.max(from_anchor))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SequencerChannelView {
+    pub channel_id: ChannelId,
+    pub channel: Option<ChannelState>,
+    pub current_slot: Slot,
+    pub own_key_index: Option<u16>,
+    pub authorized_key_index: Option<u16>,
+    pub is_our_turn: bool,
+    pub tip_message: MsgId,
+    pub queued_messages: usize,
+    pub posting_timeframe: Option<u32>,
+    pub posting_timeout: Option<u32>,
+    pub accredited_key_count: Option<usize>,
+}
+
+impl SequencerChannelView {
+    const fn new(channel_id: ChannelId) -> Self {
+        Self {
+            channel_id,
+            channel: None,
+            current_slot: Slot::genesis(),
+            own_key_index: None,
+            authorized_key_index: None,
+            is_our_turn: false,
+            tip_message: MsgId::root(),
+            queued_messages: 0,
+            posting_timeframe: None,
+            posting_timeout: None,
+            accredited_key_count: None,
+        }
+    }
+}
+
+const fn slots_from_duration(elapsed: Duration, slot_duration: Duration) -> u64 {
+    let divisor = slot_duration.as_nanos();
+    if divisor == 0 {
+        return 0;
+    }
+    (elapsed.as_nanos() / divisor) as u64
+}
+
+fn duration_mul(duration: Duration, n: u64) -> Duration {
+    let nanos = duration.as_nanos().saturating_mul(u128::from(n));
+    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
+}
+
+const fn slot_to_u64(slot: Slot) -> u64 {
+    slot.into_inner()
+}
+
+fn slot_from_u64(value: u64) -> Slot {
+    Slot::from(value)
 }
 
 /// Sequencer errors.
@@ -200,7 +332,8 @@ pub struct SequencerHandle<Node> {
     request_tx: mpsc::Sender<ActorRequest>,
     node: Node,
     event_tx: broadcast::Sender<Event>,
-    ready_rx: tokio::sync::watch::Receiver<bool>,
+    ready_rx: watch::Receiver<bool>,
+    channel_view_rx: watch::Receiver<SequencerChannelView>,
 }
 
 impl<Node> SequencerHandle<Node>
@@ -214,6 +347,11 @@ where
                 return; // sequencer dropped
             }
         }
+    }
+
+    #[must_use]
+    pub fn subscribe_channel_view(&self) -> watch::Receiver<SequencerChannelView> {
+        self.channel_view_rx.clone()
     }
 
     /// Publish an inscription to the zone's channel.
@@ -313,14 +451,14 @@ where
             reason: "actor dropped reply",
         })??;
 
-        info!(
+        info!(target: TARGET,
             "Submitted tx including inscription {:?}",
             result.inscription_id
         );
 
         // Post to network (best effort, will be resubmitted if needed)
         if let Err(e) = self.node.post_transaction(tx).await {
-            warn!("Failed to post transaction: {e}");
+            warn!(target: TARGET, "Failed to post transaction: {e}");
         }
 
         Ok(result)
@@ -372,11 +510,11 @@ where
 
         let tx_hash = signed_tx.mantle_tx.hash();
 
-        info!("Submitted channel_config transaction {:?}", tx_hash);
+        info!(target: TARGET, "Submitted channel_config transaction {:?}", tx_hash);
 
         // Post to network (best effort, will be resubmitted if needed)
         if let Err(e) = self.node.post_transaction(signed_tx).await {
-            warn!("Failed to post channel_config transaction: {e}");
+            warn!(target: TARGET, "Failed to post channel_config transaction: {e}");
         }
 
         let finalized = async move {
@@ -421,6 +559,10 @@ pub struct ZoneSequencer<Node> {
     current_tip: Option<HeaderId>,
     lib_slot: Slot,
     last_msg_id: MsgId,
+    slot_clock: Option<SlotClock>,
+    channel_state: Option<ChannelState>,
+    own_key_index: Option<u16>,
+    pending_turn_queue: VecDeque<Vec<u8>>,
 
     // Block stream
     blocks_stream: Option<BoxStream<ProcessedBlockEvent>>,
@@ -442,7 +584,8 @@ pub struct ZoneSequencer<Node> {
     event_tx: broadcast::Sender<Event>,
 
     // Readiness signal — set to true when connected and backfill is complete
-    ready_tx: tokio::sync::watch::Sender<bool>,
+    ready_tx: watch::Sender<bool>,
+    channel_view_tx: watch::Sender<SequencerChannelView>,
 }
 
 impl<Node> ZoneSequencer<Node>
@@ -487,7 +630,7 @@ where
         let (request_tx, request_rx) = mpsc::channel(config.publish_channel_capacity);
 
         let (state, lib_slot, last_msg_id) = if let Some(cp) = checkpoint {
-            info!(
+            info!(target: TARGET,
                 "Restoring from checkpoint: {} pending txs, lib={:?}, lib_slot={:?}",
                 cp.pending_txs.len(),
                 cp.lib,
@@ -519,19 +662,22 @@ where
             }
             (Some(tx_state), cp.lib_slot, cp.last_msg_id)
         } else {
-            info!("Starting fresh (no checkpoint)");
+            info!(target: TARGET, "Starting fresh (no checkpoint)");
             (None, Slot::genesis(), MsgId::root())
         };
 
         let resubmit_interval = tokio::time::interval(config.resubmit_interval);
         let (event_tx, _) = broadcast::channel(256);
-        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = watch::channel(false);
+        let (channel_view_tx, channel_view_rx) =
+            watch::channel(SequencerChannelView::new(channel_id));
 
         let handle = SequencerHandle {
             request_tx,
             node: node.clone(),
             event_tx: event_tx.clone(),
             ready_rx,
+            channel_view_rx,
         };
 
         let sequencer = Self {
@@ -544,6 +690,10 @@ where
             current_tip: None,
             lib_slot,
             last_msg_id,
+            slot_clock: None,
+            channel_state: None,
+            own_key_index: None,
+            pending_turn_queue: VecDeque::new(),
             blocks_stream: None,
             resubmit_interval,
             resubmit_active: false,
@@ -553,6 +703,7 @@ where
             backfill_to: None,
             event_tx,
             ready_tx,
+            channel_view_tx,
         };
 
         (sequencer, handle)
@@ -624,12 +775,16 @@ where
 
     /// Handle a single item from the blocks stream. `None` means the stream
     /// disconnected; any other value is processed as a block event.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     async fn handle_stream_item(
         &mut self,
         maybe_event: Option<ProcessedBlockEvent>,
     ) -> Option<Event> {
         let Some(block_event) = maybe_event else {
-            warn!("Blocks stream disconnected, will reconnect on next call");
+            warn!(target: TARGET, "Blocks stream disconnected, will reconnect on next call");
             self.blocks_stream = None;
             let _ = self.ready_tx.send(false);
             return None;
@@ -645,8 +800,19 @@ where
         )
         .await;
 
+        if let Some(slot_clock) = self.slot_clock.as_mut() {
+            slot_clock.observe_slot(block_event.tip_slot);
+        }
+        if let Err(err) = self.refresh_channel_state().await {
+            warn!(target: TARGET, "Failed to refresh channel state after block: {err}");
+        }
+
         let became_ready = self.maybe_signal_ready();
         let block_event = self.apply_block_result(result);
+        self.recompute_channel_view();
+        if let Err(err) = self.try_publish_queued().await {
+            warn!(target: TARGET, "Failed to publish queued inscription: {err}");
+        }
 
         if became_ready {
             if let Some(event) = block_event {
@@ -665,16 +831,138 @@ where
             return false;
         }
         if self.backfill_from.is_none() && self.backfill_to.is_none() {
-            debug!("Sequencer ready (backfill complete, first block processed)");
+            debug!(target: TARGET, "Sequencer ready (backfill complete, first block processed)");
             let _ = self.ready_tx.send(true);
             drop(self.event_tx.send(Event::Ready));
             true
         } else {
-            debug!(
+            debug!(target: TARGET,
                 "Not yet ready: backfill_from={:?}, backfill_to={:?}",
                 self.backfill_from, self.backfill_to
             );
             false
+        }
+    }
+
+    async fn refresh_channel_state(&mut self) -> Result<(), Error> {
+        let channel = self
+            .node
+            .channel_state(self.channel_id)
+            .await
+            .map_err(|err| Error::Network(err.to_string()))?;
+        self.own_key_index = channel
+            .as_ref()
+            .and_then(|channel| self.own_key_index_for(channel));
+        self.channel_state = channel;
+        Ok(())
+    }
+
+    fn recompute_channel_view(&self) {
+        let current_slot = self
+            .slot_clock
+            .as_ref()
+            .map_or(Slot::genesis(), SlotClock::current_slot);
+        let authorized_key_index = self
+            .channel_state
+            .as_ref()
+            .map(|channel| channel.round_robin(current_slot).0);
+        let tip_message = self
+            .channel_state
+            .as_ref()
+            .map_or(self.last_msg_id, |channel| channel.tip_message);
+        let view = SequencerChannelView {
+            channel_id: self.channel_id,
+            channel: self.channel_state.clone(),
+            current_slot,
+            own_key_index: self.own_key_index,
+            authorized_key_index,
+            is_our_turn: self.can_publish_now(),
+            tip_message,
+            queued_messages: self.pending_turn_queue.len(),
+            posting_timeframe: self
+                .channel_state
+                .as_ref()
+                .map(|channel| u32::from(channel.posting_timeframe.clone())),
+            posting_timeout: self
+                .channel_state
+                .as_ref()
+                .map(|channel| u32::from(channel.posting_timeout.clone())),
+            accredited_key_count: self
+                .channel_state
+                .as_ref()
+                .map(|channel| channel.accredited_keys.len()),
+        };
+        drop(self.channel_view_tx.send(view));
+    }
+
+    fn own_key_index_for(&self, channel: &ChannelState) -> Option<u16> {
+        channel
+            .accredited_keys
+            .iter()
+            .position(|pk| *pk == self.signing_key.public_key())
+            .map(|idx| idx as u16)
+    }
+
+    fn can_publish_now(&self) -> bool {
+        let Some(slot_clock) = &self.slot_clock else {
+            return false;
+        };
+        let current_slot = slot_clock.current_slot();
+
+        let Some(channel) = &self.channel_state else {
+            return self.last_msg_id == MsgId::root();
+        };
+
+        let Some(own_idx) = self.own_key_index else {
+            return false;
+        };
+
+        let (authorized_idx, turn_start_slot) = channel.round_robin(current_slot);
+        authorized_idx == own_idx
+            && self.has_enough_turn_time_left(channel, current_slot, turn_start_slot)
+    }
+
+    fn has_enough_turn_time_left(
+        &self,
+        channel: &ChannelState,
+        current_slot: Slot,
+        turn_start_slot: Slot,
+    ) -> bool {
+        let min_remaining = self.config.min_slots_remaining_in_turn;
+        let posting_timeframe = u32::from(channel.posting_timeframe.clone());
+        if min_remaining == 0 || posting_timeframe == 0 {
+            return true;
+        }
+
+        let turn_end_slot =
+            slot_to_u64(turn_start_slot).saturating_add(u64::from(posting_timeframe));
+        turn_end_slot.saturating_sub(slot_to_u64(current_slot)) >= min_remaining
+    }
+
+    async fn try_publish_queued(&mut self) -> Result<(), Error> {
+        if !self.can_publish_now() {
+            self.recompute_channel_view();
+            return Ok(());
+        }
+
+        let Some(payload) = self.pending_turn_queue.pop_front() else {
+            self.recompute_channel_view();
+            return Ok(());
+        };
+
+        match self.post_now(payload.clone()).await {
+            Ok(event) => {
+                drop(self.refresh_channel_state().await);
+                self.recompute_channel_view();
+                self.buffered_event = Some(event);
+                Ok(())
+            }
+            Err(err) => {
+                self.pending_turn_queue.push_front(payload);
+                drop(self.refresh_channel_state().await);
+                self.recompute_channel_view();
+                Err(err)
+            }
         }
     }
 
@@ -733,7 +1021,7 @@ where
         if self.blocks_stream.is_some() {
             return true;
         }
-        debug!("ensure_connected: connecting...");
+        debug!(target: TARGET, "ensure_connected: connecting...");
 
         if !self.init_state_if_needed().await {
             return false;
@@ -747,42 +1035,72 @@ where
         true
     }
 
-    /// Initialize `self.state` from consensus info on cold start. `current_tip`
-    /// stays None so the first live block event emits everything from LIB up to
-    /// the new tip as `adopted`. On reconnect this is a no-op.
+    /// Initialize startup-derived sequencer state from consensus info.
+    /// Preserves restored `TxState` when resuming from checkpoint, but ensures
+    /// the slot clock and initial channel view are available before the
+    /// sequencer is considered connected.
+    ///
+    /// `current_tip` stays None so the first live block event emits everything
+    /// from LIB up to the new tip as `adopted`. On reconnect this is a no-op
+    /// once both `state` and `slot_clock` are initialized.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     async fn init_state_if_needed(&mut self) -> bool {
-        if self.state.is_some() {
+        if self.state.is_some() && self.slot_clock.is_some() {
             return true;
         }
         match self.node.consensus_info().await {
             Ok(ChainServiceInfo {
                 cryptarchia_info, ..
             }) => {
-                info!(
+                info!(target: TARGET,
                     "Sequencer connected: tip={:?}, lib={:?}",
                     cryptarchia_info.tip, cryptarchia_info.lib
                 );
-                self.state = Some(TxState::new(cryptarchia_info.lib, MsgId::root()));
+                if let Err(err) = self.refresh_channel_state().await {
+                    warn!(target: TARGET, "Failed to fetch initial channel state: {err}");
+                    tokio::time::sleep(self.config.reconnect_delay).await;
+                    return false;
+                }
+                if self.state.is_none() {
+                    self.state = Some(TxState::new(cryptarchia_info.lib, MsgId::root()));
+                }
+                self.slot_clock = Some(self.build_initial_slot_clock(cryptarchia_info.slot));
+                self.recompute_channel_view();
                 true
             }
             Err(e) => {
-                warn!("Failed to fetch consensus info: {e}");
+                warn!(target: TARGET, "Failed to fetch consensus info: {e}");
                 tokio::time::sleep(self.config.reconnect_delay).await;
                 false
             }
         }
     }
 
+    fn build_initial_slot_clock(&self, observed_slot: Slot) -> SlotClock {
+        self.config.chain_start_time.map_or_else(
+            || SlotClock::from_observed_slot(observed_slot, self.config.slot_duration),
+            |chain_start_time| {
+                let mut slot_clock =
+                    SlotClock::from_chain_start_time(chain_start_time, self.config.slot_duration);
+                slot_clock.observe_slot(observed_slot);
+                slot_clock
+            },
+        )
+    }
+
     async fn open_block_stream(&mut self) -> bool {
-        debug!("ensure_connected: opening blocks stream...");
+        debug!(target: TARGET, "ensure_connected: opening blocks stream...");
         match self.node.block_stream().await {
             Ok(stream) => {
-                debug!("ensure_connected: blocks stream connected");
+                debug!(target: TARGET, "ensure_connected: blocks stream connected");
                 self.blocks_stream = Some(stream);
                 true
             }
             Err(e) => {
-                warn!("Failed to connect to blocks stream: {e}");
+                warn!(target: TARGET, "Failed to connect to blocks stream: {e}");
                 tokio::time::sleep(self.config.reconnect_delay).await;
                 false
             }
@@ -804,7 +1122,7 @@ where
                 let from: u64 = self.lib_slot.into();
                 let to: u64 = network_lib_slot.into();
                 if from < to {
-                    debug!("Starting incremental backfill from slot {from} to {to}");
+                    debug!(target: TARGET, "Starting incremental backfill from slot {from} to {to}");
                     self.backfill_from = Some(Slot::from(from + 1));
                     self.backfill_to = Some(network_lib_slot);
                     self.lib_slot = network_lib_slot;
@@ -813,7 +1131,7 @@ where
                 true
             }
             Err(e) => {
-                warn!("Failed to fetch consensus info for backfill check: {e}");
+                warn!(target: TARGET, "Failed to fetch consensus info for backfill check: {e}");
                 true
             }
         }
@@ -857,14 +1175,14 @@ where
     }
 
     fn log_channel_update(update: &crate::state::ChannelUpdateInfo) {
-        debug!(
+        debug!(target: TARGET,
             "ChannelUpdate: orphaned={}, adopted={}, new_tip={}",
             update.orphaned.len(),
             update.adopted.len(),
             hex::encode(update.new_channel_tip.as_ref()),
         );
         for info in &update.orphaned {
-            debug!(
+            debug!(target: TARGET,
                 "  orphaned: payload={:?}, tx={}, msg_id={}",
                 String::from_utf8_lossy(&info.payload),
                 hex::encode(info.tx_hash.0),
@@ -872,12 +1190,32 @@ where
             );
         }
         for info in &update.adopted {
-            debug!(
+            debug!(target: TARGET,
                 "  adopted: payload={:?}, tx={}, msg_id={}",
                 String::from_utf8_lossy(&info.payload),
                 hex::encode(info.tx_hash.0),
                 hex::encode(info.this_msg.as_ref()),
             );
+        }
+    }
+
+    /// If configured to do so, re-queue orphaned inscriptions for a retry on
+    /// the next turn.
+    fn add_orphaned_to_pending_turn_queue(&mut self, orphaned: &[InscriptionInfo]) {
+        if self.config.auto_requeue_orphaned && !orphaned.is_empty() {
+            debug!(target: TARGET,
+                "Re-queueing {} orphaned inscription(s) for rebuild on the canonical tip",
+                orphaned.len()
+            );
+            for info in orphaned {
+                debug!(target: TARGET,
+                    "  requeue orphaned: payload={:?}, tx={}, msg_id={}",
+                    String::from_utf8_lossy(&info.payload),
+                    hex::encode(info.tx_hash.0),
+                    hex::encode(info.this_msg.as_ref()),
+                );
+                self.pending_turn_queue.push_back(info.payload.clone());
+            }
         }
     }
 
@@ -896,6 +1234,7 @@ where
             (Some(s), Some(tip)) => s.shed_off_branch_pending(tip),
             _ => Vec::new(),
         };
+        self.add_orphaned_to_pending_turn_queue(&orphaned);
 
         let adopted: Vec<InscriptionInfo> = match self.state.as_ref() {
             Some(s) => u
@@ -907,7 +1246,7 @@ where
         };
 
         for info in &orphaned {
-            debug!(
+            debug!(target: TARGET,
                 "  orphaned: payload={:?}, tx={}, msg_id={}",
                 String::from_utf8_lossy(&info.payload),
                 hex::encode(info.tx_hash.0),
@@ -925,7 +1264,7 @@ where
         }
 
         match request {
-            ActorRequest::PublishMessage { data } => Some(self.handle_publish(data).await),
+            ActorRequest::PublishMessage { data } => self.handle_publish(data).await,
             ActorRequest::PrepareTx { ops, msg, reply } => {
                 let result = prepare_tx(
                     ops,
@@ -976,27 +1315,48 @@ where
                     checkpoint,
                 };
                 drop(reply.send(Ok((signed_tx, result))));
+                self.recompute_channel_view();
                 None
             }
         }
     }
 
-    async fn handle_publish(&mut self, data: Vec<u8>) -> Event {
-        // Safe to unwrap — handle_request checks is_ready() first
-        let s = self.state.as_mut().unwrap();
-
-        // Derive publish parent from state instead of trusting
-        // last_msg_id blindly — handles branch switches correctly.
-        let parent = if let Some(tip) = self.current_tip {
-            s.publish_parent(tip)
+    async fn handle_publish(&mut self, data: Vec<u8>) -> Option<Event> {
+        if self.can_publish_now() {
+            match self.post_now(data.clone()).await {
+                Ok(event) => {
+                    self.recompute_channel_view();
+                    Some(event)
+                }
+                Err(err) => {
+                    warn!(target: TARGET, "Failed to publish inscription, re-queueing: {err}");
+                    self.pending_turn_queue.push_back(data);
+                    drop(self.refresh_channel_state().await);
+                    self.recompute_channel_view();
+                    None
+                }
+            }
         } else {
-            self.last_msg_id
+            self.pending_turn_queue.push_back(data);
+            self.recompute_channel_view();
+            None
+        }
+    }
+
+    async fn post_now(&mut self, data: Vec<u8>) -> Result<Event, Error> {
+        let parent = {
+            let s = self.state.as_mut().unwrap();
+            if let Some(tip) = self.current_tip {
+                s.publish_parent(tip)
+            } else {
+                self.last_msg_id
+            }
         };
         let (signed_tx, new_msg_id) =
             create_inscribe_tx(self.channel_id, &self.signing_key, data.clone(), parent);
         let id = signed_tx.mantle_tx.hash();
 
-        debug!(
+        debug!(target: TARGET,
             "Publishing: payload={:?}, parent={}, msg_id={}, tx={}",
             String::from_utf8_lossy(&data),
             hex::encode(parent.as_ref()),
@@ -1004,13 +1364,17 @@ where
             hex::encode(id.0),
         );
 
-        s.submit_inscription(signed_tx.clone(), parent, new_msg_id, data.clone());
-        self.last_msg_id = new_msg_id;
+        self.node
+            .post_transaction(signed_tx.clone())
+            .await
+            .map_err(|err| {
+                debug!(target: TARGET, "Failed to post transaction: {err}");
+                Error::Network(err.to_string())
+            })?;
 
-        // Post to network (best effort, resubmit timer retries if needed)
-        if let Err(e) = self.node.post_transaction(signed_tx).await {
-            debug!("Failed to post transaction: {e}");
-        }
+        let s = self.state.as_mut().unwrap();
+        s.submit_inscription(signed_tx, parent, new_msg_id, data.clone());
+        self.last_msg_id = new_msg_id;
 
         let checkpoint = build_checkpoint(s, self.last_msg_id, self.lib_slot);
         let info = Box::new(InscriptionInfo {
@@ -1021,7 +1385,7 @@ where
         });
         let event = Event::Published { info, checkpoint };
         drop(self.event_tx.send(event.clone()));
-        event
+        Ok(event)
     }
 }
 
@@ -1031,7 +1395,7 @@ fn reject_not_ready(request: ActorRequest) {
     };
     match request {
         ActorRequest::PublishMessage { .. } => {
-            warn!("Publish dropped: sequencer not yet ready");
+            warn!(target: TARGET, "Publish dropped: sequencer not yet ready");
         }
         ActorRequest::ChannelConfig { reply, .. } => drop(reply.send(Err(err()))),
         ActorRequest::PrepareTx { reply, .. } => drop(reply.send(Err(err()))),
@@ -1155,7 +1519,7 @@ where
     // picture to update their local state correctly.
     let finalized_inscriptions = lib_inscriptions;
     for info in &finalized_inscriptions {
-        tracing::trace!(
+        tracing::trace!(target: TARGET,
             " Backfill-finalized: payload={:?}, tx={}",
             String::from_utf8_lossy(&info.payload),
             hex::encode(info.tx_hash.0),
@@ -1707,6 +2071,13 @@ mod tests {
                 },
                 mode: ChainServiceMode::Started(State::Online),
             })
+        }
+
+        async fn channel_state(
+            &self,
+            _channel_id: ChannelId,
+        ) -> Result<Option<ChannelState>, lb_common_http_client::Error> {
+            Ok(None)
         }
 
         async fn block_stream(

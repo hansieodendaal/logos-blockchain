@@ -3,14 +3,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use cucumber::gherkin::Step;
 use futures::future::join_all;
 use lb_common_http_client::CommonHttpClient;
-use lb_key_management_system_service::keys::ZkPublicKey;
-use lb_testing_framework::LbcManualCluster;
+use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
+use lb_testing_framework::{LbcManualCluster, NodeHttpClient};
 use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
     sequencer::{Event, PublishResult, SequencerCheckpoint, SequencerHandle, ZoneSequencer},
 };
-use tokio::{sync::mpsc::Receiver, task::JoinHandle};
+use tokio::{
+    sync::mpsc::Receiver,
+    task::JoinHandle,
+    time::{error::Elapsed, timeout},
+};
 use tracing::info;
 
 use super::{
@@ -18,22 +22,28 @@ use super::{
     steps::DEFAULT_ZONE_SEQUENCER,
     support::{
         DiscardedPayloads, PublishDeadline, StartedZoneNode, ZoneAccountBalances,
-        balance_update_payload, build_zone_deposit, ensure_zone_transactions_included, keygen,
-        prepare_zone_cluster, publish_message_with_retry, sequencer_config,
+        build_zone_deposit, ensure_zone_transactions_included, keygen, prepare_zone_cluster,
+        publish_message_with_retry, round_robin_sequencer_config, sequencer_config,
         start_balance_aware_policy, start_republish_policy, start_sequencer_event_loop,
         start_sorted_conflict_policy, start_zone_node, submit_atomic_zone_deposit,
         submit_zone_deposit, submit_zone_withdraw, wait_for_zone_network_ready,
     },
-    tables::{ConcurrentZoneMessageRow, ZoneBalanceRow, group_zone_messages_by_sequencer},
+    tables::{ConcurrentZoneMessageRow, group_zone_messages_by_sequencer},
 };
-use crate::cucumber::{
-    error::{StepError, StepResult},
-    steps::TARGET,
-    world::{CucumberWorld, NodeInfo},
+use crate::{
+    common::manual_cluster::wait_for_height,
+    cucumber::{
+        error::{StepError, StepResult},
+        steps::TARGET,
+        world::{CucumberWorld, NodeInfo},
+    },
 };
 
 const ZONE_CHANNEL_WITHDRAW_THRESHOLD: u16 = 1;
 const ZONE_CHANNEL_DEPOSIT_THRESHOLD: u16 = 1;
+const SEQUENCER_READY_TIMEOUT: Duration = Duration::from_mins(2);
+const SEQUENCER_READY_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+const SEQUENCER_READY_HEIGHT_ADVANCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) enum DriveMode {
     Passive,
@@ -43,6 +53,7 @@ pub(super) enum DriveMode {
     },
     BalanceAware {
         initial_balances: ZoneAccountBalances,
+        planned_payloads: Vec<Vec<u8>>,
     },
 }
 
@@ -136,16 +147,25 @@ pub(super) async fn submit_zone_channel_config(
     posting_timeout: u32,
 ) -> StepResult {
     let handle = log_step_error(step, world.zone.sequencer_handle(sequencer_alias))?;
-    let mut authorized_keys = vec![
-        world
-            .zone
-            .sequencer_signing_key(sequencer_alias)?
-            .public_key(),
-    ];
+    let mut ordered_aliases = vec![sequencer_alias.to_owned()];
 
     for alias in authorized_aliases {
-        authorized_keys.push(world.zone.sequencer_signing_key(&alias)?.public_key());
+        if ordered_aliases.iter().any(|existing| existing == &alias) {
+            continue;
+        }
+
+        ordered_aliases.push(alias);
     }
+
+    let authorized_keys = ordered_aliases
+        .into_iter()
+        .map(|alias| {
+            world
+                .zone
+                .sequencer_signing_key(&alias)
+                .map(Ed25519Key::public_key)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let (result, finalized) = handle
         .channel_config(
@@ -197,7 +217,7 @@ pub(super) fn save_zone_checkpoint(
     Ok(())
 }
 
-fn remember_published_zone_message(
+pub(super) fn remember_published_zone_message(
     world: &mut CucumberWorld,
     sequencer_alias: &str,
     message_alias: String,
@@ -446,27 +466,6 @@ pub(super) async fn publish_zone_messages_concurrently(
     Ok(())
 }
 
-pub(super) async fn publish_balance_updates_concurrently(
-    world: &mut CucumberWorld,
-    step: &Step,
-    rows: Vec<ZoneBalanceRow>,
-) -> StepResult {
-    let message_rows = rows
-        .into_iter()
-        .map(|row| {
-            let payload = balance_update_payload(&row.message_alias, &row.account, row.delta);
-
-            ConcurrentZoneMessageRow {
-                sequencer_alias: row.sequencer_alias,
-                message_alias: row.message_alias,
-                payload,
-            }
-        })
-        .collect();
-
-    publish_zone_messages_concurrently(world, step, message_rows).await
-}
-
 pub(super) async fn start_named_sequencer(
     world: &mut CucumberWorld,
     step: &Step,
@@ -474,21 +473,63 @@ pub(super) async fn start_named_sequencer(
     checkpoint: Option<SequencerCheckpoint>,
     mode: DriveMode,
 ) -> StepResult {
+    start_named_sequencer_with_config(
+        world,
+        step,
+        sequencer_alias,
+        checkpoint,
+        mode,
+        sequencer_config(),
+    )
+    .await
+}
+
+pub(super) async fn start_named_round_robin_sequencer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: impl AsRef<str>,
+    checkpoint: Option<SequencerCheckpoint>,
+    mode: DriveMode,
+) -> StepResult {
+    start_named_sequencer_with_config(
+        world,
+        step,
+        sequencer_alias,
+        checkpoint,
+        mode,
+        round_robin_sequencer_config(),
+    )
+    .await
+}
+
+async fn start_named_sequencer_with_config(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: impl AsRef<str>,
+    checkpoint: Option<SequencerCheckpoint>,
+    mode: DriveMode,
+    config: lb_zone_sdk::sequencer::SequencerConfig,
+) -> StepResult {
     let sequencer_alias = sequencer_alias.as_ref().to_owned();
     let signing_key =
         log_step_error(step, world.zone.sequencer_signing_key(&sequencer_alias))?.clone();
+    let node_client = log_step_error(step, world.zone_node_http_client())?;
     let node_url = log_step_error(step, world.zone_node_url())?;
     let (sequencer, mut handle) = ZoneSequencer::init_with_config(
         world.zone.sequencer_channel_id(&sequencer_alias)?,
         signing_key,
         ZoneNodeHttpClient::new(CommonHttpClient::new(None), node_url),
-        sequencer_config(),
+        config,
         checkpoint,
     );
 
     let runtime = start_sequencer_runtime(sequencer, handle.clone(), mode);
 
-    handle.wait_ready().await;
+    if let Err(error) = wait_for_sequencer_ready(&sequencer_alias, &node_client, &mut handle).await
+    {
+        runtime.task.abort();
+        return Err(error);
+    }
 
     world.zone.set_sequencer_runtime(
         sequencer_alias,
@@ -499,6 +540,46 @@ pub(super) async fn start_named_sequencer(
     );
 
     Ok(())
+}
+
+async fn wait_for_sequencer_ready(
+    sequencer_alias: &str,
+    node_client: &NodeHttpClient,
+    handle: &mut SequencerHandle<ZoneNodeHttpClient>,
+) -> StepResult {
+    timeout(SEQUENCER_READY_TIMEOUT, async {
+        let mut last_height = node_client.consensus_info().await?.cryptarchia_info.height;
+
+        loop {
+            if timeout(SEQUENCER_READY_POLL_TIMEOUT, handle.wait_ready())
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+
+            let _ = wait_for_height(
+                node_client,
+                last_height.saturating_add(1),
+                SEQUENCER_READY_HEIGHT_ADVANCE_TIMEOUT,
+            )
+            .await;
+
+            last_height = node_client
+                .consensus_info()
+                .await?
+                .cryptarchia_info
+                .height
+                .max(last_height);
+        }
+    })
+    .await
+    .map_err(|_: Elapsed| StepError::Timeout {
+        message: format!(
+            "Sequencer `{sequencer_alias}` did not become ready within {} seconds",
+            SEQUENCER_READY_TIMEOUT.as_secs()
+        ),
+    })?
 }
 
 fn start_sequencer_runtime(
@@ -526,8 +607,11 @@ fn start_sequencer_runtime(
             events: None,
             discarded_payloads: Some(discarded),
         },
-        DriveMode::BalanceAware { initial_balances } => StartedSequencerRuntime {
-            task: start_balance_aware_policy(sequencer, handle, initial_balances),
+        DriveMode::BalanceAware {
+            initial_balances,
+            planned_payloads,
+        } => StartedSequencerRuntime {
+            task: start_balance_aware_policy(sequencer, handle, initial_balances, planned_payloads),
             events: None,
             discarded_payloads: None,
         },

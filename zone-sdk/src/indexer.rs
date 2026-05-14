@@ -5,6 +5,8 @@ use tracing::warn;
 
 use crate::{ZoneMessage, adapter};
 
+const TARGET: &str = "zone_sdk::indexer";
+
 /// Indexer errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -45,7 +47,7 @@ where
                 {
                     Ok(stream) => stream,
                     Err(e) => {
-                        warn!("Failed to fetch LIB block {header_id}: {e}");
+                        warn!(target: TARGET, "Failed to fetch LIB block {header_id}: {e}");
                         // TODO: return error to stream, and stop stream
                         return None;
                     }
@@ -95,7 +97,7 @@ where
             {
                 Ok(messages) => Some((messages, end_slot + 1)),
                 Err(e) => {
-                    warn!(
+                    warn!(target: TARGET,
                         ?current_slot, ?end_slot, err = ?e,
                         "Failed to fetch zone messages from blocks",
                     );
@@ -380,6 +382,14 @@ mod tests {
                 },
                 mode: ChainServiceMode::Started(State::Online),
             })
+        }
+
+        async fn channel_state(
+            &self,
+            _channel_id: ChannelId,
+        ) -> Result<Option<lb_core::mantle::channel::ChannelState>, lb_common_http_client::Error>
+        {
+            Ok(None)
         }
 
         async fn block_stream(

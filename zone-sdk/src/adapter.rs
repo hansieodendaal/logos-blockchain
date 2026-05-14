@@ -7,7 +7,7 @@ use lb_common_http_client::{
 };
 use lb_core::{
     header::HeaderId,
-    mantle::{Op, SignedMantleTx, ops::channel::ChannelId},
+    mantle::{Op, SignedMantleTx, channel::ChannelState, ops::channel::ChannelId},
 };
 use reqwest::Url;
 
@@ -19,6 +19,8 @@ pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 #[async_trait]
 pub trait Node {
     async fn consensus_info(&self) -> Result<ChainServiceInfo, Error>;
+
+    async fn channel_state(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, Error>;
 
     async fn block_stream(&self) -> Result<BoxStream<ProcessedBlockEvent>, Error>;
 
@@ -75,6 +77,12 @@ impl NodeHttpClient {
 impl Node for NodeHttpClient {
     async fn consensus_info(&self) -> Result<ChainServiceInfo, Error> {
         self.client.consensus_info(self.base_url.clone()).await
+    }
+
+    async fn channel_state(&self, channel_id: ChannelId) -> Result<Option<ChannelState>, Error> {
+        self.client
+            .channel_state(self.base_url.clone(), channel_id)
+            .await
     }
 
     async fn block_stream(&self) -> Result<BoxStream<ProcessedBlockEvent>, Error> {

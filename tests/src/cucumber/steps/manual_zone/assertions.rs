@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -127,8 +127,9 @@ pub(super) fn assert_sorted_outcome(
     on_chain: &[Vec<u8>],
     discarded: &HashSet<Vec<u8>>,
     total: usize,
+    expected_by_sequencer: &HashMap<String, Vec<Vec<u8>>>,
 ) -> StepResult {
-    let issues = sorted_outcome_issues(on_chain, discarded, total);
+    let issues = sorted_outcome_issues(on_chain, discarded, total, expected_by_sequencer);
     if issues.is_empty() {
         return Ok(());
     }
@@ -142,18 +143,12 @@ fn sorted_outcome_issues(
     on_chain: &[Vec<u8>],
     discarded: &HashSet<Vec<u8>>,
     total: usize,
+    expected_by_sequencer: &HashMap<String, Vec<Vec<u8>>>,
 ) -> Vec<String> {
     let mut issues = Vec::new();
     let unique: HashSet<&Vec<u8>> = on_chain.iter().collect();
     if unique.len() != on_chain.len() {
         issues.push("Duplicate inscriptions detected on chain".to_owned());
-    }
-
-    if !on_chain.windows(2).all(|window| window[0] <= window[1]) {
-        issues.push(format!(
-            "On-chain payloads are not sorted: {:?}",
-            render_payloads(on_chain)
-        ));
     }
 
     let on_chain_set: HashSet<Vec<u8>> = on_chain.iter().cloned().collect();
@@ -171,6 +166,36 @@ fn sorted_outcome_issues(
             on_chain.len(),
             discarded.len()
         ));
+    }
+
+    for (sequencer_alias, expected_payloads) in expected_by_sequencer {
+        let surviving = on_chain
+            .iter()
+            .filter(|payload| expected_payloads.contains(*payload))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut last_index = None;
+        for payload in &surviving {
+            let Some(index) = expected_payloads
+                .iter()
+                .position(|expected| expected == payload)
+            else {
+                continue;
+            };
+
+            if let Some(previous_index) = last_index
+                && index <= previous_index
+            {
+                issues.push(format!(
+                    "Per-sequencer order was not preserved for {sequencer_alias}: {:?}",
+                    render_payloads(&surviving)
+                ));
+                break;
+            }
+
+            last_index = Some(index);
+        }
     }
 
     issues

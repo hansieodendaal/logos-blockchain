@@ -22,7 +22,7 @@ Feature: Zone SDK
       | MSG_1 |
       | MSG_2 |
       | MSG_3 |
-    When sequencer "SEQ_A" submits zone channel config transaction "CHANNEL_CONFIG_1" authorizing:
+    When sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" authorizing:
       | alias |
       | SEQ_B |
     Then zone transaction "CHANNEL_CONFIG_1" is included in 180 seconds
@@ -176,7 +176,7 @@ Feature: Zone SDK
 
   @zone_ci
   # [tests/src/tests/zone_sdk/e2e.rs] test_sorted_conflict_resolution
-  Scenario: Sorted conflict policy converges to a sorted chain
+  Scenario: Sorted conflict policy preserves per-sequencer order and converges without duplicates
     Given I have a zone cluster
     And the following zone sequencers exist:
       | alias |
@@ -184,7 +184,7 @@ Feature: Zone SDK
       | SEQ_B |
     When the zone node is at height 1 in 120 seconds
     And I start zone sequencer "SEQ_A" with indexer
-    And sequencer "SEQ_A" submits zone channel config transaction "CHANNEL_CONFIG_1" with posting timeframe 10 and posting timeout 0 authorizing:
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 10 and timeout 0 authorizing:
       | alias |
       | SEQ_B |
     Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
@@ -201,7 +201,102 @@ Feature: Zone SDK
       | SEQ_B     | MSG_8  | ff   |
       | SEQ_B     | MSG_9  | hh   |
       | SEQ_B     | MSG_10 | jj   |
-    Then the zone indexer returns a sorted zone conflict outcome in 600 seconds
+    Then the zone indexer preserves per-sequencer order and converges without duplicates in 600 seconds
+    And I stop all nodes
+
+  @zone_ci
+  Scenario: Round-robin waits for turn and drains queued messages
+    Given I have a zone cluster
+    And the following zone sequencers exist:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    When the zone node is at height 1 in 120 seconds
+    And I start round-robin zone sequencer "SEQ_A" with indexer
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
+    When I start round-robin zone sequencer "SEQ_B"
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 0 queued messages in 120 seconds
+    When I submit zone message "MSG_B1" to sequencer "SEQ_B" with data "decentralized-wait-for-turn" immediately
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 1 queued messages in 120 seconds
+    And sequencer "SEQ_B" publishes queued zone message "MSG_B1" on its turn and drains queued messages to 0 in 180 seconds
+    And the zone indexer returns messages in any order in 360 seconds:
+      | alias  |
+      | MSG_B1 |
+    And I stop all nodes
+
+  @zone_ci
+  Scenario: Round-robin publishes immediately when it is our turn
+    Given I have a zone cluster
+    And the following zone sequencers exist:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    When the zone node is at height 1 in 120 seconds
+    And I start round-robin zone sequencer "SEQ_A" with indexer
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
+    When I start round-robin zone sequencer "SEQ_B"
+    Then sequencer "SEQ_A" reaches round-robin state OWN_KEY_INDEX 0 OUR_TURN with 0 queued messages in 120 seconds
+    When I submit zone message "MSG_A1" to sequencer "SEQ_A" with data "decentralized-immediate-publish" immediately
+    Then sequencer "SEQ_A" publishes "MSG_A1" immediately while in turn in 120 seconds
+    And the zone indexer returns messages in any order in 360 seconds:
+      | alias  |
+      | MSG_A1 |
+    And I stop all nodes
+
+  @zone_ci
+  Scenario: Round-robin with multiple sequencers dynamically added
+    Given I have a zone cluster
+    And the following zone sequencers exist:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+      | SEQ_C |
+    When the zone node is at height 1 in 120 seconds
+    And I start round-robin zone sequencer "SEQ_A" with indexer
+    # Start with A-only round-robin config (single key), then prove immediate publish.
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+    Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
+    When I submit zone message "MSG_A_1" to sequencer "SEQ_A" with data "seq_a-msg1" on its turn
+    # Auth B without stopping A.
+    When sequencer "SEQ_A" submits zone config transaction "CONFIG_B" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    Then zone transaction "CONFIG_B" is finalized in 180 seconds
+    When I start round-robin zone sequencer "SEQ_B"
+    When I submit zone message "MSG_B_1" to sequencer "SEQ_B" with data "seq_b-msg1" on its turn
+    # Auth C without stopping A or B.
+    When sequencer "SEQ_A" submits zone config transaction "CONFIG_C" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+      | SEQ_C |
+    Then zone transaction "CONFIG_C" is finalized in 180 seconds
+    When I start round-robin zone sequencer "SEQ_C"
+    When I submit zone message "MSG_C_1" to sequencer "SEQ_C" with data "seq_c-msg1" on its turn
+    # Now publish more messages from all sequencers and check they are all indexed without duplicates
+    When I submit zone message "MSG_A_2" to sequencer "SEQ_A" with data "seq_a-msg2" immediately
+    When I submit zone message "MSG_B_2" to sequencer "SEQ_B" with data "seq_b-msg2" immediately
+    When I submit zone message "MSG_C_2" to sequencer "SEQ_C" with data "seq_c-msg2" immediately
+    # Final check: all messages on chain, exact once.
+    Then the zone indexer returns messages in any order in 120 seconds:
+      | alias |
+      | MSG_A_1 |
+      | MSG_A_2 |
+      | MSG_B_1 |
+      | MSG_B_2 |
+      | MSG_C_1 |
+      | MSG_C_2 |
     And I stop all nodes
 
   @zone_ci
@@ -220,7 +315,7 @@ Feature: Zone SDK
       | charlie | 10      |
     When the zone node is at height 1 in 120 seconds
     And I start zone sequencer "SEQ_A" with indexer
-    And sequencer "SEQ_A" submits zone channel config transaction "CHANNEL_CONFIG_1" with posting timeframe 60 and posting timeout 0 authorizing:
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with timeframe 60 and posting timeout 0 authorizing:
       | alias |
       | SEQ_B |
       | SEQ_C |
@@ -251,7 +346,7 @@ Feature: Zone SDK
       | SEQ_C |
     When the zone node is at height 1 in 120 seconds
     And I start zone sequencer "SEQ_A" with indexer
-    And sequencer "SEQ_A" submits zone channel config transaction "CHANNEL_CONFIG_1" with posting timeframe 60 and posting timeout 0 authorizing:
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with timeframe 60 and posting timeout 0 authorizing:
       | alias |
       | SEQ_B |
       | SEQ_C |

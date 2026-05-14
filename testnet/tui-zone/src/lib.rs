@@ -33,6 +33,10 @@ pub struct InscribeArgs {
     key_path: String,
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "TODO: address this in a dedicated refactor"
+)]
 pub async fn run(args: InscribeArgs) {
     let node_url: Url = args.node_url.parse().expect("invalid node URL");
     let signing_key = load_or_create_signing_key(Path::new(&args.key_path));
@@ -49,6 +53,7 @@ pub async fn run(args: InscribeArgs) {
 
     let node = NodeHttpClient::new(CommonHttpClient::new(None), node_url);
     let (mut sequencer, handle) = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
+    let mut channel_view_rx = handle.subscribe_channel_view();
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut stdin_rx = spawn_stdin_reader(ready_rx);
@@ -61,6 +66,14 @@ pub async fn run(args: InscribeArgs) {
             event = sequencer.next_event() => {
                 if let Some(event) = event {
                     handle_event(event, &mut state, &handle, &mut ready_tx).await;
+                }
+            }
+
+            changed = channel_view_rx.changed() => {
+                if changed.is_ok() {
+                    state.set_channel_view(channel_view_rx.borrow().clone());
+                    ui::render_state(&state);
+                    ui::prompt();
                 }
             }
 

@@ -6,7 +6,7 @@
 //! on.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     num::NonZero,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -48,7 +48,8 @@ use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
     sequencer::{
-        Event, InscriptionId, PublishResult, SequencerConfig, SequencerHandle, ZoneSequencer,
+        Event, InscriptionId, PublishResult, SequencerChannelView, SequencerConfig,
+        SequencerHandle, ZoneSequencer,
     },
     state::InscriptionInfo,
 };
@@ -101,6 +102,8 @@ pub enum ZoneTestError {
     FinalizationTimeout,
     #[error("timed out waiting for zone LIB to advance")]
     LibAdvanceTimeout,
+    #[error("timed out waiting for zone sequencer channel view condition: {message}")]
+    ChannelViewTimeout { message: String },
     #[error("failed to fetch wallet balance while preparing a zone deposit: {message}")]
     WalletBalance { message: String },
     #[error("failed to find a funding note with value at least {min_value}")]
@@ -329,9 +332,12 @@ pub fn start_balance_aware_policy(
     mut sequencer: ZoneSequencer<ZoneNodeHttpClient>,
     handle: SequencerHandle<ZoneNodeHttpClient>,
     initial_balances: ZoneAccountBalances,
+    planned_payloads: Vec<Vec<u8>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut balances = BalanceAwareState::new(initial_balances);
+        let mut planned = VecDeque::from(planned_payloads);
+        let view_rx = handle.subscribe_channel_view();
 
         loop {
             match sequencer.next_event().await {
@@ -342,6 +348,8 @@ pub fn start_balance_aware_policy(
                     balances.remove_orphaned_payloads(&orphaned);
                     balances.record_adopted_payloads(&adopted);
                     republish_affordable_balance_updates(&handle, &mut balances, orphaned).await;
+                    publish_planned_balance_updates(&handle, &view_rx, &mut balances, &mut planned)
+                        .await;
                 }
                 _ => {}
             }
@@ -475,6 +483,31 @@ async fn republish_affordable_balance_updates(
     }
 }
 
+async fn publish_planned_balance_updates(
+    handle: &SequencerHandle<ZoneNodeHttpClient>,
+    view_rx: &tokio::sync::watch::Receiver<SequencerChannelView>,
+    balances: &mut BalanceAwareState,
+    planned: &mut VecDeque<Vec<u8>>,
+) {
+    if !view_rx.borrow().is_our_turn {
+        return;
+    }
+
+    while let Some(payload) = planned.pop_front() {
+        if !balances.should_republish(&payload) {
+            continue;
+        }
+
+        if let Err(error) = handle.publish_message(payload.clone()).await {
+            warn!(%error, "Failed to publish planned balance-aware zone payload");
+            planned.push_front(payload);
+            break;
+        }
+
+        balances.record_republished_payload(&payload);
+    }
+}
+
 struct SortedConflictState {
     max_seen_on_chain: Option<Vec<u8>>,
     discarded: DiscardedPayloads,
@@ -561,6 +594,17 @@ pub fn sequencer_config() -> SequencerConfig {
     }
 }
 
+/// Uses the same retry profile while reserving enough turn time for the SDK's
+/// round-robin admission checks.
+#[must_use]
+pub fn round_robin_sequencer_config() -> SequencerConfig {
+    SequencerConfig {
+        auto_requeue_orphaned: true,
+        min_slots_remaining_in_turn: 2,
+        ..sequencer_config()
+    }
+}
+
 /// Publishes a zone payload and waits for the SDK to emit the matching
 /// `Published` event, retrying transient publish failures until the deadline.
 pub async fn publish_message_with_retry(
@@ -606,6 +650,45 @@ async fn wait_for_published_event(
     })
     .await
     .map_err(|_| ZoneTestError::PublishTimeout)?
+}
+
+/// Waits for one payload to emit the matching `Published` event.
+pub async fn wait_for_published_payload(
+    sequencer_events: &mut tokio::sync::mpsc::Receiver<Event>,
+    data: &[u8],
+    duration: Duration,
+) -> Result<PublishResult, ZoneTestError> {
+    wait_for_published_event(sequencer_events, data, PublishDeadline::from_now(duration)).await
+}
+
+/// Waits until the subscribed channel view satisfies the supplied predicate.
+pub async fn wait_for_channel_view(
+    view_rx: &mut tokio::sync::watch::Receiver<SequencerChannelView>,
+    duration: Duration,
+    predicate: impl Fn(&SequencerChannelView) -> bool + Send + Sync,
+) -> Result<SequencerChannelView, ZoneTestError> {
+    timeout(duration, async {
+        loop {
+            let current = view_rx.borrow().clone();
+            if predicate(&current) {
+                return Ok(current);
+            }
+
+            view_rx
+                .changed()
+                .await
+                .map_err(|error| ZoneTestError::Indexer {
+                    message: format!("channel view sender closed: {error}"),
+                })?;
+        }
+    })
+    .await
+    .map_err(|_| ZoneTestError::ChannelViewTimeout {
+        message: format!(
+            "condition not reached within {} seconds",
+            duration.as_secs()
+        ),
+    })?
 }
 
 /// Collects indexed block payloads until all expected messages have appeared.

@@ -169,6 +169,7 @@ pub struct ZoneState {
     checkpoints: HashMap<String, SequencerCheckpoint>,
     latest_checkpoints: HashMap<String, SequencerCheckpoint>,
     sorted_total_payloads: Option<usize>,
+    sorted_expected_by_sequencer: Option<HashMap<String, Vec<Vec<u8>>>>,
 }
 
 impl ZoneState {
@@ -485,10 +486,25 @@ impl ZoneState {
         self.sorted_total_payloads = Some(total);
     }
 
+    pub fn set_sorted_expected_by_sequencer(
+        &mut self,
+        expected_by_sequencer: HashMap<String, Vec<Vec<u8>>>,
+    ) {
+        self.sorted_expected_by_sequencer = Some(expected_by_sequencer);
+    }
+
     pub fn sorted_total_payloads(&self) -> Result<usize, StepError> {
         self.sorted_total_payloads.ok_or(StepError::LogicalError {
             message: "Zone sorted conflict expectations are not initialized".to_owned(),
         })
+    }
+
+    pub fn sorted_expected_by_sequencer(&self) -> Result<HashMap<String, Vec<Vec<u8>>>, StepError> {
+        self.sorted_expected_by_sequencer
+            .clone()
+            .ok_or(StepError::LogicalError {
+                message: "Zone sorted conflict payload order is not initialized".to_owned(),
+            })
     }
 
     pub fn set_indexer(&mut self, indexer: ZoneIndexer<ZoneNodeHttpClient>) {
@@ -530,6 +546,7 @@ impl ZoneState {
         self.indexer = None;
         self.default_sequencer_alias = None;
         self.sorted_total_payloads = None;
+        self.sorted_expected_by_sequencer = None;
 
         self.sequencers.clear();
         self.published_messages.clear();
