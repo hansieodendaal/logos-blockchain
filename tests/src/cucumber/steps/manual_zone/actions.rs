@@ -5,6 +5,7 @@ use futures::future::join_all;
 use lb_common_http_client::CommonHttpClient;
 use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
 use lb_testing_framework::{LbcManualCluster, NodeHttpClient};
+use lb_core::mantle::ops::channel::inscribe::Inscription;
 use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
@@ -437,7 +438,7 @@ pub(super) async fn publish_zone_messages_concurrently(
 
         async move {
             for payload in payloads {
-                handle.publish_message(payload).await.map_err(|error| {
+                handle.publish_message(Inscription::new_unchecked(payload)).await.map_err(|error| {
                     StepError::LogicalError {
                         message: format!(
                             "Zone concurrent publish failed for sequencer '{sequencer_alias}': {error}"

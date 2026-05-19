@@ -5,7 +5,7 @@ mod ui;
 use std::{fs, path::Path};
 
 use clap::Parser;
-use lb_core::mantle::ops::channel::ChannelId;
+use lb_core::mantle::ops::channel::{ChannelId, inscribe::Inscription};
 use lb_key_management_system_service::keys::{ED25519_SECRET_KEY_SIZE, Ed25519Key};
 use lb_zone_sdk::{
     CommonHttpClient,
@@ -85,7 +85,11 @@ pub async fn run(args: InscribeArgs) {
 
                 let msg = AppMessage::new(text);
                 debug!(tx_uuid = %msg.tx_uuid, text = %msg.text, "Publishing message");
-                if let Err(e) = handle.publish_message(msg.to_bytes()).await {
+                let Ok(inscription) = Inscription::try_from(msg.to_bytes()) else {
+                    error!("Message is too large to fit in an inscription");
+                    continue;
+                };
+                if let Err(e) = handle.publish_message(inscription).await {
                     error!("failed to publish: {e}");
                     break;
                 }
