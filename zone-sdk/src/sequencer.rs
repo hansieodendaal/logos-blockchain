@@ -572,9 +572,8 @@ pub struct ZoneSequencer<Node> {
     resubmit_active: bool,
     in_flight: FuturesUnordered<BoxFuture<'static, InFlight>>,
 
-    // Buffered event — when both ChannelUpdate and TxsFinalized occur on
-    // the same block, one is returned immediately and the other is buffered.
-    buffered_event: Option<Event>,
+    // Buffered events — when multiple events occur on the same block
+    buffered_events: VecDeque<Event>,
 
     // Incremental backfill state — processes one batch per next_event() call
     backfill_from: Option<Slot>,
@@ -698,7 +697,7 @@ where
             resubmit_interval,
             resubmit_active: false,
             in_flight: FuturesUnordered::new(),
-            buffered_event: None,
+            buffered_events: VecDeque::new(),
             backfill_from: None,
             backfill_to: None,
             event_tx,
@@ -727,19 +726,19 @@ where
 
     /// Drive the sequencer and return the next event.
     ///
-    /// This processes block events, resubmission, and pending requests.
-    /// The caller must call this in a loop to keep the sequencer running.
+    /// Any event returned from this method is also broadcast on `event_tx`.
+    /// Events that cannot be returned immediately are queued in
+    /// `buffered_events` and broadcast when later returned.
     pub async fn next_event(&mut self) -> Option<Event> {
-        // Return buffered event from previous call if any
-        if let Some(event) = self.buffered_event.take() {
-            drop(self.event_tx.send(event.clone()));
-            return Some(event);
+        // Return buffered event from previous call if any.
+        if let Some(event) = self.buffered_events.pop_front() {
+            return Some(self.emit_now(event));
         }
 
         // Process incremental backfill — one batch per call.
         // Returns Some(Some(event)) or Some(None) while active, None when done.
         if let Some(maybe_event) = self.process_incremental_backfill().await {
-            return maybe_event;
+            return maybe_event.map(|event| self.emit_now(event));
         }
 
         // Ensure we have a blocks stream (connects if needed).
@@ -751,10 +750,14 @@ where
 
         tokio::select! {
             Some(request) = self.request_rx.recv() => {
-                self.handle_request(request).await
+                self.handle_request(request)
+                    .await
+                    .map(|event| self.emit_now(event))
             }
             maybe_event = stream.next() => {
-                self.handle_stream_item(maybe_event).await
+                self.handle_stream_item(maybe_event)
+                    .await
+                    .map(|event| self.emit_now(event))
             }
             Some(inflight_result) = self.in_flight.next(), if !self.in_flight.is_empty() => {
                 handle_inflight(inflight_result, &mut self.resubmit_active);
@@ -775,10 +778,6 @@ where
 
     /// Handle a single item from the blocks stream. `None` means the stream
     /// disconnected; any other value is processed as a block event.
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
     async fn handle_stream_item(
         &mut self,
         maybe_event: Option<ProcessedBlockEvent>,
@@ -803,37 +802,52 @@ where
         if let Some(slot_clock) = self.slot_clock.as_mut() {
             slot_clock.observe_slot(block_event.tip_slot);
         }
+
         if let Err(err) = self.refresh_channel_state().await {
             warn!(target: TARGET, "Failed to refresh channel state after block: {err}");
         }
 
         let became_ready = self.maybe_signal_ready();
-        let block_event = self.apply_block_result(result);
-        self.recompute_channel_view();
-        if let Err(err) = self.try_publish_queued().await {
+        let mut events = self.apply_block_result(result);
+
+        let published_event = self.try_publish_queued().await.unwrap_or_else(|err| {
             warn!(target: TARGET, "Failed to publish queued inscription: {err}");
+            None
+        });
+        if let Some(event) = published_event {
+            events.push_back(event);
         }
 
         if became_ready {
-            if let Some(event) = block_event {
-                self.buffered_event = Some(event);
-            }
-            Some(Event::Ready)
-        } else {
-            block_event
+            // Preserve the existing public event contract: when readiness transitions,
+            // Ready is emitted first. Any block-derived events and any Published event
+            // produced by queue draining are buffered and emitted on subsequent
+            // next_event() calls.
+            self.buffered_events.extend(events);
+            return Some(self.emit_now(Event::Ready));
         }
+
+        let event = events.pop_front()?;
+        self.buffered_events.extend(events);
+
+        Some(event)
     }
 
-    /// If not yet ready and startup backfill is complete, mark ready and
-    /// broadcast `Event::Ready`. Returns true iff readiness transitioned.
+    fn emit_now(&self, event: Event) -> Event {
+        drop(self.event_tx.send(event.clone()));
+        event
+    }
+
+    /// If not yet ready and startup backfill is complete, mark ready. Returns
+    /// true if readiness transitioned.
     fn maybe_signal_ready(&self) -> bool {
         if self.is_ready() {
             return false;
         }
+
         if self.backfill_from.is_none() && self.backfill_to.is_none() {
             debug!(target: TARGET, "Sequencer ready (backfill complete, first block processed)");
             let _ = self.ready_tx.send(true);
-            drop(self.event_tx.send(Event::Ready));
             true
         } else {
             debug!(target: TARGET,
@@ -857,20 +871,38 @@ where
         Ok(())
     }
 
-    fn recompute_channel_view(&self) {
+    fn channel_view(&self) -> SequencerChannelView {
         let current_slot = self
             .slot_clock
             .as_ref()
             .map_or(Slot::genesis(), SlotClock::current_slot);
+
         let authorized_key_index = self
             .channel_state
             .as_ref()
             .map(|channel| channel.round_robin(current_slot).0);
+
         let tip_message = self
             .channel_state
             .as_ref()
             .map_or(self.last_msg_id, |channel| channel.tip_message);
-        let view = SequencerChannelView {
+
+        let posting_timeframe = self
+            .channel_state
+            .as_ref()
+            .map(|channel| u32::from(channel.posting_timeframe.clone()));
+
+        let posting_timeout = self
+            .channel_state
+            .as_ref()
+            .map(|channel| u32::from(channel.posting_timeout.clone()));
+
+        let accredited_key_count = self
+            .channel_state
+            .as_ref()
+            .map(|channel| channel.accredited_keys.len());
+
+        SequencerChannelView {
             channel_id: self.channel_id,
             channel: self.channel_state.clone(),
             current_slot,
@@ -879,20 +911,14 @@ where
             is_our_turn: self.can_publish_now(),
             tip_message,
             queued_messages: self.pending_turn_queue.len(),
-            posting_timeframe: self
-                .channel_state
-                .as_ref()
-                .map(|channel| u32::from(channel.posting_timeframe.clone())),
-            posting_timeout: self
-                .channel_state
-                .as_ref()
-                .map(|channel| u32::from(channel.posting_timeout.clone())),
-            accredited_key_count: self
-                .channel_state
-                .as_ref()
-                .map(|channel| channel.accredited_keys.len()),
-        };
-        drop(self.channel_view_tx.send(view));
+            posting_timeframe,
+            posting_timeout,
+            accredited_key_count,
+        }
+    }
+
+    fn publish_channel_view(&self) {
+        drop(self.channel_view_tx.send(self.channel_view()));
     }
 
     fn own_key_index_for(&self, channel: &ChannelState) -> Option<u16> {
@@ -939,28 +965,41 @@ where
         turn_end_slot.saturating_sub(slot_to_u64(current_slot)) >= min_remaining
     }
 
-    async fn try_publish_queued(&mut self) -> Result<(), Error> {
+    /// Publish at most one queued message per actor turn.
+    ///
+    /// This keeps parent selection and round-robin authorization conservative:
+    /// after posting, inclusion slot and canonical channel state are still
+    /// node/chain-dependent. A future optimization can drain multiple messages
+    /// while the turn remains valid, but that should be benchmarked/tested
+    /// separately.
+    async fn try_publish_queued(&mut self) -> Result<Option<Event>, Error> {
         if !self.can_publish_now() {
-            self.recompute_channel_view();
-            return Ok(());
+            self.publish_channel_view();
+            return Ok(None);
         }
 
         let Some(payload) = self.pending_turn_queue.pop_front() else {
-            self.recompute_channel_view();
-            return Ok(());
+            self.publish_channel_view();
+            return Ok(None);
         };
 
         match self.post_now(payload.clone()).await {
             Ok(event) => {
-                drop(self.refresh_channel_state().await);
-                self.recompute_channel_view();
-                self.buffered_event = Some(event);
-                Ok(())
+                if let Err(err) = self.refresh_channel_state().await {
+                    warn!(target: TARGET, "Failed to refresh channel state after publish: {err}");
+                }
+
+                self.publish_channel_view();
+                Ok(Some(event))
             }
             Err(err) => {
                 self.pending_turn_queue.push_front(payload);
-                drop(self.refresh_channel_state().await);
-                self.recompute_channel_view();
+
+                if let Err(refresh_err) = self.refresh_channel_state().await {
+                    warn!(target: TARGET, "Failed to refresh channel state after publish failure: {refresh_err}");
+                }
+
+                self.publish_channel_view();
                 Err(err)
             }
         }
@@ -1011,7 +1050,6 @@ where
         let event = Event::FinalizedInscriptions {
             inscriptions: batch.inscriptions,
         };
-        drop(self.event_tx.send(event.clone()));
         Some(Some(event))
     }
 
@@ -1068,7 +1106,7 @@ where
                     self.state = Some(TxState::new(cryptarchia_info.lib, MsgId::root()));
                 }
                 self.slot_clock = Some(self.build_initial_slot_clock(cryptarchia_info.slot));
-                self.recompute_channel_view();
+                self.publish_channel_view();
                 true
             }
             Err(e) => {
@@ -1137,41 +1175,40 @@ where
         }
     }
 
-    /// Process a `BlockEventResult`: apply channel updates to local state
-    /// and emit events. Returns at most one event; a second is buffered.
-    fn apply_block_result(&mut self, result: BlockEventResult) -> Option<Event> {
+    /// Process a `BlockEventResult`: apply channel updates to local state and
+    /// return the resulting block-derived events in emission order.
+    ///
+    /// This does not broadcast or buffer events. The caller owns event-delivery
+    /// policy because block processing may be combined with readiness
+    /// transitions and queued publish draining.
+    fn apply_block_result(&mut self, result: BlockEventResult) -> VecDeque<Event> {
         if let Some(update) = result.channel_update.as_ref() {
             Self::log_channel_update(update);
+
             let has_pending = self
                 .state
                 .as_ref()
                 .is_some_and(TxState::has_pending_inscriptions);
+
             if !update.orphaned.is_empty() || !has_pending {
                 self.last_msg_id = update.new_channel_tip;
             }
         }
 
-        let channel_event = result.channel_update.map(|u| self.build_channel_event(u));
+        let mut events = VecDeque::new();
 
-        let finalized_event = (!result.finalized_tx_hashes.is_empty()
-            || !result.finalized_inscriptions.is_empty())
-        .then_some(Event::TxsFinalized {
-            tx_hashes: result.finalized_tx_hashes,
-            inscriptions: result.finalized_inscriptions,
-        });
-
-        match (channel_event, finalized_event) {
-            (Some(ce), Some(fe)) => {
-                self.buffered_event = Some(fe);
-                drop(self.event_tx.send(ce.clone()));
-                Some(ce)
-            }
-            (Some(e), None) | (None, Some(e)) => {
-                drop(self.event_tx.send(e.clone()));
-                Some(e)
-            }
-            (None, None) => None,
+        if let Some(update) = result.channel_update {
+            events.push_back(self.build_channel_event(update));
         }
+
+        if !result.finalized_tx_hashes.is_empty() || !result.finalized_inscriptions.is_empty() {
+            events.push_back(Event::TxsFinalized {
+                tx_hashes: result.finalized_tx_hashes,
+                inscriptions: result.finalized_inscriptions,
+            });
+        }
+
+        events
     }
 
     fn log_channel_update(update: &crate::state::ChannelUpdateInfo) {
@@ -1315,39 +1352,28 @@ where
                     checkpoint,
                 };
                 drop(reply.send(Ok((signed_tx, result))));
-                self.recompute_channel_view();
+                self.publish_channel_view();
                 None
             }
         }
     }
 
     async fn handle_publish(&mut self, data: Vec<u8>) -> Option<Event> {
-        if self.can_publish_now() {
-            match self.post_now(data.clone()).await {
-                Ok(event) => {
-                    self.recompute_channel_view();
-                    Some(event)
-                }
-                Err(err) => {
-                    warn!(target: TARGET, "Failed to publish inscription, re-queueing: {err}");
-                    self.pending_turn_queue.push_back(data);
-                    drop(self.refresh_channel_state().await);
-                    self.recompute_channel_view();
-                    None
-                }
-            }
-        } else {
-            self.pending_turn_queue.push_back(data);
-            self.recompute_channel_view();
+        // Treat publish as an actor intent: enqueue first, then let the common
+        // queue-drain path decide whether it can be posted immediately.
+        self.pending_turn_queue.push_back(data);
+
+        self.try_publish_queued().await.unwrap_or_else(|err| {
+            warn!(target: TARGET, "Failed to publish queued inscription: {err}");
             None
-        }
+        })
     }
 
     async fn post_now(&mut self, data: Vec<u8>) -> Result<Event, Error> {
         let parent = {
-            let s = self.state.as_mut().unwrap();
+            let state = self.state.as_mut().unwrap();
             if let Some(tip) = self.current_tip {
-                s.publish_parent(tip)
+                state.publish_parent(tip)
             } else {
                 self.last_msg_id
             }
@@ -1372,20 +1398,19 @@ where
                 Error::Network(err.to_string())
             })?;
 
-        let s = self.state.as_mut().unwrap();
-        s.submit_inscription(signed_tx, parent, new_msg_id, data.clone());
+        let state = self.state.as_mut().unwrap();
+        state.submit_inscription(signed_tx, parent, new_msg_id, data.clone());
         self.last_msg_id = new_msg_id;
 
-        let checkpoint = build_checkpoint(s, self.last_msg_id, self.lib_slot);
+        let checkpoint = build_checkpoint(state, self.last_msg_id, self.lib_slot);
         let info = Box::new(InscriptionInfo {
             tx_hash: id,
             parent_msg: parent,
             this_msg: new_msg_id,
             payload: data,
         });
-        let event = Event::Published { info, checkpoint };
-        drop(self.event_tx.send(event.clone()));
-        Ok(event)
+
+        Ok(Event::Published { info, checkpoint })
     }
 }
 
