@@ -66,7 +66,7 @@ use tokio::{
 use tracing::warn;
 
 use crate::{
-    common::chain::wait_for_transactions_inclusion,
+    common::{chain::wait_for_transactions_inclusion, mantle_inscription::make_inscription},
     cucumber::utils::{extract_child_dir_name, matching_child_dirs},
 };
 
@@ -156,7 +156,7 @@ struct SelectedNote {
     value: Value,
 }
 
-pub type DiscardedPayloads = Arc<tokio::sync::Mutex<HashSet<Vec<u8>>>>;
+pub type DiscardedPayloads = Arc<tokio::sync::Mutex<HashSet<Inscription>>>;
 pub type ZoneAccountBalances = HashMap<String, i64>;
 
 /// Shared deadline for a publish attempt and the matching event wait so the
@@ -330,7 +330,7 @@ pub fn start_balance_aware_policy(
     mut sequencer: ZoneSequencer<ZoneNodeHttpClient>,
     handle: SequencerHandle<ZoneNodeHttpClient>,
     initial_balances: ZoneAccountBalances,
-    planned_payloads: Vec<Vec<u8>>,
+    planned_payloads: Vec<Inscription>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut balances = BalanceAwareState::new(initial_balances);
@@ -368,7 +368,7 @@ pub fn start_sorted_conflict_policy(
         loop {
             match sequencer.next_event().await {
                 Some(Event::Published { info, .. }) => {
-                    sorted_state.record_seen_payload(info.payload.into_inner());
+                    sorted_state.record_seen_payload(info.payload.clone());
                 }
                 Some(Event::ChannelUpdate { orphaned, adopted }) => {
                     sorted_state.record_adoptions(&adopted).await;
@@ -383,7 +383,7 @@ pub fn start_sorted_conflict_policy(
                                 warn!(%error, "Failed to re-publish sorted zone payload");
                             }
                         } else {
-                            sorted_state.discard(inscription.payload.into_inner()).await;
+                            sorted_state.discard(inscription.payload.clone()).await;
                         }
                     }
                 }
@@ -406,7 +406,7 @@ impl BalanceAwareState {
         }
     }
 
-    fn record_applied_payload(&mut self, payload: &[u8]) {
+    fn record_applied_payload(&mut self, payload: &Inscription) {
         let Some((uuid, account, delta)) = parse_balance_payload(payload) else {
             return;
         };
@@ -432,7 +432,7 @@ impl BalanceAwareState {
         }
     }
 
-    fn should_republish(&self, payload: &[u8]) -> bool {
+    fn should_republish(&self, payload: &Inscription) -> bool {
         let Some((uuid, account, delta)) = parse_balance_payload(payload) else {
             return false;
         };
@@ -444,7 +444,7 @@ impl BalanceAwareState {
         self.available_balance(&account) + delta >= 0
     }
 
-    fn record_republished_payload(&mut self, payload: &[u8]) {
+    fn record_republished_payload(&mut self, payload: &Inscription) {
         self.record_applied_payload(payload);
     }
 
@@ -485,7 +485,7 @@ async fn publish_planned_balance_updates(
     handle: &SequencerHandle<ZoneNodeHttpClient>,
     view_rx: &tokio::sync::watch::Receiver<SequencerChannelView>,
     balances: &mut BalanceAwareState,
-    planned: &mut VecDeque<Vec<u8>>,
+    planned: &mut VecDeque<Inscription>,
 ) {
     if !view_rx.borrow().is_our_turn {
         return;
@@ -507,7 +507,7 @@ async fn publish_planned_balance_updates(
 }
 
 struct SortedConflictState {
-    max_seen_on_chain: Option<Vec<u8>>,
+    max_seen_on_chain: Option<Inscription>,
     discarded: DiscardedPayloads,
 }
 
@@ -521,15 +521,12 @@ impl SortedConflictState {
 
     async fn record_adoptions(&mut self, adopted: &[InscriptionInfo]) {
         for payload in adopted {
-            self.discarded
-                .lock()
-                .await
-                .remove(payload.payload.as_slice());
-            self.record_seen_payload(payload.payload.clone().into_inner());
+            self.discarded.lock().await.remove(&payload.payload);
+            self.record_seen_payload(payload.payload.clone());
         }
     }
 
-    fn record_seen_payload(&mut self, payload: Vec<u8>) {
+    fn record_seen_payload(&mut self, payload: Inscription) {
         if self
             .max_seen_on_chain
             .as_ref()
@@ -539,7 +536,7 @@ impl SortedConflictState {
         }
     }
 
-    async fn already_discarded(&self, payload: &[u8]) -> bool {
+    async fn already_discarded(&self, payload: &Inscription) -> bool {
         self.discarded.lock().await.contains(payload)
     }
 
@@ -549,7 +546,7 @@ impl SortedConflictState {
             .is_none_or(|seen| inscription.payload.as_slice() >= seen)
     }
 
-    async fn discard(&self, payload: Vec<u8>) {
+    async fn discard(&self, payload: Inscription) {
         self.discarded.lock().await.insert(payload);
     }
 }
@@ -565,14 +562,14 @@ pub fn keygen() -> Ed25519Key {
 /// Encodes a balance-affecting zone payload used by balance-aware sequencer
 /// scenarios.
 #[must_use]
-pub fn balance_update_payload(uuid: &str, account: &str, delta: i64) -> Vec<u8> {
-    format!("{uuid}:{account}:{delta}").into_bytes()
+pub fn balance_update_payload(uuid: &str, account: &str, delta: i64) -> Inscription {
+    make_inscription(&format!("{uuid}:{account}:{delta}"))
 }
 
 /// Parses a balance-affecting payload in the same format produced by
 /// [`balance_update_payload`].
-pub fn parse_balance_payload(payload: &[u8]) -> Option<(String, String, i64)> {
-    let payload = std::str::from_utf8(payload).ok()?;
+pub fn parse_balance_payload(payload: &Inscription) -> Option<(String, String, i64)> {
+    let payload = std::str::from_utf8(payload.as_slice()).ok()?;
     let parts = payload.splitn(3, ':').collect::<Vec<_>>();
     let [uuid, account, delta] = parts.as_slice() else {
         return None;
@@ -611,7 +608,7 @@ pub fn round_robin_sequencer_config() -> SequencerConfig {
 pub async fn publish_message_with_retry(
     sequencer: &SequencerHandle<ZoneNodeHttpClient>,
     sequencer_events: &mut tokio::sync::mpsc::Receiver<Event>,
-    data: &[u8],
+    data: &Inscription,
     deadline: PublishDeadline,
 ) -> Result<PublishResult, ZoneTestError> {
     loop {
@@ -619,10 +616,7 @@ pub async fn publish_message_with_retry(
             return Err(ZoneTestError::PublishTimeout);
         }
 
-        match sequencer
-            .publish_message(Inscription::new_unchecked(data.to_vec()))
-            .await
-        {
+        match sequencer.publish_message(data.clone()).await {
             Ok(()) => return wait_for_published_event(sequencer_events, data, deadline).await,
             Err(error) => {
                 warn!(error = %error, "Zone sequencer publish failed, retrying");
@@ -701,12 +695,12 @@ pub async fn wait_for_channel_view(
 /// assertions decide whether ordering matters for the scenario.
 pub async fn collect_indexed_messages(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected_messages: &[Vec<u8>],
+    expected_messages: &[Inscription],
     duration: Duration,
-) -> Result<Vec<Vec<u8>>, ZoneTestError> {
-    let expected: HashSet<Vec<u8>> = expected_messages.iter().cloned().collect();
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut ordered: Vec<Vec<u8>> = Vec::new();
+) -> Result<Vec<Inscription>, ZoneTestError> {
+    let expected: HashSet<Inscription> = expected_messages.iter().cloned().collect();
+    let mut seen: HashSet<Inscription> = HashSet::new();
+    let mut ordered: Vec<Inscription> = Vec::new();
 
     poll_zone_indexer_until(
         indexer,
@@ -731,10 +725,10 @@ pub async fn collect_indexed_messages(
 /// sequence without duplicates.
 pub async fn collect_indexed_messages_exactly_once(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected_messages: &[Vec<u8>],
+    expected_messages: &[Inscription],
     duration: Duration,
-) -> Result<Vec<Vec<u8>>, ZoneTestError> {
-    let expected: HashSet<Vec<u8>> = expected_messages.iter().cloned().collect();
+) -> Result<Vec<Inscription>, ZoneTestError> {
+    let expected: HashSet<Inscription> = expected_messages.iter().cloned().collect();
 
     timeout(duration, async {
         loop {
@@ -788,24 +782,24 @@ pub async fn collect_indexed_messages_exactly_once(
 /// distinct transaction lineage.
 pub async fn wait_for_exact_indexed_payload_count(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected_payload: &[u8],
+    expected_payload: Inscription,
     expected_count: usize,
     duration: Duration,
 ) -> Result<(), ZoneTestError> {
     timeout(duration, async {
         loop {
-            let count = count_indexed_payload(indexer, expected_payload).await?;
+            let count = count_indexed_payload(indexer, expected_payload.clone()).await?;
 
             if count >= expected_count {
                 sleep(Duration::from_secs(30)).await;
 
-                let final_count = count_indexed_payload(indexer, expected_payload).await?;
+                let final_count = count_indexed_payload(indexer, expected_payload.clone()).await?;
                 if final_count == expected_count {
                     return Ok(());
                 }
 
                 return Err(ZoneTestError::IndexedPayloadCountMismatch {
-                    payload: String::from_utf8_lossy(expected_payload).to_string(),
+                    payload: String::from_utf8_lossy(expected_payload.as_slice()).to_string(),
                     expected: expected_count,
                     actual: final_count,
                 });
@@ -820,7 +814,7 @@ pub async fn wait_for_exact_indexed_payload_count(
 
 async fn count_indexed_payload(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected_payload: &[u8],
+    expected_payload: Inscription,
 ) -> Result<usize, ZoneTestError> {
     let mut count = 0;
     let mut cursor = None;
@@ -1083,7 +1077,7 @@ pub async fn submit_atomic_zone_deposit(
     funding_public_key: ZkPublicKey,
     amount: Value,
     metadata: Vec<u8>,
-    inscription_data: Vec<u8>,
+    inscription_data: Inscription,
 ) -> Result<AtomicZoneDepositSubmission, ZoneTestError> {
     let transfer = build_atomic_deposit_transfer(node_url, funding_public_key, amount).await?;
     let deposit = build_atomic_deposit_op(channel_id, metadata, &transfer)?;
@@ -1091,7 +1085,7 @@ pub async fn submit_atomic_zone_deposit(
     let (tx, msg_id, sequencer_sig) = sequencer
         .prepare_tx(
             [Op::Transfer(transfer), Op::ChannelDeposit(deposit.clone())].into(),
-            Inscription::new_unchecked(inscription_data),
+            inscription_data,
         )
         .await
         .map_err(|error| ZoneTestError::BuildAtomicDeposit {
@@ -1177,7 +1171,7 @@ pub async fn submit_zone_withdraw(
     channel_id: ChannelId,
     funding_public_key: ZkPublicKey,
     amount: Value,
-    inscription_data: Vec<u8>,
+    inscription_data: Inscription,
 ) -> Result<ZoneWithdrawSubmission, ZoneTestError> {
     let withdraw = ChannelWithdrawOp {
         channel_id,
@@ -1188,7 +1182,7 @@ pub async fn submit_zone_withdraw(
     let (tx, msg_id, inscription_sig) = sequencer
         .prepare_tx(
             [Op::ChannelWithdraw(withdraw.clone())].into(),
-            Inscription::new_unchecked(inscription_data),
+            inscription_data,
         )
         .await
         .map_err(|error| ZoneTestError::SubmitWithdraw {

@@ -13,7 +13,9 @@ use lb_core::{
     codec::DeserializeOp as _,
     mantle::{
         SignedMantleTx, TxHash, Utxo,
-        ops::channel::{ChannelId, deposit::DepositOp, withdraw::ChannelWithdrawOp},
+        ops::channel::{
+            ChannelId, deposit::DepositOp, inscribe::Inscription, withdraw::ChannelWithdrawOp,
+        },
     },
 };
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
@@ -129,11 +131,11 @@ impl ManualNodeConfigOverrides {
 }
 
 pub struct ZonePublishedMessage {
-    pub payload: Vec<u8>,
+    pub payload: Inscription,
     pub inscription_id: Option<InscriptionId>,
 }
 
-pub type ZoneDiscardedPayloads = std::sync::Arc<tokio::sync::Mutex<HashSet<Vec<u8>>>>;
+pub type ZoneDiscardedPayloads = std::sync::Arc<tokio::sync::Mutex<HashSet<Inscription>>>;
 
 pub struct ZoneSequencerIdentity {
     signing_key: Ed25519Key,
@@ -163,7 +165,7 @@ pub struct ZoneState {
     checkpoints: HashMap<String, SequencerCheckpoint>,
     latest_checkpoints: HashMap<String, SequencerCheckpoint>,
     sorted_total_payloads: Option<usize>,
-    sorted_expected_by_sequencer: Option<HashMap<String, Vec<Vec<u8>>>>,
+    sorted_expected_by_sequencer: Option<HashMap<String, Vec<Inscription>>>,
 }
 
 impl ZoneState {
@@ -259,7 +261,7 @@ impl ZoneState {
     pub fn remember_zone_message(
         &mut self,
         alias: String,
-        payload: Vec<u8>,
+        payload: Inscription,
         inscription_id: Option<InscriptionId>,
         sequencer_alias: Option<&str>,
         checkpoint: Option<SequencerCheckpoint>,
@@ -346,7 +348,7 @@ impl ZoneState {
     pub fn message_payloads_for_aliases(
         &self,
         aliases: &[String],
-    ) -> Result<Vec<Vec<u8>>, StepError> {
+    ) -> Result<Vec<Inscription>, StepError> {
         aliases
             .iter()
             .map(|alias| {
@@ -360,7 +362,7 @@ impl ZoneState {
             .collect()
     }
 
-    pub fn published_message_payloads(&self) -> Result<Vec<Vec<u8>>, StepError> {
+    pub fn published_message_payloads(&self) -> Result<Vec<Inscription>, StepError> {
         self.message_payloads_for_aliases(&self.published_order)
     }
 
@@ -482,7 +484,7 @@ impl ZoneState {
 
     pub fn set_sorted_expected_by_sequencer(
         &mut self,
-        expected_by_sequencer: HashMap<String, Vec<Vec<u8>>>,
+        expected_by_sequencer: HashMap<String, Vec<Inscription>>,
     ) {
         self.sorted_expected_by_sequencer = Some(expected_by_sequencer);
     }
@@ -493,7 +495,9 @@ impl ZoneState {
         })
     }
 
-    pub fn sorted_expected_by_sequencer(&self) -> Result<HashMap<String, Vec<Vec<u8>>>, StepError> {
+    pub fn sorted_expected_by_sequencer(
+        &self,
+    ) -> Result<HashMap<String, Vec<Inscription>>, StepError> {
         self.sorted_expected_by_sequencer
             .clone()
             .ok_or(StepError::LogicalError {

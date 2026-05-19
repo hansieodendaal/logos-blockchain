@@ -2,7 +2,7 @@ use core::{
     ops::{Deref, DerefMut},
     slice::Iter,
 };
-use std::vec::IntoIter;
+use std::{str::FromStr, vec::IntoIter};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -91,6 +91,17 @@ impl<T, const MAX: usize> TryFrom<Vec<T>> for BoundedVec<T, MAX> {
     }
 }
 
+impl<T, const MAX: usize> TryFrom<&[T]> for BoundedVec<T, MAX>
+where
+    T: Clone,
+{
+    type Error = BoundedError;
+
+    fn try_from(value: &[T]) -> Result<Self, Self::Error> {
+        Self::try_from(value.to_vec())
+    }
+}
+
 impl<T, const INPUT_SIZE: usize, const MAX: usize> From<[T; INPUT_SIZE]> for BoundedVec<T, MAX> {
     fn from(value: [T; INPUT_SIZE]) -> Self {
         const { assert!(INPUT_SIZE <= MAX, "Array length exceeds BoundedVec MAX") }
@@ -154,5 +165,13 @@ impl<T, const MAX: usize> IntoIterator for BoundedVec<T, MAX> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+impl<const MAX: usize> FromStr for BoundedVec<u8, MAX> {
+    type Err = BoundedError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.as_bytes().to_vec())
     }
 }

@@ -98,7 +98,9 @@ async fn channel_deposit() {
     let deposit_op = DepositOp {
         channel_id,
         inputs: Inputs::new(vec![note_id]),
-        metadata: format!("Mint {deposit_amount} to Alice in Zone").into_bytes(),
+        metadata: format!("Mint {deposit_amount} to Alice in Zone")
+            .as_bytes()
+            .to_vec(),
     };
     let body = ChannelDepositRequestBody {
         tip: None,

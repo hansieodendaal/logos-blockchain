@@ -154,7 +154,7 @@ mod tests {
     };
     use lb_core::{
         header::HeaderId,
-        mantle::{NoteId, SignedMantleTx, ledger::Inputs},
+        mantle::{NoteId, SignedMantleTx, ledger::Inputs, ops::channel::inscribe::Inscription},
     };
     use lb_groth16::Fr;
 
@@ -346,7 +346,7 @@ mod tests {
     fn block_msg(id: u8, data: &[u8]) -> ZoneMessage {
         ZoneMessage::Block(ZoneBlock {
             id: msg_id(id),
-            data: data.to_vec(),
+            data: Inscription::try_from(data).unwrap(),
         })
     }
 

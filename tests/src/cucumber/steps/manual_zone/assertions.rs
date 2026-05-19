@@ -5,7 +5,7 @@ use std::{
 
 use futures::StreamExt as _;
 use lb_common_http_client::Slot;
-use lb_core::mantle::ops::channel::MsgId;
+use lb_core::mantle::ops::channel::{MsgId, inscribe::Inscription};
 use lb_zone_sdk::{
     ZoneMessage, adapter::NodeHttpClient as ZoneNodeHttpClient, indexer::ZoneIndexer,
 };
@@ -15,9 +15,9 @@ use crate::cucumber::error::{StepError, StepResult};
 
 pub(super) async fn wait_for_indexer_unordered(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected: &HashSet<Vec<u8>>,
+    expected: &HashSet<Inscription>,
     timeout_duration: Duration,
-) -> Result<HashSet<Vec<u8>>, ZoneTestError> {
+) -> Result<HashSet<Inscription>, ZoneTestError> {
     let mut seen = HashSet::new();
     let mut cursor = None;
     let start = Instant::now();
@@ -44,8 +44,8 @@ pub(super) async fn wait_for_indexer_unordered(
 
 pub(super) async fn scan_indexer_for_payloads(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected: &HashSet<Vec<u8>>,
-) -> Result<Vec<Vec<u8>>, ZoneTestError> {
+    expected: &HashSet<Inscription>,
+) -> Result<Vec<Inscription>, ZoneTestError> {
     let mut payloads = Vec::new();
     let mut cursor = None;
 
@@ -65,11 +65,11 @@ pub(super) async fn scan_indexer_for_payloads(
 
 pub(super) async fn wait_until_sorted_conflict_settles(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
-    expected: &HashSet<Vec<u8>>,
+    expected: &HashSet<Inscription>,
     discarded: &DiscardedPayloads,
     total: usize,
     timeout_duration: Duration,
-) -> Result<Vec<Vec<u8>>, ZoneTestError> {
+) -> Result<Vec<Inscription>, ZoneTestError> {
     let mut on_chain = Vec::new();
     let mut cursor = None;
     let start = Instant::now();
@@ -98,7 +98,7 @@ pub(super) async fn wait_until_sorted_conflict_settles(
 async fn read_next_indexed_blocks(
     indexer: &ZoneIndexer<ZoneNodeHttpClient>,
     cursor: &mut Option<(MsgId, Slot)>,
-    mut visit: impl FnMut(Vec<u8>),
+    mut visit: impl FnMut(Inscription),
 ) -> Result<bool, ZoneTestError> {
     let stream = indexer
         .next_messages(*cursor)
@@ -124,10 +124,10 @@ async fn read_next_indexed_blocks(
 }
 
 pub(super) fn assert_sorted_outcome(
-    on_chain: &[Vec<u8>],
-    discarded: &HashSet<Vec<u8>>,
+    on_chain: &[Inscription],
+    discarded: &HashSet<Inscription>,
     total: usize,
-    expected_by_sequencer: &HashMap<String, Vec<Vec<u8>>>,
+    expected_by_sequencer: &HashMap<String, Vec<Inscription>>,
 ) -> StepResult {
     let issues = sorted_outcome_issues(on_chain, discarded, total, expected_by_sequencer);
     if issues.is_empty() {
@@ -140,19 +140,19 @@ pub(super) fn assert_sorted_outcome(
 }
 
 fn sorted_outcome_issues(
-    on_chain: &[Vec<u8>],
-    discarded: &HashSet<Vec<u8>>,
+    on_chain: &[Inscription],
+    discarded: &HashSet<Inscription>,
     total: usize,
-    expected_by_sequencer: &HashMap<String, Vec<Vec<u8>>>,
+    expected_by_sequencer: &HashMap<String, Vec<Inscription>>,
 ) -> Vec<String> {
     let mut issues = Vec::new();
-    let unique: HashSet<&Vec<u8>> = on_chain.iter().collect();
+    let unique: HashSet<&Inscription> = on_chain.iter().collect();
     if unique.len() != on_chain.len() {
         issues.push("Duplicate inscriptions detected on chain".to_owned());
     }
 
-    let on_chain_set: HashSet<Vec<u8>> = on_chain.iter().cloned().collect();
-    let overlap: Vec<Vec<u8>> = on_chain_set.intersection(discarded).cloned().collect();
+    let on_chain_set: HashSet<Inscription> = on_chain.iter().cloned().collect();
+    let overlap: Vec<Inscription> = on_chain_set.intersection(discarded).cloned().collect();
     if !overlap.is_empty() {
         issues.push(format!(
             "Payloads appeared both on-chain and discarded: {:?}",
@@ -201,7 +201,7 @@ fn sorted_outcome_issues(
     issues
 }
 
-fn render_payloads(payloads: &[Vec<u8>]) -> Vec<String> {
+fn render_payloads(payloads: &[Inscription]) -> Vec<String> {
     payloads
         .iter()
         .map(|payload| String::from_utf8_lossy(payload).to_string())

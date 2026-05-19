@@ -564,7 +564,7 @@ pub struct ZoneSequencer<Node> {
     slot_clock: Option<SlotClock>,
     channel_state: Option<ChannelState>,
     own_key_index: Option<u16>,
-    pending_turn_queue: VecDeque<Vec<u8>>,
+    pending_turn_queue: VecDeque<Inscription>,
 
     // Block stream
     blocks_stream: Option<BoxStream<ProcessedBlockEvent>>,
@@ -1360,7 +1360,7 @@ where
         }
     }
 
-    async fn handle_publish(&mut self, data: Vec<u8>) -> Option<Event> {
+    async fn handle_publish(&mut self, data: Inscription) -> Option<Event> {
         // Treat publish as an actor intent: enqueue first, then let the common
         // queue-drain path decide whether it can be posted immediately.
         self.pending_turn_queue.push_back(data);
@@ -1371,7 +1371,7 @@ where
         })
     }
 
-    async fn post_now(&mut self, data: Vec<u8>) -> Result<Event, Error> {
+    async fn post_now(&mut self, data: Inscription) -> Result<Event, Error> {
         let parent = {
             let state = self.state.as_mut().unwrap();
             if let Some(tip) = self.current_tip {
@@ -2023,7 +2023,7 @@ mod tests {
         let deposit_op = DepositOp {
             channel_id,
             inputs: Inputs::new(vec![utxo.id()]),
-            metadata: "to Alice".into(),
+            metadata: b"to Alice".to_vec(),
         };
 
         // Prepare a `MantleTx` — drive sequencer concurrently to process the request

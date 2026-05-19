@@ -7,7 +7,7 @@ pub use lb_common_http_client::{CommonHttpClient, Slot};
 pub use lb_core::mantle::ops::channel::Ed25519PublicKey;
 use lb_core::mantle::{
     ledger::{Inputs, Outputs},
-    ops::channel::MsgId,
+    ops::channel::{MsgId, inscribe::Inscription},
 };
 
 /// A message from a zone channel, included/finalized in Bedrock
@@ -27,7 +27,7 @@ pub struct ZoneBlock {
     /// The unique identifier of this inscription.
     pub id: MsgId,
     /// The opaque inscription data.
-    pub data: Vec<u8>,
+    pub data: Inscription,
 }
 
 /// A deposit from a zone channel, included/finalized in Bedrock

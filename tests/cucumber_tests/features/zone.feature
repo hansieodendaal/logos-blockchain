@@ -315,7 +315,7 @@ Feature: Zone SDK
       | charlie | 10      |
     When the zone node is at height 1 in 120 seconds
     And I start zone sequencer "SEQ_A" with indexer
-    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with timeframe 60 and posting timeout 0 authorizing:
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 60 and posting timeout 0 authorizing:
       | alias |
       | SEQ_B |
       | SEQ_C |
@@ -346,7 +346,7 @@ Feature: Zone SDK
       | SEQ_C |
     When the zone node is at height 1 in 120 seconds
     And I start zone sequencer "SEQ_A" with indexer
-    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with timeframe 60 and posting timeout 0 authorizing:
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 60 and posting timeout 0 authorizing:
       | alias |
       | SEQ_B |
       | SEQ_C |

@@ -3,9 +3,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use cucumber::gherkin::Step;
 use futures::future::join_all;
 use lb_common_http_client::CommonHttpClient;
+use lb_core::mantle::ops::channel::inscribe::Inscription;
 use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
 use lb_testing_framework::{LbcManualCluster, NodeHttpClient};
-use lb_core::mantle::ops::channel::inscribe::Inscription;
 use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
@@ -32,7 +32,7 @@ use super::{
     tables::{ConcurrentZoneMessageRow, group_zone_messages_by_sequencer},
 };
 use crate::{
-    common::manual_cluster::wait_for_height,
+    common::{mantle_inscription::make_inscription, manual_cluster::wait_for_height},
     cucumber::{
         error::{StepError, StepResult},
         steps::TARGET,
@@ -54,13 +54,13 @@ pub(super) enum DriveMode {
     },
     BalanceAware {
         initial_balances: ZoneAccountBalances,
-        planned_payloads: Vec<Vec<u8>>,
+        planned_payloads: Vec<Inscription>,
     },
 }
 
 struct PublishedZoneMessage {
     alias: String,
-    payload: Vec<u8>,
+    payload: Inscription,
     result: PublishResult,
 }
 
@@ -222,7 +222,7 @@ pub(super) fn remember_published_zone_message(
     world: &mut CucumberWorld,
     sequencer_alias: &str,
     message_alias: String,
-    payload: Vec<u8>,
+    payload: Inscription,
     result: &PublishResult,
 ) {
     world.zone.remember_zone_message(
@@ -249,7 +249,7 @@ pub(super) async fn submit_zone_deposit_transaction(
         world.zone.sequencer_channel_id(&channel_alias)?,
         funding_public_key,
         amount,
-        metadata.into_bytes(),
+        metadata.as_bytes().to_vec(),
     )
     .await
     .map_err(|error| zone_step_error(step, &error))?;
@@ -278,7 +278,7 @@ pub(super) async fn submit_atomic_zone_deposit_transaction(
     let node_url = log_step_error(step, world.zone_node_url())?;
     let funding_public_key = log_step_error(step, world.zone.funding_public_key())?;
     let sequencer = log_step_error(step, world.zone.sequencer_handle(sequencer_alias))?;
-    let inscription_data = format!("Mint {amount} to Alice").into_bytes();
+    let inscription_data = make_inscription(&format!("Mint {amount} to Alice"));
 
     let submission = submit_atomic_zone_deposit(
         &node_url,
@@ -286,7 +286,7 @@ pub(super) async fn submit_atomic_zone_deposit_transaction(
         world.zone.sequencer_channel_id(sequencer_alias)?,
         funding_public_key,
         amount,
-        metadata.into_bytes(),
+        metadata.as_bytes().to_vec(),
         inscription_data.clone(),
     )
     .await
@@ -317,7 +317,7 @@ pub(super) async fn submit_zone_withdraw_transaction(
 ) -> StepResult {
     let funding_public_key = log_step_error(step, world.zone.funding_public_key())?;
     let sequencer = log_step_error(step, world.zone.sequencer_handle(sequencer_alias))?;
-    let inscription_data = format!("Burn {amount}").into_bytes();
+    let inscription_data = make_inscription(&format!("Burn {amount}"));
 
     let submission = submit_zone_withdraw(
         sequencer,
@@ -365,7 +365,7 @@ pub(super) async fn publish_zone_messages(
     world: &mut CucumberWorld,
     step: &Step,
     sequencer_alias: impl AsRef<str>,
-    rows: Vec<(String, Vec<u8>)>,
+    rows: Vec<(String, Inscription)>,
 ) -> StepResult {
     let sequencer_alias = sequencer_alias.as_ref().to_owned();
     let node = log_step_error(step, world.zone_node_http_client())?;
@@ -438,7 +438,7 @@ pub(super) async fn publish_zone_messages_concurrently(
 
         async move {
             for payload in payloads {
-                handle.publish_message(Inscription::new_unchecked(payload)).await.map_err(|error| {
+                handle.publish_message(payload).await.map_err(|error| {
                     StepError::LogicalError {
                         message: format!(
                             "Zone concurrent publish failed for sequencer '{sequencer_alias}': {error}"

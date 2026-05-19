@@ -199,7 +199,7 @@ fn op_to_zone_message(op: &Op, channel_id: ChannelId) -> Option<ZoneMessage> {
         Op::ChannelInscribe(inscribe) if inscribe.channel_id == channel_id => {
             Some(ZoneMessage::Block(ZoneBlock {
                 id: inscribe.id(),
-                data: inscribe.inscription.clone().into(),
+                data: inscribe.inscription.clone(),
             }))
         }
         Op::ChannelDeposit(deposit) if deposit.channel_id == channel_id => {

@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 
 use cucumber::gherkin::Step;
+use lb_core::mantle::ops::channel::inscribe::Inscription;
 
-use crate::cucumber::error::StepError;
+use crate::{common::mantle_inscription::make_inscription, cucumber::error::StepError};
 
 #[derive(Clone)]
 pub(super) struct ConcurrentZoneMessageRow {
     pub sequencer_alias: String,
     pub message_alias: String,
-    pub payload: Vec<u8>,
+    pub payload: Inscription,
 }
 
 #[derive(Clone)]
@@ -29,9 +30,9 @@ pub(super) struct GeneratedZoneMessageBatch {
     pub data_prefix: String,
 }
 
-pub(super) fn zone_message_rows(step: &Step) -> Result<Vec<(String, Vec<u8>)>, StepError> {
+pub(super) fn zone_message_rows(step: &Step) -> Result<Vec<(String, Inscription)>, StepError> {
     parse_zone_table_rows(step, &["alias", "data"], "Zone message", |row| match row {
-        [alias, data] => Ok((alias.clone(), data.as_bytes().to_vec())),
+        [alias, data] => Ok((alias.clone(), make_inscription(data))),
         _ => invalid_zone_table_row("Zone message", &["alias", "data"], row.len()),
     })
 }
@@ -47,7 +48,7 @@ pub(super) fn concurrent_zone_message_rows(
             [sequencer_alias, message_alias, data] => Ok(ConcurrentZoneMessageRow {
                 sequencer_alias: sequencer_alias.clone(),
                 message_alias: message_alias.clone(),
-                payload: data.as_bytes().to_vec(),
+                payload: make_inscription(data),
             }),
             _ => invalid_zone_table_row(
                 "Concurrent zone message",

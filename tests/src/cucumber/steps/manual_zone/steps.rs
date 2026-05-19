@@ -5,6 +5,7 @@ use std::{
 };
 
 use cucumber::{gherkin::Step, given, when};
+use lb_core::mantle::ops::channel::inscribe::Inscription;
 
 use super::{
     actions::{
@@ -36,7 +37,7 @@ use super::{
     },
 };
 use crate::{
-    common::manual_cluster::wait_for_height,
+    common::{mantle_inscription::make_inscription, manual_cluster::wait_for_height},
     cucumber::{
         error::{StepError, StepResult},
         world::CucumberWorld,
@@ -234,7 +235,7 @@ async fn step_publish_single_zone_message_for_sequencer(
     data: String,
 ) -> StepResult {
     let _ = step;
-    let payload = data.into_bytes();
+    let payload = make_inscription(&data);
     let handle = world.zone.sequencer_handle(&sequencer_alias)?.clone();
 
     handle
@@ -263,7 +264,7 @@ async fn step_publish_single_zone_message_for_sequencer_on_turn(
     sequencer_alias: String,
     data: String,
 ) -> StepResult {
-    let payload = data.into_bytes();
+    let payload = make_inscription(&data);
     let handle = world.zone.sequencer_handle(&sequencer_alias)?.clone();
     let mut view_rx = handle.subscribe_channel_view();
 
@@ -483,7 +484,7 @@ async fn step_publish_repeated_zone_messages_concurrently_with_republish_policy(
     let rows = build_repeated_zone_message_rows(
         generated_zone_message_sequencers(step)?,
         copies_per_sequencer,
-        payload,
+        &payload,
     );
 
     publish_zone_messages_with_republish_policy(world, step, rows).await
@@ -505,10 +506,10 @@ fn build_generated_zone_message_rows(
 fn build_repeated_zone_message_rows(
     sequencer_aliases: Vec<String>,
     copies_per_sequencer: usize,
-    payload: String,
+    payload: &str,
 ) -> Vec<ConcurrentZoneMessageRow> {
     let mut builder = GeneratedZoneMessages::default();
-    let payload = payload.into_bytes();
+    let payload = make_inscription(payload);
 
     for sequencer_alias in sequencer_aliases {
         builder.append_repeated_payloads(sequencer_alias, copies_per_sequencer, &payload);
@@ -533,22 +534,27 @@ impl GeneratedZoneMessages {
         for payload_number in 1..=count {
             self.push(
                 sequencer_alias.clone(),
-                format!("{data_prefix}{payload_number}").into_bytes(),
+                make_inscription(&format!("{data_prefix}{payload_number}")),
             );
         }
     }
 
-    fn append_repeated_payloads(&mut self, sequencer_alias: String, count: usize, payload: &[u8]) {
+    fn append_repeated_payloads(
+        &mut self,
+        sequencer_alias: String,
+        count: usize,
+        payload: &Inscription,
+    ) {
         for _ in 1..count {
-            self.push(sequencer_alias.clone(), payload.to_vec());
+            self.push(sequencer_alias.clone(), payload.clone());
         }
 
         if count > 0 {
-            self.push(sequencer_alias, payload.to_vec());
+            self.push(sequencer_alias, payload.clone());
         }
     }
 
-    fn push(&mut self, sequencer_alias: String, payload: Vec<u8>) {
+    fn push(&mut self, sequencer_alias: String, payload: Inscription) {
         self.next_message_number += 1;
 
         self.rows.push(ConcurrentZoneMessageRow {
@@ -626,7 +632,7 @@ async fn step_publish_zone_balance_updates_with_balance_policy(
     let rows = zone_balance_rows(step)?;
     let initial_balances = world.zone.zone_account_balances()?;
     let grouped = rows.iter().fold(
-        HashMap::<String, Vec<(String, Vec<u8>)>>::new(),
+        HashMap::<String, Vec<(String, Inscription)>>::new(),
         |mut grouped, row| {
             let payload = balance_update_payload(&row.message_alias, &row.account, row.delta);
             grouped
@@ -1058,13 +1064,13 @@ async fn step_zone_indexer_returns_all_messages_exactly_once_any_order(
 fn published_payload_set(
     world: &CucumberWorld,
     step: &Step,
-) -> Result<HashSet<Vec<u8>>, StepError> {
+) -> Result<HashSet<Inscription>, StepError> {
     let expected_payloads = log_step_error(step, world.zone.published_message_payloads())?;
 
     Ok(expected_payloads.into_iter().collect())
 }
 
-fn message_payload(world: &CucumberWorld, message_alias: &str) -> Result<Vec<u8>, StepError> {
+fn message_payload(world: &CucumberWorld, message_alias: &str) -> Result<Inscription, StepError> {
     let payloads = world
         .zone
         .message_payloads_for_aliases(&[message_alias.to_owned()])?;
@@ -1075,11 +1081,11 @@ fn message_payload(world: &CucumberWorld, message_alias: &str) -> Result<Vec<u8>
 }
 
 fn ensure_indexed_payloads_match_once(
-    expected: &HashSet<Vec<u8>>,
-    seen: &HashSet<Vec<u8>>,
-    all_payloads: &[Vec<u8>],
+    expected: &HashSet<Inscription>,
+    seen: &HashSet<Inscription>,
+    all_payloads: &[Inscription],
 ) -> StepResult {
-    let unique: HashSet<&Vec<u8>> = all_payloads.iter().collect();
+    let unique: HashSet<&Inscription> = all_payloads.iter().collect();
 
     if unique.len() != all_payloads.len() {
         return Err(StepError::LogicalError {
@@ -1121,7 +1127,7 @@ async fn step_zone_indexer_returns_payload_count(
     let indexer = log_step_error(step, world.zone.indexer())?;
     wait_for_exact_indexed_payload_count(
         indexer,
-        payload.as_bytes(),
+        make_inscription(&payload),
         expected_count,
         Duration::from_secs(timeout_seconds),
     )
@@ -1190,7 +1196,7 @@ async fn step_zone_indexer_preserves_per_sequencer_order_without_duplicates(
     )
 }
 
-fn apply_indexed_balance_updates(balances: &mut HashMap<String, i64>, payloads: &[Vec<u8>]) {
+fn apply_indexed_balance_updates(balances: &mut HashMap<String, i64>, payloads: &[Inscription]) {
     for payload in payloads {
         let Some((_, account, delta)) = parse_balance_payload(payload) else {
             continue;
