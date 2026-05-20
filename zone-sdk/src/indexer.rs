@@ -458,5 +458,12 @@ mod tests {
         ) -> Result<(), lb_common_http_client::Error> {
             unimplemented!()
         }
+
+        async fn channel_state(
+            &self,
+            _channel_id: ChannelId,
+        ) -> Result<lb_core::mantle::channel::ChannelState, lb_common_http_client::Error> {
+            unimplemented!()
+        }
     }
 }
