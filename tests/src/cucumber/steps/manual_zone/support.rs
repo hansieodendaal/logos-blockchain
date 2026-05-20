@@ -63,8 +63,10 @@ use tokio::{
 use tracing::warn;
 
 use crate::{
-    common::{chain::wait_for_transactions_inclusion, mantle_inscription::make_inscription},
-    common::{chain::wait_for_transactions_inclusion, wallet::build_wallet_funded_transfer},
+    common::{
+        chain::wait_for_transactions_inclusion, mantle_inscription::make_inscription,
+        wallet::build_wallet_funded_transfer,
+    },
     cucumber::utils::{extract_child_dir_name, matching_child_dirs},
 };
 
@@ -102,10 +104,6 @@ pub enum ZoneTestError {
     LibAdvanceTimeout,
     #[error("timed out waiting for zone sequencer channel view condition: {message}")]
     ChannelViewTimeout { message: String },
-    #[error("failed to fetch wallet balance while preparing a zone deposit: {message}")]
-    WalletBalance { message: String },
-    #[error("failed to find a funding note with value at least {min_value}")]
-    MissingFundingNote { min_value: Value },
     #[error("failed to find a funding note with exact value {value}")]
     MissingExactFundingNote { value: Value },
     #[error("failed to submit zone deposit: {message}")]
@@ -150,7 +148,7 @@ pub struct AtomicZoneDepositRequest {
     pub available_utxos: Vec<Utxo>,
     pub amount: Value,
     pub metadata: Vec<u8>,
-    pub inscription_data: Vec<u8>,
+    pub inscription_data: Inscription,
 }
 
 /// Result of a withdraw scenario where the zone sequencer signs the channel
