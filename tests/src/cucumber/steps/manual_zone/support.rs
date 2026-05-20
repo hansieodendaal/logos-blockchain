@@ -51,10 +51,8 @@ use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
     sequencer::{
-        Event, InscriptionId, PublishResult, SequencerChannelView, SequencerConfig,
-        SequencerHandle, ZoneSequencer,
-        Event, InscriptionId, OrphanedTx, PublishResult, SequencerConfig, SequencerHandle,
-        WithdrawArg, ZoneSequencer,
+        Event, InscriptionId, OrphanedTx, PublishResult, SequencerChannelView, SequencerConfig,
+        SequencerHandle, WithdrawArg, ZoneSequencer,
     },
     state::{InscriptionInfo, PublishedTx},
 };
@@ -388,7 +386,7 @@ pub fn start_sorted_conflict_policy(
         loop {
             match sequencer.next_event().await {
                 Some(Event::Published { tx, .. }) => {
-                    sorted_state.record_seen_payload(tx.inscription().payload.clone().into_inner());
+                    sorted_state.record_seen_payload(tx.inscription().payload.clone());
                 }
                 Some(Event::ChannelUpdate { orphaned, adopted }) => {
                     sorted_state.record_adoptions(&adopted).await;
@@ -1279,7 +1277,7 @@ pub async fn publish_atomic_zone_withdraw(
     sequencer_events: &mut tokio::sync::mpsc::Receiver<Event>,
     funding_public_key: ZkPublicKey,
     outputs_per_arg: Vec<Vec<Value>>,
-    inscription_data: Vec<u8>,
+    inscription_data: Inscription,
     deadline: PublishDeadline,
 ) -> Result<ZoneAtomicWithdrawSubmission, ZoneTestError> {
     if outputs_per_arg.is_empty() {
@@ -1300,10 +1298,7 @@ pub async fn publish_atomic_zone_withdraw(
         .collect();
 
     sequencer
-        .publish_atomic_withdraw(
-            Inscription::new_unchecked(inscription_data.clone()),
-            withdraw_args,
-        )
+        .publish_atomic_withdraw(inscription_data.clone(), withdraw_args)
         .await
         .map_err(|error| ZoneTestError::SubmitWithdraw {
             message: error.to_string(),
@@ -1314,7 +1309,7 @@ pub async fn publish_atomic_zone_withdraw(
             let Event::Published { tx, checkpoint } = event else {
                 continue;
             };
-            if tx.inscription().payload.as_slice() != inscription_data {
+            if tx.inscription().payload != inscription_data {
                 continue;
             }
             let PublishedTx::AtomicWithdraw(info) = *tx else {

@@ -283,20 +283,6 @@ impl CommonHttpClient {
         self.post(request_url, declaration).await
     }
 
-    /// Get the on-chain state for a channel (`accredited_keys`,
-    /// `withdrawal_nonce`, balance, etc.). Returns the tip-of-chain view.
-    pub async fn get_channel_state(
-        &self,
-        base_url: Url,
-        channel_id: ChannelId,
-    ) -> Result<ChannelState, Error> {
-        let path = CHANNEL
-            .trim_start_matches('/')
-            .replace(":id", &channel_id.to_string());
-        let request_url = base_url.join(path.as_str()).map_err(Error::Url)?;
-        self.get::<(), ChannelState>(request_url, None).await
-    }
-
     /// Get consensus info (tip, height, etc.)
     /// Get consensus info (tip, height, etc.)
     pub async fn consensus_info(&self, base_url: Url) -> Result<ChainServiceInfo, Error> {

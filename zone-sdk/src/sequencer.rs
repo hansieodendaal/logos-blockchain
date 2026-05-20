@@ -570,7 +570,7 @@ where
 
         let tx_hash = signed_tx.mantle_tx.hash();
 
-        info!(target: TARGET, "Submitted channel_config transaction {:?}", tx_hash);
+        info!(target: TARGET, "Submitted channel_config transaction {}", hex::encode(tx_hash.0));
 
         // Post to network (best effort, will be resubmitted if needed)
         if let Err(e) = self.node.post_transaction(signed_tx).await {
@@ -852,9 +852,6 @@ where
                     &mut self.resubmit_active,
                 );
                 None
-            }
-            maybe_event = stream.next() => {
-                self.handle_stream_item(maybe_event).await
             }
         }
     }
@@ -1280,20 +1277,14 @@ where
 
         let mut events = VecDeque::new();
 
-        let finalized_event = (!result.finalized_tx_hashes.is_empty()
-            || !result.finalized_txs.is_empty())
-        .then_some(Event::TxsFinalized {
-            tx_hashes: result.finalized_tx_hashes,
-            txs: result.finalized_txs,
-        });
         if let Some(update) = result.channel_update {
             events.push_back(self.build_channel_event(update));
         }
 
-        if !result.finalized_tx_hashes.is_empty() || !result.finalized_inscriptions.is_empty() {
+        if !result.finalized_tx_hashes.is_empty() || !result.finalized_txs.is_empty() {
             events.push_back(Event::TxsFinalized {
                 tx_hashes: result.finalized_tx_hashes,
-                inscriptions: result.finalized_inscriptions,
+                txs: result.finalized_txs,
             });
         }
 
@@ -1356,11 +1347,15 @@ where
     /// works under shared-signing-key deployments: each sequencer instance
     /// only tracks what it itself submitted.
     fn build_channel_event(&mut self, u: crate::state::ChannelUpdateInfo) -> Event {
-        let shed: Vec<PublishedTx> = match (self.state.as_mut(), self.current_tip) {
+        let orphaned = match (self.state.as_mut(), self.current_tip) {
             (Some(s), Some(tip)) => s.shed_off_branch_pending(tip),
             _ => Vec::new(),
         };
-        self.add_orphaned_to_pending_turn_queue(&orphaned);
+        let orphaned_inscriptions: Vec<InscriptionInfo> = orphaned
+            .iter()
+            .map(|entry| entry.inscription().clone())
+            .collect();
+        self.add_orphaned_to_pending_turn_queue(&orphaned_inscriptions);
 
         let adopted: Vec<InscriptionInfo> = match self.state.as_ref() {
             Some(s) => u
@@ -1371,22 +1366,28 @@ where
             None => u.adopted,
         };
 
-        let mut orphaned = Vec::with_capacity(shed.len());
-        for entry in shed {
+        let mut typed_orphaned = Vec::with_capacity(orphaned.len());
+        for entry in orphaned {
             let info = entry.inscription();
             debug!(
+                target: TARGET,
                 "  orphaned: payload={:?}, tx={}, msg_id={}",
                 String::from_utf8_lossy(&info.payload),
                 hex::encode(info.tx_hash.0),
                 hex::encode(info.this_msg.as_ref()),
             );
             match entry {
-                PublishedTx::Inscription(i) => orphaned.push(OrphanedTx::Inscription(i)),
-                PublishedTx::AtomicWithdraw(a) => orphaned.push(OrphanedTx::AtomicWithdraw(a)),
+                PublishedTx::Inscription(i) => typed_orphaned.push(OrphanedTx::Inscription(i)),
+                PublishedTx::AtomicWithdraw(a) => {
+                    typed_orphaned.push(OrphanedTx::AtomicWithdraw(a));
+                }
             }
         }
 
-        Event::ChannelUpdate { orphaned, adopted }
+        Event::ChannelUpdate {
+            orphaned: typed_orphaned,
+            adopted,
+        }
     }
 
     async fn handle_request(&mut self, request: ActorRequest) -> Option<Event> {
@@ -1511,21 +1512,17 @@ where
         self.last_msg_id = new_msg_id;
 
         let checkpoint = build_checkpoint(state, self.last_msg_id, self.lib_slot);
-        let info = Box::new(InscriptionInfo {
+        let info = InscriptionInfo {
             tx_hash: id,
             parent_msg: parent,
             this_msg: new_msg_id,
             payload: data,
         };
-        let event = Event::Published {
+
+        Ok(Event::Published {
             tx: Box::new(PublishedTx::Inscription(info)),
             checkpoint,
-        };
-        drop(self.event_tx.send(event.clone()));
-        event
-        });
-
-        Ok(Event::Published { info, checkpoint })
+        })
     }
 
     /// Build, sign, and submit an atomic inscription+withdraw bundle.
@@ -1553,7 +1550,13 @@ where
             .node
             .channel_state(self.channel_id)
             .await
-            .map_err(|e| Error::Network(format!("channel_state query failed: {e}")))?;
+            .map_err(|e| Error::Network(format!("channel_state query failed: {e}")))?
+            .ok_or_else(|| {
+                Error::Network(format!(
+                    "publish_atomic_withdraw requires channel state for {:?}",
+                    self.channel_id
+                ))
+            })?;
         if channel_state.withdraw_threshold > 1 {
             return Err(Error::Network(format!(
                 "publish_atomic_withdraw requires withdraw_threshold == 1, got {}",
@@ -1676,7 +1679,7 @@ fn build_atomic_withdraw_ops_proofs(
 /// list. Returns an error if our key is not on the accredited list (we can't
 /// sign for this channel).
 fn find_own_key_index(
-    channel_state: &lb_core::mantle::channel::ChannelState,
+    channel_state: &ChannelState,
     signing_key: &Ed25519Key,
 ) -> Result<ChannelKeyIndex, Error> {
     let own_pk = signing_key.public_key();
@@ -2651,13 +2654,6 @@ mod tests {
         ) -> Result<(), lb_common_http_client::Error> {
             self.posted_transactions_sender.send(tx).await.unwrap();
             Ok(())
-        }
-
-        async fn channel_state(
-            &self,
-            _channel_id: ChannelId,
-        ) -> Result<lb_core::mantle::channel::ChannelState, lb_common_http_client::Error> {
-            unimplemented!()
         }
     }
 }

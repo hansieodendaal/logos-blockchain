@@ -24,12 +24,7 @@ use super::{
     support::{
         DiscardedPayloads, PublishDeadline, StartedZoneNode, ZoneAccountBalances,
         build_zone_deposit, ensure_zone_transactions_included, keygen, prepare_zone_cluster,
-        publish_message_with_retry, round_robin_sequencer_config, sequencer_config,
-        start_balance_aware_policy, start_republish_policy, start_sequencer_event_loop,
-        start_sorted_conflict_policy, start_zone_node, submit_atomic_zone_deposit,
-        submit_zone_deposit, submit_zone_withdraw, wait_for_zone_network_ready,
-        balance_update_payload, build_zone_deposit, ensure_zone_transactions_included, keygen,
-        prepare_zone_cluster, publish_atomic_zone_withdraw, publish_message_with_retry,
+        publish_atomic_zone_withdraw, publish_message_with_retry, round_robin_sequencer_config,
         sequencer_config, start_balance_aware_policy, start_republish_policy,
         start_sequencer_event_loop, start_sorted_conflict_policy, start_zone_node,
         submit_atomic_zone_deposit, submit_zone_deposit, submit_zone_withdraw,
@@ -372,7 +367,7 @@ pub(super) async fn publish_atomic_zone_withdraw_transaction(
         .iter()
         .flat_map(|(_, outputs)| outputs.iter())
         .sum();
-    let inscription_data = format!("Burn {total}").into_bytes();
+    let inscription_data = make_inscription(&format!("Burn {total}"));
     let outputs_per_arg: Vec<Vec<u64>> = withdraw_rows
         .iter()
         .map(|(_, outputs)| outputs.clone())
