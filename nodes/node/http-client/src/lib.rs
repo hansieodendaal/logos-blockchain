@@ -284,7 +284,6 @@ impl CommonHttpClient {
     }
 
     /// Get consensus info (tip, height, etc.)
-    /// Get consensus info (tip, height, etc.)
     pub async fn consensus_info(&self, base_url: Url) -> Result<ChainServiceInfo, Error> {
         let request_url = base_url
             .join(CRYPTARCHIA_INFO.trim_start_matches('/'))
