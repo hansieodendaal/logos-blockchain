@@ -56,6 +56,10 @@ pub struct SequencerCheckpoint {
     pub lib: HeaderId,
     /// Last known LIB slot (for backfill range queries).
     pub lib_slot: Slot,
+    /// Publish intents accepted but not yet built/signed because this
+    /// sequencer was not authorized to publish at the time.
+    #[serde(default)]
+    pub pending_turn_queue: Vec<Inscription>,
 }
 
 /// Result of a publish operation.
@@ -103,6 +107,7 @@ pub struct SequencerConfig {
     pub chain_start_time: Option<SystemTime>,
     pub min_slots_remaining_in_turn: u64,
     pub auto_requeue_orphaned: bool,
+    pub queued_publish_drain_limit: Option<usize>,
 }
 
 impl Default for SequencerConfig {
@@ -115,6 +120,7 @@ impl Default for SequencerConfig {
             chain_start_time: None,
             min_slots_remaining_in_turn: 1,
             auto_requeue_orphaned: false,
+            queued_publish_drain_limit: Some(1),
         }
     }
 }
@@ -722,21 +728,33 @@ where
     ) -> (Self, SequencerHandle<Node>) {
         let (request_tx, request_rx) = mpsc::channel(config.publish_channel_capacity);
 
-        let (state, lib_slot, last_msg_id) = if let Some(cp) = checkpoint {
+        let (state, lib_slot, last_msg_id, pending_turn_queue) = if let Some(cp) = checkpoint {
             info!(target: TARGET,
                 "Restoring from checkpoint: {} pending txs, lib={:?}, lib_slot={:?}",
                 cp.pending_txs.len(),
                 cp.lib,
                 cp.lib_slot
             );
-            let mut tx_state = TxState::new(cp.lib, cp.last_msg_id);
-            for (_hash, tx) in cp.pending_txs {
+            let SequencerCheckpoint {
+                last_msg_id,
+                pending_txs,
+                lib,
+                lib_slot,
+                pending_turn_queue,
+            } = cp;
+            let mut tx_state = TxState::new(lib, last_msg_id);
+            for (_hash, tx) in pending_txs {
                 restore_pending_tx(&mut tx_state, tx, channel_id);
             }
-            (Some(tx_state), cp.lib_slot, cp.last_msg_id)
+            (
+                Some(tx_state),
+                lib_slot,
+                last_msg_id,
+                pending_turn_queue.into_iter().collect(),
+            )
         } else {
             info!(target: TARGET, "Starting fresh (no checkpoint)");
-            (None, Slot::genesis(), MsgId::root())
+            (None, Slot::genesis(), MsgId::root(), VecDeque::new())
         };
 
         let resubmit_interval = tokio::time::interval(config.resubmit_interval);
@@ -766,7 +784,7 @@ where
             slot_clock: None,
             channel_state: None,
             own_key_index: None,
-            pending_turn_queue: VecDeque::new(),
+            pending_turn_queue,
             blocks_stream: None,
             resubmit_interval,
             resubmit_active: false,
@@ -795,7 +813,7 @@ where
     pub fn checkpoint(&self) -> Option<SequencerCheckpoint> {
         self.state
             .as_ref()
-            .map(|s| build_checkpoint(s, self.last_msg_id, self.lib_slot))
+            .map(|s| build_checkpoint(s, self.last_msg_id, self.lib_slot, &self.pending_turn_queue))
     }
 
     /// Drive the sequencer and return the next event.
@@ -890,13 +908,11 @@ where
         let became_ready = self.maybe_signal_ready();
         let mut events = self.apply_block_result(result);
 
-        let published_event = self.try_publish_queued().await.unwrap_or_else(|err| {
+        let published_events = self.try_publish_queued().await.unwrap_or_else(|err| {
             warn!(target: TARGET, "Failed to publish queued inscription: {err}");
-            None
+            VecDeque::new()
         });
-        if let Some(event) = published_event {
-            events.push_back(event);
-        }
+        events.extend(published_events);
 
         if became_ready {
             // Preserve the existing public event contract: when readiness transitions,
@@ -1045,44 +1061,57 @@ where
         turn_end_slot.saturating_sub(slot_to_u64(current_slot)) >= min_remaining
     }
 
-    /// Publish at most one queued message per actor turn.
-    ///
-    /// This keeps parent selection and round-robin authorization conservative:
-    /// after posting, inclusion slot and canonical channel state are still
-    /// node/chain-dependent. A future optimization can drain multiple messages
-    /// while the turn remains valid, but that should be benchmarked/tested
-    /// separately.
-    async fn try_publish_queued(&mut self) -> Result<Option<Event>, Error> {
-        if !self.can_publish_now() {
-            self.publish_channel_view();
-            return Ok(None);
+    /// Publish queued messages sequentially while the turn remains valid,
+    /// bounded by configuration to avoid starving block processing.
+    async fn try_publish_queued(&mut self) -> Result<VecDeque<Event>, Error> {
+        let mut events = VecDeque::new();
+        let max_drains = self
+            .config
+            .queued_publish_drain_limit
+            .map(|limit| limit.max(1));
+        let mut drained = 0usize;
+
+        loop {
+            if let Some(limit) = max_drains
+                && drained >= limit
+            {
+                break;
+            }
+
+            if !self.can_publish_now() {
+                break;
+            }
+
+            let Some(payload) = self.pending_turn_queue.pop_front() else {
+                break;
+            };
+
+            match self.post_now(payload.clone()).await {
+                Ok(event) => {
+                    events.push_back(event);
+                    drained = drained.saturating_add(1);
+
+                    if let Err(err) = self.refresh_channel_state().await {
+                        warn!(target: TARGET, "Failed to refresh channel state after publish: {err}");
+                    }
+
+                    self.publish_channel_view();
+                }
+                Err(err) => {
+                    self.pending_turn_queue.push_front(payload);
+
+                    if let Err(refresh_err) = self.refresh_channel_state().await {
+                        warn!(target: TARGET, "Failed to refresh channel state after publish failure: {refresh_err}");
+                    }
+
+                    self.publish_channel_view();
+                    return Err(err);
+                }
+            }
         }
 
-        let Some(payload) = self.pending_turn_queue.pop_front() else {
-            self.publish_channel_view();
-            return Ok(None);
-        };
-
-        match self.post_now(payload.clone()).await {
-            Ok(event) => {
-                if let Err(err) = self.refresh_channel_state().await {
-                    warn!(target: TARGET, "Failed to refresh channel state after publish: {err}");
-                }
-
-                self.publish_channel_view();
-                Ok(Some(event))
-            }
-            Err(err) => {
-                self.pending_turn_queue.push_front(payload);
-
-                if let Err(refresh_err) = self.refresh_channel_state().await {
-                    warn!(target: TARGET, "Failed to refresh channel state after publish failure: {refresh_err}");
-                }
-
-                self.publish_channel_view();
-                Err(err)
-            }
-        }
+        self.publish_channel_view();
+        Ok(events)
     }
 
     /// Process one batch of incremental backfill if active.
@@ -1418,7 +1447,14 @@ where
             ActorRequest::SubmitSignedTx { tx, msg_id, reply } => {
                 // Safe to unwrap — is_ready() guarantees state is initialized
                 let s = self.state.as_mut().unwrap();
-                let result = submit_signed_tx(s, tx, msg_id, &mut self.last_msg_id, self.lib_slot);
+                let result = submit_signed_tx(
+                    s,
+                    tx,
+                    msg_id,
+                    &mut self.last_msg_id,
+                    self.lib_slot,
+                    &self.pending_turn_queue,
+                );
                 drop(reply.send(Ok(result)));
                 None
             }
@@ -1442,7 +1478,8 @@ where
                     withdraw_threshold,
                 );
                 s.submit_other(signed_tx.clone());
-                let checkpoint = build_checkpoint(s, self.last_msg_id, self.lib_slot);
+                let checkpoint =
+                    build_checkpoint(s, self.last_msg_id, self.lib_slot, &self.pending_turn_queue);
                 let result = PublishResult {
                     inscription_id: signed_tx.mantle_tx.hash(),
                     checkpoint,
@@ -1472,10 +1509,17 @@ where
         // queue-drain path decide whether it can be posted immediately.
         self.pending_turn_queue.push_back(data);
 
-        self.try_publish_queued().await.unwrap_or_else(|err| {
-            warn!(target: TARGET, "Failed to publish queued inscription: {err}");
-            None
-        })
+        match self.try_publish_queued().await {
+            Ok(mut events) => {
+                let first = events.pop_front();
+                self.buffered_events.extend(events);
+                first
+            }
+            Err(err) => {
+                warn!(target: TARGET, "Failed to publish queued inscription: {err}");
+                None
+            }
+        }
     }
 
     async fn post_now(&mut self, data: Inscription) -> Result<Event, Error> {
@@ -1511,7 +1555,12 @@ where
         state.submit_inscription(signed_tx, parent, new_msg_id, data.clone());
         self.last_msg_id = new_msg_id;
 
-        let checkpoint = build_checkpoint(state, self.last_msg_id, self.lib_slot);
+        let checkpoint = build_checkpoint(
+            state,
+            self.last_msg_id,
+            self.lib_slot,
+            &self.pending_turn_queue,
+        );
         let info = InscriptionInfo {
             tx_hash: id,
             parent_msg: parent,
@@ -1619,7 +1668,8 @@ where
         );
         self.last_msg_id = msg_id;
 
-        let checkpoint = build_checkpoint(s, self.last_msg_id, self.lib_slot);
+        let checkpoint =
+            build_checkpoint(s, self.last_msg_id, self.lib_slot, &self.pending_turn_queue);
 
         // Best-effort post; resubmit timer retries on failure.
         if let Err(e) = self.node.post_transaction(signed_tx).await {
@@ -1632,17 +1682,14 @@ where
             this_msg: msg_id,
             payload: inscribe,
         };
-        let event = Event::Published {
+        Ok(Event::Published {
             tx: Box::new(PublishedTx::AtomicWithdraw(AtomicWithdrawInfo {
                 tx_hash: id,
                 inscription,
                 withdraws: withdraw_infos,
             })),
             checkpoint,
-        };
-        drop(self.event_tx.send(event.clone()));
-
-        Ok(event)
+        })
     }
 }
 
@@ -1712,24 +1759,31 @@ fn submit_signed_tx(
     msg_id: MsgId,
     last_msg_id: &mut MsgId,
     lib_slot: Slot,
+    pending_turn_queue: &VecDeque<Inscription>,
 ) -> PublishResult {
     let id = tx.mantle_tx.hash();
     state.submit_other(tx);
     *last_msg_id = msg_id;
 
-    let checkpoint = build_checkpoint(state, *last_msg_id, lib_slot);
+    let checkpoint = build_checkpoint(state, *last_msg_id, lib_slot, pending_turn_queue);
     PublishResult {
         inscription_id: id,
         checkpoint,
     }
 }
 
-fn build_checkpoint(state: &TxState, last_msg_id: MsgId, lib_slot: Slot) -> SequencerCheckpoint {
+fn build_checkpoint(
+    state: &TxState,
+    last_msg_id: MsgId,
+    lib_slot: Slot,
+    pending_turn_queue: &VecDeque<Inscription>,
+) -> SequencerCheckpoint {
     SequencerCheckpoint {
         last_msg_id,
         pending_txs: state.all_pending_txs(),
         lib: state.lib(),
         lib_slot,
+        pending_turn_queue: pending_turn_queue.iter().cloned().collect(),
     }
 }
 

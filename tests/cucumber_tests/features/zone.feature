@@ -212,20 +212,66 @@ Feature: Zone SDK
       | SEQ_A |
       | SEQ_B |
     When the zone node is at height 1 in 120 seconds
-    And I start round-robin zone sequencer "SEQ_A" with indexer
+    And I start round-robin zone sequencer "SEQ_A" with auto-drain queue limit "Some(2)" with indexer
     And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 2 and timeout 0 authorizing:
       | alias |
       | SEQ_A |
       | SEQ_B |
     Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
-    When I start round-robin zone sequencer "SEQ_B"
+    When I start round-robin zone sequencer "SEQ_B" with auto-drain queue limit "Some(2)"
     Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 0 queued messages in 120 seconds
-    When I submit zone message "MSG_B1" to sequencer "SEQ_B" with data "decentralized-wait-for-turn" immediately
-    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 1 queued messages in 120 seconds
-    And sequencer "SEQ_B" publishes queued zone message "MSG_B1" on its turn and drains queued messages to 0 in 180 seconds
+    # Queue three messages while SEQ_B is not on turn — tests Some(2) bounded drain acceptance
+    When sequencer "SEQ_B" submits the following zone messages to queue immediately:
+      | alias  | data         |
+      | MSG_B1 | rr-queued-b1 |
+      | MSG_B2 | rr-queued-b2 |
+      | MSG_B3 | rr-queued-b3 |
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 3 queued messages in 120 seconds
+    # Save checkpoint with queue non-empty, restart, verify queue restored — tests pending_turn_queue persistence
+    When I save current checkpoint of sequencer "SEQ_B" as "CHECKPOINT_B_QUEUED"
+    And I stop zone sequencer "SEQ_B"
+    And I restart round-robin zone sequencer "SEQ_B" from checkpoint "CHECKPOINT_B_QUEUED"
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 3 queued messages in 120 seconds
+    # One wakeup drains only the configured limit, so one message remains queued
+    And sequencer "SEQ_B" publishes queued zone message "MSG_B1" on its turn and drains queued messages to 1 in 180 seconds
     And the zone indexer returns messages in any order in 360 seconds:
       | alias  |
       | MSG_B1 |
+      | MSG_B2 |
+    And I stop all nodes
+
+  @zone_ci
+  Scenario: Round-robin drains all queued messages with no per-wakeup limit
+    Given I have a zone cluster
+    And the following zone sequencers exist:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    When the zone node is at height 1 in 120 seconds
+    And I start round-robin zone sequencer "SEQ_A" with auto-drain queue limit "None" with indexer
+    And sequencer "SEQ_A" submits zone config transaction "CHANNEL_CONFIG_1" with posting timeframe 2 and timeout 0 authorizing:
+      | alias |
+      | SEQ_A |
+      | SEQ_B |
+    Then zone transaction "CHANNEL_CONFIG_1" is finalized in 180 seconds
+    When I start round-robin zone sequencer "SEQ_B" with auto-drain queue limit "None"
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 0 queued messages in 120 seconds
+    When sequencer "SEQ_B" submits the following zone messages to queue immediately:
+      | alias  | data           |
+      | MSG_C1 | rr-unbounded-1 |
+      | MSG_C2 | rr-unbounded-2 |
+      | MSG_C3 | rr-unbounded-3 |
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 3 queued messages in 120 seconds
+    When I save current checkpoint of sequencer "SEQ_B" as "CHECKPOINT_B_NO_LIMIT"
+    And I stop zone sequencer "SEQ_B"
+    And I restart round-robin zone sequencer "SEQ_B" from checkpoint "CHECKPOINT_B_NO_LIMIT"
+    Then sequencer "SEQ_B" reaches round-robin state OWN_KEY_INDEX 1 NOT_OUR_TURN with 3 queued messages in 120 seconds
+    And sequencer "SEQ_B" publishes queued zone message "MSG_C1" on its turn and drains queued messages to 0 in 180 seconds
+    And the zone indexer returns messages in any order in 360 seconds:
+      | alias  |
+      | MSG_C1 |
+      | MSG_C2 |
+      | MSG_C3 |
     And I stop all nodes
 
   @zone_ci

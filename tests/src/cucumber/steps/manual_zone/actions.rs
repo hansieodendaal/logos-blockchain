@@ -73,6 +73,7 @@ struct PublishedZoneMessage {
 struct StartedSequencerRuntime {
     task: JoinHandle<()>,
     events: Option<Receiver<Event>>,
+    checkpoint_rx: Option<tokio::sync::watch::Receiver<Option<SequencerCheckpoint>>>,
     discarded_payloads: Option<DiscardedPayloads>,
 }
 
@@ -625,14 +626,20 @@ pub(super) async fn start_named_round_robin_sequencer(
     sequencer_alias: impl AsRef<str>,
     checkpoint: Option<SequencerCheckpoint>,
     mode: DriveMode,
+    queued_publish_drain_limit: Option<usize>,
 ) -> StepResult {
+    let sequencer_alias = sequencer_alias.as_ref().to_owned();
+    world
+        .zone
+        .set_round_robin_queue_limit(&sequencer_alias, queued_publish_drain_limit);
+
     start_named_sequencer_with_config(
         world,
         step,
-        sequencer_alias,
+        &sequencer_alias,
         checkpoint,
         mode,
-        round_robin_sequencer_config(),
+        round_robin_sequencer_config(queued_publish_drain_limit),
     )
     .await
 }
@@ -671,6 +678,7 @@ async fn start_named_sequencer_with_config(
         handle,
         runtime.task,
         runtime.events,
+        runtime.checkpoint_rx,
         runtime.discarded_payloads,
     );
 
@@ -724,22 +732,25 @@ fn start_sequencer_runtime(
 ) -> StartedSequencerRuntime {
     match mode {
         DriveMode::Passive => {
-            let (task, events) = start_sequencer_event_loop(sequencer);
+            let (task, events, checkpoint_rx) = start_sequencer_event_loop(sequencer);
 
             StartedSequencerRuntime {
                 task,
                 events: Some(events),
+                checkpoint_rx: Some(checkpoint_rx),
                 discarded_payloads: None,
             }
         }
         DriveMode::Republish => StartedSequencerRuntime {
             task: start_republish_policy(sequencer, handle),
             events: None,
+            checkpoint_rx: None,
             discarded_payloads: None,
         },
         DriveMode::Sorted { discarded } => StartedSequencerRuntime {
             task: start_sorted_conflict_policy(sequencer, handle, Arc::clone(&discarded)),
             events: None,
+            checkpoint_rx: None,
             discarded_payloads: Some(discarded),
         },
         DriveMode::BalanceAware {
@@ -748,6 +759,7 @@ fn start_sequencer_runtime(
         } => StartedSequencerRuntime {
             task: start_balance_aware_policy(sequencer, handle, initial_balances, planned_payloads),
             events: None,
+            checkpoint_rx: None,
             discarded_payloads: None,
         },
     }

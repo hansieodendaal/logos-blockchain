@@ -48,8 +48,8 @@ use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
     indexer::ZoneIndexer,
     sequencer::{
-        Event, InscriptionId, OrphanedTx, PublishResult, SequencerChannelView, SequencerConfig,
-        SequencerHandle, WithdrawArg, ZoneSequencer,
+        Event, InscriptionId, OrphanedTx, PublishResult, SequencerChannelView, SequencerCheckpoint,
+        SequencerConfig, SequencerHandle, WithdrawArg, ZoneSequencer,
     },
     state::{InscriptionInfo, PublishedTx},
 };
@@ -288,18 +288,26 @@ pub async fn wait_for_zone_network_ready(cluster: &LbcManualCluster) -> Result<(
 /// test code that needs to wait for a specific publish result.
 pub fn start_sequencer_event_loop(
     mut sequencer: ZoneSequencer<ZoneNodeHttpClient>,
-) -> (JoinHandle<()>, tokio::sync::mpsc::Receiver<Event>) {
+) -> (
+    JoinHandle<()>,
+    tokio::sync::mpsc::Receiver<Event>,
+    tokio::sync::watch::Receiver<Option<SequencerCheckpoint>>,
+) {
     let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let (checkpoint_tx, checkpoint_rx) = tokio::sync::watch::channel(sequencer.checkpoint());
 
     let handle = tokio::spawn(async move {
         loop {
-            if let Some(event) = sequencer.next_event().await {
+            let event = sequencer.next_event().await;
+            drop(checkpoint_tx.send(sequencer.checkpoint()));
+
+            if let Some(event) = event {
                 drop(tx.send(event).await);
             }
         }
     });
 
-    (handle, rx)
+    (handle, rx, checkpoint_rx)
 }
 
 /// Drives a competing-sequencer policy that re-publishes this sequencer's own
@@ -635,10 +643,11 @@ pub fn sequencer_config() -> SequencerConfig {
 /// Uses the same retry profile while reserving enough turn time for the SDK's
 /// round-robin admission checks.
 #[must_use]
-pub fn round_robin_sequencer_config() -> SequencerConfig {
+pub fn round_robin_sequencer_config(queued_publish_drain_limit: Option<usize>) -> SequencerConfig {
     SequencerConfig {
         auto_requeue_orphaned: true,
         min_slots_remaining_in_turn: 2,
+        queued_publish_drain_limit,
         ..sequencer_config()
     }
 }

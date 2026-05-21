@@ -146,6 +146,7 @@ pub struct ZoneSequencerRuntime {
     handle: SequencerHandle<ZoneNodeHttpClient>,
     task: JoinHandle<()>,
     events: Option<tokio::sync::mpsc::Receiver<Event>>,
+    checkpoint_rx: Option<tokio::sync::watch::Receiver<Option<SequencerCheckpoint>>>,
     discarded_payloads: Option<ZoneDiscardedPayloads>,
 }
 
@@ -164,6 +165,7 @@ pub struct ZoneState {
     published_order: Vec<String>,
     checkpoints: HashMap<String, SequencerCheckpoint>,
     latest_checkpoints: HashMap<String, SequencerCheckpoint>,
+    round_robin_queue_limits: HashMap<String, Option<usize>>,
     sorted_total_payloads: Option<usize>,
     sorted_expected_by_sequencer: Option<HashMap<String, Vec<Inscription>>>,
 }
@@ -384,10 +386,44 @@ impl ZoneState {
             .insert(sequencer_alias.to_owned(), checkpoint);
     }
 
+    pub fn set_round_robin_queue_limit(
+        &mut self,
+        sequencer_alias: impl AsRef<str>,
+        limit: Option<usize>,
+    ) {
+        self.round_robin_queue_limits
+            .insert(sequencer_alias.as_ref().to_owned(), limit);
+    }
+
+    pub fn round_robin_queue_limit_for(
+        &self,
+        sequencer_alias: impl AsRef<str>,
+    ) -> Result<Option<usize>, StepError> {
+        let sequencer_alias = sequencer_alias.as_ref();
+
+        self.round_robin_queue_limits
+            .get(sequencer_alias)
+            .copied()
+            .ok_or(StepError::LogicalError {
+                message: format!(
+                    "Zone sequencer '{sequencer_alias}' has no remembered round-robin queue limit"
+                ),
+            })
+    }
+
     pub fn current_checkpoint_for(
         &self,
         sequencer_alias: &str,
     ) -> Result<SequencerCheckpoint, StepError> {
+        if let Some(Some(checkpoint)) = self
+            .runtimes
+            .get(sequencer_alias)
+            .and_then(|runtime| runtime.checkpoint_rx.as_ref())
+            .map(|rx| rx.borrow().clone())
+        {
+            return Ok(checkpoint);
+        }
+
         self.latest_checkpoints
             .get(sequencer_alias)
             .cloned()
@@ -418,6 +454,7 @@ impl ZoneState {
         sequencer_handle: SequencerHandle<ZoneNodeHttpClient>,
         sequencer_task: JoinHandle<()>,
         sequencer_events: Option<tokio::sync::mpsc::Receiver<Event>>,
+        checkpoint_rx: Option<tokio::sync::watch::Receiver<Option<SequencerCheckpoint>>>,
         discarded_payloads: Option<ZoneDiscardedPayloads>,
     ) {
         if let Some(runtime) = self.runtimes.remove(&alias) {
@@ -430,6 +467,7 @@ impl ZoneState {
                 handle: sequencer_handle,
                 task: sequencer_task,
                 events: sequencer_events,
+                checkpoint_rx,
                 discarded_payloads,
             },
         );

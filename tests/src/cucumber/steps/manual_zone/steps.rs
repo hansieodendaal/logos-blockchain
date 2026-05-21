@@ -46,6 +46,35 @@ use crate::{
 };
 
 pub(super) const DEFAULT_ZONE_SEQUENCER: &str = "SEQ_A";
+
+fn parse_queue_limit(step: &Step, value: &str) -> Result<Option<usize>, StepError> {
+    if value == "None" {
+        return Ok(None);
+    }
+
+    let Some(inner) = value
+        .strip_prefix("Some(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return Err(StepError::LogicalError {
+            message: format!(
+                "Invalid auto-drain queue limit '{value}' in step '{}'; expected 'None' or 'Some(<usize>)'",
+                step.value
+            ),
+        });
+    };
+
+    let limit = inner
+        .parse::<usize>()
+        .map_err(|error| StepError::LogicalError {
+            message: format!(
+                "Invalid auto-drain queue limit '{value}' in step '{}': {error}",
+                step.value
+            ),
+        })?;
+
+    Ok(Some(limit))
+}
 const CONCURRENT_DUPLICATE_SETTLE_SECS: u64 = 30;
 
 #[given("I have a zone cluster")]
@@ -130,7 +159,15 @@ async fn step_start_round_robin_zone_sequencer(
     step: &Step,
     sequencer_alias: String,
 ) -> StepResult {
-    start_named_round_robin_sequencer(world, step, sequencer_alias, None, DriveMode::Passive).await
+    start_named_round_robin_sequencer(
+        world,
+        step,
+        sequencer_alias,
+        None,
+        DriveMode::Passive,
+        Some(2),
+    )
+    .await
 }
 
 #[when(expr = "I start round-robin zone sequencer {string} with indexer")]
@@ -139,8 +176,54 @@ async fn step_start_round_robin_zone_sequencer_with_indexer(
     step: &Step,
     sequencer_alias: String,
 ) -> StepResult {
-    start_named_round_robin_sequencer(world, step, &sequencer_alias, None, DriveMode::Passive)
-        .await?;
+    start_named_round_robin_sequencer(
+        world,
+        step,
+        &sequencer_alias,
+        None,
+        DriveMode::Passive,
+        Some(2),
+    )
+    .await?;
+    initialize_zone_indexer(world, step, &sequencer_alias)
+}
+
+#[when(expr = "I start round-robin zone sequencer {string} with auto-drain queue limit {string}")]
+async fn step_start_round_robin_zone_sequencer_with_limit(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    drain_limit: String,
+) -> StepResult {
+    start_named_round_robin_sequencer(
+        world,
+        step,
+        sequencer_alias,
+        None,
+        DriveMode::Passive,
+        parse_queue_limit(step, &drain_limit)?,
+    )
+    .await
+}
+
+#[when(
+    expr = "I start round-robin zone sequencer {string} with auto-drain queue limit {string} with indexer"
+)]
+async fn step_start_round_robin_zone_sequencer_with_limit_and_indexer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    drain_limit: String,
+) -> StepResult {
+    start_named_round_robin_sequencer(
+        world,
+        step,
+        &sequencer_alias,
+        None,
+        DriveMode::Passive,
+        parse_queue_limit(step, &drain_limit)?,
+    )
+    .await?;
     initialize_zone_indexer(world, step, &sequencer_alias)
 }
 
@@ -256,6 +339,26 @@ async fn step_publish_single_zone_message_for_sequencer(
 }
 
 #[when(
+    expr = "sequencer {string} submits zone message {string} with data {string} to queue immediately"
+)]
+async fn step_publish_single_zone_message_to_queue_for_sequencer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    message_alias: String,
+    data: String,
+) -> StepResult {
+    step_publish_single_zone_message_for_sequencer(
+        world,
+        step,
+        message_alias,
+        sequencer_alias,
+        data,
+    )
+    .await
+}
+
+#[when(
     expr = "I submit zone message {string} to sequencer {string} with data {string} on its turn"
 )]
 async fn step_publish_single_zone_message_for_sequencer_on_turn(
@@ -294,6 +397,33 @@ async fn step_publish_single_zone_message_for_sequencer_on_turn(
     Ok(())
 }
 
+#[when(expr = "sequencer {string} submits the following zone messages to queue immediately:")]
+async fn step_publish_zone_messages_to_queue_for_sequencer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+) -> StepResult {
+    let rows = zone_message_rows(step)?;
+    let handle = world.zone.sequencer_handle(&sequencer_alias)?.clone();
+
+    for (message_alias, payload) in rows {
+        handle
+            .publish_message(payload.clone())
+            .await
+            .map_err(|error| StepError::LogicalError {
+                message: format!(
+                    "Zone publish failed for sequencer '{sequencer_alias}' and message '{message_alias}': {error}"
+                ),
+            })?;
+
+        world
+            .zone
+            .remember_zone_message(message_alias, payload, None, None, None);
+    }
+
+    Ok(())
+}
+
 #[when(expr = "I save current checkpoint of sequencer {string} as {string}")]
 fn step_save_zone_checkpoint(
     world: &mut CucumberWorld,
@@ -319,6 +449,27 @@ async fn step_restart_zone_sequencer_from_checkpoint(
         &sequencer_alias,
         Some(checkpoint),
         DriveMode::Passive,
+    )
+    .await
+}
+
+#[when(expr = "I restart round-robin zone sequencer {string} from checkpoint {string}")]
+async fn step_restart_round_robin_zone_sequencer_from_checkpoint(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    checkpoint_alias: String,
+) -> StepResult {
+    let checkpoint = world.zone.resolve_checkpoint(checkpoint_alias)?;
+    let queued_publish_drain_limit = world.zone.round_robin_queue_limit_for(&sequencer_alias)?;
+
+    start_named_round_robin_sequencer(
+        world,
+        step,
+        &sequencer_alias,
+        Some(checkpoint),
+        DriveMode::Passive,
+        queued_publish_drain_limit,
     )
     .await
 }
