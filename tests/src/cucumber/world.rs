@@ -703,6 +703,9 @@ pub struct CucumberWorld {
     pub submitted_transactions: HashMap<String, TxHash>,
     /// Manual: Exact signed transactions prepared for later submission.
     pub prepared_transactions: HashMap<String, SignedMantleTx>,
+    /// Manual: Transaction hashes observed while wallet/block sync scanned
+    /// blocks.
+    pub scanned_transaction_hashes: HashSet<TxHash>,
     /// Manual: Mapping of logical node names to their corresponding libp2p peer
     /// IDs.
     pub node_peer_ids: HashMap<String, PeerId>,
@@ -849,6 +852,10 @@ impl Debug for CucumberWorld {
             .field("scenario_fee_state", &fee_state_summary(&self.fee_state))
             .field("submitted_transactions", &self.submitted_transactions.len())
             .field("prepared_transactions", &self.prepared_transactions.len())
+            .field(
+                "scanned_transaction_hashes",
+                &self.scanned_transaction_hashes.len(),
+            )
             .field(
                 "wallet_utxos_by_block",
                 &wallet_diagnostics.utxo_snapshot_count,
@@ -1412,6 +1419,21 @@ impl CucumberWorld {
         self.submitted_transactions.insert(alias, tx_hash);
     }
 
+    pub fn record_scanned_transaction_hashes(
+        &mut self,
+        tx_hashes: impl IntoIterator<Item = TxHash>,
+    ) {
+        self.scanned_transaction_hashes.extend(tx_hashes);
+    }
+
+    pub fn missing_scanned_transaction_hashes(&self, expected: &HashSet<TxHash>) -> Vec<TxHash> {
+        expected
+            .iter()
+            .copied()
+            .filter(|hash| !self.scanned_transaction_hashes.contains(hash))
+            .collect()
+    }
+
     pub fn resolve_submitted_transaction(&self, alias: &str) -> Result<TxHash, StepError> {
         self.submitted_transactions
             .get(alias)
@@ -1586,6 +1608,10 @@ impl CucumberWorld {
                 &wallet_accounts_display(&self.wallet_accounts),
             )
             .field("scenario_fee_state", &fee_state_summary(&self.fee_state))
+            .field(
+                "scanned_transaction_hashes",
+                &self.scanned_transaction_hashes.len(),
+            )
             .field(
                 "wallet_utxos_by_block",
                 &wallet_utxos_by_block_display(&wallet_diagnostics),

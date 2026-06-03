@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use lb_common_http_client::ApiBlock;
-use lb_core::mantle::Utxo;
+use lb_core::mantle::{TxHash, Utxo};
 use lb_key_management_system_service::keys::ZkPublicKey;
 use thiserror::Error;
 
@@ -154,6 +154,7 @@ pub struct WalletSyncedBlock {
     header_id: String,
     wallet_count: usize,
     transaction_count: usize,
+    transaction_hashes: Vec<TxHash>,
     synced_outputs: Vec<WalletSyncedOutput>,
     synced_spends: Vec<WalletSyncedSpend>,
 }
@@ -177,6 +178,11 @@ impl WalletSyncedBlock {
     #[must_use]
     pub const fn transaction_count(&self) -> usize {
         self.transaction_count
+    }
+
+    #[must_use]
+    pub fn transaction_hashes(&self) -> &[TxHash] {
+        &self.transaction_hashes
     }
 
     #[must_use]
@@ -387,6 +393,11 @@ impl WalletChainSync {
             header_id,
             wallet_count: self.scanner.wallet_count(),
             transaction_count: block.transactions.len(),
+            transaction_hashes: block
+                .transactions
+                .iter()
+                .map(lb_node::Transaction::hash)
+                .collect(),
             synced_outputs: scan.synced_outputs,
             synced_spends: scan.synced_spends,
         }
