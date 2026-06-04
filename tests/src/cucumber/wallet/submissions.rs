@@ -3,7 +3,7 @@
 //! This adapter resolves scenario wallets, syncs spendable state, applies
 //! scenario fee policy, submits signed transactions, and records reservations.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use hex::ToHex as _;
 use lb_core::{
@@ -12,8 +12,8 @@ use lb_core::{
 };
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
 use lb_key_management_system_service::keys::ZkPublicKey;
-use lb_testing_framework::{NodeHttpClient, configs::wallet::WalletAccount};
-use tracing::warn;
+use lb_testing_framework::{NodeHttpClient, configs::wallet::WalletAccount, is_truthy_env};
+use tracing::{info, warn};
 
 use crate::{
     common::{
@@ -25,6 +25,7 @@ use crate::{
         },
     },
     cucumber::{
+        defaults::CUCUMBER_VERBOSE_CONSOLE,
         error::StepError,
         fee_reserve::{DEFAULT_STORAGE_GAS_PRICE, ScenarioFeeFundingError},
         wallet::{
@@ -99,16 +100,50 @@ pub async fn create_and_submit_transaction_hashes(
     receivers: &[(ZkPublicKey, u64)],
     best_node_info: Option<&BestNodeInfo>,
 ) -> Result<Vec<TxHash>, StepError> {
+    create_and_submit_transaction_hashes_with_utxo_cache(
+        world,
+        step,
+        sender_wallet_name,
+        receivers,
+        best_node_info,
+        None,
+    )
+    .await
+}
+
+pub async fn create_and_submit_transaction_hashes_with_utxo_cache(
+    world: &mut CucumberWorld,
+    step: &str,
+    sender_wallet_name: &str,
+    receivers: &[(ZkPublicKey, u64)],
+    best_node_info: Option<&BestNodeInfo>,
+    in_memory_available_utxos: Option<&mut WalletUtxos>,
+) -> Result<Vec<TxHash>, StepError> {
     let wallet = world.resolve_wallet(sender_wallet_name).inspect_err(|e| {
         warn!(target: TARGET, "Step `{}` error: {e}", step);
     })?;
 
     let tx_hashes = match wallet.wallet_type {
         WalletType::User { .. } => {
-            vec![
-                submit_user_wallet_transaction(world, step, &wallet, receivers, best_node_info)
-                    .await?,
-            ]
+            let tx_hash = submit_user_wallet_transaction(
+                world,
+                step,
+                &wallet,
+                receivers,
+                best_node_info,
+                in_memory_available_utxos,
+            )
+            .await?;
+            if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
+                info!(
+                    target: TARGET,
+                    "Wallet `{sender_wallet_name}` submitted transaction {} total value {} LGO \
+                    successfully",
+                    tx_hash.to_bytes()?.to_ascii_lowercase().encode_hex::<String>(),
+                    receivers.iter().map(|(_, value)| value).sum::<u64>()
+                );
+            }
+            vec![tx_hash]
         }
         WalletType::Funding { .. } => {
             let mut tx_hashes = Vec::with_capacity(receivers.len());
@@ -126,6 +161,15 @@ pub async fn create_and_submit_transaction_hashes(
                     .inspect_err(|e| {
                         warn!(target: TARGET, "Step `{}` error: {e}", step);
                     })?;
+                if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
+                    info!(
+                        target: TARGET,
+                        "Wallet `{sender_wallet_name}` submitted transaction {} total value {} \
+                        LGO successfully",
+                        tx_hash.to_bytes()?.to_ascii_lowercase().encode_hex::<String>(),
+                        receivers.iter().map(|(_, value)| value).sum::<u64>(),
+                    );
+                }
                 tx_hashes.push(tx_hash);
             }
             tx_hashes
@@ -178,6 +222,7 @@ pub async fn submit_prepared_user_wallet_transaction(
     prepared: PreparedUserWalletSubmission,
     extra_op_proofs: Vec<OpProof>,
     best_node_info: Option<&BestNodeInfo>,
+    in_memory_available_utxos: Option<&mut WalletUtxos>,
 ) -> Result<TxHash, StepError> {
     let PreparedUserWalletSubmission { wallet, submission } = prepared;
     let signed_submission = submission
@@ -197,7 +242,12 @@ pub async fn submit_prepared_user_wallet_transaction(
             warn!(target: TARGET, "Step `{}` error: {e}", step);
         })?;
 
-    record_wallet_submission(world, &wallet, &signed_submission);
+    record_wallet_submission(
+        world,
+        &wallet,
+        &signed_submission,
+        in_memory_available_utxos,
+    );
     Ok(tx_hash)
 }
 
@@ -228,6 +278,7 @@ pub(crate) fn record_signed_user_wallet_submission(
         world,
         &signed_submission.wallet,
         &signed_submission.submission,
+        None,
     );
 }
 
@@ -237,6 +288,7 @@ pub(crate) async fn prepare_user_wallet_transaction_submission(
     sender_wallet_name: &str,
     transaction_intent: WalletTransactionIntent,
     best_node_info: Option<&BestNodeInfo>,
+    in_memory_available_utxos: Option<&WalletUtxos>,
 ) -> Result<PreparedUserWalletSubmission, StepError> {
     let wallet = world.resolve_wallet(sender_wallet_name).inspect_err(|e| {
         warn!(target: TARGET, "Step `{}` error: {e}", step);
@@ -253,8 +305,14 @@ pub(crate) async fn prepare_user_wallet_transaction_submission(
         }
     };
 
-    let available_utxos =
-        sync_available_utxos_for_user_wallets(world, step, best_node_info).await?;
+    let synced_available_utxos;
+    let available_utxos = if let Some(cache) = in_memory_available_utxos {
+        cache
+    } else {
+        synced_available_utxos =
+            sync_available_utxos_for_user_wallets(world, step, best_node_info).await?;
+        &synced_available_utxos
+    };
     let sender_available_utxos =
         available_utxos
             .get(sender_wallet_name)
@@ -263,7 +321,7 @@ pub(crate) async fn prepare_user_wallet_transaction_submission(
                 message: format!("Wallet '{sender_wallet_name}' not found in updated balances"),
             })?;
     let scenario_fee_funds =
-        scenario_fee_account_state(world, sender_wallet_name, &available_utxos)?;
+        scenario_fee_account_state(world, sender_wallet_name, available_utxos)?;
 
     let funding_resources = user_wallet_funding_resources(
         wallet_account.clone(),
@@ -285,7 +343,9 @@ async fn submit_user_wallet_transaction(
     wallet: &WalletInfo,
     receivers: &[(ZkPublicKey, u64)],
     best_node_info: Option<&BestNodeInfo>,
+    in_memory_available_utxos: Option<&mut WalletUtxos>,
 ) -> Result<TxHash, StepError> {
+    let in_memory_available_utxos_read = in_memory_available_utxos.as_deref();
     let prepared = prepare_user_wallet_transaction_submission(
         world,
         step,
@@ -293,10 +353,19 @@ async fn submit_user_wallet_transaction(
         WalletTransactionIntent::transfer(receivers, DEFAULT_STORAGE_GAS_PRICE)
             .map_err(wallet_transaction_error)?,
         best_node_info,
+        in_memory_available_utxos_read,
     )
     .await?;
 
-    submit_prepared_user_wallet_transaction(world, step, prepared, Vec::new(), best_node_info).await
+    submit_prepared_user_wallet_transaction(
+        world,
+        step,
+        prepared,
+        Vec::new(),
+        best_node_info,
+        in_memory_available_utxos,
+    )
+    .await
 }
 
 fn user_wallet_funding_resources(
@@ -337,7 +406,13 @@ fn record_wallet_submission(
     world: &mut CucumberWorld,
     wallet: &WalletInfo,
     signed_submission: &SignedWalletTransaction,
+    in_memory_available_utxos: Option<&mut WalletUtxos>,
 ) {
+    if let Some(cache) = in_memory_available_utxos {
+        apply_submitted_inputs_to_utxo_cache(cache, signed_submission);
+        return;
+    }
+
     let wallet_name = wallet.wallet_name.as_str();
     let group_key = world
         .node_to_group
@@ -357,6 +432,24 @@ fn record_wallet_submission(
         group_key,
         recorded.into_fee_sponsor_reserved_inputs(),
     );
+}
+
+fn apply_submitted_inputs_to_utxo_cache(
+    cache: &mut WalletUtxos,
+    signed_submission: &SignedWalletTransaction,
+) {
+    let reserved_inputs = signed_submission.reserved_inputs();
+    let (sender_inputs, fee_sponsor_inputs) = reserved_inputs.into_sender_and_fee_sponsor_inputs();
+
+    let spent_note_ids = sender_inputs
+        .into_iter()
+        .chain(fee_sponsor_inputs)
+        .map(|utxo| utxo.id())
+        .collect::<HashSet<_>>();
+
+    for utxos in cache.values_mut() {
+        utxos.retain(|utxo| !spent_note_ids.contains(&utxo.id()));
+    }
 }
 
 fn scenario_fee_account_state(
@@ -387,4 +480,119 @@ fn group_key_for_wallet(world: &CucumberWorld, wallet_name: &str) -> Result<Stri
         .get(&wallet.node_name)
         .cloned()
         .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use lb_core::mantle::Note;
+
+    use super::*;
+
+    fn account(index: u64) -> WalletAccount {
+        WalletAccount::deterministic(index, 1, false).expect("test wallet account should build")
+    }
+
+    fn utxo(seed: u8, output_index: usize, value: u64, pk: ZkPublicKey) -> Utxo {
+        Utxo::new([seed; 32], output_index, Note::new(value, pk))
+    }
+
+    fn signed_submission_with_fee_sponsor_input() -> SignedWalletTransaction {
+        let sender_account = account(1);
+        let fee_sponsor_account = account(2);
+        let receiver_pk = ZkPublicKey::new(3u8.into());
+
+        // Keep sender input exactly equal to output so fee must come from sponsor
+        // input.
+        let sender_input = utxo(10, 0, 50, sender_account.public_key());
+        let fee_sponsor_input = utxo(11, 0, 1_000, fee_sponsor_account.public_key());
+        let funding_resources = WalletFundingResources::fee_sponsored(
+            WalletFundingSource::new(sender_account, vec![sender_input]),
+            WalletFundingSource::new(fee_sponsor_account, vec![fee_sponsor_input]),
+        );
+        let tx_builder = lb_core::mantle::tx_builder::MantleTxBuilder::new(
+            lb_core::mantle::tx::MantleTxContext {
+                gas_context: lb_core::mantle::tx::MantleTxGasContext::new(
+                    HashMap::new(),
+                    HashMap::new(),
+                    lb_core::mantle::tx::GasPrices::new(1, DEFAULT_STORAGE_GAS_PRICE),
+                ),
+                ..lb_core::mantle::tx::MantleTxContext::default()
+            },
+        )
+        .add_ledger_output(Note::new(50, receiver_pk))
+        .unwrap();
+        let intent = WalletTransactionIntent::from_builder(tx_builder)
+            .expect("transaction intent should build");
+        let prepared = prepare_wallet_transaction(intent, funding_resources)
+            .expect("prepared wallet transaction should build");
+
+        prepared
+            .sign_with_leading_proofs(Vec::new())
+            .expect("prepared wallet transaction should sign")
+    }
+
+    #[test]
+    fn cache_mutation_removes_sender_and_fee_sponsor_inputs_only() {
+        let signed_submission = signed_submission_with_fee_sponsor_input();
+        let (sender_inputs, fee_sponsor_inputs) = signed_submission
+            .reserved_inputs()
+            .into_sender_and_fee_sponsor_inputs();
+        assert!(
+            !sender_inputs.is_empty(),
+            "test fixture should contain sender reserved inputs"
+        );
+        assert!(
+            !fee_sponsor_inputs.is_empty(),
+            "test fixture should contain fee sponsor reserved inputs"
+        );
+
+        let sender_remaining = utxo(20, 1, 75, ZkPublicKey::new(4u8.into()));
+        let fee_remaining = utxo(21, 1, 80, ZkPublicKey::new(5u8.into()));
+        let unrelated_utxo = utxo(22, 0, 90, ZkPublicKey::new(6u8.into()));
+
+        let mut cache = WalletUtxos::default();
+        let sender_wallet_id = crate::common::wallet::WalletId::from("sender-wallet");
+        let fee_wallet_id = crate::common::wallet::WalletId::from("fee-wallet");
+        let unrelated_wallet_id = crate::common::wallet::WalletId::from("unrelated-wallet");
+        let mut sender_cache = sender_inputs.clone();
+        sender_cache.push(sender_remaining);
+        cache.insert(sender_wallet_id.clone(), sender_cache);
+        let mut fee_cache = fee_sponsor_inputs.clone();
+        fee_cache.push(fee_remaining);
+        cache.insert(fee_wallet_id.clone(), fee_cache);
+        cache.insert(unrelated_wallet_id.clone(), vec![unrelated_utxo]);
+
+        apply_submitted_inputs_to_utxo_cache(&mut cache, &signed_submission);
+
+        for spent in sender_inputs.iter().chain(fee_sponsor_inputs.iter()) {
+            assert!(
+                cache
+                    .values()
+                    .all(|utxos| utxos.iter().all(|utxo| utxo.id() != spent.id())),
+                "spent input {:?} should be removed from cache",
+                spent.id()
+            );
+        }
+
+        assert!(
+            cache[&sender_wallet_id]
+                .iter()
+                .any(|utxo| utxo.id() == sender_remaining.id()),
+            "non-spent sender UTXOs should remain"
+        );
+        assert!(
+            cache[&fee_wallet_id]
+                .iter()
+                .any(|utxo| utxo.id() == fee_remaining.id()),
+            "non-spent fee sponsor UTXOs should remain"
+        );
+        assert!(
+            cache[&unrelated_wallet_id]
+                .iter()
+                .any(|utxo| utxo.id() == unrelated_utxo.id()),
+            "unrelated wallet UTXOs should remain untouched"
+        );
+    }
 }

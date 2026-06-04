@@ -18,11 +18,21 @@ use crate::{
         fee_reserve::{SCENARIO_FEE_ACCOUNT_NAME, ScenarioFeeState},
         wallet::{
             TARGET, WalletStateView,
-            best_node::{BestNodeInfo, sanitize_best_node_info_for_group},
+            best_node::{BestNodeInfo, get_best_node_info, sanitize_best_node_info_for_group},
         },
         world::{CucumberWorld, WalletInfo},
     },
 };
+
+struct SyncedWalletObservations {
+    on_chain_utxos: WalletUtxos,
+    observations: BTreeMap<WalletId, WalletStateView>,
+}
+
+pub struct FreshWalletAvailableState {
+    pub observation: WalletStateView,
+    pub available_utxos: Vec<Utxo>,
+}
 
 pub async fn sync_available_utxos_for_user_wallets(
     world: &mut CucumberWorld,
@@ -38,15 +48,17 @@ pub async fn sync_available_utxos_for_user_wallets(
 pub async fn sync_available_utxos_for_funding_wallets(
     world: &mut CucumberWorld,
     step: &str,
-    _best_node_info: Option<&BestNodeInfo>,
 ) -> Result<WalletUtxos, StepError> {
+    let wallets = world.all_funding_wallets();
     let mut funding_wallet_utxos = WalletUtxos::new();
-    for wallet in world.all_funding_wallets() {
-        let utxos = sync_wallet(world, step, &wallet.wallet_name)
+
+    for wallet in wallets {
+        let utxos = sync_wallet(world, step, &wallet.wallet_name, None)
             .await?
             .into_available_utxos();
         funding_wallet_utxos.insert(wallet.wallet_name.clone().into(), utxos);
     }
+
     Ok(funding_wallet_utxos)
 }
 
@@ -56,37 +68,12 @@ pub async fn sync_available_utxos_for_all_wallets(
     best_node_info: Option<&BestNodeInfo>,
 ) -> Result<WalletUtxos, StepError> {
     let mut all_wallet_utxos =
-        sync_available_utxos_for_wallets(world, step, world.all_user_wallets(), best_node_info)
-            .await?;
-    for wallet in world.all_funding_wallets() {
-        let utxos = sync_wallet(world, step, &wallet.wallet_name)
-            .await?
-            .into_available_utxos();
-        all_wallet_utxos.insert(wallet.wallet_name.clone().into(), utxos);
-    }
+        sync_available_utxos_for_user_wallets(world, step, best_node_info).await?;
+
+    let funding_wallet_utxos = sync_available_utxos_for_funding_wallets(world, step).await?;
+    all_wallet_utxos.extend(funding_wallet_utxos);
+
     Ok(all_wallet_utxos)
-}
-
-pub async fn sync_available_utxos_for_wallets(
-    world: &mut CucumberWorld,
-    step: &str,
-    wallets: Vec<WalletInfo>,
-    best_node_info: Option<&BestNodeInfo>,
-) -> Result<WalletUtxos, StepError> {
-    for wallet in &wallets {
-        if wallet.is_funding_wallet() {
-            return Err(StepError::LogicalError {
-                message: format!(
-                    "Funding wallet {} should be updated individually due to their strict coupling \
-                    with their node's state.",
-                    wallet.wallet_name
-                ),
-            });
-        }
-    }
-
-    let requests = build_wallet_sync_requests(world, step, &wallets)?;
-    scan_available_utxos(world, step, &requests, best_node_info).await
 }
 
 pub async fn sync_available_utxos_for_wallet(
@@ -94,7 +81,8 @@ pub async fn sync_available_utxos_for_wallet(
     step: &str,
     wallet_name: &str,
 ) -> Result<Vec<Utxo>, StepError> {
-    Ok(sync_wallet(world, step, wallet_name)
+    let best_node_info = get_best_node_info(world, wallet_name).await?;
+    Ok(sync_wallet(world, step, wallet_name, Some(&best_node_info))
         .await?
         .into_available_utxos())
 }
@@ -116,8 +104,9 @@ pub async fn sync_wallet_balance(
     step: &str,
     wallet_name: &str,
     wallet_state_type: WalletOutputState,
+    best_node_info: Option<&BestNodeInfo>,
 ) -> Result<WalletBalance, StepError> {
-    Ok(sync_wallet(world, step, wallet_name)
+    Ok(sync_wallet(world, step, wallet_name, best_node_info)
         .await?
         .balance(wallet_state_type))
 }
@@ -138,28 +127,27 @@ pub async fn sync_wallet_state_from_chain(
         .ok_or_else(|| StepError::LogicalError {
             message: format!("Cannot scan wallet `{wallet_name}` without a wallet sync request"),
         })?;
-    let genesis_utxos = world.genesis_block_utxos.clone();
-    let sync_results = sync_batches_from_chain(
-        &mut world.wallets,
-        [(sync_batch.clone(), source)],
-        &genesis_utxos,
-    )
-    .await
-    .map_err(wallet_sync_error)?;
 
-    for synced_block in sync_results.synced_blocks() {
-        log_wallet_synced_block(synced_block);
-    }
-    let on_chain_utxos = sync_results.into_wallet_utxos();
+    let mut synced =
+        sync_observations_from_sources(world, &requests, [(sync_batch.clone(), source)]).await?;
 
-    let mut observations = world.wallets.observe_synced_wallets(&requests);
-    apply_scenario_fee_observations(world, &mut observations, &on_chain_utxos);
+    take_wallet_observation(&mut synced.observations, wallet_name)
+}
 
-    observations
-        .remove(wallet_name)
-        .ok_or_else(|| StepError::LogicalError {
-            message: format!("Wallet state observation for `{wallet_name}` was not returned"),
-        })
+pub async fn sync_wallet_available_state(
+    world: &mut CucumberWorld,
+    wallet_name: &str,
+    wallet_node_name: &str,
+    wallet_pk: ZkPublicKey,
+) -> Result<FreshWalletAvailableState, StepError> {
+    let observation =
+        sync_wallet_state_from_chain(world, wallet_name, wallet_node_name, wallet_pk).await?;
+    let available_utxos = observation.clone().into_available_utxos();
+
+    Ok(FreshWalletAvailableState {
+        observation,
+        available_utxos,
+    })
 }
 
 fn build_wallet_sync_requests(
@@ -199,6 +187,22 @@ async fn scan_available_utxos(
     requests: &WalletSyncRequests,
     best_node_info: Option<&BestNodeInfo>,
 ) -> Result<WalletUtxos, StepError> {
+    let SyncedWalletObservations {
+        on_chain_utxos,
+        observations,
+    } = sync_observations_from_best_nodes(world, step, requests, best_node_info).await?;
+
+    drop(on_chain_utxos);
+
+    Ok(observations_into_available_utxos(observations))
+}
+
+async fn sync_observations_from_best_nodes(
+    world: &mut CucumberWorld,
+    step: &str,
+    requests: &WalletSyncRequests,
+    best_node_info: Option<&BestNodeInfo>,
+) -> Result<SyncedWalletObservations, StepError> {
     let mut sync_sources = Vec::new();
     for sync_batch in requests.sync_batches() {
         let source = wallet_source_from_best_node(world, &sync_batch, best_node_info)
@@ -210,15 +214,28 @@ async fn scan_available_utxos(
         sync_sources.push((sync_batch, source));
     }
 
+    sync_observations_from_sources(world, requests, sync_sources)
+        .await
+        .inspect_err(|e| {
+            warn!(target: TARGET, "Step `{}` error: {e}", step);
+        })
+}
+
+async fn sync_observations_from_sources<I>(
+    world: &mut CucumberWorld,
+    requests: &WalletSyncRequests,
+    sync_sources: I,
+) -> Result<SyncedWalletObservations, StepError>
+where
+    I: IntoIterator<Item = (WalletSyncBatch, NodeHttpWalletChainSource)>,
+{
     let genesis_utxos = world.genesis_block_utxos.clone();
     let sync_results = sync_batches_from_chain(&mut world.wallets, sync_sources, &genesis_utxos)
         .await
-        .map_err(wallet_sync_error)
-        .inspect_err(|e| {
-            warn!(target: TARGET, "Step `{}` error: {e}", step);
-        })?;
+        .map_err(wallet_sync_error)?;
 
     for synced_block in sync_results.synced_blocks() {
+        record_wallet_synced_block_transactions(world, synced_block);
         log_wallet_synced_block(synced_block);
     }
     let on_chain_utxos = sync_results.into_wallet_utxos();
@@ -226,10 +243,30 @@ async fn scan_available_utxos(
     let mut observations = world.wallets.observe_synced_wallets(requests);
     apply_scenario_fee_observations(world, &mut observations, &on_chain_utxos);
 
-    Ok(observations
+    Ok(SyncedWalletObservations {
+        on_chain_utxos,
+        observations,
+    })
+}
+
+fn take_wallet_observation(
+    observations: &mut BTreeMap<WalletId, WalletStateView>,
+    wallet_name: &str,
+) -> Result<WalletStateView, StepError> {
+    observations
+        .remove(wallet_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Wallet state observation for `{wallet_name}` was not returned"),
+        })
+}
+
+fn observations_into_available_utxos(
+    observations: BTreeMap<WalletId, WalletStateView>,
+) -> WalletUtxos {
+    observations
         .into_iter()
         .map(|(wallet_name, observation)| (wallet_name, observation.into_available_utxos()))
-        .collect())
+        .collect()
 }
 
 fn log_wallet_balance(wallet_name: &str, observation: &WalletStateView) {
@@ -254,13 +291,19 @@ async fn sync_wallet(
     world: &mut CucumberWorld,
     step: &str,
     wallet_name: &str,
+    best_node_info: Option<&BestNodeInfo>,
 ) -> Result<WalletStateView, StepError> {
     let wallet = world.resolve_wallet(wallet_name).inspect_err(|e| {
         warn!(target: TARGET, "Step `{}` error: {e}", step);
     })?;
+    let best_node_name = if let Some(info) = best_node_info {
+        info.best_node_for_wallet(world, wallet_name)?
+    } else {
+        wallet.node_name.clone()
+    };
 
     let state_observation =
-        sync_wallet_state_from_chain(world, wallet_name, &wallet.node_name, wallet.public_key()?)
+        sync_wallet_state_from_chain(world, wallet_name, &best_node_name, wallet.public_key()?)
             .await
             .inspect_err(|e| {
                 warn!(target: TARGET, "Step `{}` error: {e}", step);
@@ -304,19 +347,19 @@ async fn wallet_source_from_best_node(
 }
 
 fn log_wallet_synced_block(block: &WalletSyncedBlock) {
-    if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
-        info!(
-            target: TARGET,
-            "Evaluating block {height_prefix}{height} for {} wallets on `{}`: {header_id}, \
-            transactions len: {}",
-            block.wallet_count(),
-            block.source_node_name(),
-            block.transaction_count(),
-            height_prefix = block.height_log_prefix(),
-            height = block.height_value(),
-            header_id = block.header_id(),
-        );
-    }
+    info!(
+        target: TARGET,
+        "Evaluating block {height_prefix}{height} for {} wallets on `{}`: {header_id}, \
+        transactions len: {}, inputs len: {}, outputs len: {}",
+        block.wallet_count(),
+        block.source_node_name(),
+        block.transaction_count(),
+        block.synced_spends().len(),
+        block.synced_outputs().len(),
+        height_prefix = block.height_log_prefix(),
+        height = block.height_value(),
+        header_id = block.header_id(),
+    );
 
     log_wallet_synced_outputs(block.synced_outputs());
     log_wallet_synced_spends(block.synced_spends());
@@ -348,15 +391,17 @@ fn log_wallet_synced_outputs(synced_outputs: &[WalletSyncedOutput]) {
 }
 
 fn log_wallet_synced_spends(synced_spends: &[WalletSyncedSpend]) {
+    if !is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
+        return;
+    }
+
     for spent in synced_spends {
-        if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
-            info!(
-                target: TARGET,
-                "Found spent UTXO for `{}`: id: {:?}",
-                spent.wallet_id,
-                spent.note_id,
-            );
-        }
+        info!(
+            target: TARGET,
+            "Found spent UTXO for `{}`: id: {:?}",
+            spent.wallet_id,
+            spent.note_id,
+        );
     }
 }
 
@@ -383,4 +428,8 @@ fn apply_scenario_fee_observations(
                 .state_observation_for(wallet_id, wallet_on_chain_utxos),
         );
     }
+}
+
+fn record_wallet_synced_block_transactions(world: &mut CucumberWorld, block: &WalletSyncedBlock) {
+    world.record_scanned_transaction_hashes(block.transaction_hashes().iter().copied());
 }
