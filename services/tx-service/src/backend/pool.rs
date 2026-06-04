@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::Debug,
     hash::Hash,
     marker::PhantomData,
@@ -134,13 +134,11 @@ where
         I: IntoIterator<Item = Self::TxHash> + Send,
         <I as IntoIterator>::IntoIter: Send,
     {
-        let mut txs = self.forks_tracker.get_txs();
-        // keep incoming request order
-        let txs: Vec<Tx> = keys
-            .into_iter()
-            .filter_map(move |key| txs.remove(&key))
-            .collect();
-        Ok(Box::pin(stream::iter(txs)))
+        let keys_set: BTreeSet<Self::TxHash> = keys.into_iter().collect();
+        self.adapter
+            .get_txs(&keys_set)
+            .await
+            .map_err(|e| MempoolError::StorageError(format!("{e:?}")))
     }
 
     async fn remove(&mut self, keys: &[Self::TxHash]) {

@@ -244,23 +244,6 @@ where
         removed
     }
 
-    pub fn get_txs(&self) -> HashMap<Tx::Hash, Tx> {
-        self.tips
-            .iter()
-            .flat_map(|header_id| {
-                TxTracker::<Tx, Tx::Hash>::get_txs(
-                    &self
-                        .block_states
-                        .get(header_id)
-                        .expect("Tip state should always be present")
-                        .state,
-                )
-            })
-            .cloned()
-            .map(|tx| (tx.hash(), tx))
-            .collect()
-    }
-
     pub fn process_lib(&mut self, event: &LibUpdate) {
         let LibUpdate {
             pruned_blocks:
