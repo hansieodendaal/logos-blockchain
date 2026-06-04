@@ -132,14 +132,12 @@ where
     Adapter: BlockInfoGetter<Tx> + LedgerStateGetter + Clone + Send + Sync,
 {
     pub fn new(adapter: Adapter) -> Self {
-        let mut instance = Self {
+        Self {
             block_states: HashMap::new(),
             tips: HashSet::new(),
             mempool_log: TxHistory::new(),
             adapter,
-        };
-        instance.bootstrap_root(HeaderId::zeroes());
-        instance
+        }
     }
 
     pub fn to_state(&self) -> ForksTrackerState<Tx::Hash> {
@@ -271,6 +269,14 @@ where
             parent,
             transactions,
         } = self.adapter.get_block(block_id).await?;
+
+        // Bootstrap: the very first block event seeds its parent as an empty
+        // frontier so subsequent events have somewhere to extend from. The
+        // parent here is the genesis HeaderId on a fresh node, which is
+        // otherwise never inserted into `block_states`.
+        if self.tips.is_empty() && !self.block_states.contains_key(&parent) {
+            self.bootstrap_root(parent);
+        }
 
         let parent_fork = self
             .block_states
