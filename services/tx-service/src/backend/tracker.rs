@@ -191,8 +191,28 @@ where
         }
     }
 
-    pub fn get_ready_txs(&self) -> Vec<Tx> {
-        self.ready_txs.values().map(|tx| Tx::clone(tx)).collect()
+    pub fn get_ready_txs(&self) -> impl Iterator<Item = Vec<Tx>> + use<Tx> {
+        // cheap clone state to send with the iterator
+        let mut moved = self.clone();
+        std::iter::once(
+            self.ready_txs
+                .values()
+                .map(|tx| Tx::clone(tx))
+                .collect::<Vec<_>>(),
+        )
+        .chain((1..).map(move |deps_count: usize| {
+            moved
+                .tx_pending_count
+                .iter()
+                .filter_map(|(id, count)| {
+                    if *count == deps_count {
+                        pop(&mut moved.orphan_txs, id).map(|tx| Tx::clone(tx.as_ref()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        }))
     }
 
     pub fn force_remove_tx(&mut self, id: &Tx::Hash) -> bool {

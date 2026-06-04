@@ -179,14 +179,14 @@ where
     pub async fn get_frontier_txs(
         &self,
         parent_hint: HeaderId,
-    ) -> Result<Vec<Tx>, ForksTrackerError>
+    ) -> Result<impl Iterator<Item = Tx> + use<Tx, Adapter>, ForksTrackerError>
     where
         Tx: TxPriorityTip,
     {
-        if !self.tips.contains(&parent_hint) {
+        if !self.block_states.contains_key(&parent_hint) {
             return Err(ForksTrackerError::ParentNotFound(parent_hint));
         }
-        let mut txs: Vec<Tx> = self
+        let txs = self
             .block_states
             .get(&parent_hint)
             .map(|fork| fork.state.get_ready_txs())
@@ -196,29 +196,37 @@ where
         // uses to decide tx readiness. The epoch-boundary snapshot
         // (`epoch_state().utxos`) omits notes created mid-epoch, so chained
         // txs (e.g. coin splits) would fail input lookup with `InexistingNote`.
-        let utxos = ledger_state.latest_utxos();
+        let utxos = ledger_state.latest_utxos().clone();
         let gas_prices = ledger_state.get_gas_prices();
-        let cached_keys: HashMap<_, _> = txs
-            .iter()
-            .filter_map(|tx| {
-                match TxPriorityTip::priority_tip::<MainnetGasConstants>(tx, &gas_prices, utxos) {
-                    Ok(ratio) => Some((tx.hash(), ratio)),
-                    Err(e) => {
-                        error!(
-                            "Error computing rewards ratio for tx {:?}: {e:?}",
-                            tx.hash()
-                        );
-                        None
+        let sorted_txs = txs.flat_map(move |mut txs| {
+            let cached_keys: HashMap<_, _> = txs
+                .iter()
+                .filter_map(|tx| {
+                    match TxPriorityTip::priority_tip::<MainnetGasConstants>(
+                        tx,
+                        &gas_prices,
+                        &utxos,
+                    ) {
+                        Ok(ratio) => Some((tx.hash(), ratio)),
+                        Err(e) => {
+                            error!(
+                                "Error computing rewards ratio for tx {:?}: {e:?}",
+                                tx.hash()
+                            );
+                            None
+                        }
                     }
-                }
-            })
-            .collect();
-        // Drop any tx whose ratio could not be computed; it is not applicable
-        // to a block built on `parent_hint`. Keeping it would panic the sort
-        // below on a missing `cached_keys` entry.
-        txs.retain(|tx| cached_keys.contains_key(&tx.hash()));
-        txs.sort_unstable_by_key(|tx| cached_keys[&tx.hash()]);
-        Ok(txs)
+                })
+                .collect();
+            // Drop any tx whose ratio could not be computed; it is not applicable
+            // to a block built on `parent_hint`. Keeping it would panic the sort
+            // below on a missing `cached_keys` entry.
+            txs.retain(|tx| cached_keys.contains_key(&tx.hash()));
+            txs.sort_unstable_by_key(|tx| cached_keys[&tx.hash()]);
+            txs
+        });
+
+        Ok(sorted_txs)
     }
 
     pub fn force_remove_txs(&mut self, txs: &[Tx::Hash]) -> usize {
