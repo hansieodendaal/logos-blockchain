@@ -5,11 +5,12 @@ pub mod openapi {
 }
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt::{Debug, Display},
+    hash::Hash,
     marker::PhantomData,
     pin::Pin,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{Stream, StreamExt as _};
@@ -37,7 +38,8 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error};
 
 use crate::{
-    MempoolMetrics, MempoolMsg, TransactionsByHashesResponse, backend,
+    MempoolMetrics, MempoolMsg, MempoolRemoveReason, TransactionsByHashesResponse,
+    TxLifecycleStatus, backend,
     backend::{MemPool as MemPoolTrait, MempoolAdapter, MempoolError, RecoverableMempool},
     network::NetworkAdapter as NetworkAdapterTrait,
     storage::MempoolStorageAdapter,
@@ -45,6 +47,132 @@ use crate::{
 };
 
 const LOG_TARGET: &str = mempool::SERVICE;
+const TX_LIFECYCLE_RETENTION: usize = 50_000;
+
+#[derive(Clone, Copy, Debug)]
+enum TxLifecycleSource {
+    LocalSubmit,
+    Gossip,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TxLifecycleRecordState {
+    SeenInMempool,
+    IncludedInCanonicalBlock,
+    RemovedFromMempool,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TxLifecycleRecord {
+    last_seq: u64,
+    _timestamp_ms: u64,
+    _source: TxLifecycleSource,
+    state: TxLifecycleRecordState,
+}
+
+struct TxLifecycleTracker<TxHash>
+where
+    TxHash: Clone + Eq + Hash,
+{
+    entries: HashMap<TxHash, TxLifecycleRecord>,
+    order: VecDeque<(u64, TxHash)>,
+    next_seq: u64,
+    capacity: usize,
+}
+
+impl<TxHash> TxLifecycleTracker<TxHash>
+where
+    TxHash: Clone + Eq + Hash,
+{
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            next_seq: 1,
+            capacity,
+        }
+    }
+
+    fn record_seen_in_mempool(&mut self, hash: TxHash, source: TxLifecycleSource) {
+        self.record(hash, TxLifecycleRecordState::SeenInMempool, source);
+    }
+
+    fn record_removed(&mut self, hash: TxHash, reason: MempoolRemoveReason) {
+        let state = match reason {
+            MempoolRemoveReason::CanonicalBlockApplied => {
+                TxLifecycleRecordState::IncludedInCanonicalBlock
+            }
+            MempoolRemoveReason::ProposalValidationFailed
+            | MempoolRemoveReason::ExplicitRemoval => TxLifecycleRecordState::RemovedFromMempool,
+        };
+        self.record(hash, state, TxLifecycleSource::Unknown);
+    }
+
+    fn record_rejected(&mut self, hash: TxHash, source: TxLifecycleSource) {
+        self.record(hash, TxLifecycleRecordState::Rejected, source);
+    }
+
+    fn classify(&self, hash: &TxHash, in_mempool_now: bool) -> TxLifecycleStatus {
+        if in_mempool_now {
+            return TxLifecycleStatus::InMempool;
+        }
+
+        match self.entries.get(hash).map(|record| record.state) {
+            Some(TxLifecycleRecordState::IncludedInCanonicalBlock) => {
+                TxLifecycleStatus::IncludedInCanonicalBlock
+            }
+            Some(TxLifecycleRecordState::RemovedFromMempool) => {
+                TxLifecycleStatus::RemovedFromMempool
+            }
+            Some(TxLifecycleRecordState::Rejected) => TxLifecycleStatus::Rejected,
+            Some(TxLifecycleRecordState::SeenInMempool) => TxLifecycleStatus::SeenButNotInMempool,
+            None => TxLifecycleStatus::NeverSeen,
+        }
+    }
+
+    fn record(&mut self, hash: TxHash, state: TxLifecycleRecordState, source: TxLifecycleSource) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+
+        self.entries.insert(
+            hash.clone(),
+            TxLifecycleRecord {
+                last_seq: seq,
+                _timestamp_ms: current_timestamp_millis(),
+                _source: source,
+                state,
+            },
+        );
+
+        self.order.push_back((seq, hash));
+        self.prune_if_needed();
+    }
+
+    fn prune_if_needed(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some((old_seq, old_hash)) = self.order.pop_front() else {
+                break;
+            };
+
+            if self
+                .entries
+                .get(&old_hash)
+                .is_some_and(|record| record.last_seq == old_seq)
+            {
+                self.entries.remove(&old_hash);
+            }
+        }
+    }
+}
+
+fn current_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 type MempoolStateUpdater<Pool, NetworkAdapter, RuntimeServiceId> =
     overwatch::services::state::StateUpdater<
@@ -186,7 +314,7 @@ where
     Pool: MemPoolTrait<Adapter = Adapter> + RecoverableMempool + Send + Sync,
     Adapter: MempoolAdapter<Pool::Tx, RuntimeServiceId> + Clone + Send + Sync,
     <Pool as RecoverableMempool>::RecoveryState: Debug + Send + Sync,
-    Pool::TxHash: Send + Sync + 'static,
+    Pool::TxHash: Eq + Hash + Clone + Send + Sync + 'static,
     Pool::Tx: Transaction<Hash = Pool::TxHash> + Debug + Eq + Clone + Send + Sync + 'static,
     Pool::Settings: Clone + Sync + Send,
     NetworkAdapter:
@@ -308,6 +436,7 @@ where
     Adapter: Clone + Send + Sync,
     Cryptarchia: CryptarchiaServiceData,
     Pool::Tx: Transaction<Hash = Pool::TxHash> + Clone + Send + 'static,
+    Pool::TxHash: Eq + Hash + Clone,
     Pool::Settings: Clone,
     NetworkAdapter: NetworkAdapterTrait<RuntimeServiceId, Payload = Pool::Tx> + Send + Sync,
     NetworkAdapter::Settings: Clone + Send + 'static,
@@ -331,7 +460,10 @@ where
     where
         Pool::Settings: Send + Sync,
         NetworkAdapter::Settings: Send + Sync,
+        Pool::TxHash: Eq + Hash + Clone,
     {
+        let mut lifecycle_tracker = TxLifecycleTracker::<Pool::TxHash>::new(TX_LIFECYCLE_RETENTION);
+
         loop {
             tokio::select! {
                 // Queue for relay messages
@@ -344,7 +476,15 @@ where
                         .get_updated_settings()
                         .network_adapter;
 
-                    Self::handle_mempool_message(pool, relay_msg, network_service_relay.clone(), state_updater, settings).await;
+                    Self::handle_mempool_message(
+                        pool,
+                        relay_msg,
+                        network_service_relay.clone(),
+                        state_updater,
+                        settings,
+                        &mut lifecycle_tracker,
+                    )
+                    .await;
                 }
                 Some(new_block_event) = blocks_stream.next() => {
                     match new_block_event {
@@ -370,8 +510,15 @@ where
                     }
 
                 }
-                Some((_key, item)) = network_items.next() => {
-                    Self::handle_network_item(pool, item, &self.service_resources_handle.state_updater).await;
+                Some((key, item)) = network_items.next() => {
+                    Self::handle_network_item(
+                        pool,
+                        key,
+                        item,
+                        &self.service_resources_handle.state_updater,
+                        &mut lifecycle_tracker,
+                    )
+                    .await;
                 }
             }
         }
@@ -383,23 +530,29 @@ where
         network_relay: OutboundRelay<BackendNetworkMsg<NetworkAdapter::Backend, RuntimeServiceId>>,
         state_updater: MempoolStateUpdater<Pool, NetworkAdapter, RuntimeServiceId>,
         settings: NetworkAdapter::Settings,
+        lifecycle_tracker: &mut TxLifecycleTracker<Pool::TxHash>,
     ) where
         Pool::Settings: Send + Sync,
         NetworkAdapter::Settings: Send + Sync,
+        Pool::TxHash: Eq + Hash + Clone,
     {
         match message {
             MempoolMsg::Add {
+                key,
                 payload,
                 reply_channel,
                 ..
             } => {
                 Self::handle_add_message(
                     pool,
+                    key,
                     payload,
                     reply_channel,
                     network_relay,
                     state_updater,
                     settings,
+                    lifecycle_tracker,
+                    TxLifecycleSource::LocalSubmit,
                 )
                 .await;
             }
@@ -419,8 +572,23 @@ where
                     tracing::debug!(target: LOG_TARGET, "Failed to send transactions reply");
                 }
             }
-            MempoolMsg::Remove { ids } => {
+            MempoolMsg::Remove { ids, reason } => {
                 pool.remove(&ids).await;
+                for id in ids {
+                    lifecycle_tracker.record_removed(id, reason);
+                }
+            }
+            MempoolMsg::ClassifyTransactions {
+                hashes,
+                reply_channel,
+            } => {
+                Self::handle_classify_transactions_message(
+                    pool,
+                    lifecycle_tracker,
+                    hashes,
+                    reply_channel,
+                )
+                .await;
             }
             MempoolMsg::Metrics { reply_channel } => {
                 Self::handle_metrics_message(pool, reply_channel).await;
@@ -434,21 +602,27 @@ where
         }
     }
 
+    #[expect(clippy::too_many_arguments, reason = "Need all args")]
     async fn handle_add_message(
         pool: &mut Pool,
+        item_key: Pool::TxHash,
         item: Pool::Tx,
         reply_channel: oneshot::Sender<Result<(), MempoolError>>,
         network_relay: OutboundRelay<BackendNetworkMsg<NetworkAdapter::Backend, RuntimeServiceId>>,
         state_updater: MempoolStateUpdater<Pool, NetworkAdapter, RuntimeServiceId>,
         settings: NetworkAdapter::Settings,
+        lifecycle_tracker: &mut TxLifecycleTracker<Pool::TxHash>,
+        source: TxLifecycleSource,
     ) where
         Pool::Settings: Send + Sync,
         NetworkAdapter::Settings: Send + Sync,
+        Pool::TxHash: Eq + Hash + Clone,
     {
         let item_for_broadcast = item.clone();
 
         match pool.add_item(item).await {
             Ok(_id) => {
+                lifecycle_tracker.record_seen_in_mempool(item_key, source);
                 Self::handle_add_success(
                     pool,
                     &state_updater,
@@ -459,6 +633,7 @@ where
                 );
             }
             Err(MempoolError::ExistingItem) => {
+                lifecycle_tracker.record_seen_in_mempool(item_key, source);
                 // Tx already in pool, but since this came from a local submission
                 // (not gossip), re-gossip it so leader nodes can pick it up.
                 tokio::spawn(async move {
@@ -469,7 +644,40 @@ where
                     tracing::debug!(target: LOG_TARGET, "Failed to send add reply: {:?}", e);
                 }
             }
-            Err(e) => Self::handle_add_error(e, reply_channel),
+            Err(e) => {
+                lifecycle_tracker.record_rejected(item_key, source);
+                Self::handle_add_error(e, reply_channel);
+            }
+        }
+    }
+
+    async fn handle_classify_transactions_message(
+        pool: &Pool,
+        lifecycle_tracker: &TxLifecycleTracker<Pool::TxHash>,
+        hashes: Vec<Pool::TxHash>,
+        reply_channel: oneshot::Sender<Vec<TxLifecycleStatus>>,
+    ) where
+        Pool::TxHash: Eq + Hash + Clone,
+    {
+        let in_mempool: HashSet<Pool::TxHash> =
+            match pool.get_items_by_keys(hashes.iter().cloned()).await {
+                Ok(stream) => stream.map(|tx| tx.hash()).collect().await,
+                Err(e) => {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        "failed to classify current mempool membership for hashes: {e}"
+                    );
+                    HashSet::new()
+                }
+            };
+
+        let statuses = hashes
+            .iter()
+            .map(|hash| lifecycle_tracker.classify(hash, in_mempool.contains(hash)))
+            .collect::<Vec<_>>();
+
+        if let Err(_e) = reply_channel.send(statuses) {
+            tracing::debug!(target: LOG_TARGET, "Failed to send classify-transactions reply");
         }
     }
 
@@ -594,21 +802,26 @@ where
 
     async fn handle_network_item(
         pool: &mut Pool,
+        key: Pool::TxHash,
         item: Pool::Tx,
         state_updater: &MempoolStateUpdater<Pool, NetworkAdapter, RuntimeServiceId>,
+        lifecycle_tracker: &mut TxLifecycleTracker<Pool::TxHash>,
     ) where
         Pool::Settings: Send + Sync,
         NetworkAdapter::Settings: Send + Sync,
+        Pool::TxHash: Eq + Hash + Clone,
     {
         if let Err(e) = pool.add_item(item).await {
             match e {
                 MempoolError::ExistingItem => {
+                    lifecycle_tracker.record_seen_in_mempool(key, TxLifecycleSource::Gossip);
                     tracing::trace!(
                         target: LOG_TARGET,
                         "network item already exists in the mempool"
                     );
                 }
                 err => {
+                    lifecycle_tracker.record_rejected(key, TxLifecycleSource::Gossip);
                     tracing::debug!(
                         target: LOG_TARGET,
                         "could not add item to the pool due to: {err}"
@@ -617,6 +830,8 @@ where
             }
             return;
         }
+
+        lifecycle_tracker.record_seen_in_mempool(key, TxLifecycleSource::Gossip);
 
         Self::log_mempool_pending_items(pool).await;
 

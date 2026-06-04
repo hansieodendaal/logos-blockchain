@@ -5,7 +5,7 @@ use lb_core::{
     header::HeaderId,
     mantle::{Transaction, TxHash},
 };
-use lb_tx_service::MempoolMsg;
+use lb_tx_service::{MempoolMsg, MempoolRemoveReason};
 use overwatch::services::relay::OutboundRelay;
 use tokio::sync::oneshot;
 
@@ -50,7 +50,10 @@ where
 
     async fn remove_transactions(&self, ids: &[TxHash]) -> Result<(), overwatch::DynError> {
         self.mempool_relay
-            .send(MempoolMsg::Remove { ids: ids.to_vec() })
+            .send(MempoolMsg::Remove {
+                ids: ids.to_vec(),
+                reason: MempoolRemoveReason::ProposalValidationFailed,
+            })
             .await
             .map_err(|(e, _)| format!("Could not remove transactions from mempool: {e}"))?;
 

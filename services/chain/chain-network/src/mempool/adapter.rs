@@ -2,7 +2,10 @@ use lb_core::{
     header::HeaderId,
     mantle::{Transaction, TxHash},
 };
-use lb_tx_service::{MempoolMsg, TransactionsByHashesResponse};
+use lb_tx_service::{
+    MempoolMetrics, MempoolMsg, MempoolRemoveReason, TransactionsByHashesResponse,
+    TxLifecycleStatus,
+};
 use overwatch::services::relay::OutboundRelay;
 use tokio::sync::oneshot;
 
@@ -44,11 +47,48 @@ where
 
     async fn remove_transactions(&self, ids: &[TxHash]) -> Result<(), overwatch::DynError> {
         self.mempool_relay
-            .send(MempoolMsg::Remove { ids: ids.to_vec() })
+            .send(MempoolMsg::Remove {
+                ids: ids.to_vec(),
+                reason: MempoolRemoveReason::CanonicalBlockApplied,
+            })
             .await
             .map_err(|(e, _)| format!("Could not remove transactions from mempool: {e}"))?;
 
         Ok(())
+    }
+
+    async fn classify_transactions(
+        &self,
+        hashes: Vec<TxHash>,
+    ) -> Result<Vec<TxLifecycleStatus>, overwatch::DynError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.mempool_relay
+            .send(MempoolMsg::ClassifyTransactions {
+                hashes,
+                reply_channel: resp_tx,
+            })
+            .await
+            .map_err(|(e, _)| format!("Could not classify transactions by hashes: {e}"))?;
+
+        resp_rx
+            .await
+            .map_err(|e| format!("Could not receive classification response: {e}").into())
+    }
+
+    async fn metrics(&self) -> Result<MempoolMetrics, overwatch::DynError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        self.mempool_relay
+            .send(MempoolMsg::Metrics {
+                reply_channel: resp_tx,
+            })
+            .await
+            .map_err(|(e, _)| format!("Could not get mempool metrics: {e}"))?;
+
+        resp_rx
+            .await
+            .map_err(|e| format!("Could not receive metrics response: {e}").into())
     }
 
     async fn get_transactions_by_hashes(

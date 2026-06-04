@@ -43,7 +43,7 @@ pub fn consensus_observe_proposal_reconstruct_ok(duration: Duration) {
 
 pub fn consensus_observe_proposal_reconstruct_err(origin: &'static str, err: &Error) {
     let reason = match err {
-        Error::MissingMempoolTransactions(_) => "missing_txs",
+        Error::MissingMempoolTransactions { .. } => "missing_txs",
         Error::Mempool(_) => "mempool",
         Error::InvalidBlock(_) => "invalid_block",
         _ => "other",

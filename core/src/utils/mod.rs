@@ -51,4 +51,27 @@ macro_rules! serde_bytes_newtype {
 }
 
 pub(crate) use display_hex_bytes_newtype;
+use hex::ToHex as _;
 pub(crate) use serde_bytes_newtype;
+
+use crate::{codec::SerializeOp as _, header::HeaderId, mantle::TxHash};
+
+/// Convert a `TxHash` to a lowercase hex string with "0x" prefix.
+#[must_use]
+pub fn tx_hash_hex(tx_hash: &TxHash) -> String {
+    tx_hash
+        .to_bytes()
+        .expect("is valid")
+        .to_ascii_lowercase()
+        .encode_hex::<String>()
+}
+
+/// Convert a `HeaderId` to a lowercase hex string with "0x" prefix.
+#[must_use]
+pub fn header_id_hex(header_id: &HeaderId) -> String {
+    header_id
+        .to_bytes()
+        .expect("is valid")
+        .to_ascii_lowercase()
+        .encode_hex::<String>()
+}

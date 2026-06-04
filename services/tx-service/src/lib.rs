@@ -25,6 +25,23 @@ pub struct TransactionsByHashesResponse<Item, Key> {
     not_found: BTreeSet<Key>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxLifecycleStatus {
+    InMempool,
+    IncludedInCanonicalBlock,
+    RemovedFromMempool,
+    Rejected,
+    SeenButNotInMempool,
+    NeverSeen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MempoolRemoveReason {
+    CanonicalBlockApplied,
+    ProposalValidationFailed,
+    ExplicitRemoval,
+}
+
 impl<Item, Key> TransactionsByHashesResponse<Item, Key>
 where
     Key: Ord,
@@ -69,6 +86,11 @@ pub enum MempoolMsg<BlockId, Tx, TxHash> {
     },
     Remove {
         ids: Vec<TxHash>,
+        reason: MempoolRemoveReason,
+    },
+    ClassifyTransactions {
+        hashes: Vec<TxHash>,
+        reply_channel: Sender<Vec<TxLifecycleStatus>>,
     },
     Metrics {
         reply_channel: Sender<MempoolMetrics>,
@@ -97,7 +119,12 @@ where
                 )
             }
             Self::Add { payload, .. } => write!(f, "MempoolMsg::Add{{payload: {payload:?}}}"),
-            Self::Remove { ids } => write!(f, "MempoolMsg::Prune{{ids: {ids:?}}}"),
+            Self::Remove { ids, reason } => {
+                write!(f, "MempoolMsg::Prune{{ids: {ids:?}, reason: {reason:?}}}")
+            }
+            Self::ClassifyTransactions { hashes, .. } => {
+                write!(f, "MempoolMsg::ClassifyTransactions{{hashes: {hashes:?}}}")
+            }
             Self::Metrics { .. } => write!(f, "MempoolMsg::Metrics"),
             Self::Status { items, .. } => write!(f, "MempoolMsg::Status{{items: {items:?}}}"),
         }

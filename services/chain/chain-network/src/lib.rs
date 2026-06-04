@@ -20,6 +20,7 @@ use lb_core::{
     block::{Block, Proposal},
     header::HeaderId,
     mantle::{AuthenticatedMantleTx, Transaction, TxHash},
+    utils::{header_id_hex, tx_hash_hex},
 };
 pub use lb_cryptarchia_engine::{Epoch, Slot};
 pub use lb_ledger::EpochState;
@@ -27,7 +28,7 @@ use lb_network_service::NetworkService;
 use lb_services_utils::wait_until_services_are_ready;
 use lb_time_service::TimeService;
 use lb_tx_service::{
-    TxMempoolService,
+    MempoolMetrics, TxLifecycleStatus, TxMempoolService,
     backend::{MemPool, MempoolAdapter as TxMempoolAdapter, RecoverableMempool},
     network::NetworkAdapter as MempoolNetworkAdapter,
 };
@@ -70,8 +71,11 @@ pub enum Error {
     Serialisation(#[from] lb_core::codec::Error),
     #[error("Invalid block: {0}")]
     InvalidBlock(String),
-    #[error("Failed to reconstruct block: {0} mempool transactions not found")]
-    MissingMempoolTransactions(usize),
+    #[error("Failed to reconstruct block: {missing_count} mempool transactions not found")]
+    MissingMempoolTransactions {
+        missing_count: usize,
+        missing_hashes: Vec<TxHash>,
+    },
     #[error("Mempool error: {0}")]
     Mempool(String),
     #[error("Block header id not found: {0}")]
@@ -462,6 +466,14 @@ where
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     async fn handle_incoming_proposal(
         &self,
         proposal: Proposal,
@@ -477,6 +489,9 @@ where
         RuntimeServiceId: Send + Sync + 'static,
     {
         let block_id = proposal.header().id();
+        let proposal_parent = proposal.header().parent();
+        let proposal_slot = proposal.header().slot();
+        let proposal_tx_count = proposal.mempool_transactions().len();
         let block_slot = proposal.header().slot();
         metrics::consensus_proposals_received_total("network");
 
@@ -496,6 +511,138 @@ where
             }
             Err(e) => {
                 metrics::consensus_observe_proposal_reconstruct_err("network", &e);
+
+                if let Error::MissingMempoolTransactions {
+                    missing_count,
+                    missing_hashes,
+                } = &e
+                {
+                    let statuses = relays
+                        .mempool_adapter()
+                        .classify_transactions(missing_hashes.clone())
+                        .await
+                        .unwrap_or_else(|err| {
+                            warn!(
+                                target: LOG_TARGET,
+                                "Failed to classify missing proposal transaction hashes: {err}"
+                            );
+                            vec![TxLifecycleStatus::NeverSeen; missing_hashes.len()]
+                        });
+
+                    let MempoolMetrics {
+                        pending_items: local_mempool_size,
+                        ..
+                    } = relays.mempool_adapter().metrics().await.unwrap_or_else(|err| {
+                        warn!(
+                            target: LOG_TARGET,
+                            "Failed to fetch mempool metrics during missing tx classification: {err}"
+                        );
+                        MempoolMetrics {
+                            pending_items: 0,
+                            last_item_timestamp: 0,
+                        }
+                    });
+
+                    let (chain_tip, chain_tip_height) = match relays.cryptarchia().info().await {
+                        Ok(info) => (
+                            header_id_hex(&info.cryptarchia_info.tip),
+                            info.cryptarchia_info.height,
+                        ),
+                        Err(err) => {
+                            warn!(
+                                target: LOG_TARGET,
+                                "Failed to fetch chain info during missing tx classification: {err}"
+                            );
+                            ("unavailable".to_owned(), 0)
+                        }
+                    };
+
+                    let mut already_included_count = 0usize;
+                    let mut removed_count = 0usize;
+                    let mut rejected_count = 0usize;
+                    let mut seen_but_not_in_mempool_count = 0usize;
+                    let mut never_seen_count = 0usize;
+                    let mut still_in_mempool_count = 0usize;
+
+                    let mut sample_already_included = Vec::new();
+                    let mut sample_removed = Vec::new();
+                    let mut sample_rejected = Vec::new();
+                    let mut sample_never_seen = Vec::new();
+
+                    let bounded_len = missing_hashes.len().min(statuses.len());
+                    for (hash, status) in
+                        missing_hashes.iter().zip(statuses.iter()).take(bounded_len)
+                    {
+                        let hash_hex = tx_hash_hex(hash);
+                        match status {
+                            TxLifecycleStatus::IncludedInCanonicalBlock => {
+                                already_included_count += 1;
+                                if sample_already_included.len() < 5 {
+                                    sample_already_included.push(hash_hex);
+                                }
+                            }
+                            TxLifecycleStatus::RemovedFromMempool => {
+                                removed_count += 1;
+                                if sample_removed.len() < 5 {
+                                    sample_removed.push(hash_hex);
+                                }
+                            }
+                            TxLifecycleStatus::Rejected => {
+                                rejected_count += 1;
+                                if sample_rejected.len() < 5 {
+                                    sample_rejected.push(hash_hex);
+                                }
+                            }
+                            TxLifecycleStatus::SeenButNotInMempool => {
+                                seen_but_not_in_mempool_count += 1;
+                            }
+                            TxLifecycleStatus::NeverSeen => {
+                                never_seen_count += 1;
+                                if sample_never_seen.len() < 5 {
+                                    sample_never_seen.push(hash_hex);
+                                }
+                            }
+                            TxLifecycleStatus::InMempool => {
+                                still_in_mempool_count += 1;
+                            }
+                        }
+                    }
+
+                    // Preserve a strict accounting: every missing hash is assigned exactly one
+                    // bucket.
+                    let classified_count = already_included_count
+                        + removed_count
+                        + rejected_count
+                        + seen_but_not_in_mempool_count
+                        + never_seen_count
+                        + still_in_mempool_count;
+                    let missing_unclassified = missing_count.saturating_sub(classified_count);
+                    never_seen_count += missing_unclassified;
+
+                    warn!(
+                        target: LOG_TARGET,
+                        proposal_id = %block_id,
+                        proposal_parent = %proposal_parent,
+                        proposal_slot = ?proposal_slot,
+                        proposal_tx_count,
+                        missing_count,
+                        local_mempool_size,
+                        chain_tip,
+                        chain_tip_height,
+                        already_included_count,
+                        removed_count,
+                        rejected_count,
+                        seen_but_not_in_mempool_count,
+                        never_seen_count,
+                        still_in_mempool_count,
+                        sample_already_included = ?sample_already_included,
+                        sample_removed = ?sample_removed,
+                        sample_rejected = ?sample_rejected,
+                        sample_never_seen = ?sample_never_seen,
+                        "proposal reconstruction failed: missing mempool transactions classified"
+                    );
+                }
+
                 error!(
                     target: LOG_TARGET,
                     "Failed to reconstruct block from proposal: {:?}",
@@ -862,9 +1009,17 @@ where
         })?;
 
     if !mempool_response.all_found() {
-        let missing_count = mempool_response.not_found().len();
+        let missing_hashes = mempool_response
+            .not_found()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let missing_count = missing_hashes.len();
         metrics::consensus_observe_proposal_missing_txs(missing_count);
-        return Err(Error::MissingMempoolTransactions(missing_count));
+        return Err(Error::MissingMempoolTransactions {
+            missing_count,
+            missing_hashes,
+        });
     }
 
     let reconstructed_transactions = mempool_response.into_found();
