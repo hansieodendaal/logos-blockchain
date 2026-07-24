@@ -5,7 +5,8 @@ use std::{
 };
 
 use hex::ToHex as _;
-use lb_core::{codec::SerializeOp as _, sdp::Locator};
+use lb_core::{codec::SerializeOp as _, mantle::TxHash, sdp::Locator};
+use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_libp2p::{PeerId, identity, identity::ed25519};
 use lb_node::UserConfig;
 use lb_testing_framework::{CoreBuilderExt as _, ScenarioBuilder};
@@ -184,6 +185,24 @@ pub fn funding_wallet_pk_from_node_yaml(path: &Path) -> Result<String, StepError
     Ok(config.sdp.wallet.funding_pk.to_bytes()?.encode_hex())
 }
 
+/// Reads all configured node-wallet known public keys in deterministic order.
+pub fn known_wallet_pks_from_node_yaml(path: &Path) -> Result<Vec<String>, StepError> {
+    let config = user_config_from_node_yaml(path)?;
+    let mut public_keys = config
+        .wallet
+        .known_keys
+        .values()
+        .map(|public_key| {
+            public_key
+                .to_bytes()
+                .map(|bytes| bytes.encode_hex::<String>())
+                .map_err(StepError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    public_keys.sort();
+    Ok(public_keys)
+}
+
 /// Reads a node YAML user config file and extracts the configured Blend core
 /// ZK wallet public key.
 pub fn blend_core_zk_pk_from_node_yaml(path: &Path) -> Result<String, StepError> {
@@ -321,4 +340,24 @@ pub fn display_last_path_components(path: &Path, levels: usize) -> String {
 
     let start = components.len().saturating_sub(levels);
     components[start..].join("/")
+}
+
+/// Returns a lowercase hex string representation of the given transaction hash.
+#[must_use]
+pub fn tx_hash_to_hex(tx_hash: &TxHash) -> String {
+    tx_hash
+        .to_bytes()
+        .unwrap()
+        .to_ascii_lowercase()
+        .encode_hex::<String>()
+}
+
+/// Returns a lowercase hex string representation of the given public key.
+#[must_use]
+pub fn pk_to_hex(tx_hash: &ZkPublicKey) -> String {
+    tx_hash
+        .to_bytes()
+        .unwrap()
+        .to_ascii_lowercase()
+        .encode_hex::<String>()
 }

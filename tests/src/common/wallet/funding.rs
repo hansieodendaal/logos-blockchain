@@ -84,19 +84,59 @@ pub enum WalletFundingPolicy {
     FeeSponsored,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Input-selection strategy used when funding a wallet transaction.
+pub enum WalletInputSelectionStrategy {
+    /// Select the largest available inputs first, stopping when the
+    /// transaction has sufficient funds.
+    #[default]
+    LargestFirst,
+    /// Select the smallest available inputs first, stopping when the
+    /// transaction has sufficient funds.
+    SmallestFirst,
+    /// Include every provided UTXO as a required transaction input.
+    AllProvided,
+}
+
 /// Wallet account plus the UTXOs that may fund a transaction.
 pub struct WalletFundingSource {
     account: WalletAccount,
     funding_utxos: WalletFundingUtxos,
+    input_selection_strategy: WalletInputSelectionStrategy,
 }
 
 impl WalletFundingSource {
     #[must_use]
     pub fn new(account: WalletAccount, available_utxos: Vec<Utxo>) -> Self {
         let change_pk = account.public_key();
+        Self::with_change_pk(account, available_utxos, change_pk)
+    }
+
+    #[must_use]
+    pub const fn with_change_pk(
+        account: WalletAccount,
+        available_utxos: Vec<Utxo>,
+        change_pk: ZkPublicKey,
+    ) -> Self {
+        Self::with_change_pk_and_strategy(
+            account,
+            available_utxos,
+            change_pk,
+            WalletInputSelectionStrategy::LargestFirst,
+        )
+    }
+
+    #[must_use]
+    pub const fn with_change_pk_and_strategy(
+        account: WalletAccount,
+        available_utxos: Vec<Utxo>,
+        change_pk: ZkPublicKey,
+        input_selection_strategy: WalletInputSelectionStrategy,
+    ) -> Self {
         Self {
             account,
             funding_utxos: WalletFundingUtxos::new(change_pk, available_utxos),
+            input_selection_strategy,
         }
     }
 
@@ -118,6 +158,24 @@ impl WalletFundingSource {
     #[must_use]
     pub(crate) fn into_funding_utxos(self) -> WalletFundingUtxos {
         self.funding_utxos
+    }
+
+    #[must_use]
+    pub(crate) fn into_funding_parts(self) -> (WalletFundingUtxos, WalletInputSelectionStrategy) {
+        (self.funding_utxos, self.input_selection_strategy)
+    }
+
+    /// Public key that owns the funding UTXOs and authorizes their spending.
+    #[must_use]
+    pub fn owner_public_key(&self) -> ZkPublicKey {
+        self.account.public_key()
+    }
+
+    /// Public key receiving change from the funded transaction.
+    #[must_use]
+    #[expect(dead_code, reason = "Busy developing tests.")]
+    pub(crate) const fn change_public_key(&self) -> ZkPublicKey {
+        self.funding_utxos.change_pk()
     }
 }
 
@@ -281,6 +339,14 @@ impl WalletFundingPlan {
         Self {
             ordered_utxos: utxos,
             base_inputs,
+        }
+    }
+
+    #[must_use]
+    pub const fn all_provided(utxos: Vec<Utxo>) -> Self {
+        Self {
+            ordered_utxos: Vec::new(),
+            base_inputs: utxos,
         }
     }
 
@@ -460,5 +526,66 @@ mod tests {
 
         assert_eq!(selected_count, 0);
         assert_eq!(observed_input_values, vec![Vec::<u64>::new()]);
+    }
+
+    #[test]
+    fn funding_plan_can_require_all_provided_inputs() {
+        let plan = WalletFundingPlan::all_provided(vec![
+            utxo(10_000, 0),
+            utxo(1, 1),
+            utxo(1, 2),
+            utxo(1, 3),
+        ]);
+        let mut observed_input_values = Vec::new();
+
+        let selected_count = plan
+            .fund_with::<_, WalletError>(|selected_inputs| {
+                observed_input_values.push(
+                    selected_inputs
+                        .iter()
+                        .map(|utxo| utxo.note.value)
+                        .collect::<Vec<_>>(),
+                );
+
+                Ok(WalletFundingOutcome::Funded(selected_inputs.len()))
+            })
+            .expect("all provided inputs should fund this plan");
+
+        assert_eq!(selected_count, 4);
+        assert_eq!(observed_input_values, vec![vec![10_000, 1, 1, 1]]);
+    }
+
+    #[test]
+    fn smallest_first_input_strategy_uses_smallest_inputs_first() {
+        let plan = WalletFundingPlan::smallest_first(
+            vec![utxo(20, 0), utxo(5, 1), utxo(10, 2)],
+            Vec::new(),
+        );
+        let mut observed_input_values = Vec::new();
+
+        let selected_count = plan
+            .fund_with::<_, WalletError>(|selected_inputs| {
+                observed_input_values.push(
+                    selected_inputs
+                        .iter()
+                        .map(|utxo| utxo.note.value)
+                        .collect::<Vec<_>>(),
+                );
+
+                if selected_inputs
+                    .iter()
+                    .map(|utxo| utxo.note.value)
+                    .sum::<u64>()
+                    >= 15
+                {
+                    Ok(WalletFundingOutcome::Funded(selected_inputs.len()))
+                } else {
+                    Ok(WalletFundingOutcome::NeedsMoreInputs)
+                }
+            })
+            .expect("smallest inputs should fund this plan");
+
+        assert_eq!(selected_count, 2);
+        assert_eq!(observed_input_values, vec![vec![], vec![5], vec![5, 10]],);
     }
 }

@@ -18,7 +18,7 @@ pub use chain::{
 };
 pub use funding::{
     WalletFundedTransfer, WalletFundingPolicy, WalletFundingResources, WalletFundingSource,
-    WalletReservedInputs, build_wallet_funded_transfer,
+    WalletInputSelectionStrategy, WalletReservedInputs, build_wallet_funded_transfer,
 };
 pub(crate) use funding::{
     WalletFundingOutcome, WalletFundingPlan, WalletFundingUtxos, WalletSelectedInputs,
@@ -40,6 +40,6 @@ pub use transaction::{
     transfer_proofs_for_funded_wallet_tx, wallet_state_from_utxos,
 };
 pub(crate) use transaction::{
-    PreparedWalletTransactionWorkItem, finalize_prepared_wallet_transaction,
-    prepare_wallet_transaction_work_item,
+    PreparedWalletTransactionWorkItem, extend_wallet_funding_inputs,
+    finalize_prepared_wallet_transaction, prepare_wallet_transaction_work_item,
 };

@@ -24,7 +24,11 @@ use crate::{
     },
 };
 
-const CURRENT_WALLET_STATE_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
+/// We need to allow sufficient time for wallet scanner catch up, as node sync
+/// may be in turmpoil and the wallet scsanner will only go ahead if the
+/// majority nodes are synced. This is prevelant in large local-run or
+/// devent-linked scenarios and will not impact CI.
+const CURRENT_WALLET_STATE_CATCH_UP_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Return currently available UTXOs for all user wallets.
 ///
@@ -71,6 +75,29 @@ pub async fn current_wallet_output_balance(
     wallet: &WalletInfo,
     wallet_state_type: WalletOutputState,
 ) -> Result<WalletBalance, StepError> {
+    if wallet.is_node_wallet() {
+        let node =
+            world
+                .nodes_info
+                .get(&wallet.node_name)
+                .ok_or_else(|| StepError::LogicalError {
+                    message: format!(
+                        "Node '{}' for wallet '{}' not found",
+                        wallet.node_name, wallet.wallet_name
+                    ),
+                })?;
+        let client = node.started_node.client.clone();
+        let balance_response = client.wallet_balance(wallet.public_key()?, None).await;
+
+        return Ok(match balance_response {
+            Ok(balance) if wallet_state_type == WalletOutputState::OnChain => WalletBalance {
+                output_count: balance.notes.len(),
+                value: balance.balance,
+            },
+            Ok(_) | Err(_) => WalletBalance::default(),
+        });
+    }
+
     current_wallet_state_for_wallet(world, wallet)
         .await
         .map(|observation| observation.balance(wallet_state_type))

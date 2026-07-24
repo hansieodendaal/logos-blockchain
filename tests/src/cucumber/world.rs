@@ -1205,7 +1205,13 @@ pub enum WalletType {
     /// User defined wallets with are not tied to a specific node
     User { wallet_account: WalletAccount },
     /// Funding wallets are tied to a node and participate in consensus
-    Funding { wallet_pk: String },
+    Funding {
+        wallet_pk: String,
+        known_keys: Vec<String>,
+    },
+    /// A public key known by a node wallet, but not tracked by the scenario
+    /// wallet scanner.
+    KnownKey { wallet_pk: String },
 }
 
 /// Information about a wallet resource created in the world, which can be used
@@ -1221,13 +1227,22 @@ pub struct WalletInfo {
     pub wallet_type: WalletType,
 }
 
+/// A recipient accepted by transaction steps, with a display label for logs.
+#[derive(Clone, Debug)]
+pub struct WalletRecipient {
+    pub label: String,
+    pub public_key: ZkPublicKey,
+}
+
 impl WalletInfo {
     /// Helper to get the wallet's public key as `String` type (default hex).
     #[must_use]
     pub fn public_key_hex(&self) -> String {
         match &self.wallet_type {
             WalletType::User { wallet_account, .. } => wallet_account.public_key_hex(),
-            WalletType::Funding { wallet_pk } => wallet_pk.clone(),
+            WalletType::Funding { wallet_pk, .. } | WalletType::KnownKey { wallet_pk } => {
+                wallet_pk.clone()
+            }
         }
     }
 
@@ -1235,7 +1250,7 @@ impl WalletInfo {
     pub fn public_key(&self) -> Result<ZkPublicKey, StepError> {
         match &self.wallet_type {
             WalletType::User { wallet_account, .. } => Ok(wallet_account.public_key()),
-            WalletType::Funding { wallet_pk } => {
+            WalletType::Funding { wallet_pk, .. } | WalletType::KnownKey { wallet_pk } => {
                 Ok(ZkPublicKey::from_bytes(&hex::decode(wallet_pk)?)?)
             }
         }
@@ -1251,6 +1266,19 @@ impl WalletInfo {
     #[must_use]
     pub const fn is_funding_wallet(&self) -> bool {
         matches!(self.wallet_type, WalletType::Funding { .. })
+    }
+
+    #[must_use]
+    pub const fn is_node_wallet(&self) -> bool {
+        matches!(
+            self.wallet_type,
+            WalletType::Funding { .. } | WalletType::KnownKey { .. }
+        )
+    }
+
+    #[must_use]
+    pub const fn is_known_key_wallet(&self) -> bool {
+        matches!(self.wallet_type, WalletType::KnownKey { .. })
     }
 }
 
@@ -1825,6 +1853,59 @@ impl CucumberWorld {
             .filter(|w| matches!(w.wallet_type, WalletType::Funding { .. }))
             .cloned()
             .collect::<Vec<_>>()
+    }
+
+    /// Helper to resolve all node-owned wallet keys, including configured
+    /// known keys that are not part of scanner tracking.
+    pub fn all_node_wallets(&self) -> Vec<WalletInfo> {
+        let mut wallets = self
+            .wallet_info
+            .values()
+            .filter(|w| w.is_node_wallet())
+            .cloned()
+            .collect::<Vec<_>>();
+        wallets.sort_by(|left, right| left.wallet_name.cmp(&right.wallet_name));
+        wallets
+    }
+
+    /// Resolve a scenario wallet name or a bare hexadecimal public key.
+    pub fn resolve_recipient(&self, value: &str) -> Result<WalletRecipient, StepError> {
+        if let Ok(wallet) = self.resolve_wallet(value) {
+            let public_key = wallet.public_key()?;
+            return Ok(WalletRecipient {
+                label: wallet.wallet_name,
+                public_key,
+            });
+        }
+
+        let public_key = ZkPublicKey::from_bytes(&hex::decode(value).map_err(|_| {
+            StepError::InvalidArgument {
+                message: format!(
+                    "Recipient `{value}` must be a scenario wallet name or bare hexadecimal public key"
+                ),
+            }
+        })?)
+        .map_err(|_| StepError::InvalidArgument {
+            message: format!("Recipient `{value}` is not a valid public key"),
+        })?;
+
+        let mut matching_wallets = self
+            .wallet_info
+            .values()
+            .filter(|wallet| wallet.public_key().ok().as_ref() == Some(&public_key))
+            .collect::<Vec<_>>();
+        matching_wallets.sort_by(|left, right| {
+            left.is_known_key_wallet()
+                .cmp(&right.is_known_key_wallet())
+                .then_with(|| left.wallet_name.cmp(&right.wallet_name))
+        });
+
+        Ok(WalletRecipient {
+            label: matching_wallets
+                .first()
+                .map_or_else(|| value.to_owned(), |wallet| wallet.wallet_name.clone()),
+            public_key,
+        })
     }
 
     /// Helper to resolve a wallet name to the actual wallet information.

@@ -383,6 +383,8 @@ async fn catch_up_known_wallet_tracking_after_chain_sync(
     }
 
     let started_at = Instant::now();
+    // The wallet scanner timeout is moderate here because the contract is that the
+    // majority nodes have been synced prior just to this step.
     world
         .wait_for_wallet_scanner_catch_up(Duration::from_secs(30))
         .await?;
@@ -947,7 +949,7 @@ fn add_wallets(
     for (wallet_name, info) in &wallet_info {
         let wallet_type = match info.wallet_type.clone() {
             WalletType::User { .. } => "User",
-            WalletType::Funding { .. } => "Funding",
+            WalletType::Funding { .. } | WalletType::KnownKey { .. } => "Funding",
         };
         info!(target: TARGET, "{wallet_type} wallet `{}/{node_name}` created: {}",
            wallet_name,
@@ -1334,6 +1336,9 @@ fn compile_wallet_in_map(
         );
     }
 
+    let known_keys = crate::cucumber::utils::known_wallet_pks_from_node_yaml(
+        &node_runtime_dir.join(USER_CONFIG_FILE),
+    )?;
     let funding_wallet_name = format!("{node_name}_WALLET");
     wallet_info.insert(
         funding_wallet_name.clone(),
@@ -1344,9 +1349,22 @@ fn compile_wallet_in_map(
                 wallet_pk: funding_wallet_pk_from_node_yaml(
                     &node_runtime_dir.join(USER_CONFIG_FILE),
                 )?,
+                known_keys: known_keys.clone(),
             },
         },
     );
+
+    for (index, wallet_pk) in known_keys.into_iter().enumerate() {
+        let wallet_name = format!("{node_name}_WALLET_KNOWN_KEY_{}", index + 1);
+        wallet_info.insert(
+            wallet_name.clone(),
+            WalletInfo {
+                wallet_name,
+                node_name: node_name.to_owned(),
+                wallet_type: WalletType::KnownKey { wallet_pk },
+            },
+        );
+    }
 
     Ok(wallet_info)
 }

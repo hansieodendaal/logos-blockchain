@@ -78,7 +78,7 @@ async fn submit_inscription_transaction(
 
     match &wallet.wallet_type {
         WalletType::User { .. } => {}
-        WalletType::Funding { .. } => {
+        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
             return Err(StepError::InvalidArgument {
                 message: format!(
                     "Wallet `{wallet_name}` must be a user wallet to submit inscriptions"
