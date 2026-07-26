@@ -44,10 +44,13 @@ pub fn predict_signed_mantle_tx_size(tx: &MantleTx, context: &MantleTxGasContext
             // Ed25519SigProof = Ed25519Signature
             Op::ChannelInscribe(_) => ED25519_SIGNATURE_SIZE,
 
-            // ChannelMultiSigProof — for an existing channel, threshold sigs;
-            // for a new channel (just-in-time created here), no sigs required.
-            // TODO: underpredicts if there is a non-empty proof for a new
-            // channel. Tighten before enabling non-zero storage gas prices.
+            // ChannelMultiSigProof
+            //
+            // For existing channels, the ledger enforces exactly
+            // `configuration_threshold` proofs.
+            //
+            // On the other hand, for new channels, the ledger skips proof verifications.
+            // So, this function predicts the tx size assuming that 0 proofs will be added for this operation.
             Op::ChannelConfig(operation) => {
                 let threshold = context
                     .configuration_threshold(&operation.channel)
