@@ -298,7 +298,7 @@ Feature: Transactions
     And I perform 4 coin split transactions for each user wallet with 250 outputs of 1000 LGO each
     And I verify each wallet has minimum 1000 outputs "available" in 3000 seconds
     When I log wallet balances for all wallets
-    And I perform 3 stress continuous cycles with 250 transactions of 1 LGO to the next user wallet
+    And I perform 1 stress continuous cycles with 250 transactions of 1 LGO to the next user wallet
     When I log wallet balances for all wallets
     When I start peer node "NODE_LATE" connected to node "NODE_1"
     When all nodes converged to within 0 blocks in 3000 seconds

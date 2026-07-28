@@ -7,6 +7,7 @@ use std::{
 use lb_core::mantle::{
     Note, Utxo,
     gas::{GasCost, MainnetGasConstants},
+    ledger::MAX_TRANSACTION_INPUTS,
     transactions::{
         GENESIS_EXECUTION_GAS_PRICE, GasPrices, MantleTxBuilder, MantleTxContext,
         MantleTxGasContext, OpsProofs,
@@ -38,7 +39,7 @@ use crate::{
     },
 };
 
-const DRAIN_MAX_INPUTS_PER_TRANSACTION: usize = u8::MAX as usize;
+const DRAIN_MAX_INPUTS_PER_TRANSACTION: usize = MAX_TRANSACTION_INPUTS;
 const DRAIN_TRANSACTION_TIMEOUT: Duration = Duration::from_mins(3);
 
 // Select the smallest low-value-first tranche that can pay its own fee,

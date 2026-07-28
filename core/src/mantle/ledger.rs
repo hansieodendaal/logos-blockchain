@@ -32,7 +32,7 @@ use crate::{
 // memory usage (e.g., 68GB allocation). As an example, if the network currently
 // limits maximum transaction size to 1MiB, for memory safety limits we can
 // allow 4MiB.
-const MAX_TRANSACTION_INPUTS: usize = u8::MAX as usize;
+pub const MAX_TRANSACTION_INPUTS: usize = u8::MAX as usize;
 const MAX_TRANSACTION_OUTPUTS: usize = u8::MAX as usize;
 pub type BoundedUtxos = UpperBoundedVec<Utxo, MAX_TRANSACTION_INPUTS>;
 pub type BoundedInputs = UpperBoundedVec<NoteId, MAX_TRANSACTION_INPUTS>;
