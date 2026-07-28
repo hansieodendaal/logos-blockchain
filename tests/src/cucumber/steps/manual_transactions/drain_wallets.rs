@@ -480,7 +480,7 @@ fn finalize_fee(builder: &MantleTxBuilder) -> Result<u64, StepError> {
         ..MantleTxContext::default()
     };
     builder
-        .gas_cost::<MainnetGasConstants>(&context)
+        .minimum_gas_cost::<MainnetGasConstants>(&context)
         .map(GasCost::into_inner)
         .map_err(|error| StepError::LogicalError {
             message: error.to_string(),
