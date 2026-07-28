@@ -1344,7 +1344,7 @@ mod tests {
         assert_eq!(
             794,
             funded_tx_builder
-                .gas_cost::<Gas>(&context)
+                .minimum_gas_cost::<Gas>(&context)
                 .unwrap()
                 .into_inner()
         );
@@ -1400,7 +1400,7 @@ mod tests {
 
         // The tip is left as excess balance above the mandatory fee.
         let gas_cost = funded_tx_builder
-            .gas_cost::<Gas>(&context)
+            .minimum_gas_cost::<Gas>(&context)
             .unwrap()
             .into_inner();
         assert_eq!(
@@ -1643,7 +1643,7 @@ mod tests {
                 .clone()
                 .add_ledger_input(Utxo::new(tx_hash(0), 0, Note::new(0, pk(0))))
                 .unwrap()
-                .gas_cost::<Gas>(&context)
+                .minimum_gas_cost::<Gas>(&context)
                 .unwrap()
                 .into_inner()
         );
@@ -1682,7 +1682,7 @@ mod tests {
                 .unwrap()
                 .with_dummy_change_note()
                 .unwrap()
-                .gas_cost::<Gas>(&context)
+                .minimum_gas_cost::<Gas>(&context)
                 .unwrap()
                 .into_inner()
         );
