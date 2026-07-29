@@ -3,9 +3,10 @@ use std::time::Duration;
 use lb_common_http_client::Slot;
 use lb_core::{
     crypto::Hash,
+    events::DepositRecreatedNotes,
     header::HeaderId,
     mantle::{
-        NoteId, SignedMantleTx, Value,
+        SignedMantleTx, Value,
         channel::ChannelState,
         gas::GasCost,
         ledger::{Inputs, Outputs},
@@ -135,6 +136,14 @@ pub struct FundingConfig {
     pub funding_pk: ZkPublicKey,
     /// Hard cap on the fee of a single transaction.
     pub max_tx_fee: GasCost,
+    /// Execution tip paid on top of the mandatory fee when funding a
+    /// transaction. [`Self::max_tx_fee`] caps the total.
+    pub priority_fee: Value,
+}
+
+impl FundingConfig {
+    /// Default execution tip.
+    pub const DEFAULT_PRIORITY_FEE: Value = 200;
 }
 
 /// Configuration for the zone sequencer.
@@ -432,7 +441,7 @@ pub struct DepositInfo {
     /// The channel notes the deposit re-created its inputs as, sourced from
     /// the block's events. These carry new `NoteId`s and are what the channel
     /// now owns.
-    pub notes: Vec<NoteId>,
+    pub notes: DepositRecreatedNotes,
     /// Total value deposited, sourced from the block's events.
     pub amount: Value,
     /// Opaque metadata associated with this deposit.

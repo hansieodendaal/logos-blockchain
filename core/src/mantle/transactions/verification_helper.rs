@@ -98,7 +98,7 @@ pub mod test_utils {
                 keys: keys.into_iter().collect(),
                 locked_notes: LockedNotes::new(),
                 utxos: Utxos::new(),
-                declarations: Declarations::new_sync(),
+                declarations: Declarations::new(),
                 min_stake: MinStake {
                     threshold: 0,
                     timestamp: 0,
@@ -171,8 +171,7 @@ pub mod test_utils {
             channel_id: &ChannelId,
         ) -> Result<ChannelKeyIndex, VerificationError> {
             self.channels
-                .channels
-                .get(channel_id)
+                .channel_state(channel_id)
                 .ok_or(VerificationError::ChannelNotFound {
                     channel_id: *channel_id,
                 })
