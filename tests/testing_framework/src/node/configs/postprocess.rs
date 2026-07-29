@@ -5,7 +5,7 @@ use lb_core::{
     mantle::{Note, traits::GenesisTx as _},
     sdp::{Locator, ServiceType},
 };
-use lb_key_management_system_service::keys::{Key, ZkKey};
+use lb_key_management_system_service::keys::ZkKey;
 
 use super::{
     Config,
@@ -29,12 +29,12 @@ pub fn leader_stake_amount(total_wallet_funds: u64, n_participants: usize) -> u6
     scaled.max(100_000)
 }
 
+#[must_use]
 pub fn apply_wallet_genesis_overrides(
-    general_configs: &mut [Config],
+    general_configs: &[Config],
     genesis_block: &GenesisBlock,
     n_blend_core_nodes: usize,
     wallet_accounts: &[(ZkKey, u64)],
-    key_id_for_preload_backend: impl Fn(&Key) -> String,
     test_context: Option<&str>,
 ) -> GenesisBlock {
     if wallet_accounts.is_empty() {
@@ -90,16 +90,5 @@ pub fn apply_wallet_genesis_overrides(
             .expect("wallet account outputs must fit transfer output bounds");
     }
 
-    let genesis_block =
-        create_genesis_block_with_declarations(transfer_op, providers, test_context);
-
-    for general in general_configs.iter_mut() {
-        for (secret_key, _) in wallet_accounts {
-            let key = Key::Zk(secret_key.clone());
-            let key_id = key_id_for_preload_backend(&key);
-            general.kms_config.backend.keys.entry(key_id).or_insert(key);
-        }
-    }
-
-    genesis_block
+    create_genesis_block_with_declarations(transfer_op, providers, test_context)
 }

@@ -114,11 +114,9 @@ async fn step_topup_node_funding_wallet(
     node_name: String,
     transaction_alias: String,
 ) -> StepResult {
-    let funding_wallet = world
-        .resolve_wallet(&format!("{node_name}_WALLET"))
-        .inspect_err(|e| {
-            warn!(target: TARGET, "Step `{}` error: {e}", step.value);
-        })?;
+    let funding_wallet = world.sdp_funding_wallet(&node_name).inspect_err(|e| {
+        warn!(target: TARGET, "Step `{}` error: {e}", step.value);
+    })?;
     let funding_pk = funding_wallet.public_key().inspect_err(|e| {
         warn!(target: TARGET, "Step `{}` error: {e}", step.value);
     })?;
@@ -160,7 +158,8 @@ async fn step_topup_node_funding_wallet(
     info!(
         target: TARGET,
         "Submitted funding wallet top-up `{transaction_alias}`: {note_count} notes of \
-        {note_value} LGO from `{wallet_name}` to `{node_name}_WALLET`",
+        {note_value} LGO from `{wallet_name}` to `{}`",
+        funding_wallet.wallet_name,
     );
 
     Ok(())
@@ -431,9 +430,7 @@ async fn step_drain_wallet(
         WalletType::User { .. } => {
             drain_user_wallet(world, &step.value, &sender, receiver_pk).await
         }
-        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
-            drain_node_wallet(world, &sender, receiver_pk).await
-        }
+        WalletType::Funding { .. } => drain_node_wallet(world, &sender, receiver_pk).await,
     }
 }
 

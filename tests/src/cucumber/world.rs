@@ -1199,19 +1199,19 @@ pub struct GenesisTokens {
     pub token_amount: u64,
 }
 
-/// The wallet type can either be ussr defined or funding.
+/// A scenario wallet is either user-owned or backed by a node wallet key.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum WalletType {
-    /// User defined wallets with are not tied to a specific node
+    /// User-defined wallets are signed and tracked by the Cucumber harness.
     User { wallet_account: WalletAccount },
-    /// Funding wallets are tied to a node and participate in consensus
+    /// Funding wallets are keys owned by a node and served by its wallet API.
     Funding {
         wallet_pk: String,
-        known_keys: Vec<String>,
+        known_key_ids: Vec<String>,
+        is_sdp_funding: bool,
+        sdp_declaration_id: Option<String>,
+        is_voucher_master: bool,
     },
-    /// A public key known by a node wallet, but not tracked by the scenario
-    /// wallet scanner.
-    KnownKey { wallet_pk: String },
 }
 
 /// Information about a wallet resource created in the world, which can be used
@@ -1240,9 +1240,7 @@ impl WalletInfo {
     pub fn public_key_hex(&self) -> String {
         match &self.wallet_type {
             WalletType::User { wallet_account, .. } => wallet_account.public_key_hex(),
-            WalletType::Funding { wallet_pk, .. } | WalletType::KnownKey { wallet_pk } => {
-                wallet_pk.clone()
-            }
+            WalletType::Funding { wallet_pk, .. } => wallet_pk.clone(),
         }
     }
 
@@ -1250,7 +1248,7 @@ impl WalletInfo {
     pub fn public_key(&self) -> Result<ZkPublicKey, StepError> {
         match &self.wallet_type {
             WalletType::User { wallet_account, .. } => Ok(wallet_account.public_key()),
-            WalletType::Funding { wallet_pk, .. } | WalletType::KnownKey { wallet_pk } => {
+            WalletType::Funding { wallet_pk, .. } => {
                 Ok(ZkPublicKey::from_bytes(&hex::decode(wallet_pk)?)?)
             }
         }
@@ -1269,16 +1267,25 @@ impl WalletInfo {
     }
 
     #[must_use]
-    pub const fn is_node_wallet(&self) -> bool {
+    pub const fn is_sdp_funding_wallet(&self) -> bool {
         matches!(
             self.wallet_type,
-            WalletType::Funding { .. } | WalletType::KnownKey { .. }
+            WalletType::Funding {
+                is_sdp_funding: true,
+                ..
+            }
         )
     }
 
     #[must_use]
-    pub const fn is_known_key_wallet(&self) -> bool {
-        matches!(self.wallet_type, WalletType::KnownKey { .. })
+    pub const fn is_voucher_master_wallet(&self) -> bool {
+        matches!(
+            self.wallet_type,
+            WalletType::Funding {
+                is_voucher_master: true,
+                ..
+            }
+        )
     }
 }
 
@@ -1496,7 +1503,11 @@ impl CucumberWorld {
         let mut wallets_by_source_and_key: HashMap<String, HashMap<ZkPublicKey, Vec<String>>> =
             HashMap::new();
 
-        for wallet in self.wallet_info.values() {
+        for wallet in self
+            .wallet_info
+            .values()
+            .filter(|wallet| wallet.is_user_wallet())
+        {
             wallets_by_source_and_key
                 .entry(wallet.node_name.clone())
                 .or_default()
@@ -1848,24 +1859,39 @@ impl CucumberWorld {
     /// Helper to resolve all funding wallet names to the actual wallet
     /// information.
     pub fn all_funding_wallets(&self) -> Vec<WalletInfo> {
-        self.wallet_info
-            .values()
-            .filter(|w| matches!(w.wallet_type, WalletType::Funding { .. }))
-            .cloned()
-            .collect::<Vec<_>>()
-    }
-
-    /// Helper to resolve all node-owned wallet keys, including configured
-    /// known keys that are not part of scanner tracking.
-    pub fn all_node_wallets(&self) -> Vec<WalletInfo> {
         let mut wallets = self
             .wallet_info
             .values()
-            .filter(|w| w.is_node_wallet())
+            .filter(|w| matches!(w.wallet_type, WalletType::Funding { .. }))
             .cloned()
             .collect::<Vec<_>>();
         wallets.sort_by(|left, right| left.wallet_name.cmp(&right.wallet_name));
         wallets
+    }
+
+    /// Helper to resolve all node-owned wallet keys.
+    pub fn all_node_wallets(&self) -> Vec<WalletInfo> {
+        self.all_funding_wallets()
+    }
+
+    /// Resolve the node key configured to fund SDP transactions.
+    pub fn sdp_funding_wallet(&self, node_name: &str) -> Result<WalletInfo, StepError> {
+        let mut wallets = self
+            .wallet_info
+            .values()
+            .filter(|wallet| wallet.node_name == node_name && wallet.is_sdp_funding_wallet())
+            .cloned()
+            .collect::<Vec<_>>();
+        wallets.sort_by(|left, right| left.wallet_name.cmp(&right.wallet_name));
+        match wallets.as_slice() {
+            [wallet] => Ok(wallet.clone()),
+            [] => Err(StepError::LogicalError {
+                message: format!("Node `{node_name}` has no SDP funding wallet"),
+            }),
+            _ => Err(StepError::LogicalError {
+                message: format!("Node `{node_name}` has multiple SDP funding wallets"),
+            }),
+        }
     }
 
     /// Resolve a scenario wallet name or a bare hexadecimal public key.
@@ -1895,8 +1921,8 @@ impl CucumberWorld {
             .filter(|wallet| wallet.public_key().ok().as_ref() == Some(&public_key))
             .collect::<Vec<_>>();
         matching_wallets.sort_by(|left, right| {
-            left.is_known_key_wallet()
-                .cmp(&right.is_known_key_wallet())
+            left.is_funding_wallet()
+                .cmp(&right.is_funding_wallet())
                 .then_with(|| left.wallet_name.cmp(&right.wallet_name))
         });
 

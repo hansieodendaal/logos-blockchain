@@ -556,12 +556,12 @@ mod tests {
     }
 
     fn assert_drain_command() {
-        let command = parse_ok("DRAIN, from 'WALLET_1A', to 'NODE_1_WALLET_KNOWN_KEY_3'");
+        let command = parse_ok("DRAIN, from 'WALLET_1A', to 'NODE_1_WALLET_KNOWN_KEY_SDP_FUNDING'");
 
         assert!(matches!(
             command,
             ManualCommand::Drain { from, to }
-                if from == "WALLET_1A" && to == "NODE_1_WALLET_KNOWN_KEY_3"
+                if from == "WALLET_1A" && to == "NODE_1_WALLET_KNOWN_KEY_SDP_FUNDING"
         ));
     }
 

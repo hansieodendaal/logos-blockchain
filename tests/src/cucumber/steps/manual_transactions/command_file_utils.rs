@@ -552,9 +552,7 @@ async fn execute_drain(world: &mut CucumberWorld, step: &str, from: &str, to: &s
 
     match sender.wallet_type {
         WalletType::User { .. } => drain_user_wallet(world, step, &sender, receiver_pk).await,
-        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
-            drain_node_wallet(world, &sender, receiver_pk).await
-        }
+        WalletType::Funding { .. } => drain_node_wallet(world, &sender, receiver_pk).await,
     }
 }
 
@@ -565,7 +563,7 @@ pub async fn log_wallet_balances(
 ) -> StepResult {
     let tracked_wallets = wallets
         .iter()
-        .filter(|wallet| !wallet.is_known_key_wallet())
+        .filter(|wallet| wallet.is_user_wallet())
         .cloned()
         .collect::<Vec<_>>();
     let states = if tracked_wallets.is_empty() {
@@ -575,7 +573,7 @@ pub async fn log_wallet_balances(
     };
 
     for wallet in &wallets {
-        if wallet.is_known_key_wallet() {
+        if wallet.is_funding_wallet() {
             log_node_wallet_balance(world, wallet).await?;
             continue;
         }

@@ -355,7 +355,7 @@ pub async fn submit_node_wallet_transfer(
     change_public_key: ZkPublicKey,
 ) -> Result<TxHash, StepError> {
     let wallet = world.resolve_wallet(sender_wallet_name)?;
-    if !wallet.is_node_wallet() {
+    if !wallet.is_funding_wallet() {
         return Err(StepError::InvalidArgument {
             message: format!("Wallet `{sender_wallet_name}` must be a node wallet"),
         });
@@ -409,7 +409,7 @@ pub async fn create_and_submit_transaction_hashes_with_utxo_cache(
             }
             vec![tx_hash]
         }
-        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
+        WalletType::Funding { .. } => {
             let mut tx_hashes = Vec::with_capacity(receivers.len());
             for (receiver_pk, value) in receivers {
                 let body = WalletTransferFundsRequestBody {
@@ -662,7 +662,7 @@ async fn reserve_user_wallet_transaction_submission(
 
     let wallet_account = match &wallet.wallet_type {
         WalletType::User { wallet_account } => wallet_account,
-        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
+        WalletType::Funding { .. } => {
             return Err(StepError::InvalidArgument {
                 message: format!(
                     "Wallet `{sender_wallet_name}` must be a user wallet for this step"

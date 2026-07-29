@@ -46,17 +46,6 @@ pub async fn current_available_utxos_for_user_wallets(
     current_available_utxos_for_wallet_keys_with_requirements(world, &wallet_keys).await
 }
 
-/// Return currently available UTXOs for funding wallets.
-///
-/// Funding wallets use the same tracked-wallet state as user wallets, but are
-/// selected from the funding-wallet namespace.
-pub async fn current_available_utxos_for_funding_wallets(
-    world: &mut CucumberWorld,
-    step: &str,
-) -> Result<WalletUtxos, StepError> {
-    current_available_utxos_for_named_wallets(world, step, world.all_funding_wallets()).await
-}
-
 /// Return currently available UTXOs for one named wallet.
 pub async fn current_available_utxos_for_wallet(
     world: &mut CucumberWorld,
@@ -75,7 +64,7 @@ pub async fn current_wallet_output_balance(
     wallet: &WalletInfo,
     wallet_state_type: WalletOutputState,
 ) -> Result<WalletBalance, StepError> {
-    if wallet.is_node_wallet() {
+    if wallet.is_funding_wallet() {
         let node =
             world
                 .nodes_info
@@ -136,16 +125,6 @@ pub async fn current_wallet_available_state(
 ) -> Result<WalletStateView, StepError> {
     let wallet = world.resolve_wallet(wallet_name)?;
     current_wallet_state_for_wallet(world, &wallet).await
-}
-
-async fn current_available_utxos_for_named_wallets(
-    world: &mut CucumberWorld,
-    step: &str,
-    wallets: Vec<WalletInfo>,
-) -> Result<WalletUtxos, StepError> {
-    let wallet_keys = build_tracked_wallet_keys(world, step, &wallets)?;
-
-    current_available_utxos_for_wallet_keys_with_requirements(world, &wallet_keys).await
 }
 
 async fn current_available_utxos_for_wallet_keys_with_requirements(

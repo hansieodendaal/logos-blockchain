@@ -20,7 +20,6 @@ pub use block_feed::{
     block_feed_sources, named_block_feed_sources,
 };
 use common_http_client::BasicAuthCredentials;
-use lb_config::kms::key_id_for_preload_backend;
 use lb_core::block::genesis::GenesisBlock;
 use lb_node::config::RunConfig;
 use reqwest::Url;
@@ -161,7 +160,7 @@ pub fn apply_wallet_config_to_deployment(deployment: &mut DeploymentPlan, wallet
         .map(|account| (account.secret_key.clone(), account.value))
         .collect::<Vec<_>>();
 
-    let mut node_configs = deployment
+    let node_configs = deployment
         .plans
         .iter()
         .map(|plan| plan.general.clone())
@@ -172,18 +171,13 @@ pub fn apply_wallet_config_to_deployment(deployment: &mut DeploymentPlan, wallet
     };
 
     let genesis_block = postprocess::apply_wallet_genesis_overrides(
-        &mut node_configs,
+        &node_configs,
         &genesis_block,
         deployment.config.blend_core_nodes,
         &wallet_accounts,
-        key_id_for_preload_backend,
         deployment.config.test_context.as_deref(),
     );
     deployment.config.genesis_block = Some(genesis_block);
-
-    for (plan, node_config) in deployment.plans.iter_mut().zip(node_configs) {
-        plan.general = node_config;
-    }
 }
 
 pub trait ScenarioBuilderExt: Sized {

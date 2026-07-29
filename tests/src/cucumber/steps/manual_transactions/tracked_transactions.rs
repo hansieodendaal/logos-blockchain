@@ -69,7 +69,7 @@ pub async fn submit_funded_transfer_transaction(
 
     match &sender_wallet.wallet_type {
         WalletType::User { .. } => {}
-        WalletType::Funding { .. } | WalletType::KnownKey { .. } => {
+        WalletType::Funding { .. } => {
             return Err(StepError::InvalidArgument {
                 message: format!(
                     "Wallet `{sender_wallet_name}` must be a user wallet to submit funded transfers"

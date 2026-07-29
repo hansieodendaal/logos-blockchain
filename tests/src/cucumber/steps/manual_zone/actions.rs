@@ -776,7 +776,7 @@ async fn start_named_sequencer_with_config(
     let funding = world
         .zone
         .sequencer_node_name(&sequencer_alias)
-        .and_then(|node_name| world.resolve_wallet(&format!("{node_name}_WALLET")))
+        .and_then(|node_name| world.sdp_funding_wallet(node_name))
         .and_then(|wallet| wallet.public_key())
         .map(|funding_pk| FundingConfig {
             funding_pk,
