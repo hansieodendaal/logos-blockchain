@@ -226,16 +226,16 @@ pub fn start_sequencer_event_loop(
     }
 }
 
-/// Drives a competing-sequencer policy that publishes `planned` once ready and
-/// re-publishes its own orphans (tracked by intent lineage) until they land —
-/// correct even when payloads repeat.
+/// Drives a competing-sequencer policy that publishes `planned` once ready,
+/// retries transient publish failures, and re-publishes its own orphans
+/// (tracked by intent lineage) until they land — correct even when payloads
+/// repeat.
 pub fn start_republish_lineage_policy(
     sequencer: ZoneSequencer<ZoneNodeHttpClient>,
     planned: Vec<Inscription>,
 ) -> PolicyRuntime {
     let policy = RepublishLineagePolicy {
-        planned,
-        published_initial: false,
+        pending_initial: VecDeque::from(planned),
         lineage: LineageTracker::default(),
     };
     to_policy_runtime(runner::spawn(sequencer, policy))
@@ -410,9 +410,33 @@ impl LineageTracker {
 /// publishes is what gives the policy its outbox: every `this_msg` it sends is
 /// recorded.
 struct RepublishLineagePolicy {
-    planned: Vec<Inscription>,
-    published_initial: bool,
+    pending_initial: VecDeque<Inscription>,
     lineage: LineageTracker,
+}
+
+impl RepublishLineagePolicy {
+    async fn publish_pending<Node>(&mut self, sequencer: &mut ZoneSequencer<Node>)
+    where
+        Node: lb_zone_sdk::adapter::Node + Clone + Send + Sync + 'static,
+    {
+        while let Some(payload) = self.pending_initial.front().cloned() {
+            match sequencer.handle().publish(payload).await {
+                Ok((result, _checkpoint)) => {
+                    self.pending_initial.pop_front();
+                    self.lineage
+                        .record_publish(result.tx.inscription().this_msg);
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        remaining = self.pending_initial.len(),
+                        "Failed to publish planned zone payload; will retry on the next event"
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl<Node> runner::Policy<Node> for RepublishLineagePolicy
@@ -421,17 +445,8 @@ where
 {
     async fn on_event(&mut self, sequencer: &mut ZoneSequencer<Node>, event: &Event) {
         match event {
-            Event::Ready if !self.published_initial => {
-                self.published_initial = true;
-                for payload in self.planned.clone() {
-                    match sequencer.handle().publish(payload).await {
-                        Ok((result, _checkpoint)) => {
-                            self.lineage
-                                .record_publish(result.tx.inscription().this_msg);
-                        }
-                        Err(error) => warn!(%error, "Failed to publish planned zone payload"),
-                    }
-                }
+            Event::Ready => {
+                self.publish_pending(sequencer).await;
             }
             Event::BlocksProcessed {
                 channel_update,
@@ -458,6 +473,7 @@ where
                         Err(error) => warn!(%error, "Failed to re-publish orphaned zone payload"),
                     }
                 }
+                self.publish_pending(sequencer).await;
             }
             _ => {}
         }
