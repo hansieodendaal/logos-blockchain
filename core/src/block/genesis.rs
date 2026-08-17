@@ -11,7 +11,7 @@ use crate::{
     header::Header,
     mantle::{
         Note, Op, OpProof, SignedMantleTx,
-        ledger::{BoundedOutputs, Inputs, Outputs},
+        ledger::{BoundedOutputs, Inputs, MAX_TRANSACTION_OUTPUTS, Outputs},
         ops::{channel::inscribe::InscriptionOp, sdp::SDPDeclareOp, transfer::TransferOp},
         transactions::{
             GenesisTx, MAX_OPS_PER_TX, Ops, OpsProofs, VerificationError, genesis_tx,
@@ -192,6 +192,8 @@ impl core::ops::Deref for GenesisBlock {
 const GENESIS_REQUIRED_OPS: usize = 2;
 
 pub const MAX_GENESIS_DECLARATIONS: usize = MAX_OPS_PER_TX - GENESIS_REQUIRED_OPS; // 253
+/// Maximum number of transfer outputs allowed in a genesis transaction.
+pub const MAX_GENESIS_TRANSFER_OUTPUTS: usize = MAX_TRANSACTION_OUTPUTS;
 pub type GenesisSDPDeclareOps = UpperBoundedVec<SDPDeclareOp, MAX_GENESIS_DECLARATIONS>;
 
 /// Typestate marker: builder has no input yet.
