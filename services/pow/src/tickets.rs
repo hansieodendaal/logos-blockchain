@@ -8,7 +8,7 @@
 use std::{
     collections::{HashMap, HashSet},
     iter,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -21,7 +21,7 @@ use lb_chain_service::{
 use lb_core::{
     crypto::ZkHash,
     header::HeaderId,
-    mantle::ops::pow::{ClaimPowRewardOp, PowTarget, SLOT_WINDOW},
+    mantle::ops::pow::{ClaimPowRewardOp, PowTarget},
 };
 use lb_key_management_system_keys::keys::UnsecuredZkKey;
 use lb_ledger::LedgerState;
@@ -92,6 +92,9 @@ pub struct TicketGenerator {
     /// Maximum number of ticket-search attempts kept in flight concurrently for
     /// each block (the `buffer_unordered` degree of every per-block search).
     max_tickets_per_block: NonZeroUsize,
+    /// Acceptance window, in slots: a block older than this leaves the reward
+    /// window and its search is pruned. Matches the consensus `slot_window`.
+    slot_window: NonZeroU64,
 }
 
 impl TicketGenerator {
@@ -109,6 +112,7 @@ impl TicketGenerator {
         cryptarchia_api: CryptarchiaServiceApi<CryptarchiaServiceData, RuntimeServiceId>,
         pool: Arc<ThreadPool>,
         max_tickets_per_block: NonZeroUsize,
+        slot_window: NonZeroU64,
     ) -> Result<Self, lb_chain_service::api::ApiError>
     where
         CryptarchiaServiceData:
@@ -130,6 +134,7 @@ impl TicketGenerator {
             tip: HeaderId::from([0u8; 32]),
             pool,
             max_tickets_per_block,
+            slot_window,
         })
     }
 }
@@ -300,7 +305,7 @@ impl Stream for TicketGenerator {
                 ))) => {
                     this.tip = tip;
                     // compute which slot is old enough
-                    let frontier_slot = tip_slot.saturating_sub(Slot::new(SLOT_WINDOW));
+                    let frontier_slot = tip_slot.saturating_sub(Slot::new(this.slot_window.get()));
                     // trigger new stream if its new enough
                     if frontier_slot < block_slot {
                         let stream = new_block_search_stream(
@@ -345,7 +350,7 @@ impl Stream for TicketGenerator {
 mod tests {
     use std::{
         collections::{HashMap, HashSet},
-        num::NonZeroUsize,
+        num::{NonZeroU64, NonZeroUsize},
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
@@ -364,6 +369,8 @@ mod tests {
         TicketGenerator, WinnerTicketStream, WinningTicket, prune_out_of_window_streams,
         search_winner_ticket,
     };
+
+    const SLOT_WINDOW: NonZeroU64 = NonZeroU64::new(100).expect("100 is not 0");
 
     /// A never-resolving search stream, used to populate the map under test.
     fn pending_stream() -> WinnerTicketStream {
@@ -521,6 +528,7 @@ mod tests {
             tip: HeaderId::from([0u8; 32]),
             pool: test_pool(),
             max_tickets_per_block: NonZeroUsize::new(4).unwrap(),
+            slot_window: SLOT_WINDOW,
         };
         assert!(matches!(poll_once(&mut generator), Poll::Ready(None)));
     }
@@ -541,6 +549,7 @@ mod tests {
             tip: HeaderId::from([0u8; 32]),
             pool: test_pool(),
             max_tickets_per_block: NonZeroUsize::new(4).unwrap(),
+            slot_window: SLOT_WINDOW,
         };
         assert!(matches!(poll_once(&mut generator), Poll::Ready(None)));
     }
@@ -556,6 +565,7 @@ mod tests {
             tip: HeaderId::from([0u8; 32]),
             pool: test_pool(),
             max_tickets_per_block: NonZeroUsize::new(16).unwrap(),
+            slot_window: SLOT_WINDOW,
         };
         assert!(matches!(poll_once(&mut generator), Poll::Pending));
     }
@@ -578,6 +588,7 @@ mod tests {
             tip,
             pool: test_pool(),
             max_tickets_per_block: NonZeroUsize::new(16).unwrap(),
+            slot_window: SLOT_WINDOW,
         };
 
         let Poll::Ready(Some(winner)) = poll_once(&mut generator) else {
@@ -602,6 +613,7 @@ mod tests {
             tip: HeaderId::from([0u8; 32]),
             pool: test_pool(),
             max_tickets_per_block: NonZeroUsize::new(4).unwrap(),
+            slot_window: SLOT_WINDOW,
         };
 
         // A winner already produced is emitted first...
