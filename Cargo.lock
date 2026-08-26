@@ -4765,6 +4765,7 @@ name = "logos-blockchain-ledger"
 version = "0.0.0"
 dependencies = [
  "derivative",
+ "divan",
  "logos-blockchain-blend-crypto",
  "logos-blockchain-blend-message",
  "logos-blockchain-blend-proofs",
@@ -4776,6 +4777,7 @@ dependencies = [
  "logos-blockchain-pol",
  "logos-blockchain-utils",
  "logos-blockchain-utxotree",
+ "logos-blockchain-zksign",
  "num-bigint",
  "rand 0.8.6",
  "rpds",
