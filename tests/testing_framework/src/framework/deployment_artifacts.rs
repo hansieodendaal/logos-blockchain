@@ -15,7 +15,7 @@ use crate::{
     node::{
         NodePlan,
         configs::{
-            default_e2e_deployment_settings,
+            deployment_settings_for_topology,
             node_configs::consensus::{ProviderInfo, create_genesis_block_with_declarations},
         },
     },
@@ -100,7 +100,10 @@ fn deployment_settings(
         topology.config.test_context.as_deref(),
     );
 
-    Ok(default_e2e_deployment_settings(&genesis_block))
+    Ok(deployment_settings_for_topology(
+        &genesis_block,
+        topology.config(),
+    ))
 }
 
 fn collect_runtime_blend_providers(

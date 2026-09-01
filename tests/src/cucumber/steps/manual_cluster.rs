@@ -47,6 +47,7 @@ pub fn build_manual_cluster_deployment(
         .with_allow_multiple_genesis_tokens(true)
         .with_allow_zero_value_genesis_tokens(true)
         .with_test_context(world.test_context.clone())
+        .with_sdp_funding_config(world.sdp_funding_config)
         .with_node_binary_profile(if world.tokio_console_profile_enabled() {
             NodeBinaryProfile::TokioConsole
         } else {
@@ -142,6 +143,7 @@ fn build_devnet_manual_cluster_deployment(
         .with_allow_multiple_genesis_tokens(true)
         .with_allow_zero_value_genesis_tokens(true)
         .with_test_context(world.test_context.clone())
+        .with_sdp_funding_config(world.sdp_funding_config)
         .with_node_binary_profile(if world.tokio_console_profile_enabled() {
             NodeBinaryProfile::TokioConsole
         } else {

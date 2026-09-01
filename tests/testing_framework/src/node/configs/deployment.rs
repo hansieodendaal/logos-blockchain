@@ -1,8 +1,12 @@
-use std::{collections::HashMap, error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, error::Error, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration,
+};
 
+pub use lb_config::consensus::SdpFundingConfig;
 use lb_config::kms::key_id_for_preload_backend;
 use lb_core::block::genesis::GenesisBlock;
 use lb_node::config::RunConfig;
+use lb_utils::math::NonNegativeRatio;
 use rand::{Rng, SeedableRng as _};
 use testing_framework_core::topology::{DeploymentProvider, DeploymentSeed, DynTopologyError};
 use thiserror::Error;
@@ -16,13 +20,18 @@ use crate::{
     get_reserved_available_udp_port,
     node::{
         DeploymentPlan, NodePlan,
-        configs::{Config, create_node_configs_from_ids, postprocess},
+        configs::{
+            Config,
+            create_general_configs_from_ids_with_additional_wallet_outputs_and_sdp_funding_config,
+            postprocess,
+        },
     },
 };
 
 pub type DynError = Box<dyn Error + Send + Sync + 'static>;
 const DEFAULT_SLOT_TIME_IN_SECS: u64 = 1;
-const DEFAULT_ACTIVE_SLOT_COEFF: f64 = 1.0;
+const DEFAULT_ACTIVE_SLOT_COEFF: NonNegativeRatio =
+    NonNegativeRatio::new(1, NonZeroU32::new(10).unwrap());
 const DEFAULT_SECURITY_PARAM: u32 = 10;
 
 #[derive(Debug, Error)]
@@ -77,12 +86,13 @@ impl NodeBinaryProfile {
 pub struct TopologyConfig {
     pub n_nodes: usize,
     pub blend_core_nodes: usize,
+    pub sdp_funding_config: SdpFundingConfig,
     pub network_params: Arc<NetworkParams>,
     pub wallet_config: WalletConfig,
     pub scenario_base_dir: PathBuf,
     pub genesis_block: Option<GenesisBlock>,
     pub slot_duration: Option<Duration>,
-    pub active_slot_coeff: f64,
+    pub active_slot_coeff: NonNegativeRatio,
     pub security_param: u32,
     node_config_overrides: HashMap<usize, RunConfig>,
     allow_multiple_genesis_tokens: bool,
@@ -144,8 +154,21 @@ impl TopologyConfig {
     }
 
     #[must_use]
+    pub const fn with_sdp_funding_config(mut self, config: SdpFundingConfig) -> Self {
+        self.sdp_funding_config = config;
+        self
+    }
+
+    #[must_use]
     pub fn node_config_override(&self, index: usize) -> Option<&RunConfig> {
         self.node_config_overrides.get(&index)
+    }
+
+    pub(crate) const fn apply_deployment_overrides(
+        &self,
+        settings: &mut lb_node::config::DeploymentSettings,
+    ) {
+        settings.cryptarchia.slot_activation_coeff = self.active_slot_coeff;
     }
 }
 
@@ -154,6 +177,7 @@ impl Default for TopologyConfig {
         Self {
             n_nodes: 0,
             blend_core_nodes: 0,
+            sdp_funding_config: SdpFundingConfig::default(),
             network_params: Arc::new(NetworkParams::default()),
             wallet_config: WalletConfig::default(),
             scenario_base_dir: std::env::temp_dir(),
@@ -252,14 +276,6 @@ impl DeploymentBuilder {
         let ids = generate_node_ids(node_count, self.seed.as_ref());
 
         let blend_ports = allocate_blend_ports(node_count)?;
-        let (mut node_configs, genesis_block) = create_node_configs_from_ids(
-            &ids,
-            &blend_ports,
-            self.config.blend_core_nodes,
-            self.config.network_params.as_ref(),
-            self.config.test_context.as_deref(),
-        );
-
         let wallet_accounts = self
             .config
             .wallet_config
@@ -267,6 +283,17 @@ impl DeploymentBuilder {
             .iter()
             .map(|account| (account.secret_key.clone(), account.value))
             .collect::<Vec<_>>();
+
+        let (mut node_configs, genesis_block) =
+            create_general_configs_from_ids_with_additional_wallet_outputs_and_sdp_funding_config(
+                &ids,
+                &blend_ports,
+                self.config.blend_core_nodes,
+                self.config.network_params.as_ref(),
+                self.config.test_context.as_deref(),
+                wallet_accounts.len(),
+                self.config.sdp_funding_config,
+            );
 
         let genesis_block = postprocess::apply_wallet_genesis_overrides(
             &mut node_configs,

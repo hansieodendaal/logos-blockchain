@@ -31,7 +31,10 @@ use lb_libp2p::{Multiaddr, PeerId};
 use lb_node::config::RunConfig;
 use lb_testing_framework::{
     LbcEnv, LbcK8sManualCluster, LbcManualCluster, NodeHttpClient, ScenarioBuilder,
-    ScenarioBuilderExt as _, configs::wallet::WalletAccount, env::set_default_env, workloads,
+    ScenarioBuilderExt as _,
+    configs::{deployment::SdpFundingConfig, wallet::WalletAccount},
+    env::set_default_env,
+    workloads,
 };
 use lb_zone_sdk::{adapter::NodeHttpClient as ZoneNodeHttpClient, indexer::ZoneIndexer};
 use reqwest::Url;
@@ -59,6 +62,7 @@ use crate::{
         error::{StepError, StepResult},
         fee_reserve::{SCENARIO_FEE_ACCOUNT_NAME, ScenarioFeeState},
         steps::{
+            manual_nodes::blend_relay::BlendRelayRegistry,
             manual_zone::runner::{
                 Event, InscriptionId, SequencerCheckpoint, SequencerClient, TxStatusUpdate,
             },
@@ -115,6 +119,24 @@ pub struct ManualNodeConfigOverrides {
 pub enum ManualClusterKind {
     Generated,
     Devnet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlendDiagnosticPhase {
+    Baseline,
+    Outage,
+    Recovery,
+}
+
+impl BlendDiagnosticPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Outage => "outage",
+            Self::Recovery => "recovery",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -858,6 +880,8 @@ pub struct CucumberWorld {
     pub test_context: Option<String>,
     /// Base directory for scenario artifacts like logs and generated configs.
     pub scenario_base_dir: PathBuf,
+    /// Cucumber scenario name used in scenario-local diagnostic artifacts.
+    pub scenario_name: Option<String>,
     /// Automated: Scenario specification
     pub spec: ScenarioSpec,
     /// Automated: Runtime state for the scenario.
@@ -956,6 +980,25 @@ pub struct CucumberWorld {
     pub user_config_overrides: Vec<ConfigOverride>,
     /// Manual: Dynamic deployment-config overrides applied on node startup.
     pub deployment_config_overrides: Vec<ConfigOverride>,
+    /// Manual: Current phase of the Blend/TSI diagnostic scenario.
+    pub blend_diagnostic_phase: Option<BlendDiagnosticPhase>,
+    /// Manual: Number of epoch-observation steps completed by the diagnostic
+    /// scenario.
+    pub blend_diagnostic_observation_count: u32,
+    /// Manual: Nodes that were successfully stopped during the diagnostic
+    /// outage phase.
+    pub blend_diagnostic_stopped_nodes: HashSet<String>,
+    /// Manual: Registry-owned controllable Blend relays keyed by logical node
+    /// name. The registry also owns the opt-in mode state.
+    pub blend_diagnostic_relays: BlendRelayRegistry,
+    /// Manual: Whether this scenario has written its diagnostic timeline
+    /// header.
+    pub blend_diagnostic_timeline_header_written: Mutex<bool>,
+    /// Manual: Nodes whose Blend endpoint is currently blackholed by a test
+    /// relay. These nodes remain running and chain-connected.
+    pub blend_diagnostic_unreachable_nodes: HashSet<String>,
+    /// Manual: SDP funding profile used by generated deployments.
+    pub sdp_funding_config: SdpFundingConfig,
     /// Manual: If set, nodes use a `DeploymentSettings` loaded from disk
     /// bypassing generated genesis/test deployment.
     pub deployment_config_override_path: Option<PathBuf>,
@@ -991,6 +1034,7 @@ pub struct CucumberWorld {
 impl Drop for CucumberWorld {
     fn drop(&mut self) {
         self.zone.clear();
+        self.blend_diagnostic_relays.shutdown();
 
         if let Some(runtime) = self.wallet_scanner_runtime.take() {
             runtime.cancel();
@@ -1055,6 +1099,7 @@ impl Debug for CucumberWorld {
             .field("deployer", &format!("{:?}", self.deployer))
             .field("test_context", &format!("{:?}", self.test_context))
             .field("scenario_base_dir", &self.scenario_base_dir)
+            .field("scenario_name", &self.scenario_name)
             .field("spec", &format!("{:?}", self.spec))
             .field("run", &format!("{:?}", self.run))
             .field("membership_check", &self.membership_check)
@@ -1168,6 +1213,28 @@ impl Debug for CucumberWorld {
                 "deployment_config_overrides",
                 &user_config_overrides_display(&self.deployment_config_overrides),
             )
+            .field("blend_diagnostic_phase", &self.blend_diagnostic_phase)
+            .field(
+                "blend_diagnostic_observation_count",
+                &self.blend_diagnostic_observation_count,
+            )
+            .field(
+                "blend_diagnostic_stopped_nodes",
+                &self.blend_diagnostic_stopped_nodes,
+            )
+            .field(
+                "blend_diagnostic_relays",
+                &self.blend_diagnostic_relays.len().ok(),
+            )
+            .field(
+                "blend_diagnostic_timeline_header_written",
+                &self.blend_diagnostic_timeline_header_written,
+            )
+            .field(
+                "blend_diagnostic_unreachable_nodes",
+                &self.blend_diagnostic_unreachable_nodes,
+            )
+            .field("sdp_funding_config", &self.sdp_funding_config)
             .field(
                 "deployment_config_override_path",
                 &deployment_config_override_path_display(
@@ -1322,6 +1389,11 @@ impl CucumberWorld {
             .set_prolonged_bootstrap_period(period);
     }
 
+    /// Set the SDP funding profile for generated manual-cluster deployments.
+    pub const fn set_sdp_funding_config(&mut self, config: SdpFundingConfig) {
+        self.sdp_funding_config = config;
+    }
+
     /// Get the best known height for the given node, if any. This is based on
     /// the cached height -> hash information stored in the world for each
     /// node.
@@ -1349,6 +1421,11 @@ impl CucumberWorld {
         if let Some(topology) = self.spec.topology.as_mut() {
             topology.scenario_base_dir = log_dir;
         }
+    }
+
+    /// Set the name of the current Cucumber scenario.
+    pub fn set_scenario_name(&mut self, scenario_name: &str) {
+        self.scenario_name = Some(scenario_name.to_owned());
     }
 
     pub fn set_test_context(&mut self, test_context: String) {

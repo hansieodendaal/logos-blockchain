@@ -9,10 +9,7 @@ use std::{
 use async_trait::async_trait;
 use config::{api, sdp, state, storage, wallet};
 use lb_config::kms::key_id_for_preload_backend;
-use lb_core::{
-    block::genesis::GenesisBlock,
-    mantle::{self},
-};
+use lb_core::mantle;
 use lb_key_management_system_service::keys::{Key, secured_key::SecuredKey as _};
 use lb_libp2p::Multiaddr;
 use lb_node::{
@@ -46,7 +43,7 @@ use crate::{
         DeploymentPlan, NodeHttpClient, NodePlan,
         configs::{
             Config, Libp2pNetworkLayout, NetworkParams, create_node_config_for_node,
-            default_e2e_deployment_settings, deployment::TopologyConfig,
+            deployment::TopologyConfig, deployment_settings_for_topology,
         },
     },
 };
@@ -61,7 +58,7 @@ pub const DEPLOYMENT_CONFIG_FILE: &str = "deployment.yaml";
 struct PlannedLocalNodeConfig {
     config: Config,
     descriptor_override: Option<RunConfig>,
-    genesis_block: GenesisBlock,
+    deployment_settings: config::DeploymentSettings,
     port_strategy: PortStrategy,
 }
 
@@ -511,11 +508,14 @@ fn plan_local_node_config(
         return Ok(PlannedLocalNodeConfig {
             config,
             descriptor_override: descriptors.config().node_config_override(index).cloned(),
-            genesis_block: descriptors
-                .config()
-                .genesis_block
-                .clone()
-                .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
+            deployment_settings: deployment_settings_for_topology(
+                descriptors
+                    .config()
+                    .genesis_block
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
+                descriptors.config(),
+            ),
             port_strategy: PortStrategy::PreservePlannedPorts,
         });
     }
@@ -561,11 +561,14 @@ fn plan_local_node_config(
     Ok(PlannedLocalNodeConfig {
         config,
         descriptor_override: descriptors.config().node_config_override(index).cloned(),
-        genesis_block: descriptors
-            .config()
-            .genesis_block
-            .clone()
-            .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
+        deployment_settings: deployment_settings_for_topology(
+            descriptors
+                .config()
+                .genesis_block
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
+            descriptors.config(),
+        ),
         port_strategy: PortStrategy::AllocateEphemeralPorts,
     })
 }
@@ -584,7 +587,8 @@ pub fn build_node_run_config(
         .genesis_block
         .clone()
         .ok_or_else(|| io::Error::other("missing topology genesis tx"))?;
-    Ok(build_run_config(node.general.clone(), &genesis_block))
+    let deployment_settings = deployment_settings_for_topology(&genesis_block, topology.config());
+    Ok(build_run_config(node.general.clone(), &deployment_settings))
 }
 
 fn finalize_dynamic_run_config(
@@ -604,11 +608,10 @@ fn finalize_dynamic_run_config(
         return override_config.clone();
     }
 
-    build_run_config(plan.config.clone(), &plan.genesis_block)
+    build_run_config(plan.config.clone(), &plan.deployment_settings)
 }
 
-fn build_run_config(config: Config, genesis_block: &GenesisBlock) -> RunConfig {
-    let deployment_config = default_e2e_deployment_settings(genesis_block);
+fn build_run_config(config: Config, deployment_config: &config::DeploymentSettings) -> RunConfig {
     let mut tracing = config.tracing_config.tracing_settings;
     tracing.level = Level::INFO;
 
@@ -687,7 +690,7 @@ fn build_run_config(config: Config, genesis_block: &GenesisBlock) -> RunConfig {
     };
 
     RunConfig {
-        deployment: deployment_config,
+        deployment: deployment_config.clone(),
         user: user_config,
     }
 }

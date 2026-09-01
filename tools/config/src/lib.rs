@@ -28,7 +28,7 @@ use tracing::GeneralTracingConfig;
 use crate::{
     api::GeneralApiConfig,
     consensus::{
-        GeneralConsensusConfig, ProviderInfo, SHORT_PROLONGED_BOOTSTRAP_PERIOD,
+        GeneralConsensusConfig, ProviderInfo, SHORT_PROLONGED_BOOTSTRAP_PERIOD, SdpFundingConfig,
         create_genesis_block_with_declarations,
     },
     kms::create_kms_configs,
@@ -111,6 +111,33 @@ pub fn create_general_configs_from_ids(
     prolonged_bootstrap_period: Duration,
     test_context: Option<&str>,
 ) -> (Vec<GeneralConfig>, GenesisBlock) {
+    create_general_configs_from_ids_with_additional_wallet_outputs_and_sdp_funding_config(
+        ids,
+        blend_ports,
+        n_blend_core_nodes,
+        network_params,
+        prolonged_bootstrap_period,
+        test_context,
+        0,
+        SdpFundingConfig::default(),
+    )
+}
+
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Configuration wrapper passes through all deployment inputs"
+)]
+pub fn create_general_configs_from_ids_with_additional_wallet_outputs_and_sdp_funding_config(
+    ids: &[[u8; 32]],
+    blend_ports: &[u16],
+    n_blend_core_nodes: usize,
+    network_params: &NetworkParams,
+    prolonged_bootstrap_period: Duration,
+    test_context: Option<&str>,
+    additional_wallet_outputs: usize,
+    sdp_funding_config: SdpFundingConfig,
+) -> (Vec<GeneralConfig>, GenesisBlock) {
     let n_nodes = ids.len();
 
     assert_eq!(
@@ -127,7 +154,13 @@ pub fn create_general_configs_from_ids(
     );
 
     let (consensus_configs, genesis_block) =
-        consensus::create_consensus_configs(ids, prolonged_bootstrap_period, test_context);
+        consensus::create_consensus_configs_with_additional_wallet_outputs_and_sdp_funding_config(
+            ids,
+            prolonged_bootstrap_period,
+            test_context,
+            additional_wallet_outputs,
+            sdp_funding_config,
+        );
     let network_configs = network::create_network_configs(ids, network_params);
     let api_configs = api::create_api_configs(ids);
     let blend_configs = blend::create_blend_configs(ids, blend_ports);

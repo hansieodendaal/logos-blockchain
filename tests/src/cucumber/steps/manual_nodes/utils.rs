@@ -32,6 +32,7 @@ use crate::cucumber::{
         TARGET,
         manual_nodes::{
             config_override::{apply_deployment_config_overrides, apply_user_config_overrides},
+            diagnostics::{log_blend_relay_event, log_node_lifecycle_marker},
             snapshots::{
                 reset_named_snapshot, restore_node_state_from_snapshot,
                 save_named_node_state_snapshot, validate_snapshot_path_component,
@@ -646,10 +647,14 @@ pub async fn start_node(
     let runtime_dir_prefix = format!("{node_name}_");
     let final_dir_ignore_list = matching_child_dirs(&persist_dir, &runtime_dir_prefix);
     let tokio_console_node = startup_settings.tokio_console_node.clone();
+    let blend_relays = world.blend_diagnostic_relays.clone();
+    let relay_node_name = node_name.to_owned();
+    let relay_preexisting = blend_relays.metadata(node_name)?.is_some();
     let start_options = StartNodeOptions::default()
         .with_peers(startup_settings.peer_selection)
         .with_persist_dir(persist_dir)
         .create_patch(move |mut config: RunConfig| {
+            let declared_blend_address = config.user.blend.core.backend.listening_address.clone();
             prepare_config_patch(
                 &mut config,
                 startup_settings.join_external_network,
@@ -661,17 +666,50 @@ pub async fn start_node(
                 &startup_settings.deployment_config_overrides,
                 startup_settings.tokio_console_node.as_ref(),
             )?;
+            blend_relays.configure_provider(
+                &relay_node_name,
+                &mut config,
+                &declared_blend_address,
+            )?;
             Ok(config)
         });
 
-    let started_node = {
+    let start_result = {
         let cluster = world.local_cluster.as_ref().expect("local cluster checked");
         Box::pin(cluster.start_node_with(node_name, start_options))
             .await
             .inspect_err(|e| {
                 warn!(target: TARGET, "Step `{step}` error: {e}");
-            })?
+            })
     };
+
+    let started_node = match start_result {
+        Ok(started_node) => started_node,
+        Err(error) => {
+            if !relay_preexisting
+                && let Err(cleanup_error) = world.blend_diagnostic_relays.remove_provider(node_name)
+            {
+                warn!(
+                    target: TARGET,
+                    node = node_name,
+                    error = %cleanup_error,
+                    "Failed to remove provisional Blend relay after node-start failure"
+                );
+            }
+            return Err(error.into());
+        }
+    };
+
+    if let Some(metadata) = world.blend_diagnostic_relays.metadata(node_name)? {
+        log_blend_relay_event(
+            world,
+            "blend_relay_configured",
+            node_name,
+            metadata.declared_addr,
+            metadata.backend_addr,
+            "setup",
+        );
+    }
 
     let node_final_dir = extract_child_dir_name(
         &world.scenario_base_dir,
@@ -868,12 +906,16 @@ pub async fn stop_node(world: &CucumberWorld, step: &str, node_name: &str) -> St
             warn!(target: TARGET, "Step `{step}` error: {e}");
         })?;
 
+    log_node_lifecycle_marker(world, "node_stop", node_name, "before").await;
+
     cluster
         .stop_node(&started_node_name)
         .await
         .inspect_err(|e| {
             warn!(target: TARGET, "Step `{step}` error: {e}");
         })?;
+
+    log_node_lifecycle_marker(world, "node_stop", node_name, "after").await;
 
     info!(
         target: TARGET,
@@ -895,12 +937,16 @@ pub async fn restart_node(world: &CucumberWorld, step: &str, node_name: &str) ->
             warn!(target: TARGET, "Step `{step}` error: {e}");
         })?;
 
+    log_node_lifecycle_marker(world, "node_restart", node_name, "before").await;
+
     cluster
         .restart_node(&started_node_name)
         .await
         .inspect_err(|e| {
             warn!(target: TARGET, "Step `{step}` error: {e}");
         })?;
+
+    log_node_lifecycle_marker(world, "node_restart", node_name, "after").await;
     let client = world.resolve_node_http_client(node_name).inspect_err(|e| {
         warn!(target: TARGET, "Step `{step}` error: {e}");
     })?;
