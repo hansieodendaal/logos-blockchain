@@ -1188,6 +1188,17 @@ pub struct CucumberWorld {
     /// assert a wallet's balance strictly increased relative to the recorded
     /// baseline (used by the `PoW` mining test to prove the reward landed).
     pub recorded_wallet_balances: HashMap<String, u64>,
+    /// Manual: Per-node key that mined `PoW` rewards are claimed to, recorded
+    /// when the node's mining wallet is declared. The claim step names it on
+    /// each request, since the node no longer carries a claim address in its
+    /// configuration.
+    pub mining_claim_addresses: HashMap<String, ZkPublicKey>,
+    /// Manual: Per-node `pow.auto_claim` overrides, staged by the auto-claim
+    /// configuration step and applied when that node starts. Auto-claim must be
+    /// configured before the node boots, since it validates its targets against
+    /// the wallet's known keys at startup; the override is per-node because a
+    /// target key a node's wallet does not track aborts that node's startup.
+    pub auto_claim_overrides: HashMap<String, Vec<ConfigOverride>>,
 }
 
 impl Drop for CucumberWorld {
@@ -1330,6 +1341,8 @@ impl Debug for CucumberWorld {
                 "recorded_wallet_balances",
                 &self.recorded_wallet_balances.len(),
             )
+            .field("mining_claim_addresses", &self.mining_claim_addresses.len())
+            .field("auto_claim_overrides", &self.auto_claim_overrides.len())
             .field("submission_outcomes", &self.txs.submission_outcomes.len())
             .field(
                 "prepared_transactions",
