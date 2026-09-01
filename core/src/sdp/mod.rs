@@ -524,6 +524,14 @@ pub enum ActivityMetadata {
 }
 
 impl ActivityMetadata {
+    /// Returns the epoch whose activity is proven by this metadata.
+    #[must_use]
+    pub const fn origin_epoch(&self) -> Epoch {
+        match self {
+            Self::Blend(proof) => proof.epoch,
+        }
+    }
+
     /// The epoch during which this activity must be submitted/accepted.
     #[must_use]
     pub fn submission_epoch(&self) -> Epoch {
