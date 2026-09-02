@@ -26,7 +26,7 @@ use lb_core::{
     },
 };
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
-use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
+use lb_key_management_system_service::keys::{Ed25519Key, Ed25519PublicKey, ZkPublicKey};
 use lb_libp2p::{Multiaddr, PeerId};
 use lb_node::config::RunConfig;
 use lb_testing_framework::{
@@ -63,7 +63,8 @@ use crate::{
         steps::{
             tokio_console::profile::TokioConsoleProfile,
             zone::runner::{
-                Event, InscriptionId, SequencerCheckpoint, SequencerClient, TxStatusUpdate,
+                Event, IndexedSignature, InscriptionId, PreparedChannelConfig, SequencerCheckpoint,
+                SequencerClient, TxStatusUpdate,
             },
         },
         utils::{make_builder, shared_host_bin_path},
@@ -236,6 +237,8 @@ pub struct ZoneState {
     published_order: Vec<String>,
     saved_checkpoints: HashMap<String, SequencerCheckpoint>,
     latest_checkpoints: HashMap<String, SequencerCheckpoint>,
+    prepared_configs: HashMap<String, PreparedChannelConfig>,
+    prepared_config_signatures: HashMap<String, Vec<IndexedSignature>>,
     sequencer_startups: HashMap<String, ZoneSequencerStartup>,
     observed_mempool_pending: HashMap<String, HashSet<InscriptionId>>,
     sorted_total_payloads: Option<usize>,
@@ -309,6 +312,12 @@ impl ZoneState {
             .ok_or(StepError::LogicalError {
                 message: format!("Zone sequencer '{alias}' is not registered"),
             })
+    }
+
+    /// A registered sequencer's public key, without touching its private key.
+    pub fn sequencer_public_key(&self, alias: &str) -> Result<Ed25519PublicKey, StepError> {
+        self.sequencer_signing_key(alias)
+            .map(Ed25519Key::public_key)
     }
 
     pub fn sequencer_channel_id(&self, alias: &str) -> Result<ChannelId, StepError> {
@@ -547,6 +556,33 @@ impl ZoneState {
 
     pub fn remember_checkpoint(&mut self, alias: String, checkpoint: SequencerCheckpoint) {
         self.saved_checkpoints.insert(alias, checkpoint);
+    }
+
+    pub fn remember_prepared_config(&mut self, alias: String, prepared: PreparedChannelConfig) {
+        self.prepared_configs.insert(alias, prepared);
+    }
+
+    pub fn prepared_config(&self, alias: &str) -> Result<&PreparedChannelConfig, StepError> {
+        self.prepared_configs
+            .get(alias)
+            .ok_or(StepError::LogicalError {
+                message: format!("No prepared zone config transaction '{alias}'"),
+            })
+    }
+
+    pub fn add_prepared_config_signature(&mut self, alias: String, signature: IndexedSignature) {
+        self.prepared_config_signatures
+            .entry(alias)
+            .or_default()
+            .push(signature);
+    }
+
+    #[must_use]
+    pub fn prepared_config_signatures(&self, alias: &str) -> Vec<IndexedSignature> {
+        self.prepared_config_signatures
+            .get(alias)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_latest_checkpoint_for(
@@ -816,6 +852,8 @@ impl ZoneState {
         self.published_order.clear();
         self.saved_checkpoints.clear();
         self.latest_checkpoints.clear();
+        self.prepared_configs.clear();
+        self.prepared_config_signatures.clear();
         self.expected_custom_payloads.clear();
     }
 
