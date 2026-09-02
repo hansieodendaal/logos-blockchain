@@ -3,10 +3,11 @@ use super::{
     NodeHttpClient, PolicyRuntime, SEQUENCER_READY_HEIGHT_ADVANCE_TIMEOUT,
     SEQUENCER_READY_POLL_TIMEOUT, SEQUENCER_READY_TIMEOUT, SequencerCheckpoint,
     StartedSequencerRuntime, Step, StepError, StepResult, ZONE_TEST_PRIORITY_FEE_PERCENT,
-    ZoneNodeHttpClient, ZoneSequencer, log_step_error, sequencer_config,
+    ZoneNodeHttpClient, ZoneSequencer, initialize_zone_indexer, log_step_error, sequencer_config,
     sequencer_config_with_pending_submit_depth, start_balance_aware_policy,
-    start_custom_republish_policy, start_republish_lineage_policy, start_sequencer_event_loop,
-    start_sorted_conflict_policy, timeout, wait_for_height,
+    start_custom_republish_policy, start_deposit_lifecycle_policy, start_deposit_withdraw_policy,
+    start_republish_lineage_policy, start_sequencer_event_loop, start_sorted_conflict_policy,
+    timeout, wait_for_height,
 };
 
 pub(in super::super) async fn start_named_sequencer(
@@ -55,6 +56,52 @@ pub(in super::super) async fn start_named_sequencer_with_pending_submit_depth(
     let config = sequencer_config_with_pending_submit_depth(max_pending_publish_depth, funding);
 
     start_named_sequencer_with_config(world, step, sequencer_alias, checkpoint, mode, config).await
+}
+
+/// Start `sequencer_alias` with the deposit-lifecycle policy and an indexer.
+pub(in super::super) async fn start_deposit_reaction_sequencer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: &str,
+    withdraw_outputs: Vec<u64>,
+) -> StepResult {
+    let recipient = log_step_error(step, sequencer_funding(world, sequencer_alias))?.funding_pk;
+    start_named_sequencer(
+        world,
+        step,
+        sequencer_alias,
+        None,
+        DriveMode::DepositReaction {
+            withdraw_outputs,
+            recipient,
+        },
+    )
+    .await?;
+    initialize_zone_indexer(world, step, sequencer_alias)
+}
+
+/// Start `sequencer_alias` with the deposit-withdraw policy and an indexer.
+pub(in super::super) async fn start_deposit_withdraw_sequencer(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: &str,
+    target_amount: u64,
+    withdraw_outputs: Vec<u64>,
+) -> StepResult {
+    let recipient = log_step_error(step, sequencer_funding(world, sequencer_alias))?.funding_pk;
+    start_named_sequencer(
+        world,
+        step,
+        sequencer_alias,
+        None,
+        DriveMode::DepositWithdraw {
+            target_amount,
+            withdraw_outputs,
+            recipient,
+        },
+    )
+    .await?;
+    initialize_zone_indexer(world, step, sequencer_alias)
 }
 
 async fn start_named_sequencer_with_config(
@@ -197,5 +244,20 @@ fn start_sequencer_runtime(
         DriveMode::CustomRepublish { deps } => {
             from_policy_runtime(start_custom_republish_policy(sequencer, *deps), None)
         }
+        DriveMode::DepositReaction {
+            withdraw_outputs,
+            recipient,
+        } => from_policy_runtime(
+            start_deposit_lifecycle_policy(sequencer, withdraw_outputs, recipient),
+            None,
+        ),
+        DriveMode::DepositWithdraw {
+            target_amount,
+            withdraw_outputs,
+            recipient,
+        } => from_policy_runtime(
+            start_deposit_withdraw_policy(sequencer, target_amount, withdraw_outputs, recipient),
+            None,
+        ),
     }
 }

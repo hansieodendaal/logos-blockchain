@@ -480,7 +480,11 @@ mod tests {
     ) -> Event {
         Event::BlocksProcessed {
             checkpoint,
-            channel_update: ChannelUpdate { orphaned, adopted },
+            channel_update: ChannelUpdate {
+                orphaned,
+                adopted,
+                adopted_deposits: Vec::new(),
+            },
             finalized,
         }
     }

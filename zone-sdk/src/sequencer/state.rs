@@ -4,6 +4,7 @@ use lb_core::{
     header::HeaderId,
     mantle::{
         SignedMantleTx,
+        ledger::{Inputs, NoteId, Outputs},
         ops::{
             Op,
             channel::{ChannelId, MsgId, inscribe::Inscription},
@@ -29,7 +30,7 @@ use super::{
     channel_wallet::{ChannelWallet, NoteOp},
     types::{
         AtomicWithdrawInfo, ChannelNote, ChannelUpdateTx, ChannelWalletView, InscriptionInfo,
-        PendingTx, TxSource, WithdrawInfo,
+        PendingTx, PinDepositInfo, TxSource, WithdrawInfo,
     },
 };
 
@@ -94,11 +95,25 @@ fn opaque_lineage(
     (first_parent, last_msg, config_parent, last_config)
 }
 
-/// Local pending inscription with lineage metadata.
-///
-/// `withdraws == None` is a plain inscription; `Some(_)` is an atomic
-/// inscription+withdraw bundle. The bundle nature lets us surface the right
+/// The bundle nature of a pending inscription. Lets us surface the right
 /// [`PendingTx`] variant on finalize/adopt and re-prepare on orphan.
+#[derive(Debug, Clone)]
+pub enum PendingBundle {
+    /// A plain inscription.
+    Plain,
+    /// An atomic inscription+withdraw bundle: the tx's `Op::ChannelWithdraw`
+    /// ops (in tx order) plus the recipient notes it releases (for re-issue
+    /// from an orphan report).
+    Withdraw {
+        withdraws: Vec<WithdrawInfo>,
+        outputs: Outputs,
+    },
+    /// An atomic inscription+transfer bundle pinning a deposit: the channel
+    /// notes the bundled transfer consumes.
+    PinDeposit(Inputs),
+}
+
+/// Local pending inscription with lineage metadata.
 #[derive(Debug, Clone)]
 pub struct PendingInscription {
     pub tx_hash: TxHash,
@@ -106,7 +121,7 @@ pub struct PendingInscription {
     pub parent_msg: MsgId,
     pub this_msg: MsgId,
     pub payload: Inscription,
-    pub withdraws: Option<Vec<WithdrawInfo>>,
+    pub bundle: PendingBundle,
     pub posted: bool,
 }
 
@@ -162,6 +177,9 @@ pub enum BlockChannelTx {
     Inscription(InscriptionInfo),
     /// `publish_atomic_withdraw` shape: an inscription + its withdraws.
     AtomicWithdraw(AtomicWithdrawInfo),
+    /// `publish_pin_deposit` shape: an inscription + a transfer
+    /// consuming an observed deposited note.
+    PinDeposit(PinDepositInfo),
     /// A pure `channel_config` tx: a single config on the config lineage
     /// (`this_msg` = config id, `parent_msg` = config parent), which does not
     /// advance the message tip.
@@ -185,6 +203,7 @@ impl BlockChannelTx {
         match self {
             Self::Inscription(i) => std::slice::from_ref(i),
             Self::AtomicWithdraw(a) => std::slice::from_ref(&a.inscription),
+            Self::PinDeposit(a) => std::slice::from_ref(&a.inscription),
             Self::Config(_) => &[],
             Self::Custom { entries, .. } => entries,
         }
@@ -197,7 +216,7 @@ impl BlockChannelTx {
     /// [`Self::Config`]; mixed/unknown configs ride in [`Self::Custom`].
     pub fn config_entries(&self) -> &[InscriptionInfo] {
         match self {
-            Self::Inscription(_) | Self::AtomicWithdraw(_) => &[],
+            Self::Inscription(_) | Self::AtomicWithdraw(_) | Self::PinDeposit(_) => &[],
             Self::Config(c) => std::slice::from_ref(c),
             Self::Custom { config_entries, .. } => config_entries,
         }
@@ -279,11 +298,18 @@ impl TxState {
         this_msg: MsgId,
         payload: Inscription,
     ) {
-        self.insert_pending(signed_tx, parent_msg, this_msg, payload, None);
+        self.insert_pending(
+            signed_tx,
+            parent_msg,
+            this_msg,
+            payload,
+            PendingBundle::Plain,
+        );
     }
 
     /// Submit an atomic inscription+withdraw bundle for tracking. `withdraws`
-    /// must mirror the `Op::ChannelWithdraw` ops in the bundle, in tx order.
+    /// must mirror the `Op::ChannelWithdraw` ops in the bundle, in tx order;
+    /// `outputs` are the recipient notes it releases (for orphan re-issue).
     pub fn submit_atomic_withdraw(
         &mut self,
         signed_tx: SignedMantleTx<Unverified>,
@@ -291,8 +317,35 @@ impl TxState {
         this_msg: MsgId,
         payload: Inscription,
         withdraws: Vec<WithdrawInfo>,
+        outputs: Outputs,
     ) {
-        self.insert_pending(signed_tx, parent_msg, this_msg, payload, Some(withdraws));
+        self.insert_pending(
+            signed_tx,
+            parent_msg,
+            this_msg,
+            payload,
+            PendingBundle::Withdraw { withdraws, outputs },
+        );
+    }
+
+    /// Submit an atomic inscription+transfer bundle pinning a deposit.
+    /// `consumed_notes` mirrors the bundled transfer's input notes (the
+    /// deposited notes being pinned).
+    pub fn submit_pin_deposit(
+        &mut self,
+        signed_tx: SignedMantleTx<Unverified>,
+        parent_msg: MsgId,
+        this_msg: MsgId,
+        payload: Inscription,
+        consumed_notes: Inputs,
+    ) {
+        self.insert_pending(
+            signed_tx,
+            parent_msg,
+            this_msg,
+            payload,
+            PendingBundle::PinDeposit(consumed_notes),
+        );
     }
 
     fn insert_pending(
@@ -301,7 +354,7 @@ impl TxState {
         parent_msg: MsgId,
         this_msg: MsgId,
         payload: Inscription,
-        withdraws: Option<Vec<WithdrawInfo>>,
+        bundle: PendingBundle,
     ) {
         let tx_hash = signed_tx.mantle_tx().hash();
         self.track_local_tx(tx_hash);
@@ -317,7 +370,7 @@ impl TxState {
                 parent_msg,
                 this_msg,
                 payload,
-                withdraws,
+                bundle,
                 posted: false,
             },
         );
@@ -329,17 +382,17 @@ impl TxState {
     /// channel tip is retried byte-identically via [`Self::pending_txs`],
     /// no matter who authored it. No-op when the tx is already tracked.
     ///
-    /// `withdraws` mirrors the tx's `ChannelWithdraw` ops (an atomic
-    /// inscription+withdraw bundle), matching [`Self::submit_atomic_withdraw`]
-    /// classification. Observed entries start `posted` — they were seen on
-    /// chain, so they never count as first-time publishes.
+    /// `bundle` classifies the tx (plain inscription, atomic withdraw, or
+    /// pin deposit), matching the `submit_*` classification.
+    /// Observed entries start `posted` — they were seen on chain, so they never
+    /// count as first-time publishes.
     pub fn observe_channel_inscription(
         &mut self,
         signed_tx: SignedMantleTx<Unverified>,
         parent_msg: MsgId,
         this_msg: MsgId,
         payload: Inscription,
-        withdraws: Option<Vec<WithdrawInfo>>,
+        bundle: PendingBundle,
     ) {
         let tx_hash = signed_tx.mantle_tx().hash();
         if self.is_tracked(&tx_hash) {
@@ -357,7 +410,7 @@ impl TxState {
                 parent_msg,
                 this_msg,
                 payload,
-                withdraws,
+                bundle,
                 posted: true,
             },
         );
@@ -678,17 +731,23 @@ impl TxState {
             for info in self.collect_pending_suffix(root) {
                 if eligible.contains(&info.tx_hash) && seen.insert(info.tx_hash) {
                     let tx_hash = info.tx_hash;
-                    let entry = match self
-                        .pending
-                        .get(&tx_hash)
-                        .and_then(|p| p.withdraws.as_ref())
-                    {
-                        Some(withdraws) => PendingTx::AtomicWithdraw(AtomicWithdrawInfo {
-                            tx_hash,
-                            inscription: info,
-                            withdraws: withdraws.clone(),
-                        }),
-                        None => PendingTx::Inscription(info),
+                    let entry = match self.pending.get(&tx_hash).map(|p| &p.bundle) {
+                        Some(PendingBundle::Withdraw { withdraws, outputs }) => {
+                            PendingTx::AtomicWithdraw(AtomicWithdrawInfo {
+                                tx_hash,
+                                inscription: info,
+                                withdraws: withdraws.clone(),
+                                outputs: outputs.clone(),
+                            })
+                        }
+                        Some(PendingBundle::PinDeposit(consumed_notes)) => {
+                            PendingTx::PinDeposit(PinDepositInfo {
+                                tx_hash,
+                                inscription: info,
+                                consumed_notes: consumed_notes.clone(),
+                            })
+                        }
+                        Some(PendingBundle::Plain) | None => PendingTx::Inscription(info),
                     };
                     ordered.push(entry);
                 }
@@ -1174,6 +1233,7 @@ impl TxState {
                 BlockChannelTx::AtomicWithdraw(a) => {
                     Some(ChannelUpdateTx::AtomicWithdraw(a.clone()))
                 }
+                BlockChannelTx::PinDeposit(a) => Some(ChannelUpdateTx::PinDeposit(a.clone())),
                 BlockChannelTx::Inscription(_) => Some(ChannelUpdateTx::Inscription(info.clone())),
                 // A pure config carries no message-lineage entry to report.
                 BlockChannelTx::Config(_) => None,
@@ -1184,20 +1244,24 @@ impl TxState {
             };
         }
         // Not in any held block — the lineage bridged through a pending link.
-        let withdraws = self
-            .pending
-            .get(&info.tx_hash)
-            .and_then(|p| p.withdraws.clone());
-        Some(withdraws.map_or_else(
-            || ChannelUpdateTx::Inscription(info.clone()),
-            |withdraws| {
-                ChannelUpdateTx::AtomicWithdraw(AtomicWithdrawInfo {
+        match self.pending.get(&info.tx_hash).map(|p| &p.bundle) {
+            Some(PendingBundle::Withdraw { withdraws, outputs }) => {
+                Some(ChannelUpdateTx::AtomicWithdraw(AtomicWithdrawInfo {
                     tx_hash: info.tx_hash,
                     inscription: info.clone(),
-                    withdraws,
-                })
-            },
-        ))
+                    withdraws: withdraws.clone(),
+                    outputs: outputs.clone(),
+                }))
+            }
+            Some(PendingBundle::PinDeposit(consumed_notes)) => {
+                Some(ChannelUpdateTx::PinDeposit(PinDepositInfo {
+                    tx_hash: info.tx_hash,
+                    inscription: info.clone(),
+                    consumed_notes: consumed_notes.clone(),
+                }))
+            }
+            Some(PendingBundle::Plain) | None => Some(ChannelUpdateTx::Inscription(info.clone())),
+        }
     }
 
     /// Apply channel-note ops from finalized blocks to the wallet base set.
@@ -1223,6 +1287,13 @@ impl TxState {
             blocks.reverse();
         }
         self.wallet.view(blocks.iter())
+    }
+
+    /// Look up a tracked channel note by id (see
+    /// [`ChannelWallet::find_note`](super::channel_wallet::ChannelWallet::find_note)).
+    #[must_use]
+    pub fn find_channel_note(&self, id: &NoteId) -> Option<&ChannelNote> {
+        self.wallet.find_note(id)
     }
 
     /// Export the finalized channel-note base for checkpointing.
@@ -1481,15 +1552,15 @@ mod tests {
 
     fn wallet_note(seed: u64, value: u64) -> NoteOp {
         NoteOp::Add(ChannelNote {
-            note_id: lb_core::mantle::ledger::NoteId::from(lb_groth16::Fr::from(seed)),
+            note_id: NoteId::from(lb_groth16::Fr::from(seed)),
             value,
             pk: lb_groth16::Fr::from(seed).into(),
             slot: lb_common_http_client::Slot::from(1),
         })
     }
 
-    fn wallet_note_id(seed: u64) -> lb_core::mantle::ledger::NoteId {
-        lb_core::mantle::ledger::NoteId::from(lb_groth16::Fr::from(seed))
+    fn wallet_note_id(seed: u64) -> NoteId {
+        NoteId::from(lb_groth16::Fr::from(seed))
     }
 
     #[test]
@@ -2251,7 +2322,13 @@ mod tests {
         // Mirror the observed inscription into pending before the safe-set
         // build, as `handle_block_event` does — the pending set reflects the
         // channel view, so c1 is retried too if it later reorgs out.
-        state.observe_channel_inscription(c1_tx, MsgId::root(), c1_msg, [99].into(), None);
+        state.observe_channel_inscription(
+            c1_tx,
+            MsgId::root(),
+            c1_msg,
+            [99].into(),
+            PendingBundle::Plain,
+        );
         state.process_block(
             block2,
             block1,

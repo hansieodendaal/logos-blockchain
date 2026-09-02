@@ -2,6 +2,7 @@ use lb_core::{
     mantle::{
         SignedMantleTx,
         channel::{SlotTimeframe, SlotTimeout},
+        ledger::NoteId,
         ops::channel::{MsgId, config::Keys, inscribe::Inscription},
         transactions::{Ops, mantle_tx::RawMantleTx, states::Unverified},
     },
@@ -243,6 +244,23 @@ where
     ) -> Result<PublishReceipt, Error> {
         self.sequencer
             .do_publish_atomic_withdraw(inscribe, withdraws, inputs)
+            .await
+    }
+
+    /// Pin an observed deposit without waiting for finalization: publish
+    /// `[CHANNEL_INSCRIBE, CHANNEL_TRANSFER]`, the transfer consuming
+    /// `consumed_notes` (the deposit's channel `NoteId`s from `DepositInfo`) so
+    /// the tx lands only if the deposit is on chain. Same contract as
+    /// [`Self::publish_atomic_withdraw`]; [`Error::Network`] if a note is not
+    /// in the tracked set (deposit not on this branch, or already
+    /// consumed).
+    pub async fn publish_pin_deposit(
+        &mut self,
+        inscribe: Inscription,
+        consumed_notes: Vec<NoteId>,
+    ) -> Result<PublishReceipt, Error> {
+        self.sequencer
+            .do_publish_pin_deposit(inscribe, consumed_notes)
             .await
     }
 

@@ -8,7 +8,7 @@ use lb_core::mantle::{
     gas::GasCost,
     ops::channel::{config::Keys, deposit::Metadata, inscribe::Inscription},
 };
-use lb_key_management_system_service::keys::Ed25519Key;
+use lb_key_management_system_service::keys::{Ed25519Key, ZkPublicKey};
 use lb_testing_framework::NodeHttpClient;
 use lb_zone_sdk::{
     adapter::NodeHttpClient as ZoneNodeHttpClient,
@@ -29,8 +29,8 @@ use super::{
     keygen, publish_atomic_zone_withdraw, publish_message_with_retry,
     runner::{Event, PublishResult, SequencerCheckpoint, SequencerClient},
     sequencer_config, sequencer_config_with_pending_submit_depth, start_balance_aware_policy,
-    start_custom_republish_policy, start_republish_lineage_policy, start_sequencer_event_loop,
-    start_sorted_conflict_policy,
+    start_custom_republish_policy, start_deposit_lifecycle_policy, start_deposit_withdraw_policy,
+    start_republish_lineage_policy, start_sequencer_event_loop, start_sorted_conflict_policy,
     steps::DEFAULT_ZONE_SEQUENCER,
     submit_atomic_zone_deposit, submit_zone_channel_split, submit_zone_deposit,
     submit_zone_withdraw,
@@ -83,6 +83,17 @@ pub(super) enum DriveMode {
     },
     CustomRepublish {
         deps: Box<CustomRepublishDeps>,
+    },
+    /// Pin then withdraw each observed deposit.
+    DepositReaction {
+        withdraw_outputs: Vec<u64>,
+        recipient: ZkPublicKey,
+    },
+    /// Withdraw the observed deposit of `target_amount`.
+    DepositWithdraw {
+        target_amount: u64,
+        withdraw_outputs: Vec<u64>,
+        recipient: ZkPublicKey,
     },
 }
 
@@ -138,5 +149,6 @@ pub(super) use publishing::{
     initialize_zone_indexer, publish_zone_messages, publish_zone_messages_concurrently,
 };
 pub(super) use sequencer::{
-    start_named_sequencer, start_named_sequencer_with_pending_submit_depth,
+    start_deposit_reaction_sequencer, start_deposit_withdraw_sequencer, start_named_sequencer,
+    start_named_sequencer_with_pending_submit_depth,
 };

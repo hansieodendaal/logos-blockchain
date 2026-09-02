@@ -1,7 +1,8 @@
 use super::{
     CucumberWorld, DriveMode, Duration, Step, StepError, StepResult, ZoneSequencerStartup, given,
     initialize_zone_indexer, log_step_error, parse_optional_submit_depth,
-    register_zone_sequencers_with_shared_key, single_column_table, start_named_sequencer,
+    register_zone_sequencers_with_shared_key, single_column_table,
+    start_deposit_reaction_sequencer, start_deposit_withdraw_sequencer, start_named_sequencer,
     start_named_sequencer_with_startup, start_nodes_with_zone_resources, stop_zone_sequencer,
     wait_for_lib_advance, when, zone_account_balances, zone_node_resource_rows,
     zone_sequencer_start_rows, zone_step_error,
@@ -69,6 +70,60 @@ async fn start_sequencer_with_indexer(
 ) -> StepResult {
     start_named_sequencer(world, step, sequencer_alias, None, DriveMode::passive()).await?;
     initialize_zone_indexer(world, step, sequencer_alias)
+}
+
+#[when(
+    expr = "I start zone sequencer {string} pinning then withdrawing observed deposits with outputs {string}"
+)]
+async fn step_start_zone_sequencer_deposit_reaction(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    outputs: String,
+) -> StepResult {
+    let withdraw_outputs = outputs
+        .split(',')
+        .map(|amount| {
+            amount
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| StepError::InvalidArgument {
+                    message: format!("invalid withdraw output amount '{amount}': {error}"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    start_deposit_reaction_sequencer(world, step, &sequencer_alias, withdraw_outputs).await
+}
+
+#[when(
+    expr = "I start zone sequencer {string} withdrawing observed deposit of {int} with outputs {string}"
+)]
+async fn step_start_zone_sequencer_deposit_withdraw(
+    world: &mut CucumberWorld,
+    step: &Step,
+    sequencer_alias: String,
+    target_amount: u64,
+    outputs: String,
+) -> StepResult {
+    let withdraw_outputs = outputs
+        .split(',')
+        .map(|amount| {
+            amount
+                .trim()
+                .parse::<u64>()
+                .map_err(|error| StepError::InvalidArgument {
+                    message: format!("invalid withdraw output amount '{amount}': {error}"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    start_deposit_withdraw_sequencer(
+        world,
+        step,
+        &sequencer_alias,
+        target_amount,
+        withdraw_outputs,
+    )
+    .await
 }
 
 #[when("I start zone sequencers:")]

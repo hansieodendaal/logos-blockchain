@@ -2,6 +2,7 @@ use lb_core::{
     mantle::{
         SignedMantleTx,
         channel::{SlotTimeframe, SlotTimeout},
+        ledger::NoteId,
         ops::channel::{MsgId, config::Keys, inscribe::Inscription},
         transactions::{Ops, mantle_tx::RawMantleTx, states::Unverified},
     },
@@ -89,6 +90,25 @@ impl SequencerClient {
             inscribe,
             withdraws,
             inputs,
+            response_tx,
+        })?;
+        Self::recv(response_rx).await?
+    }
+
+    /// Publish an atomic inscription+transfer bundle pinning an observed
+    /// deposit.
+    ///
+    /// Async counterpart of
+    /// [`super::SequencerHandle::publish_pin_deposit`].
+    pub async fn publish_pin_deposit(
+        &self,
+        inscribe: Inscription,
+        consumed_notes: Vec<NoteId>,
+    ) -> Result<PublishReceipt, Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send(ActorRequest::PublishPinDeposit {
+            inscribe,
+            consumed_notes,
             response_tx,
         })?;
         Self::recv(response_rx).await?

@@ -13,10 +13,11 @@ use std::{
 
 use lb_common_http_client::{CommonHttpClient, Slot};
 use lb_core::{
+    crypto::Hash,
     mantle::{
         Note, Op, OpProof, RawMantleTx, Utxo, Value,
         gas::GasCost,
-        ledger::{Inputs, Outputs, OutputsError},
+        ledger::{Inputs, NoteId, Outputs, OutputsError},
         ops::{
             OpId as _,
             channel::{
@@ -245,6 +246,7 @@ fn to_policy_runtime(rt: runner::Runtime) -> PolicyRuntime {
 
 mod atomic;
 mod custom_policy;
+mod deposit_policy;
 mod observation;
 mod policies;
 mod transactions;
@@ -252,6 +254,7 @@ mod transactions;
 use atomic::{build_atomic_deposit_op, build_atomic_deposit_transfer, sign_tx_zk};
 pub(super) use atomic::{publish_atomic_zone_withdraw, submit_zone_withdraw};
 pub(super) use custom_policy::{CustomRepublishDeps, start_custom_republish_policy};
+pub(super) use deposit_policy::{start_deposit_lifecycle_policy, start_deposit_withdraw_policy};
 pub(super) use observation::{
     balance_update_payload, collect_indexed_messages, collect_indexed_messages_exactly_once,
     ensure_zone_transactions_included, keygen, parse_balance_payload, publish_message_with_retry,

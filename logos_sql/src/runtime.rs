@@ -545,6 +545,7 @@ mod tests {
             channel_update: ChannelUpdate {
                 adopted: Vec::new(),
                 orphaned: Vec::new(),
+                adopted_deposits: Vec::new(),
             },
             finalized: Vec::new(),
         }

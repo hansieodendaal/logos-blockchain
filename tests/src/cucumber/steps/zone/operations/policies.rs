@@ -303,12 +303,15 @@ where
         } = event
         {
             self.balances.record_finalized_payloads(finalized);
-            let ChannelUpdate { orphaned, adopted } = channel_update;
+            let ChannelUpdate {
+                orphaned, adopted, ..
+            } = channel_update;
             let orphaned_inscriptions: Vec<InscriptionInfo> = orphaned
                 .iter()
                 .filter_map(|o| match o {
                     ChannelUpdateTx::Inscription(i) => Some(i.clone()),
                     ChannelUpdateTx::AtomicWithdraw(_)
+                    | ChannelUpdateTx::PinDeposit(_)
                     | ChannelUpdateTx::Custom(_)
                     | ChannelUpdateTx::Config(_) => None,
                 })
@@ -370,12 +373,15 @@ where
         };
         // Pin finalized payloads first.
         self.state.record_finalized(finalized);
-        let ChannelUpdate { orphaned, adopted } = channel_update;
+        let ChannelUpdate {
+            orphaned, adopted, ..
+        } = channel_update;
         let orphaned_inscriptions: Vec<&InscriptionInfo> = orphaned
             .iter()
             .filter_map(|o| match o {
                 ChannelUpdateTx::Inscription(i) => Some(i),
                 ChannelUpdateTx::AtomicWithdraw(_)
+                | ChannelUpdateTx::PinDeposit(_)
                 | ChannelUpdateTx::Custom(_)
                 | ChannelUpdateTx::Config(_) => None,
             })
