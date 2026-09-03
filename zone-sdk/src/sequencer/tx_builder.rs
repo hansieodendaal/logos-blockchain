@@ -1,21 +1,18 @@
 use lb_core::{
     mantle::{
-        MantleTransaction, TxHash,
+        SignedOps, TxHash,
         channel::{ChannelState, SlotTimeframe, SlotTimeout},
+        ledger::verification_mode::StandardMode,
         ops::{
-            Op, OpProof,
+            Op, OpProof, OpRef,
             channel::{
                 ChannelId, ChannelKeyIndex, MsgId,
                 config::{ChannelConfigOp, Keys},
                 inscribe::{Inscription, InscriptionOp},
             },
         },
-        traits::Hashable as _,
-        transactions::{
-            MantleTxBuilder, OpProofs, Ops,
-            mantle_tx::{MantleTx, RawMantleTx},
-            states::Unverified,
-        },
+        traits::{Hashable as _, MantleTx},
+        transactions::{MantleTxBuilder, OpProofs, Ops, states::Unverified},
     },
     proofs::channel_multi_sig_proof::{ChannelMultiSigProof, IndexedSignature},
 };
@@ -34,7 +31,7 @@ pub(super) async fn fund_ops<Node>(
     node: &Node,
     funding: &FundingConfig,
     ops: Vec<Op>,
-) -> Result<(RawMantleTx, Option<OpProof>), Error>
+) -> Result<(Ops, Option<OpProof>), Error>
 where
     Node: adapter::Node + Sync,
 {
@@ -68,9 +65,9 @@ pub(super) fn attach_transfer_proof(
     transfer_proof: Option<OpProof>,
 ) -> Result<OpProofs, Error> {
     let transfer_count = tx
-        .ops()
-        .iter()
-        .filter(|op| matches!(op, Op::Transfer(_)))
+        .op_refs()
+        .into_iter()
+        .filter(|op| matches!(op, OpRef::Transfer(_)))
         .count();
     match (transfer_count, transfer_proof) {
         (0, _) => {}
@@ -108,20 +105,20 @@ pub(super) fn build_atomic_bundle_ops_proofs(
         ChannelMultiSigProof::try_new([IndexedSignature::new(own_key_index, own_sig)].into())
             .map_err(|e| Error::Network(format!("multi-sig proof assembly failed: {e:?}")))?;
     let mut ops_proofs = OpProofs::empty();
-    for op in tx.ops() {
+    for op in tx.op_refs() {
         match op {
             // Channel transfers (recipient/change or re-created deposit notes)
             // and withdraws (releasing recipient notes) are single-signer
             // multi-sig proofs over the same funded tx hash.
-            Op::ChannelTransfer(_) | Op::ChannelWithdraw(_) => {
+            OpRef::ChannelTransfer(_) | OpRef::ChannelWithdraw(_) => {
                 ops_proofs
                     .try_push(OpProof::ChannelMultiSigProof(channel_proof.clone()))
                     .map_err(|e| Error::Network(format!("too many operation proofs: {e:?}")))?;
             }
-            Op::ChannelInscribe(_) => ops_proofs
+            OpRef::ChannelInscribe(_) => ops_proofs
                 .try_push(OpProof::Ed25519Sig(own_sig))
                 .map_err(|e| Error::Network(format!("too many operation proofs: {e:?}")))?,
-            Op::Transfer(_) => match transfer_proof {
+            OpRef::Transfer(_) => match transfer_proof {
                 Some(proof) => ops_proofs
                     .try_push(proof.clone())
                     .map_err(|e| Error::Network(format!("too many operation proofs: {e:?}")))?,
@@ -164,7 +161,7 @@ pub(super) async fn create_inscribe_tx<Node>(
     signing_key: &Ed25519Key,
     inscription: Inscription,
     parent: MsgId,
-) -> Result<(MantleTransaction<Unverified>, MsgId), Error>
+) -> Result<(SignedOps<Unverified, StandardMode>, MsgId), Error>
 where
     Node: adapter::Node + Sync,
 {
@@ -189,7 +186,8 @@ where
         transfer_proof,
     )?;
 
-    let signed_tx = MantleTransaction::new(inscribe_tx, ops_proofs);
+    let signed_tx = SignedOps::from_parts(inscribe_tx, ops_proofs)
+        .unwrap_or_else(|error| panic!("Node returned an unprovable transaction: {error}"));
 
     Ok((signed_tx, msg_id))
 }
@@ -216,7 +214,7 @@ pub(super) async fn build_and_fund_config<Node>(
     posting_timeout: SlotTimeout,
     configuration_threshold: u16,
     transfer_threshold: u16,
-) -> Result<(RawMantleTx, Option<OpProof>), Error>
+) -> Result<(Ops, Option<OpProof>), Error>
 where
     Node: adapter::Node + Sync,
 {
@@ -241,10 +239,10 @@ where
 /// ascending by index. Pass an empty vec to configure an unclaimed channel,
 /// whose configuration requires no signatures (the empty multi-sig proof).
 pub(super) fn assemble_channel_config_tx(
-    config_tx: RawMantleTx,
+    config_tx: Ops,
     transfer_proof: Option<OpProof>,
     signatures: Vec<IndexedSignature>,
-) -> Result<MantleTransaction<Unverified>, Error> {
+) -> Result<SignedOps<Unverified, StandardMode>, Error> {
     let signatures = signatures
         .try_into()
         .map_err(|e| Error::Network(format!("too many channel-config signatures: {e:?}")))?;
@@ -256,7 +254,8 @@ pub(super) fn assemble_channel_config_tx(
         transfer_proof,
     )?;
 
-    Ok(MantleTransaction::new(config_tx, ops_proofs))
+    SignedOps::from_parts(config_tx, ops_proofs)
+        .map_err(|error| Error::Network(format!("failed to assemble channel config tx: {error:?}")))
 }
 
 /// Build, fund, and single-signer-sign a `ChannelConfig` transaction.
@@ -284,7 +283,7 @@ pub(super) async fn create_channel_config_tx<Node>(
     posting_timeout: SlotTimeout,
     configuration_threshold: u16,
     transfer_threshold: u16,
-) -> Result<MantleTransaction<Unverified>, Error>
+) -> Result<SignedOps<Unverified, StandardMode>, Error>
 where
     Node: adapter::Node + Sync,
 {
@@ -315,7 +314,7 @@ pub(super) fn prepare_tx(
     signing_key: &Ed25519Key,
     inscription: Inscription,
     parent: MsgId,
-) -> (RawMantleTx, MsgId, Ed25519Signature) {
+) -> (Ops, MsgId, Ed25519Signature) {
     let inscription_op = InscriptionOp {
         channel_id,
         inscription,
@@ -326,12 +325,10 @@ pub(super) fn prepare_tx(
     // TODO: Return `Error` in case there's too many ops already.
     ops.try_push(Op::ChannelInscribe(inscription_op)).unwrap();
 
-    // TODO: fund tx
-    let tx = RawMantleTx(ops);
+    // TODO: fund tx (ops)
+    let inscription_sig = sign_tx(ops.hash(), signing_key);
 
-    let inscription_sig = sign_tx(tx.hash(), signing_key);
-
-    (tx, msg_id, inscription_sig)
+    (ops, msg_id, inscription_sig)
 }
 
 pub(super) fn sign_tx(tx_hash: TxHash, signing_key: &Ed25519Key) -> Ed25519Signature {
