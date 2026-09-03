@@ -1,3 +1,5 @@
+use lb_core::mantle::{SignedOps, ledger::verification_mode::StandardMode, transactions::OpProofs};
+
 use super::*;
 
 /// Builds a regular channel deposit for an existing funding note with the
@@ -166,17 +168,22 @@ pub async fn submit_zone_channel_split(
         .map_err(|error| ZoneTestError::SplitTransfer {
             message: format!("multi-sig proof assembly failed: {error:?}"),
         })?;
-    let mut ops_proofs = OpsProofs::new_unchecked(vec![OpProof::ChannelMultiSigProof(proof)]);
+    let mut op_proofs = OpProofs::from([OpProof::ChannelMultiSigProof(proof)]);
     if let Some(transfer_proof) = response.transfer_proof {
-        ops_proofs
+        op_proofs
             .try_push(transfer_proof)
             .map_err(|error| ZoneTestError::SplitTransfer {
                 message: format!("too many operation proofs: {error:?}"),
             })?;
     }
 
-    let signed_tx = SignedMantleTx::new(funded_tx, ops_proofs);
-    node.submit_transaction(&signed_tx)
+    let signed_ops = SignedOps::from_parts(funded_tx, op_proofs).map_err(|error| {
+        ZoneTestError::SplitTransfer {
+            message: format!("signed ops assembly failed: {error}"),
+        }
+    })?;
+
+    node.submit_transaction(&signed_ops)
         .await
         .map_err(|error| ZoneTestError::SplitTransfer {
             message: format!("submit failed: {error}"),
@@ -204,7 +211,7 @@ pub async fn submit_atomic_zone_deposit(
         build_atomic_deposit_transfer(available_utxos, funding_public_key, amount)?;
     let deposit = build_atomic_deposit_op(channel_id, metadata, &transfer)?;
 
-    let (tx, msg_id, sequencer_sig) = client
+    let (ops, msg_id, sequencer_sig) = client
         .prepare_tx(
             [Op::Transfer(transfer), Op::ChannelDeposit(deposit.clone())].into(),
             inscription_data,
@@ -214,16 +221,18 @@ pub async fn submit_atomic_zone_deposit(
             message: error.to_string(),
         })?;
 
-    let user_sig = sign_tx_zk(node_url, &tx, vec![funding_public_key]).await?;
-    let signed_tx = SignedMantleTx::new(
-        tx,
-        [
-            OpProof::ZkSig(user_sig.clone()),
-            OpProof::ZkSig(user_sig),
-            OpProof::Ed25519Sig(sequencer_sig),
-        ]
-        .into(),
-    );
+    let user_sig = sign_tx_zk(node_url, &ops, vec![funding_public_key]).await?;
+    let op_proofs = OpProofs::from([
+        OpProof::ZkSig(user_sig.clone()),
+        OpProof::ZkSig(user_sig),
+        OpProof::Ed25519Sig(sequencer_sig),
+    ]);
+
+    let signed_tx = SignedOps::from_parts(ops, op_proofs).map_err(|error| {
+        ZoneTestError::BuildAtomicDeposit {
+            message: format!("signed ops assembly failed: {error}"),
+        }
+    })?;
 
     let (result, _cp) = client
         .submit_signed_tx(signed_tx, msg_id)
@@ -246,7 +255,7 @@ pub(super) async fn build_funded_custom_tx(
     funding_pk: ZkPublicKey,
     payloads: &[Inscription],
     mut parent: MsgId,
-) -> Result<(SignedMantleTx<Unverified>, MsgId), ZoneTestError> {
+) -> Result<(SignedOps<Unverified, StandardMode>, MsgId), ZoneTestError> {
     let signer = signing_key.public_key();
     let mut tx_builder = MantleTxBuilder::new();
     for payload in payloads {
@@ -282,16 +291,24 @@ pub(super) async fn build_funded_custom_tx(
     // proven by the sequencer key over the funded tx hash.
     let funded_tx = response.funded_tx;
     let signature = signing_key.sign_payload(funded_tx.hash().as_signing_bytes().as_ref());
-    let mut ops_proofs =
-        OpsProofs::new_unchecked(vec![OpProof::Ed25519Sig(signature); payloads.len()]);
+    let mut op_proofs = OpProofs::try_from(vec![OpProof::Ed25519Sig(signature); payloads.len()])
+        .map_err(|error| ZoneTestError::BuildCustomTx {
+            message: format!("too many operation proofs: {error:?}"),
+        })?;
+
     if let Some(proof) = response.transfer_proof {
-        ops_proofs
+        op_proofs
             .try_push(proof)
             .map_err(|error| ZoneTestError::BuildCustomTx {
                 message: format!("too many operation proofs: {error:?}"),
             })?;
     }
-    let signed_tx = SignedMantleTx::new(funded_tx, ops_proofs);
 
-    Ok((signed_tx, parent))
+    let signed_ops = SignedOps::from_parts(funded_tx, op_proofs).map_err(|error| {
+        ZoneTestError::BuildCustomTx {
+            message: format!("signed ops assembly failed: {error}"),
+        }
+    })?;
+
+    Ok((signed_ops, parent))
 }

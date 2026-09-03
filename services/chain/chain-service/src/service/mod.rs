@@ -17,9 +17,10 @@ use lb_core::{
     events::Events,
     header::HeaderId,
     mantle::{
-        ops::Op,
-        traits::{MantleTxWithProofs, PreverifiedMantleTx},
-        transactions::{GasPrices, mantle_tx::MantleTx as _},
+        OpRef, TxGasCalculator,
+        ledger::verification_mode::StandardMode,
+        traits::{MantleTx, PreverifiedMantleTransaction, SignedMantleTx},
+        transactions::{GasPrices, states::Preverified},
     },
     sdp::ServiceType,
 };
@@ -114,7 +115,7 @@ impl EpochStateQuerySourceTracker {
 pub struct Service<Phase, Tx, Storage, RuntimeServiceId>
 where
     Phase: phases::Phase,
-    Tx: PreverifiedMantleTx + Clone + Eq + Debug,
+    Tx: PreverifiedMantleTransaction + Clone + Eq + Debug,
     Storage: StorageBackend + Send + Sync + 'static,
     <Storage as StorageChainApi>::Tx: From<Bytes> + AsRef<[u8]>,
 {
@@ -138,8 +139,9 @@ where
 impl<Phase, Tx, Storage, RuntimeServiceId> Service<Phase, Tx, Storage, RuntimeServiceId>
 where
     Phase: phases::Phase,
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -563,7 +565,7 @@ fn log_canonical_tsi_transition<Tx>(cryptarchia: &Cryptarchia, block: &Block<Tx>
 
 fn log_canonical_sdp_activity<Tx>(cryptarchia: &Cryptarchia, parent_id: HeaderId, block: &Block<Tx>)
 where
-    Tx: MantleTxWithProofs,
+    Tx: MantleTx,
 {
     let (Some(parent_state), Some(committed_state)) = (
         cryptarchia.ledger.state(&parent_id),
@@ -573,8 +575,8 @@ where
     };
 
     for tx in block.transactions_iter() {
-        for op in tx.mantle_tx().ops() {
-            let Op::SDPActive(active) = op else {
+        for op in tx.op_refs_iter() {
+            let OpRef::SDPActive(active) = op else {
                 continue;
             };
             let Some(previous_declaration) = parent_state
@@ -775,8 +777,9 @@ pub async fn process_block<Tx, Storage, RuntimeServiceId>(
     lib_broadcaster: &broadcast::Sender<LibUpdate>,
 ) -> Result<ProcessBlockOutcome<Tx>, Error>
 where
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -793,11 +796,11 @@ where
     RuntimeServiceId: Display + 'static,
 {
     debug!(target: LOG_TARGET, "Received proposal with ID: {:?}", block.header().id());
-    let header = block.header();
+    let header = block.header().clone();
     let prev_lib = cryptarchia.lib();
 
     let mut candidate = cryptarchia.clone();
-    let applied = candidate.try_apply_block_with_state_retention(&block, current_slot)?;
+    let applied = candidate.try_apply_block_with_state_retention(block.clone(), current_slot)?;
     let new_lib = candidate.lib();
 
     let tx_count = block.transactions_iter().count();
@@ -910,8 +913,9 @@ async fn log_newly_canonical_blocks<Tx, Storage, RuntimeServiceId>(
     newly_canonical_blocks: &[HeaderId],
     storage: &StorageAdapter<Storage, Tx, RuntimeServiceId>,
 ) where
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -969,8 +973,9 @@ pub fn get_block_ids<Tx, Storage, RuntimeServiceId>(
     storage_adapter: StorageAdapter<Storage, Tx, RuntimeServiceId>,
 ) -> Pin<Box<dyn Stream<Item = Result<HeaderId, Error>> + Send>>
 where
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -1028,8 +1033,9 @@ pub fn load_block_ids_from_storage<Tx, Storage, RuntimeServiceId>(
     storage: StorageAdapter<Storage, Tx, RuntimeServiceId>,
 ) -> impl Stream<Item = Result<HeaderId, Error>>
 where
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -1089,8 +1095,9 @@ pub async fn delete_stale_blocks_from_storage<Tx, Storage, RuntimeServiceId>(
     storage_adapter: &StorageAdapter<Storage, Tx, RuntimeServiceId>,
 ) -> HashSet<HeaderId>
 where
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq
@@ -1134,8 +1141,9 @@ async fn delete_blocks_from_storage<Headers, Tx, Storage, RuntimeServiceId>(
 ) -> Result<(), Vec<(HeaderId, DynError)>>
 where
     Headers: Iterator<Item = HeaderId> + Send,
-    Tx: PreverifiedMantleTx
-        + MantleTxWithProofs<Context = GasPrices>
+    Tx: PreverifiedMantleTransaction
+        + SignedMantleTx<Preverified, StandardMode>
+        + TxGasCalculator<Context = GasPrices>
         + Debug
         + Clone
         + Eq

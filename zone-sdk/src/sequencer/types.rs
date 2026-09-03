@@ -6,10 +6,10 @@ use lb_core::{
     events::DepositRecreatedNotes,
     header::HeaderId,
     mantle::{
-        SignedMantleTx, Value,
+        SignedOps, Value,
         channel::ChannelState,
         gas::GasCost,
-        ledger::{Inputs, NoteId, Outputs},
+        ledger::{Inputs, NoteId, Outputs, verification_mode::StandardMode},
         ops::{
             OpProof,
             channel::{
@@ -18,7 +18,7 @@ use lb_core::{
             },
         },
         traits::Hashable as _,
-        transactions::{TxHash, mantle_tx::RawMantleTx, states::Unverified},
+        transactions::{Ops, TxHash, states::Unverified},
     },
 };
 use lb_key_management_system_service::keys::{Ed25519PublicKey, ZkPublicKey};
@@ -37,7 +37,7 @@ pub struct SequencerCheckpoint {
     /// Last message ID for chain continuity.
     pub last_msg_id: MsgId,
     /// Pending transactions to restore.
-    pub pending_txs: Vec<(TxHash, SignedMantleTx<Unverified>)>,
+    pub pending_txs: Vec<(TxHash, SignedOps<Unverified, StandardMode>)>,
     /// Last known LIB.
     pub lib: HeaderId,
     /// Last known LIB slot (for backfill range queries).
@@ -95,7 +95,7 @@ impl PublishResult {
 /// submission.
 #[derive(Debug, Clone)]
 pub struct PreparedChannelConfig {
-    pub(crate) tx: RawMantleTx,
+    pub(crate) tx: Ops,
     pub(crate) transfer_proof: Option<OpProof>,
     /// The exact bytes each accredited key must sign (the funded tx hash's
     /// signing bytes).
@@ -172,10 +172,10 @@ pub enum ChannelUpdateTx {
     PinDeposit(PinDepositInfo),
     /// A config-only tx (a single `ChannelConfig` op) on the config lineage.
     /// Caller-recovered, like [`Self::Custom`] — never auto-resubmitted.
-    Config(SignedMantleTx<Unverified>),
+    Config(SignedOps<Unverified, StandardMode>),
     /// A tx shape the SDK cannot produce (bundled deposits, multi-inscribe,
     /// other custom-built txs), reported whole as a unit.
-    Custom(SignedMantleTx<Unverified>),
+    Custom(SignedOps<Unverified, StandardMode>),
 }
 
 impl ChannelUpdateTx {
@@ -185,7 +185,7 @@ impl ChannelUpdateTx {
             Self::Inscription(i) => i.tx_hash,
             Self::AtomicWithdraw(a) => a.tx_hash,
             Self::PinDeposit(a) => a.tx_hash,
-            Self::Config(tx) | Self::Custom(tx) => tx.mantle_tx().hash(),
+            Self::Config(tx) | Self::Custom(tx) => tx.hash(),
         }
     }
 

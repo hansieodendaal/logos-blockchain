@@ -3,9 +3,10 @@ use std::{collections::BTreeSet, time::Duration};
 use lb_core::{
     codec::DeserializeOp as _,
     mantle::{
-        SignedMantleTx, TxHash,
+        SignedOps, TxHash,
+        ledger::verification_mode::StandardMode,
         traits::Hashable as _,
-        transactions::{OpsProofs, states::Preverified},
+        transactions::{OpProofs, states::Preverified},
     },
 };
 use lb_key_management_system_service::keys::ZkPublicKey;
@@ -51,7 +52,7 @@ pub async fn prepare_transfer_transaction(
     let prepared =
         prepare_user_wallet_transaction_submission(world, step, &sender_wallet_name, intent, None)
             .await?;
-    let signed = sign_prepared_user_wallet_transaction(step, prepared, OpsProofs::empty())?;
+    let signed = sign_prepared_user_wallet_transaction(step, prepared, OpProofs::empty())?;
     let tx_hash = record_prepared_transaction(world, transaction_alias.clone(), &signed)?;
 
     report_prepared_transaction(
@@ -104,7 +105,7 @@ pub async fn submit_prepared_transaction_through_blend(
         warn!(target: TARGET, "Step `{step}` error: {e}");
     })?;
 
-    let tx_hash = node.blend_transaction(&signed_tx).await.inspect_err(|e| {
+    let tx_hash = node.blend_transaction(signed_tx).await.inspect_err(|e| {
         warn!(target: TARGET, "Step `{step}` error: {e}");
     })?;
 
@@ -318,7 +319,7 @@ async fn submit_prepared_transaction_to_node(
     world: &CucumberWorld,
     step: &str,
     transaction_alias: &str,
-    signed_tx: &SignedMantleTx<Preverified>,
+    signed_tx: &SignedOps<Preverified, StandardMode>,
     tx_hash: TxHash,
     node_name: &str,
 ) -> Result<(), StepError> {

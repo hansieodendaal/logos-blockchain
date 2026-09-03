@@ -22,11 +22,11 @@ use lb_core::{
     },
     header::HeaderId,
     mantle::{
-        SignedMantleTx,
+        OpRef, SignedOps,
         gas::MainnetGasProfile,
-        ops::Op,
-        traits::{Hashable, MantleTxWithProofs, StorageSize},
-        transactions::{hash::TxHash, mantle_tx::MantleTx as _, states::Preverified},
+        ledger::verification_mode::StandardMode,
+        traits::{Hashable, MantleTx, SignedMantleTx, StorageSize},
+        transactions::{hash::TxHash, states::Preverified},
     },
     proofs::leader_proof::{Groth16LeaderProof, LeaderPrivate},
 };
@@ -66,11 +66,11 @@ use crate::{
 
 fn log_sdp_activity_selected_for_proposal<Tx>(block: &Block<Tx>, ledger_state: &LedgerState)
 where
-    Tx: MantleTxWithProofs,
+    Tx: MantleTx,
 {
     for (tx, active) in block.transactions_iter().flat_map(|tx| {
-        tx.mantle_tx().ops().iter().filter_map(move |op| match op {
-            Op::SDPActive(active) => Some((tx, active)),
+        tx.op_refs_iter().filter_map(move |op| match op {
+            OpRef::SDPActive(active) => Some((tx, active)),
             _ => None,
         })
     }) {
@@ -204,7 +204,7 @@ pub struct CryptarchiaLeader<
     Mempool::RecoveryState: Serialize + DeserializeOwned,
     Mempool::Settings: Clone,
     Mempool::Item: Clone + Eq + Debug + 'static,
-    Mempool::Item: MantleTxWithProofs,
+    Mempool::Item: SignedMantleTx<Preverified, StandardMode>,
     MempoolNetAdapter:
         MempoolNetworkAdapter<RuntimeServiceId, Payload = Mempool::Item, Key = Mempool::Key>,
     <MempoolNetAdapter as MempoolNetworkAdapter<RuntimeServiceId>>::Settings: Send + Sync,
@@ -243,7 +243,7 @@ where
     Mempool::RecoveryState: Serialize + DeserializeOwned,
     Mempool::Storage: MempoolStorageAdapter<RuntimeServiceId> + Clone + Send + Sync,
     Mempool::Settings: Clone,
-    Mempool::Item: MantleTxWithProofs + Clone + Eq + Debug,
+    Mempool::Item: SignedMantleTx<Preverified, StandardMode> + Clone + Eq + Debug,
     MempoolNetAdapter:
         MempoolNetworkAdapter<RuntimeServiceId, Payload = Mempool::Item, Key = Mempool::Key>,
     <MempoolNetAdapter as MempoolNetworkAdapter<RuntimeServiceId>>::Settings: Send + Sync,
@@ -288,7 +288,7 @@ where
         > + lb_blend_service::ServiceComponents<NodeId: Send + Sync>
         + Send
         + 'static,
-    Mempool: MemPool<Item = SignedMantleTx<Preverified>>
+    Mempool: MemPool<Item = SignedOps<Preverified, StandardMode>>
         + RecoverableMempool<BlockId = HeaderId, Key = TxHash>
         + Send
         + Sync
@@ -306,7 +306,7 @@ where
         + Sync
         + Unpin
         + 'static,
-    Mempool::Item: MantleTxWithProofs,
+    Mempool::Item: SignedMantleTx<Preverified, StandardMode>,
     MempoolNetAdapter: MempoolNetworkAdapter<RuntimeServiceId, Payload = Mempool::Item, Key = Mempool::Key>
         + Send
         + Sync
@@ -572,14 +572,14 @@ where
         > + lb_blend_service::ServiceComponents<NodeId: Send + Sync>
         + Send
         + 'static,
-    Mempool: MemPool<Item = SignedMantleTx<Preverified>>
+    Mempool: MemPool<Item = SignedOps<Preverified, StandardMode>>
         + RecoverableMempool<BlockId = HeaderId, Key = TxHash>
         + Send
         + Sync
         + 'static,
     Mempool::RecoveryState: Serialize + DeserializeOwned,
     Mempool::Settings: Clone + Send + Sync + 'static,
-    Mempool::Item: MantleTxWithProofs<Hash = Mempool::Key>
+    Mempool::Item: SignedMantleTx<Preverified, StandardMode, Hash = Mempool::Key>
         + Debug
         + Clone
         + Eq
@@ -682,7 +682,10 @@ where
                     .clone()
                     .try_apply_contents::<_, HeaderId, MainnetGasProfile>(
                         ledger_config,
-                        iter::once(&tx),
+                        // Tx is cloned eagerly: `try_apply_contents` consumes the tx, but we need
+                        // it for the block if it is valid.
+                        // Avoidable if we made the ledger hand it back.
+                        iter::once(tx.clone()),
                     ) {
                     Ok((new_state, _events, deferred_zkps)) => match deferred_zkps.verify() {
                         Ok(()) => {
