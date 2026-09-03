@@ -10,14 +10,14 @@ use crate::{
     block::{Block, BlockTransactions, UncleHeaders},
     header::Header,
     mantle::{
-        Note, Op, OpProof, SignedMantleTx,
+        MantleTransaction, Note, Op, OpProof,
         ledger::{BoundedOutputs, Inputs, Outputs},
         ops::{
             ZkAndEd25519Proof, channel::inscribe::InscriptionOp, sdp::SDPDeclareOp,
             transfer::TransferOp,
         },
         transactions::{
-            GenesisTx, MAX_OPS_PER_TX, Ops, OpsProofs, VerificationError, genesis_tx,
+            GenesisTx, MAX_OPS_PER_TX, OpProofs, Ops, VerificationError, genesis_tx,
             mantle_tx::RawMantleTx,
         },
     },
@@ -27,7 +27,7 @@ use crate::{
 /// [`GenesisBlockBuilder`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The op proofs supplied to [`SignedMantleTx`] failed verification.
+    /// The op proofs supplied to [`MantleTransaction`] failed verification.
     #[error("Transaction verification failed: {0}")]
     Verification(#[from] VerificationError),
     /// The constructed transaction does not satisfy genesis transaction
@@ -1254,7 +1254,7 @@ impl GenesisBlockBuilder<WithAll> {
                 count: n,
             }));
         };
-        let mut ops_proofs = OpsProofs::from([
+        let mut ops_proofs = OpProofs::from([
             OpProof::ZkSig(ZkSignature::new(CompressedGroth16Proof::from_bytes(
                 &[0u8; 128],
             ))),
@@ -1269,7 +1269,7 @@ impl GenesisBlockBuilder<WithAll> {
                 .try_push(OpProof::ZkAndEd25519Sigs(proof))
                 .expect("genesis transaction proofs are bounded");
         }
-        let signed_tx = SignedMantleTx::new_trusted(RawMantleTx(capped_ops), ops_proofs);
+        let signed_tx = MantleTransaction::new_trusted(RawMantleTx(capped_ops), ops_proofs);
         Ok(GenesisBlock::genesis(GenesisTx::from_tx(signed_tx)?))
     }
 }
@@ -1364,7 +1364,7 @@ mod tests {
 
     // ── helpers for the with_genesis_tx path ──────────────────────────────────
 
-    fn make_signed_genesis_tx(extra_ops: Vec<Op>) -> SignedMantleTx<Preverified> {
+    fn make_signed_genesis_tx(extra_ops: Vec<Op>) -> MantleTransaction<Preverified> {
         let mut ops = vec![
             Op::Transfer(TransferOp::new(
                 Inputs::empty(),
@@ -1374,7 +1374,7 @@ mod tests {
         ];
         ops.extend(extra_ops);
 
-        let ops_proofs = OpsProofs::try_from_iter(ops.iter().map(|op| match op {
+        let ops_proofs = OpProofs::try_from_iter(ops.iter().map(|op| match op {
             Op::ChannelInscribe(_) => OpProof::Ed25519Sig(Ed25519Signature::zero()),
             Op::Transfer(_) => OpProof::ZkSig(ZkSignature::new(
                 CompressedGroth16Proof::from_bytes(&[0u8; 128]),
@@ -1390,7 +1390,7 @@ mod tests {
         }))
         .expect("genesis transaction proofs are bounded");
 
-        SignedMantleTx::new_trusted(RawMantleTx(Ops::new_unchecked(ops)), ops_proofs)
+        MantleTransaction::new_trusted(RawMantleTx(Ops::new_unchecked(ops)), ops_proofs)
     }
 
     fn make_genesis_tx(extra_ops: Vec<Op>) -> GenesisTx {

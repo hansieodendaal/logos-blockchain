@@ -1,5 +1,5 @@
 use crate::mantle::{
-    Op, OpProof, SignedMantleTx, VerificationError,
+    MantleTransaction, Op, OpProof, VerificationError,
     batch::DeferredZkpVerification,
     traits::Hashable as _,
     transactions::{
@@ -8,16 +8,16 @@ use crate::mantle::{
     },
 };
 
-pub struct VerifiedOps<'tx> {
+pub struct VerifiedOperations<'tx> {
     ops: &'tx [Op],
     proofs: &'tx [OpProof],
     tx_hash_view: TxHashView,
     index: usize,
 }
 
-impl<'tx> VerifiedOps<'tx> {
+impl<'tx> VerifiedOperations<'tx> {
     #[must_use]
-    pub fn new(transaction: &'tx SignedMantleTx<Preverified>) -> Self {
+    pub fn new(transaction: &'tx MantleTransaction<Preverified>) -> Self {
         let ops = transaction.mantle_tx.ops();
         let proofs = transaction.ops_proofs();
         let tx_hash = transaction.hash();
@@ -50,11 +50,10 @@ impl<'tx> VerifiedOps<'tx> {
     ) -> Option<Result<(&'tx Op, Option<DeferredZkpVerification>), VerificationError>> {
         let index = self.index;
         let op = self.ops.get(index)?;
-        let proof = self
-            .proofs
-            .get(index)
-            .expect("SignedMantleTx<Preverified> invariant: ops and proofs have the same length");
-        match SignedMantleTx::<Preverified>::verify_stateful_op(
+        let proof = self.proofs.get(index).expect(
+            "MantleTransaction<Preverified> invariant: ops and proofs have the same length",
+        );
+        match MantleTransaction::<Preverified>::verify_stateful_op(
             index,
             op,
             proof,
@@ -75,9 +74,9 @@ impl<'tx> VerifiedOps<'tx> {
     }
 }
 
-impl<'tx> From<&'tx SignedMantleTx<Preverified>> for VerifiedOps<'tx> {
-    fn from(transaction: &'tx SignedMantleTx<Preverified>) -> Self {
-        VerifiedOps::new(transaction)
+impl<'tx> From<&'tx MantleTransaction<Preverified>> for VerifiedOperations<'tx> {
+    fn from(transaction: &'tx MantleTransaction<Preverified>) -> Self {
+        VerifiedOperations::new(transaction)
     }
 }
 
@@ -92,7 +91,7 @@ mod tests {
         ledger::Inputs,
         ops::channel::{ChannelId, config::Keys},
         transactions::{
-            signed_mantle_tx::test_utils::{create_withdraw_tx, make_channel_state},
+            mantle_transaction::test_utils::{create_withdraw_tx, make_channel_state},
             verification_helper::test_utils::TestOperationVerificationHelper,
         },
     };

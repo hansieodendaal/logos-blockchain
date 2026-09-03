@@ -5,17 +5,17 @@ use crate::{
     mantle::{
         Op, OpProof,
         ops::{NoOpProof, ZkAndEd25519Proof},
-        transactions::OpsProofs,
+        transactions::OpProofs,
     },
     proofs::{
         channel_multi_sig_proof::ChannelMultiSigProof, leader_claim_proof::Groth16LeaderClaimProof,
     },
 };
 
-pub fn decode_ops_proofs<'a>(
+pub fn decode_op_proofs<'a>(
     input: &'a [u8],
     ops: &[Op],
-) -> Result<(&'a [u8], OpsProofs), DecodeError> {
+) -> Result<(&'a [u8], OpProofs), DecodeError> {
     let mut remaining = input;
     let mut proofs = Vec::with_capacity(ops.len());
 
@@ -24,8 +24,8 @@ pub fn decode_ops_proofs<'a>(
         proofs.push(proof);
         remaining = new_remaining;
     }
-    let ops_proofs = OpsProofs::try_from(proofs).map_err(|_| {
-        DecodeError::length_out_of_bounds::<OpsProofs>(ops.len(), OpsProofs::MIN, OpsProofs::MAX)
+    let ops_proofs = OpProofs::try_from(proofs).map_err(|_| {
+        DecodeError::length_out_of_bounds::<OpProofs>(ops.len(), OpProofs::MIN, OpProofs::MAX)
     })?;
 
     Ok((remaining, ops_proofs))
@@ -87,7 +87,7 @@ fn encode_op_proof(proof: &OpProof, op: &Op) -> Vec<u8> {
     }
 }
 
-pub fn encode_ops_proofs(proofs: &[OpProof], ops: &[Op]) -> Vec<u8> {
+pub fn encode_op_proofs(proofs: &[OpProof], ops: &[Op]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (proof, op) in proofs.iter().zip(ops.iter()) {
         bytes.extend(encode_op_proof(proof, op));

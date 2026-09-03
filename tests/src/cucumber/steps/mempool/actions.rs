@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, time::Duration};
 use lb_core::{
     codec::DeserializeOp as _,
     mantle::{
-        SignedMantleTx, TxHash,
+        MantleTransaction, TxHash,
         traits::Hashable as _,
-        transactions::{OpsProofs, states::Preverified},
+        transactions::{OpProofs, states::Preverified},
     },
 };
 use lb_key_management_system_service::keys::ZkPublicKey;
@@ -51,7 +51,7 @@ pub async fn prepare_transfer_transaction(
     let prepared =
         prepare_user_wallet_transaction_submission(world, step, &sender_wallet_name, intent, None)
             .await?;
-    let signed = sign_prepared_user_wallet_transaction(step, prepared, OpsProofs::empty())?;
+    let signed = sign_prepared_user_wallet_transaction(step, prepared, OpProofs::empty())?;
     let tx_hash = record_prepared_transaction(world, transaction_alias.clone(), &signed)?;
 
     report_prepared_transaction(
@@ -318,7 +318,7 @@ async fn submit_prepared_transaction_to_node(
     world: &CucumberWorld,
     step: &str,
     transaction_alias: &str,
-    signed_tx: &SignedMantleTx<Preverified>,
+    signed_tx: &MantleTransaction<Preverified>,
     tx_hash: TxHash,
     node_name: &str,
 ) -> Result<(), StepError> {
