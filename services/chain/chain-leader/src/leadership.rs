@@ -32,7 +32,8 @@ use tokio::{
 };
 
 use crate::{
-    LOG_TARGET, WinningPolEpochSlots, WinningPolSlotStream, WinningSlotFuture,
+    LOG_TARGET, WinningPolEpochSlots, WinningPolEpochState, WinningPolEpochStateSource,
+    WinningPolSlotStream, WinningSlotFuture,
     kms::{KmsAdapter, PreloadKmsService},
     metrics,
 };
@@ -241,9 +242,12 @@ pub enum BuildProofError {
 /// per slot; the Blend winning-slot scan does not, since the leadership quota
 /// proof only attests that a note was aged, not that it is unspent.
 pub struct SlotContext {
-    pub tip: HeaderId,
+    /// Tip explicitly passed to `get_leader_aged_notes` for the wallet query.
+    pub wallet_tip: HeaderId,
     pub epoch_state: EpochState,
     pub eligible_aged: Vec<UtxoWithKeyId>,
+    /// Tip/LIB provenance of the chain-derived epoch state.
+    pub source: WinningPolEpochStateSource,
 }
 
 /// Per-subscriber background task that hands one lazy winning-slot stream per
@@ -309,6 +313,38 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
             continue;
         };
 
+        let SlotContext {
+            wallet_tip,
+            epoch_state,
+            eligible_aged,
+            source,
+        } = slot_context;
+        let state = WinningPolEpochState {
+            nonce: epoch_state.nonce,
+            aged_utxo_root: epoch_state.utxo_merkle_root(),
+            lottery_0: epoch_state.lottery_0,
+            lottery_1: epoch_state.lottery_1,
+            source,
+        };
+        tracing::info!(
+            target: LOG_TARGET,
+            diagnostic = "blend_tsi_outage",
+            event = "pol_epoch_state_frozen",
+            epoch = u32::from(epoch),
+            slot = u64::from(slot),
+            wallet_tip_id = %wallet_tip,
+            source_tip_id = %state.source.tip_id,
+            source_tip_slot = u64::from(state.source.tip_slot),
+            source_lib_id = %state.source.lib_id,
+            source_lib_slot = u64::from(state.source.lib_slot),
+            wallet_tip_matches_epoch_state_source = wallet_tip == state.source.tip_id,
+            nonce = ?state.nonce,
+            aged_utxo_root = ?state.aged_utxo_root,
+            lottery_0 = ?state.lottery_0,
+            lottery_1 = ?state.lottery_1,
+            "Frozen ChainLeader epoch state for winning PoL slots"
+        );
+
         // Hand the subscriber a *lazy* stream over this epoch's slot range. No
         // slot is scanned until the subscriber drives the stream, and it decides
         // how far ahead to pre-compute, so the whole epoch is never materialized
@@ -316,14 +352,15 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
         // the subscriber just stops polling it once it moves to the next epoch.
         let winning_slots_stream = epoch_winning_slots_stream(
             &ledger_config,
-            slot_context.epoch_state,
-            &slot_context.eligible_aged,
+            epoch_state,
+            &eligible_aged,
             kms.clone(),
             slot,
         );
         if epoch_handoff_sender
             .send(WinningPolEpochSlots {
                 epoch,
+                state,
                 slots: winning_slots_stream,
             })
             .await
@@ -372,7 +409,19 @@ where
     RuntimeServiceId: AsServiceId<Wallet> + Debug + Display + Sync,
 {
     let tip = cryptarchia_api.info().await.ok()?.cryptarchia_info.tip;
-    let epoch_state = cryptarchia_api.get_epoch_state(slot).await.ok()?.ok()?;
+    let query_result = cryptarchia_api
+        .get_epoch_state_with_source(slot)
+        .await
+        .ok()?
+        .ok()?;
+    let lb_chain_service::EpochStateQueryResult {
+        epoch_state,
+        source_tip_id,
+        source_tip_slot,
+        source_lib_id,
+        source_lib_slot,
+        ..
+    } = query_result;
     let eligible_utxos = wallet_api.get_leader_aged_notes(Some(tip)).await.ok()?;
     let eligible = match &ledger_config.faucet_pk {
         Some(faucet_pk) => eligible_utxos
@@ -383,9 +432,15 @@ where
         None => eligible_utxos.response,
     };
     Some(SlotContext {
-        tip,
+        wallet_tip: tip,
         epoch_state,
         eligible_aged: eligible,
+        source: WinningPolEpochStateSource {
+            tip_id: source_tip_id,
+            tip_slot: source_tip_slot,
+            lib_id: source_lib_id,
+            lib_slot: source_lib_slot,
+        },
     })
 }
 

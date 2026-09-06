@@ -430,7 +430,12 @@ where
     };
 
     if current_secret_epoch_info.epoch != current_public_epoch_info.epoch {
-        debug!(target: LOG_TARGET, "Secret PoL info is for epoch {:?} which does not match the current public epoch {:?}, cannot create message handler until they line up.", current_secret_epoch_info.epoch, current_public_epoch_info.epoch);
+        debug!(
+            target: LOG_TARGET,
+            "Secret PoL info is for epoch {:?} which does not match the current public epoch {:?}, \
+            cannot create message handler until they line up.",
+            current_secret_epoch_info.epoch, current_public_epoch_info.epoch
+        );
         // Re-instate the stream since we need it for when the new public epoch info
         // will arrive. We chose this over not calling `.take()` here and use
         // `.take().unwrap()` below instead.
