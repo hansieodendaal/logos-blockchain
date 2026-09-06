@@ -691,7 +691,7 @@ impl LedgerState {
                             parameters.inactivity_period.into_inner().into_inner()
                         });
                     tracing::trace!(
-                        diagnostic = "blend_tsi_outage",
+                        diagnostic = "blend_reachability",
                         event = "sdp_declaration_applied",
                         evaluation_context = "proposal",
                         canonical = false,
@@ -721,7 +721,7 @@ impl LedgerState {
                     result.sdp_ledger().get_declaration(&op.declaration_id)
                 {
                     tracing::trace!(
-                        diagnostic = "blend_tsi_outage",
+                        diagnostic = "blend_reachability",
                         event = "sdp_activity_applied",
                         evaluation_context = "proposal",
                         canonical = false,

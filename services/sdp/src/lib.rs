@@ -406,7 +406,7 @@ where
         let declaration_id = declaration.id();
 
         tracing::debug!(
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_declaration_submitted",
             provider_id = ?declaration.provider_id,
             declaration_id = ?declaration_id,
@@ -484,7 +484,7 @@ where
                 }
                 (consensus_result, config_result) => {
                     tracing::warn!(
-                        diagnostic = "blend_tsi_outage",
+                        diagnostic = "blend_reachability",
                         event = "sdp_activity_context_unavailable",
                         provider_id = ?declaration.zk_id,
                         declaration_id = ?declaration.id,
@@ -497,7 +497,7 @@ where
             };
 
         tracing::info!(
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_submission_requested",
             proof_epoch,
             chain_epoch = ?chain_epoch,
@@ -522,7 +522,7 @@ where
             Ok(tx) => tx,
             Err(e) => {
                 tracing::warn!(
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "sdp_activity_tx_failed",
                     proof_epoch,
                     chain_epoch = ?chain_epoch,
@@ -540,7 +540,7 @@ where
 
         let tx_id = signed_tx.hash();
         tracing::info!(
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_tx_created",
             proof_epoch,
             chain_epoch = ?chain_epoch,
@@ -553,7 +553,7 @@ where
 
         if let Err(e) = mempool_adapter.post_tx(signed_tx).await {
             tracing::warn!(
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_activity_tx_failed",
                 proof_epoch,
                 chain_epoch = ?chain_epoch,
@@ -568,7 +568,7 @@ where
             metrics::activity_mempool_failures_total();
         } else {
             tracing::info!(
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_activity_tx_submitted",
                 proof_epoch,
                 chain_epoch = ?chain_epoch,

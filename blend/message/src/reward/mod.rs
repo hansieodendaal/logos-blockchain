@@ -129,7 +129,7 @@ impl OldEpochBlendingTokenCollector {
 
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "blend_activity_token_evaluation",
             proof_epoch,
             candidate_blending_token_count = candidate_hamming_distances.len(),

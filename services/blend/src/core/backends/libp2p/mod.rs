@@ -113,7 +113,7 @@ where
         {
             tracing::error!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "blend_send_failure",
                 epoch = u32::from(intended_epoch),
                 error = %e,

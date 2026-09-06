@@ -76,7 +76,7 @@ impl LeaderProofsGenerator for RealLeaderProofsGenerator {
         let Some(proof) = self.proofs_stream.next().await else {
             tracing::warn!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "leadership_proof_stream_ended",
                 epoch = u32::from(self.settings.epoch),
                 "Leadership proof stream ended. No proof is generated."

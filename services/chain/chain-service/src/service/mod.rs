@@ -201,7 +201,7 @@ where
             for query_source in query_sources {
                 warn!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "epoch_state_query_source_became_stale",
                     requested_epoch = u32::from(query_source.requested_epoch),
                     requested_slot = u64::from(query_source.requested_slot),
@@ -410,7 +410,7 @@ fn log_epoch_state_query(result: &EpochStateQueryResult) {
 
     info!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "epoch_state_query",
         requested_slot = u64::from(result.requested_slot),
         requested_epoch = u32::from(result.requested_epoch),
@@ -461,7 +461,7 @@ fn log_canonical_tsi_transition(
         );
         info!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "tsi_epoch_committed",
             from_epoch = transition.from_epoch,
             to_epoch = transition.to_epoch,
@@ -531,7 +531,7 @@ where
 
             info!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_activity_committed",
                 provider_id = ?new_declaration.provider_id,
                 declaration_id = ?active.declaration_id,
@@ -582,7 +582,7 @@ fn log_blend_snapshot_provider_decisions(
         .unwrap_or_default();
     debug!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "blend_active_declarations_snapshot",
         epoch = u32::from(target_epoch),
         snapshot_slot = u64::from(snapshot_slot),
@@ -604,7 +604,7 @@ fn log_blend_snapshot_provider_decisions(
                 );
                 info!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_snapshot_provider_decision",
                     target_epoch = u32::from(target_epoch),
                     snapshot_slot = u64::from(snapshot_slot),
@@ -625,7 +625,7 @@ fn log_blend_snapshot_provider_decisions(
                 // ledger declaration.
                 info!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_snapshot_provider_decision",
                     target_epoch = u32::from(target_epoch),
                     snapshot_slot = u64::from(snapshot_slot),

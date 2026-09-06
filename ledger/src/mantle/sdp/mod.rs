@@ -436,7 +436,7 @@ impl SdpLedger {
                 });
             tracing::info!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_declaration_applied",
                 provider_id = ?declaration.provider_id,
                 declaration_id = ?op.id(),

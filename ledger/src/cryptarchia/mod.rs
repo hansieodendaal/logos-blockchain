@@ -67,7 +67,7 @@ fn log_tsi_update(
     measured_block_density: u64,
 ) {
     tracing::info!(
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "tsi_update",
         from_epoch = u32::from(from_epoch),
         to_epoch = u32::from(to_epoch),
