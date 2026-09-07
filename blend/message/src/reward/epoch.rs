@@ -102,7 +102,7 @@ impl BlendingTokenEvaluation {
         let satisfies_activity_threshold = distance <= self.activity_threshold;
         tracing::trace!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "blend_activity_token_distance",
             signing_key = ?token.signing_key(),
             hamming_distance = distance.value(),

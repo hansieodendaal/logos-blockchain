@@ -481,7 +481,7 @@ where
                     ConnectionUpgradeFailureReason::ConnectionFailure => {
                         tracing::debug!(
                             target: LOG_TARGET,
-                            diagnostic = "blend_tsi_outage",
+                            diagnostic = "blend_reachability",
                             event = "blend_peer_negotiation_failure",
                             epoch = u32::from(self.current_epoch_info.epoch),
                             peer_id = ?peer,
@@ -502,7 +502,7 @@ where
                     upgrade_error @ (ConnectionUpgradeFailureReason::DuplicateConnection | ConnectionUpgradeFailureReason::MaximumPeeringDegreeReached | ConnectionUpgradeFailureReason::ReverseDirectionPreferred) => {
                         tracing::trace!(
                             target: LOG_TARGET,
-                            diagnostic = "blend_tsi_outage",
+                            diagnostic = "blend_reachability",
                             event = "blend_peer_negotiation_failure",
                             epoch = u32::from(self.current_epoch_info.epoch),
                             peer_id = ?peer,
@@ -527,7 +527,7 @@ where
             lb_blend::network::core::with_core::behaviour::Event::InboundConnectionUpgradeFailed { peer, reason } => {
                 tracing::trace!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_peer_negotiation_failure",
                     epoch = u32::from(self.current_epoch_info.epoch),
                     peer_id = ?peer,
@@ -820,7 +820,7 @@ where
             } else {
                 tracing::error!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_send_failure",
                     epoch = u32::from(self.current_epoch_info.epoch),
                     error = ?e,
@@ -855,7 +855,7 @@ where
             if !matches!(e, SendError::NoPeers | SendError::InvalidEpoch) {
                 tracing::error!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_send_failure",
                     epoch = u32::from(epoch),
                     error = ?e,
@@ -939,7 +939,7 @@ where
         {
             tracing::error!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "blend_send_failure",
                 epoch = u32::from(intended_epoch),
                 error = ?e,

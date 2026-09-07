@@ -507,7 +507,7 @@ where
 
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_declaration_submission_requested",
             provider_id = ?provider_id,
             declaration_id = ?declaration_id,
@@ -530,7 +530,7 @@ where
         let tx_id = signed_tx.hash();
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_declaration_tx_created",
             provider_id = ?provider_id,
             declaration_id = ?declaration_id,
@@ -547,7 +547,7 @@ where
 
         tracing::info!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_declaration_submitted",
             provider_id = ?provider_id,
             declaration_id = ?declaration_id,
@@ -643,7 +643,7 @@ where
 
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_submission_requested",
             proof_epoch,
             chain_epoch,
@@ -670,7 +670,7 @@ where
             Err(e) => {
                 tracing::error!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "sdp_activity_tx_failed",
                     proof_epoch,
                     chain_epoch,
@@ -690,7 +690,7 @@ where
         let tx_id = signed_tx.hash();
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_tx_created",
             proof_epoch,
             chain_epoch,
@@ -705,7 +705,7 @@ where
         if let Err(e) = mempool_adapter.post_tx(signed_tx).await {
             tracing::error!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_activity_tx_failed",
                 proof_epoch,
                 chain_epoch,
@@ -724,7 +724,7 @@ where
 
         tracing::info!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_tx_submitted",
             proof_epoch,
             chain_epoch,

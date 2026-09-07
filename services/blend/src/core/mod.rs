@@ -131,6 +131,56 @@ pub use state::RecoveryServiceState as CoreServiceState;
 
 const LOG_TARGET: &str = blend::service::CORE;
 
+fn pol_state_matches(
+    pol_info: &PolEpochInfo,
+    blend_epoch: Epoch,
+    blend_leadership_public_inputs: &LeaderInputs,
+) -> bool {
+    pol_info.epoch == blend_epoch
+        && pol_info.state.nonce == blend_leadership_public_inputs.pol_epoch_nonce
+        && pol_info.state.aged_utxo_root == blend_leadership_public_inputs.pol_ledger_aged
+        && pol_info.state.lottery_0 == blend_leadership_public_inputs.lottery_0
+        && pol_info.state.lottery_1 == blend_leadership_public_inputs.lottery_1
+}
+
+fn log_pol_state_handoff(
+    pol_info: &PolEpochInfo,
+    blend_epoch: Epoch,
+    blend_leadership_public_inputs: &LeaderInputs,
+) {
+    let state_matches = pol_state_matches(pol_info, blend_epoch, blend_leadership_public_inputs);
+    macro_rules! log_handoff {
+        ($level:ident) => {
+            $level!(
+                target: LOG_TARGET,
+                diagnostic = "blend_reachability",
+                event = "blend_pol_state_handoff",
+                epoch = u32::from(pol_info.epoch),
+                blend_epoch = u32::from(blend_epoch),
+                state_matches,
+                pol_source_tip_id = %pol_info.state.source.tip_id,
+                pol_source_tip_slot = u64::from(pol_info.state.source.tip_slot),
+                pol_source_lib_id = %pol_info.state.source.lib_id,
+                pol_source_lib_slot = u64::from(pol_info.state.source.lib_slot),
+                pol_nonce = ?pol_info.state.nonce,
+                blend_nonce = ?blend_leadership_public_inputs.pol_epoch_nonce,
+                pol_aged_utxo_root = ?pol_info.state.aged_utxo_root,
+                blend_aged_utxo_root = ?blend_leadership_public_inputs.pol_ledger_aged,
+                pol_lottery_0 = ?pol_info.state.lottery_0,
+                blend_lottery_0 = ?blend_leadership_public_inputs.lottery_0,
+                pol_lottery_1 = ?pol_info.state.lottery_1,
+                blend_lottery_1 = ?blend_leadership_public_inputs.lottery_1,
+                "Compared private ChainLeader PoL state with public Blend epoch state"
+            );
+        };
+    }
+    if state_matches {
+        log_handoff!(info);
+    } else {
+        log_handoff!(error);
+    }
+}
+
 type OldEpochCryptographicProcessor<ProofsVerifier> =
     ReceiverCryptographicProcessor<ProofsVerifier>;
 
@@ -1372,6 +1422,11 @@ fn apply_or_hold_secret_pol_info<NodeId, CorePoQGenerator, ProofsGenerator, Proo
 {
     if current_epoch.epoch_info().epoch == pol_secret_info.epoch {
         // Apply now: move the winning-slot stream into the current processor.
+        log_pol_state_handoff(
+            &pol_secret_info,
+            current_epoch.epoch_info().epoch,
+            &current_epoch.epoch_info().poq_leadership_public_inputs,
+        );
         current_epoch.crypto_processor_mut().set_epoch_private(
             pol_secret_info.winning_pol_info_stream,
             pol_secret_info.epoch,
@@ -1805,6 +1860,11 @@ where
                             let current_secret_info = current_secret_info
                                 .take()
                                 .expect("Secret PoL info presence checked above.");
+                            log_pol_state_handoff(
+                                &current_secret_info,
+                                new_epoch_info.epoch,
+                                &new_epoch_info.poq_leadership_public_inputs,
+                            );
                             new_processor.set_epoch_private(
                                 current_secret_info.winning_pol_info_stream,
                                 new_epoch_info.epoch,
@@ -2684,7 +2744,7 @@ async fn submit_activity_proof(
     let proof_epoch = proof.epoch();
     debug!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "sdp_activity_proof_submission_requested",
         proof_epoch = u32::from(proof_epoch),
         signing_key = ?proof.token().signing_key(),
@@ -2699,7 +2759,7 @@ async fn submit_activity_proof(
     match &result {
         Ok(()) => debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_proof_submitted",
             proof_epoch = u32::from(proof_epoch),
             signing_key = ?proof.token().signing_key(),
@@ -2707,7 +2767,7 @@ async fn submit_activity_proof(
         ),
         Err(error) => error!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_proof_submission_failed",
             proof_epoch = u32::from(proof_epoch),
             signing_key = ?proof.token().signing_key(),

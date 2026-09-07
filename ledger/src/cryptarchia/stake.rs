@@ -52,7 +52,7 @@ impl StakeInference {
 
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "tsi_calculated",
             old_total_stake = total_stake_estimate,
             new_total_stake = new_total_stake_estimate,
