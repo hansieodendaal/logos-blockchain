@@ -668,7 +668,7 @@ impl LedgerState {
             });
         tracing::trace!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_declaration_applied",
             evaluation_context = "candidate",
             canonical = false,
@@ -707,7 +707,7 @@ impl LedgerState {
             });
         tracing::trace!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "sdp_activity_applied",
             evaluation_context = "candidate",
             canonical = false,

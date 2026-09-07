@@ -185,7 +185,7 @@ where
             let mode_changed = previous_mode != resulting_mode;
             info!(
                 target: crate::LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "blend_mode_applied",
                 selected_mode,
                 previous_mode = previous_mode.as_str(),
@@ -196,7 +196,7 @@ where
             if mode_changed {
                 info!(
                     target: crate::LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_mode_changed",
                     previous_mode = previous_mode.as_str(),
                     new_mode = resulting_mode.as_str(),
@@ -349,7 +349,7 @@ impl Mode {
         };
         info!(
             target: crate::LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "blend_mode_chosen",
             mode = mode.as_str(),
             membership_count = membership.size(),

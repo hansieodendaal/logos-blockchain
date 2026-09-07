@@ -45,7 +45,7 @@ impl ActivityTokenEvaluationDiagnostic {
         let candidate_blending_token_count = self.candidate_hamming_distances.len();
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = "blend_activity_token_evaluation",
             proof_epoch = self.proof_epoch,
             candidate_blending_token_count,

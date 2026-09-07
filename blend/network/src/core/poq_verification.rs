@@ -69,7 +69,7 @@ pub fn spawn_poq_verification<Verifier>(
             Ok(Ok(message)) => {
                 tracing::trace!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_poq_verification",
                     result = "success",
                     blend_epoch = u32::from(epoch),
@@ -87,7 +87,7 @@ pub fn spawn_poq_verification<Verifier>(
             Ok(Err(e)) => {
                 tracing::debug!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_poq_verification_failed",
                     result = "failure",
                     blend_epoch = u32::from(epoch),
@@ -105,7 +105,7 @@ pub fn spawn_poq_verification<Verifier>(
             Err(e) => {
                 tracing::error!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "blend_poq_verification_task_failed",
                     result = "error",
                     blend_epoch = u32::from(epoch),

@@ -65,7 +65,7 @@ fn log_membership_transition<NodeId>(
         .collect();
     tracing::info!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "blend_membership_latched",
         component,
         epoch = u32::from(epoch),
@@ -173,7 +173,7 @@ where
                         };
                         tracing::info!(
                             target: LOG_TARGET,
-                            diagnostic = "blend_tsi_outage",
+                            diagnostic = "blend_reachability",
                             event = "blend_epoch_state_latched",
                             component,
                             clock_epoch = u32::from(epoch),

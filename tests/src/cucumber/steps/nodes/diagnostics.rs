@@ -17,7 +17,7 @@ use crate::cucumber::{
     world::{BlendDiagnosticPhase, CucumberWorld},
 };
 
-const DIAGNOSTIC: &str = "blend_tsi_outage";
+const DIAGNOSTIC: &str = "blend_reachability";
 
 fn diagnostic_node_sort_number(node_name: &str) -> Option<u32> {
     let number = node_name.strip_prefix("NODE_")?;
@@ -37,6 +37,9 @@ struct BlendDiagnosticParameterSet {
 impl BlendDiagnosticParameterSet {
     fn from_name(name: &str) -> Option<Self> {
         match name {
+            // No undue blend behaviour is expected with these parameters when running happy-path
+            // scenarios, so they are suitable for clean control tests when epoch have
+            // to complete in the shortest possible time.
             "clean_control" => Some(Self {
                 name: "clean_control",
                 security_parameter: 10,
@@ -45,6 +48,8 @@ impl BlendDiagnosticParameterSet {
                 epoch_period_nonce_buffer: 1,
                 epoch_period_nonce_stabilization: 1,
             }),
+            // These parameters are representative of the testnet, and are suitable for testing
+            // blend behaviour in a more realistic setting.
             "testnet_representative" => Some(Self {
                 name: "testnet_representative",
                 security_parameter: 5,
@@ -53,6 +58,9 @@ impl BlendDiagnosticParameterSet {
                 epoch_period_nonce_buffer: 3,
                 epoch_period_nonce_stabilization: 4,
             }),
+            // These parameters will invoke undue blend behaviour in a very short time, and are
+            // suitable for testing blend diagnostic measurements in a more extreme
+            // setting.
             "fast_repro" => Some(Self {
                 name: "fast_repro",
                 security_parameter: 3,

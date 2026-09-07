@@ -264,7 +264,7 @@ where
             for query_source in query_sources {
                 warn!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = "epoch_state_query_source_became_stale",
                     requested_epoch = u32::from(query_source.requested_epoch),
                     requested_slot = u64::from(query_source.requested_slot),
@@ -509,7 +509,7 @@ fn log_epoch_state_query(result: &EpochStateQueryResult) {
 
     debug!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "epoch_state_query",
         requested_slot = u64::from(result.requested_slot),
         requested_epoch = u32::from(result.requested_epoch),
@@ -549,7 +549,7 @@ fn log_canonical_tsi_transition<Tx>(cryptarchia: &Cryptarchia, block: &Block<Tx>
         .saturating_sub(1);
     info!(
         target: LOG_TARGET,
-        diagnostic = "blend_tsi_outage",
+        diagnostic = "blend_reachability",
         event = "tsi_epoch_committed",
         canonical = true,
         from_epoch = u32::from(from_epoch),
@@ -605,7 +605,7 @@ where
 
             info!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "sdp_activity_committed",
                 canonical = true,
                 provider_id = ?new_declaration.provider_id,
@@ -653,7 +653,7 @@ fn log_blend_snapshot_provider_decisions(
             .unwrap_or_default();
         debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_tsi_outage",
+            diagnostic = "blend_reachability",
             event = summary_event,
             canonical = true,
             epoch = u32::from(target_epoch),
@@ -671,7 +671,7 @@ fn log_blend_snapshot_provider_decisions(
             Some(snapshot_declaration) => {
                 debug!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = provider_event,
                     canonical = true,
                     target_epoch = u32::from(target_epoch),
@@ -691,7 +691,7 @@ fn log_blend_snapshot_provider_decisions(
                 // ledger declaration.
                 debug!(
                     target: LOG_TARGET,
-                    diagnostic = "blend_tsi_outage",
+                    diagnostic = "blend_reachability",
                     event = provider_event,
                     canonical = true,
                     target_epoch = u32::from(target_epoch),
@@ -945,7 +945,7 @@ async fn log_newly_canonical_blocks<Tx, Storage, RuntimeServiceId>(
         let Some(canonical_block) = canonical_block else {
             warn!(
                 target: LOG_TARGET,
-                diagnostic = "blend_tsi_outage",
+                diagnostic = "blend_reachability",
                 event = "canonical_diagnostic_block_unavailable",
                 block_id = %block_id,
                 "Could not load a newly canonical block for diagnostics"
