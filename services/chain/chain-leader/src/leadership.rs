@@ -5,13 +5,17 @@ use std::{
 };
 
 use futures::{StreamExt as _, stream};
-use lb_chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
+use lb_chain_service::{
+    EpochStateQueryResult,
+    api::{CryptarchiaServiceApi, CryptarchiaServiceData},
+};
 use lb_core::{
     header::HeaderId,
     mantle::Utxo,
     proofs::leader_proof::{
         Error as LeaderProofError, Groth16LeaderProof, LeaderPrivate, LeaderPublic,
     },
+    sdp::blend::{PolEpochState, PolEpochStateSource},
 };
 use lb_cryptarchia_engine::{Epoch, Slot};
 use lb_key_management_system_service::{
@@ -19,7 +23,7 @@ use lb_key_management_system_service::{
     operators::zk::leader::BuildPrivateInputsWithLeaderKey,
 };
 use lb_ledger::{EpochState, UtxoTree};
-use lb_log_targets::chain;
+use lb_log_targets::{chain, diagnostic::BLEND_REACHABILITY};
 use lb_time_service::{EpochSlotTickStream, SlotTick, TimeServiceMessage};
 use lb_utils::tokio::task::spawn_blocking;
 use lb_wallet_service::{
@@ -34,8 +38,7 @@ use tokio::{
 };
 
 use crate::{
-    WinningPolEpochSlots, WinningPolEpochState, WinningPolEpochStateSource, WinningPolSlotStream,
-    WinningSlotFuture,
+    WinningPolEpochSlots, WinningPolSlotStream, WinningSlotFuture,
     kms::{KmsAdapter, PreloadKmsService},
     metrics,
 };
@@ -258,7 +261,7 @@ pub struct SlotContext {
     pub epoch_state: EpochState,
     pub eligible_aged: Vec<UtxoWithKeyId>,
     /// Tip/LIB provenance of the chain-derived epoch state.
-    pub source: WinningPolEpochStateSource,
+    pub source: PolEpochStateSource,
 }
 
 /// Per-subscriber background task that hands one lazy winning-slot stream per
@@ -330,16 +333,16 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
             eligible_aged,
             source,
         } = slot_context;
-        let state = WinningPolEpochState {
+        let state = PolEpochState {
             nonce: epoch_state.nonce,
             aged_utxo_root: epoch_state.utxo_merkle_root(),
             lottery_0: epoch_state.lottery_0,
             lottery_1: epoch_state.lottery_1,
             source,
         };
-        tracing::info!(
+        tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_reachability",
+            diagnostic = BLEND_REACHABILITY,
             event = "pol_epoch_state_frozen",
             epoch = u32::from(epoch),
             slot = u64::from(slot),
@@ -420,19 +423,18 @@ where
     RuntimeServiceId: AsServiceId<Wallet> + Debug + Display + Sync,
 {
     let wallet_tip = cryptarchia_api.info().await.ok()?.cryptarchia_info.tip;
-    let query_result = cryptarchia_api
-        .get_epoch_state_with_source(slot)
-        .await
-        .ok()?
-        .ok()?;
-    let lb_chain_service::EpochStateQueryResult {
+    let EpochStateQueryResult {
         epoch_state,
         source_tip_id,
         source_tip_slot,
         source_lib_id,
         source_lib_slot,
         ..
-    } = query_result;
+    } = cryptarchia_api
+        .get_epoch_state_with_source(slot)
+        .await
+        .ok()?
+        .ok()?;
     let eligible_utxos = wallet_api
         .get_leader_aged_notes(Some(wallet_tip))
         .await
@@ -449,7 +451,7 @@ where
         wallet_tip,
         epoch_state,
         eligible_aged: eligible,
-        source: WinningPolEpochStateSource {
+        source: PolEpochStateSource {
             tip_id: source_tip_id,
             tip_slot: source_tip_slot,
             lib_id: source_lib_id,

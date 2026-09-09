@@ -4,12 +4,13 @@ use std::{
 };
 
 use lb_blend::scheduling::{epoch::EpochEvent, membership::Membership};
+use lb_log_targets::diagnostic::BLEND_REACHABILITY;
 use lb_network_service::NetworkService;
 use overwatch::{
     overwatch::OverwatchHandle,
     services::{AsServiceId, ServiceData},
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     core::{
@@ -183,9 +184,9 @@ where
         if let Ok(instance) = &result {
             let resulting_mode = instance.mode();
             let mode_changed = previous_mode != resulting_mode;
-            info!(
+            debug!(
                 target: crate::LOG_TARGET,
-                diagnostic = "blend_reachability",
+                diagnostic = BLEND_REACHABILITY,
                 event = "blend_mode_applied",
                 selected_mode,
                 previous_mode = previous_mode.as_str(),
@@ -196,7 +197,7 @@ where
             if mode_changed {
                 info!(
                     target: crate::LOG_TARGET,
-                    diagnostic = "blend_reachability",
+                    diagnostic = BLEND_REACHABILITY,
                     event = "blend_mode_changed",
                     previous_mode = previous_mode.as_str(),
                     new_mode = resulting_mode.as_str(),
@@ -347,9 +348,9 @@ impl Mode {
         } else {
             Self::Edge
         };
-        info!(
+        debug!(
             target: crate::LOG_TARGET,
-            diagnostic = "blend_reachability",
+            diagnostic = BLEND_REACHABILITY,
             event = "blend_mode_chosen",
             mode = mode.as_str(),
             membership_count = membership.size(),

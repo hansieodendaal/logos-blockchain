@@ -3,12 +3,8 @@ use core::fmt::{Debug, Display};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt as _};
 use lb_blend::proofs::quota::inputs::prove::private::ProofOfLeadershipQuotaInputs;
-use lb_blend_service::epoch_info::{
-    PolEpochInfo, PolEpochState, PolEpochStateSource, PolInfoProvider as PolInfoProviderTrait,
-};
-use lb_chain_leader_service::{
-    LeaderMsg, WinningPolEpochSlots, WinningPolEpochState, WinningPolEpochStateSource,
-};
+use lb_blend_service::epoch_info::{PolEpochInfo, PolInfoProvider as PolInfoProviderTrait};
+use lb_chain_leader_service::{LeaderMsg, WinningPolEpochSlots};
 use lb_pol::{PolChainInputsData, PolWalletInputsData, PolWitnessInputsData};
 use lb_services_utils::wait_until_services_are_ready;
 use overwatch::{overwatch::OverwatchHandle, services::AsServiceId};
@@ -57,36 +53,12 @@ where
         Some(Box::new(winning_pol_epoch_slots_stream.map(
             |WinningPolEpochSlots {
                  epoch,
-                 state:
-                     WinningPolEpochState {
-                         nonce,
-                         aged_utxo_root,
-                         lottery_0,
-                         lottery_1,
-                         source:
-                             WinningPolEpochStateSource {
-                                 tip_id,
-                                 tip_slot,
-                                 lib_id,
-                                 lib_slot,
-                             },
-                     },
+                 state,
                  slots,
              }| {
                 PolEpochInfo {
                     epoch,
-                    state: PolEpochState {
-                        nonce,
-                        aged_utxo_root,
-                        lottery_0,
-                        lottery_1,
-                        source: PolEpochStateSource {
-                            tip_id,
-                            tip_slot,
-                            lib_id,
-                            lib_slot,
-                        },
-                    },
+                    state,
                     // Just drive each per-slot future and drop the non-winners.
                     winning_pol_info_stream: Box::pin(
                         slots

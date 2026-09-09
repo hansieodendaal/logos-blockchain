@@ -29,12 +29,12 @@ use lb_core::{
         transactions::{hash::TxHash, states::Preverified},
     },
     proofs::leader_proof::{Groth16LeaderProof, LeaderPrivate},
+    sdp::blend::PolEpochState,
 };
 use lb_cryptarchia_engine::Slot;
-use lb_groth16::Fr;
 use lb_key_management_system_service::{api::KmsServiceApi, keys::Ed25519Key};
 use lb_ledger::LedgerState;
-use lb_log_targets::chain;
+use lb_log_targets::{chain, diagnostic::BLEND_REACHABILITY};
 use lb_services_utils::wait_until_services_are_ready;
 use lb_storage_service::StorageService;
 use lb_time_service::{SlotTick, TimeService, TimeServiceMessage};
@@ -83,11 +83,11 @@ where
             .map(|declaration| declaration.provider_id);
         tracing::debug!(
             target: LOG_TARGET,
-            diagnostic = "blend_reachability",
+            diagnostic = BLEND_REACHABILITY,
             event = "sdp_activity_selected_for_proposal",
-            tx_id = ?tx.hash(),
+            tx_id = %tx.hash(),
             provider_id = ?provider_id,
-            declaration_id = ?active.declaration_id,
+            declaration_id = %active.declaration_id,
             proof_epoch = u32::from(active.metadata.origin_epoch()),
             proposal_block_id = %block.header().id(),
             proposal_slot = u64::from(block.header().slot()),
@@ -107,26 +107,8 @@ pub type WinningPolEpochSlotsStream =
 
 pub struct WinningPolEpochSlots {
     pub epoch: Epoch,
-    pub state: WinningPolEpochState,
+    pub state: PolEpochState,
     pub slots: WinningPolSlotStream,
-}
-
-/// Chain-derived state used to construct an epoch's winning-slot stream.
-pub struct WinningPolEpochState {
-    pub nonce: Fr,
-    pub aged_utxo_root: Fr,
-    pub lottery_0: Fr,
-    pub lottery_1: Fr,
-    pub source: WinningPolEpochStateSource,
-}
-
-/// Provenance of the chain-derived state used for an epoch's winning-slot
-/// stream.
-pub struct WinningPolEpochStateSource {
-    pub tip_id: HeaderId,
-    pub tip_slot: Slot,
-    pub lib_id: HeaderId,
-    pub lib_slot: Slot,
 }
 
 /// A single slot's leadership-proof work: a future resolving to that slot's
@@ -511,7 +493,7 @@ where
                             Err(e) => {
                                 error!(
                                     target: LOG_TARGET,
-                                    diagnostic = "blend_reachability",
+                                    diagnostic = BLEND_REACHABILITY,
                                     event = "leadership_proof_failure",
                                     epoch = u32::from(ledger_config.epoch(slot)),
                                     slot = u64::from(slot),

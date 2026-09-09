@@ -100,10 +100,18 @@ fn pol_state_match_detects_fingerprint_mismatch() {
         winning_pol_info_stream: Box::pin(empty()),
     };
 
-    assert!(super::pol_state_matches(&private, Epoch::new(7), &public));
+    assert!(super::diagnostics::pol_state_matches(
+        &private,
+        Epoch::new(7),
+        &public
+    ));
 
     private.state.lottery_1 = Fr::from(1u64);
-    assert!(!super::pol_state_matches(&private, Epoch::new(7), &public));
+    assert!(!super::diagnostics::pol_state_matches(
+        &private,
+        Epoch::new(7),
+        &public
+    ));
 }
 
 fn test_blend_epoch_state(
