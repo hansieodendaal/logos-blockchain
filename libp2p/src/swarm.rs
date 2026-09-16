@@ -8,6 +8,7 @@ use std::{
     io,
     net::Ipv4Addr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -42,6 +43,16 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     /// Builds a [`Swarm`] configured for use with Logos blockchain on top of a
     /// tokio executor.
     pub fn build(config: SwarmConfig, rng: R) -> Result<Self, Box<dyn Error>> {
+        Self::build_with_chain_sync_admission(config, rng, None)
+    }
+
+    /// Builds a [`Swarm`] with an optional synchronous predicate for newly
+    /// opened inbound `ChainSync` streams.
+    pub fn build_with_chain_sync_admission(
+        config: SwarmConfig,
+        rng: R,
+        chain_sync_peer_block_predicate: Option<Arc<dyn Fn(PeerId) -> bool + Send + Sync>>,
+    ) -> Result<Self, Box<dyn Error>> {
         let keypair =
             libp2p::identity::Keypair::from(ed25519::Keypair::from(config.node_key.clone()));
         let peer_id = PeerId::from(keypair.public());
@@ -77,6 +88,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                         chain_sync_protocol_name: chain_sync_protocol_name.into(),
                         public_key: keypair.public(),
                         chain_sync_config,
+                        chain_sync_peer_block_predicate,
                     },
                     rng,
                 )

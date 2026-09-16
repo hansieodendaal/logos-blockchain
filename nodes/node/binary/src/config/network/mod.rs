@@ -1,3 +1,4 @@
+use lb_banning_service::ConfiguredBanPolicy;
 use lb_libp2p::{ChainSyncSettings, IdentifySettings, KademliaSettings, SwarmConfig};
 use lb_network_service::{backends::libp2p::config::Libp2pConfig, config::NetworkConfig};
 
@@ -14,6 +15,7 @@ pub mod serde;
 pub struct ServiceConfig {
     pub user: Config,
     pub deployment: DeploymentSettings,
+    pub configured_ban_policy: ConfiguredBanPolicy,
 }
 
 impl From<ServiceConfig> for NetworkConfig<Libp2pConfig> {
@@ -21,6 +23,7 @@ impl From<ServiceConfig> for NetworkConfig<Libp2pConfig> {
         Self {
             backend: Libp2pConfig {
                 initial_peers: value.user.backend.initial_peers,
+                configured_ban_policy: value.configured_ban_policy,
                 inner: SwarmConfig {
                     host: value.user.backend.swarm.host,
                     port: value.user.backend.swarm.port,

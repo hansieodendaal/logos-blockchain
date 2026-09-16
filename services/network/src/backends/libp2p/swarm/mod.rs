@@ -17,8 +17,9 @@ macro_rules! log_error {
     };
 }
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use lb_banning_service::{BanScope, Subsystem};
 use lb_libp2p::{
     Multiaddr, PeerId, Protocol, Swarm, SwarmEvent,
     behaviour::BehaviourEvent,
@@ -48,7 +49,7 @@ pub use chainsync::ChainSyncCommand;
 pub use gossipsub::PubSubCommand;
 pub use kademlia::DiscoveryCommand;
 
-use crate::message::ChainSyncEvent;
+use crate::{LocalBanView, message::ChainSyncEvent};
 
 const LOG_TARGET: &str = network_service::backends::libp2p::ROOT;
 
@@ -59,6 +60,7 @@ pub struct SwarmHandler<R: Clone + Send + RngCore + 'static> {
     pub commands_rx: mpsc::Receiver<Command>,
     pub pubsub_messages_tx: broadcast::Sender<Message>,
     pub chainsync_events_tx: broadcast::Sender<ChainSyncEvent>,
+    pub chainsync_ban_view: LocalBanView,
 
     pending_queries: HashMap<QueryId, PendingQueryData>,
 }
@@ -69,6 +71,7 @@ const BACKOFF: u64 = 5;
 const MAX_RETRY: usize = 3;
 
 impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
+    #[cfg(test)]
     pub fn new(
         config: Libp2pConfig,
         commands_tx: mpsc::Sender<Command>,
@@ -77,7 +80,38 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         chainsync_events_tx: broadcast::Sender<ChainSyncEvent>,
         rng: R,
     ) -> Self {
-        let swarm = Swarm::build(config.inner, rng).unwrap();
+        let chainsync_ban_view =
+            LocalBanView::new::<()>(None, config.configured_ban_policy.clone());
+        Self::new_with_ban_view(
+            config,
+            commands_tx,
+            commands_rx,
+            pubsub_events_tx,
+            chainsync_events_tx,
+            chainsync_ban_view,
+            rng,
+        )
+    }
+
+    pub fn new_with_ban_view(
+        config: Libp2pConfig,
+        commands_tx: mpsc::Sender<Command>,
+        commands_rx: mpsc::Receiver<Command>,
+        pubsub_events_tx: broadcast::Sender<Message>,
+        chainsync_events_tx: broadcast::Sender<ChainSyncEvent>,
+        chainsync_ban_view: LocalBanView,
+        rng: R,
+    ) -> Self {
+        let admission_view = chainsync_ban_view.clone();
+        let chain_sync_peer_block_predicate = Arc::new(move |peer_id| {
+            admission_view.is_banned_for(peer_id, &BanScope::Service(Subsystem::ChainSync))
+        });
+        let swarm = Swarm::build_with_chain_sync_admission(
+            config.inner,
+            rng,
+            Some(chain_sync_peer_block_predicate),
+        )
+        .unwrap();
 
         // Keep the dialing history since swarm.connect doesn't return the result
         // synchronously
@@ -90,6 +124,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             commands_rx,
             pubsub_messages_tx: pubsub_events_tx,
             chainsync_events_tx,
+            chainsync_ban_view,
             pending_queries: HashMap::new(),
         }
     }
@@ -266,6 +301,9 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             NetworkCommand::Connect(dial) => {
                 self.connect(dial);
             }
+            NetworkCommand::ConfigureChainSyncBanning { api } => {
+                self.chainsync_ban_view.start_synchronizer(api);
+            }
             NetworkCommand::Info { reply } => {
                 let discovered_peers: Vec<PeerId> = self
                     .swarm
@@ -371,6 +409,7 @@ const fn exp_backoff(retry: usize) -> Duration {
 mod tests {
     use std::{collections::HashSet, net::Ipv4Addr, sync::Once, time::Instant};
 
+    use lb_banning_service::{BanSource, BanningConfig, ConfiguredBanPolicy, OffenseKind};
     use lb_libp2p::protocol_name::StreamProtocol;
     use lb_utils::net::get_available_udp_port;
     use rand::rngs::OsRng;
@@ -426,6 +465,7 @@ mod tests {
         Libp2pConfig {
             inner: create_swarm_config(port, !initial_peers.is_empty()),
             initial_peers,
+            configured_ban_policy: ConfiguredBanPolicy::default(),
         }
     }
 
@@ -795,5 +835,230 @@ mod tests {
 
         assert!(info.discovered_peers.is_empty());
         assert_eq!(info.n_discovered_peers, 0);
+    }
+
+    fn test_ban_record(peer_id: PeerId, scope: BanScope) -> lb_banning_service::BanRecord {
+        lb_banning_service::BanRecord {
+            peer_id,
+            source: BanSource::Service(Subsystem::ChainSync),
+            scope,
+            offense: OffenseKind::ProtocolViolation,
+            context: Some("test".to_owned()),
+            reported_at: std::time::SystemTime::UNIX_EPOCH,
+            expires_at: Some(std::time::SystemTime::now() + Duration::from_secs(60)),
+        }
+    }
+
+    fn handler_with_ban_view(view: LocalBanView) -> SwarmHandler<OsRng> {
+        let (tx, rx) = mpsc::channel(10);
+        let (pubsub_events_tx, _) = broadcast::channel(10);
+        let (chainsync_events_tx, _) = broadcast::channel(10);
+        let config = create_libp2p_config(vec![], get_available_udp_port().unwrap());
+        SwarmHandler::new_with_ban_view(
+            config,
+            tx,
+            rx,
+            pubsub_events_tx,
+            chainsync_events_tx,
+            view,
+            OsRng,
+        )
+    }
+
+    #[tokio::test]
+    async fn final_tip_dispatch_rejects_a_banned_peer_without_invoking_chainsync() {
+        let peer = PeerId::random();
+        let policy = ConfiguredBanPolicy::from_config(&BanningConfig {
+            blacklist: vec![peer],
+            ..Default::default()
+        });
+        let view = LocalBanView::new::<()>(None, policy);
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+
+        handler.handle_chainsync_command(ChainSyncCommand::RequestTip { peer, reply_sender });
+
+        assert!(
+            reply_receiver
+                .await
+                .expect("local rejection reply")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn final_block_dispatch_rejects_a_banned_peer_with_a_bounded_error_stream() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(
+            None,
+            ConfiguredBanPolicy::from_config(&BanningConfig {
+                blacklist: vec![peer],
+                ..Default::default()
+            }),
+        );
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let block = lb_libp2p::cryptarchia_sync::HeaderId::from([0; 32]);
+
+        handler.handle_chainsync_command(ChainSyncCommand::DownloadBlocks {
+            peer,
+            target_block: block,
+            local_tip: block,
+            latest_immutable_block: block,
+            additional_blocks: HashSet::new(),
+            reply_sender,
+        });
+
+        let mut stream = reply_receiver.await.expect("local rejection stream");
+        assert!(stream.next().await.expect("rejection item").is_err());
+    }
+
+    #[tokio::test]
+    async fn final_dispatch_is_scope_isolated_and_catches_a_queued_dynamic_ban() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        let mut handler = handler_with_ban_view(view.clone());
+        let (reply_sender, reply_receiver) = oneshot::channel();
+
+        handler
+            .commands_tx
+            .send(Command::ChainSync(ChainSyncCommand::RequestTip {
+                peer,
+                reply_sender,
+            }))
+            .await
+            .expect("queue tip request");
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            peer,
+            BanScope::Service(Subsystem::ChainSync),
+        )]);
+        let command = handler.commands_rx.recv().await.expect("queued command");
+        handler.handle_command(command);
+        assert!(
+            reply_receiver
+                .await
+                .expect("local rejection reply")
+                .is_err()
+        );
+
+        let other_peer = PeerId::random();
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            other_peer,
+            BanScope::Service(Subsystem::Blend),
+        )]);
+        let (reply_sender, mut reply_receiver) = oneshot::channel();
+        handler.handle_chainsync_command(ChainSyncCommand::RequestTip {
+            peer: other_peer,
+            reply_sender,
+        });
+        assert!(matches!(
+            reply_receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_admitted_inbound_event_is_not_rejected_by_a_later_ban() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        let handler = handler_with_ban_view(view.clone());
+        let mut event_receiver = handler.chainsync_events_tx.subscribe();
+        let (reply_sender, _reply_receiver) = mpsc::channel(1);
+
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            peer,
+            BanScope::Service(Subsystem::ChainSync),
+        )]);
+
+        handler.handle_chainsync_event(lb_cryptarchia_sync::Event::ProvideTipsRequest {
+            peer_id: peer,
+            reply_sender,
+        });
+
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(ChainSyncEvent::ProvideTipRequest { peer_id, .. }) if peer_id == peer
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_dispatch_recognizes_a_dynamic_global_ban() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+
+        handler.handle_chainsync_command(ChainSyncCommand::RequestTip { peer, reply_sender });
+
+        assert!(
+            reply_receiver
+                .await
+                .expect("local rejection reply")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn final_dispatch_fails_open_after_dynamic_authority_is_lost() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            peer,
+            BanScope::Service(Subsystem::ChainSync),
+        )]);
+        view.invalidate_dynamic_authority();
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, mut reply_receiver) = oneshot::channel();
+
+        handler.handle_chainsync_command(ChainSyncCommand::RequestTip { peer, reply_sender });
+
+        assert!(matches!(
+            reply_receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn healthy_inbound_event_preserves_authenticated_peer_id() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        let handler = handler_with_ban_view(view);
+        let mut event_receiver = handler.chainsync_events_tx.subscribe();
+        let (reply_sender, _reply_receiver) = mpsc::channel(1);
+
+        handler.handle_chainsync_event(lb_cryptarchia_sync::Event::ProvideTipsRequest {
+            peer_id: peer,
+            reply_sender,
+        });
+
+        match event_receiver.try_recv().expect("inbound event") {
+            ChainSyncEvent::ProvideTipRequest { peer_id, .. } => assert_eq!(peer_id, peer),
+            ChainSyncEvent::ProvideBlocksRequest { .. } => panic!("expected tip event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_inbound_block_event_preserves_authenticated_peer_id() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        let handler = handler_with_ban_view(view);
+        let mut event_receiver = handler.chainsync_events_tx.subscribe();
+        let (reply_sender, _reply_receiver) = mpsc::channel(1);
+        let block = lb_libp2p::cryptarchia_sync::HeaderId::from([0; 32]);
+
+        handler.handle_chainsync_event(lb_cryptarchia_sync::Event::ProvideBlocksRequest {
+            peer_id: peer,
+            target_block: block,
+            local_tip: block,
+            latest_immutable_block: block,
+            additional_blocks: HashSet::new(),
+            reply_sender,
+        });
+
+        match event_receiver.try_recv().expect("inbound event") {
+            ChainSyncEvent::ProvideBlocksRequest { peer_id, .. } => assert_eq!(peer_id, peer),
+            ChainSyncEvent::ProvideTipRequest { .. } => panic!("expected blocks event"),
+        }
     }
 }

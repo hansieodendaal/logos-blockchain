@@ -2,8 +2,10 @@ use std::{
     fmt::{Debug, Display},
     hash::Hash,
     marker::PhantomData,
+    time::Duration,
 };
 
+use lb_banning_service::{BanningService, BanningServiceApi};
 use lb_chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
 use lb_core::{
     header::HeaderId,
@@ -25,12 +27,15 @@ use overwatch::{
     services::{AsServiceId, relay::OutboundRelay},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::time::timeout;
 
 use crate::{ChainNetwork, mempool::adapter::MempoolAdapter, network};
 
 type NetworkRelay<NetworkBackend, RuntimeServiceId> =
     OutboundRelay<BackendNetworkMsg<NetworkBackend, RuntimeServiceId>>;
 type TimeRelay = OutboundRelay<TimeServiceMessage>;
+
+const BANNING_RELAY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct ChainNetworkRelays<
     Cryptarchia,
@@ -48,6 +53,7 @@ pub struct ChainNetworkRelays<
     network_relay: NetworkRelay<NetworkAdapter::Backend, RuntimeServiceId>,
     mempool_adapter: MempoolAdapter<Mempool::Item>,
     time_relay: TimeRelay,
+    banning_service: Option<BanningServiceApi<RuntimeServiceId>>,
     _mempool_adapter: PhantomData<MempoolNetAdapter>,
 }
 
@@ -88,8 +94,21 @@ where
             network_relay,
             mempool_adapter,
             time_relay,
+            banning_service: None,
             _mempool_adapter: PhantomData,
         }
+    }
+
+    pub fn with_banning_service(
+        cryptarchia: CryptarchiaServiceApi<Cryptarchia>,
+        network_relay: NetworkRelay<NetworkAdapter::Backend, RuntimeServiceId>,
+        mempool_relay: OutboundRelay<MempoolMsg<HeaderId, Mempool::Item, Mempool::Item, TxHash>>,
+        time_relay: TimeRelay,
+        banning_service: Option<BanningServiceApi<RuntimeServiceId>>,
+    ) -> Self {
+        let mut relays = Self::new(cryptarchia, network_relay, mempool_relay, time_relay);
+        relays.banning_service = banning_service;
+        relays
     }
 
     #[expect(clippy::allow_attributes_without_reason)]
@@ -129,7 +148,8 @@ where
             + AsServiceId<
                 TxMempoolService<MempoolNetAdapter, Mempool, Mempool::Storage, RuntimeServiceId>,
             >
-            + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>,
+            + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>
+            + AsServiceId<BanningService<RuntimeServiceId>>,
     {
         let cryptarchia = CryptarchiaServiceApi::<Cryptarchia>::from_overwatch_handle(
             &service_resources_handle.overwatch_handle,
@@ -153,7 +173,36 @@ where
             .await
             .expect("Relay connection with TimeService should succeed");
 
-        Self::new(cryptarchia, network_relay, mempool_relay, time_relay)
+        let banning_service = match timeout(
+            BANNING_RELAY_ACQUIRE_TIMEOUT,
+            service_resources_handle
+                .overwatch_handle
+                .relay::<BanningService<RuntimeServiceId>>(),
+        )
+        .await
+        {
+            Ok(Ok(relay)) => Some(BanningServiceApi::new(relay)),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    "BanningService relay unavailable; ChainSync banning enforcement disabled: {error}"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "BanningService relay acquisition timed out; ChainSync banning enforcement disabled"
+                );
+                None
+            }
+        };
+
+        Self::with_banning_service(
+            cryptarchia,
+            network_relay,
+            mempool_relay,
+            time_relay,
+            banning_service,
+        )
     }
 
     pub const fn cryptarchia(&self) -> &CryptarchiaServiceApi<Cryptarchia> {
@@ -170,5 +219,9 @@ where
 
     pub const fn time_relay(&self) -> &TimeRelay {
         &self.time_relay
+    }
+
+    pub const fn banning_service(&self) -> Option<&BanningServiceApi<RuntimeServiceId>> {
+        self.banning_service.as_ref()
     }
 }

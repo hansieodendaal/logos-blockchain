@@ -1,3 +1,4 @@
+use lb_banning_service::BanningServiceApi;
 use overwatch::overwatch::handle::OverwatchHandle;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -13,6 +14,7 @@ pub trait NetworkBackend<RuntimeServiceId> {
     type PubSubEvent: Debug + Send + Sync + 'static;
     type ChainSyncEvent: Debug + Send + Sync + 'static;
     fn new(config: Self::Settings, overwatch_handle: OverwatchHandle<RuntimeServiceId>) -> Self;
+    async fn configure_chain_sync_banning(&self, _api: BanningServiceApi<()>) {}
     async fn process(&self, msg: Self::Message);
     async fn subscribe_to_pubsub(&mut self) -> BroadcastStream<Self::PubSubEvent>;
 

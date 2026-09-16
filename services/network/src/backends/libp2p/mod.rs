@@ -2,6 +2,7 @@ mod command;
 pub mod config;
 pub(crate) mod swarm;
 
+use lb_banning_service::BanningServiceApi;
 pub use lb_libp2p::{
     PeerId,
     libp2p::gossipsub::{Message, TopicHash},
@@ -23,7 +24,7 @@ pub use self::{
     config::Libp2pConfig,
 };
 use super::NetworkBackend;
-use crate::message::ChainSyncEvent;
+use crate::{LocalBanView, message::ChainSyncEvent};
 
 const LOG_TARGET: &str = network_service::backends::libp2p::ROOT;
 
@@ -49,13 +50,15 @@ impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p {
         let (chainsync_events_tx, _) = broadcast::channel(BUFFER_SIZE);
 
         let initial_peers = config.initial_peers.clone();
+        let ban_view = LocalBanView::new::<()>(None, config.configured_ban_policy.clone());
 
-        let mut swarm_handler = SwarmHandler::new(
+        let mut swarm_handler = SwarmHandler::new_with_ban_view(
             config,
             commands_tx.clone(),
             commands_rx,
             pubsub_events_tx.clone(),
             chainsync_events_tx.clone(),
+            ban_view,
             rng,
         );
 
@@ -71,6 +74,22 @@ impl<RuntimeServiceId> NetworkBackend<RuntimeServiceId> for Libp2p {
             pubsub_events_tx,
             chainsync_events_tx,
             commands_tx,
+        }
+    }
+
+    async fn configure_chain_sync_banning(&self, api: BanningServiceApi<()>) {
+        if let Err(error) = self
+            .commands_tx
+            .send(Command::Network(
+                NetworkCommand::ConfigureChainSyncBanning { api },
+            ))
+            .await
+        {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?error,
+                "failed to configure dynamic ChainSync banning"
+            );
         }
     }
 

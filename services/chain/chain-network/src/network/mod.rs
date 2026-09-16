@@ -3,6 +3,7 @@ pub mod adapters;
 use std::collections::HashSet;
 
 use futures::Stream;
+use lb_banning_service::{BanningServiceApi, ConfiguredBanPolicy};
 use lb_core::header::HeaderId;
 use lb_cryptarchia_sync::GetTipResponse;
 use lb_network_service::{NetworkService, backends::NetworkBackend, message::ChainSyncEvent};
@@ -26,7 +27,11 @@ pub trait NetworkAdapter<RuntimeServiceId> {
         network_relay: OutboundRelay<
             <NetworkService<Self::Backend, RuntimeServiceId> as ServiceData>::Message,
         >,
+        banning_service: Option<BanningServiceApi<RuntimeServiceId>>,
+        configured_ban_policy: ConfiguredBanPolicy,
     ) -> Self;
+
+    async fn configure_chain_sync_banning(&self, _banning_service: BanningServiceApi<()>) {}
     async fn proposals_stream(&self) -> Result<BoxedStream<Self::Proposal>, DynError>;
 
     async fn chainsync_events_stream(&self) -> Result<BoxedStream<ChainSyncEvent>, DynError>;

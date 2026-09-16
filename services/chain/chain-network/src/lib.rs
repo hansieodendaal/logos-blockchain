@@ -15,6 +15,7 @@ use std::{
 
 use bootstrap::ibd::ChainNetworkIbdBlockProcessor;
 use futures::{StreamExt as _, future::join_all};
+use lb_banning_service::{BanningService, ConfiguredBanPolicy};
 use lb_chain_service::api::{CryptarchiaServiceApi, CryptarchiaServiceData};
 use lb_core::{
     block::{Block, BlockTransactions, Proposal, verify_header_alone, verify_header_signature},
@@ -139,6 +140,8 @@ pub struct ChainNetworkSettings<NodeId, NetworkAdapterSettings>
 where
     NodeId: Clone + Eq + Hash,
 {
+    #[serde(default)]
+    pub configured_ban_policy: ConfiguredBanPolicy,
     pub network: NetworkAdapterSettings,
     pub bootstrap: BootstrapConfig<NodeId>,
     pub sync: SyncConfig,
@@ -266,7 +269,8 @@ where
         + AsServiceId<
             TxMempoolService<MempoolNetAdapter, Mempool, Mempool::Storage, RuntimeServiceId>,
         >
-        + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>,
+        + AsServiceId<TimeService<TimeBackend, RuntimeServiceId>>
+        + AsServiceId<BanningService<RuntimeServiceId>>,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
@@ -293,6 +297,7 @@ where
         .await;
 
         let ChainNetworkSettings {
+            configured_ban_policy,
             network: network_config,
             bootstrap: bootstrap_config,
             sync: sync_config,
@@ -319,7 +324,19 @@ where
         )
         .await?;
 
-        let network_adapter = NetAdapter::new(network_config, relays.network_relay().clone()).await;
+        let network_adapter = NetAdapter::new(
+            network_config,
+            relays.network_relay().clone(),
+            relays.banning_service().cloned(),
+            configured_ban_policy,
+        )
+        .await;
+
+        if let Some(banning_service) = relays.banning_service().cloned() {
+            network_adapter
+                .configure_chain_sync_banning(banning_service.into_untyped())
+                .await;
+        }
 
         let initial_block_download = InitialBlockDownload::new(
             ChainNetworkIbdBlockProcessor::<_, Mempool> {
@@ -1426,7 +1443,9 @@ mod tests {
     struct NoopNetworkAdapter;
 
     #[async_trait::async_trait]
-    impl<RuntimeServiceId: Send + Sync> NetworkAdapter<RuntimeServiceId> for NoopNetworkAdapter {
+    impl<RuntimeServiceId: Send + Sync + 'static> NetworkAdapter<RuntimeServiceId>
+        for NoopNetworkAdapter
+    {
         type Backend = Mock;
         type Settings = ();
         type PeerId = ();
@@ -1438,6 +1457,8 @@ mod tests {
             _network_relay: OutboundRelay<
                 <NetworkService<Self::Backend, RuntimeServiceId> as ServiceData>::Message,
             >,
+            _banning_service: Option<lb_banning_service::BanningServiceApi<RuntimeServiceId>>,
+            _configured_ban_policy: ConfiguredBanPolicy,
         ) -> Self {
             unimplemented!()
         }

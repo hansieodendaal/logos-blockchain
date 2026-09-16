@@ -15,8 +15,11 @@ use crate::{config::NetworkConfig, message::BackendNetworkMsg};
 
 pub mod backends;
 pub mod config;
+mod local_ban_view;
 pub mod message;
 mod metrics;
+
+pub use local_ban_view::LocalBanView;
 
 const LOG_TARGET: &str = network_service::ROOT;
 

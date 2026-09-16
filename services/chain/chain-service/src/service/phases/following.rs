@@ -89,6 +89,7 @@ where
                 latest_immutable_block,
                 additional_blocks,
                 reply_sender,
+                ..
             } => {
                 let known_blocks = vec![local_tip, latest_immutable_block]
                     .into_iter()
@@ -104,7 +105,7 @@ where
                     )
                     .await;
             }
-            ChainSyncEvent::ProvideTipRequest { reply_sender } => {
+            ChainSyncEvent::ProvideTipRequest { reply_sender, .. } => {
                 let tip = self.cryptarchia.tip_branch();
                 let response = ProviderResponse::Available(GetTipResponse::Tip {
                     tip: tip.id(),
