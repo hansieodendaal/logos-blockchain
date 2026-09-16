@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use color_eyre::eyre::Result;
+use lb_banning_service::BanningConfig;
 use lb_core::mantle::Value;
 use lb_pow_service::ClaimTarget;
 use libp2p::{Multiaddr, PeerId};
@@ -109,6 +110,7 @@ pub fn build_user_config(keystore: &Keystore, args: InitArgs) -> UserConfig {
     let pow_config = build_pow_config(keystore);
 
     UserConfig {
+        banning: BanningConfig::default(),
         network: network_config,
         blend: blend_config,
         cryptarchia: cryptarchia_config,

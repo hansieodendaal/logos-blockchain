@@ -61,6 +61,7 @@ members = [
   "nodes/node/http-client",
   "nodes/version",
   "services/api",
+  "services/banning",
   "services/blend",
   "services/chain/broadcast-service",
   "services/chain/chain-leader",
@@ -110,6 +111,7 @@ jf-poseidon2                       = { default-features = false, git = "https://
 lb-api-service                     = { default-features = false, package = "logos-blockchain-api-service", path = "./services/api" }
 lb-binary-codec                    = { default-features = false, package = "logos-blockchain-binary-codec", path = "./binary-codec" }
 lb-binary-codec-macros             = { default-features = false, package = "logos-blockchain-binary-codec-macros", path = "./binary-codec/macros" }
+lb-banning-service                 = { default-features = false, package = "logos-blockchain-banning-service", path = "./services/banning" }
 lb-blake2btree                     = { default-features = false, package = "logos-blockchain-blake2btree", path = "merkle/blake2btree" }
 lb-blend                           = { default-features = false, package = "logos-blockchain-blend", path = "./blend/core" }
 lb-blend-crypto                    = { default-features = false, package = "logos-blockchain-blend-crypto", path = "./blend/crypto" }
