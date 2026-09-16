@@ -21,6 +21,7 @@ flate2                           = { features = ["rust_backend"], workspace = tr
 futures                          = { workspace = true }
 hex                              = { workspace = true }
 lb-binary-codec                  = { workspace = true }
+lb-banning-service               = { workspace = true }
 lb-blend-service                 = { workspace = true }
 lb-chain-service                 = { workspace = true }
 lb-config                        = { features = ["testing"], workspace = true }

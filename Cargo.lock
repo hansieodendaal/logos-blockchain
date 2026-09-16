@@ -4017,6 +4017,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "logos-blockchain-banning-service"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "logos-blockchain-binary-codec",
+ "logos-blockchain-libp2p",
+ "logos-blockchain-log-targets",
+ "logos-blockchain-services-utils",
+ "logos-blockchain-storage-service",
+ "logos-blockchain-utils",
+ "overwatch",
+ "serde",
+ "serde_with",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "logos-blockchain-binary-codec"
 version = "0.0.0"
 dependencies = [
@@ -4358,6 +4379,7 @@ dependencies = [
  "async-trait",
  "backon",
  "futures",
+ "logos-blockchain-banning-service",
  "logos-blockchain-binary-codec",
  "logos-blockchain-chain-service",
  "logos-blockchain-core",
@@ -4533,6 +4555,7 @@ name = "logos-blockchain-config"
 version = "0.0.0"
 dependencies = [
  "hex",
+ "logos-blockchain-banning-service",
  "logos-blockchain-binary-codec",
  "logos-blockchain-core",
  "logos-blockchain-cryptarchia-engine",
@@ -4892,6 +4915,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "logos-blockchain-banning-service",
  "logos-blockchain-core",
  "logos-blockchain-cryptarchia-sync",
  "logos-blockchain-libp2p",
@@ -4925,6 +4949,7 @@ dependencies = [
  "http",
  "libp2p",
  "logos-blockchain-api-service",
+ "logos-blockchain-banning-service",
  "logos-blockchain-binary-codec",
  "logos-blockchain-blend",
  "logos-blockchain-blend-service",
@@ -8340,6 +8365,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "logos-blockchain-banning-service",
  "logos-blockchain-binary-codec",
  "logos-blockchain-blend-service",
  "logos-blockchain-chain-service",
