@@ -1,5 +1,5 @@
-use lb_codec::BinaryEncode;
 use lb_key_management_system_keys::keys::{Ed25519Signature, ZkSignature};
+use lb_serialization::canonical::BinaryEncode;
 use serde::Serialize;
 
 use crate::{

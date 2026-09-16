@@ -5,13 +5,13 @@ mod test_utils;
 use std::collections::HashMap;
 
 use lb_core::{
-    codec::SerializeOp as _,
     crypto::{Digest, Hash, Hasher},
     mantle::{Note, Utxo, Value},
     sdp::{ActivityMetadata, ProviderId, ServiceParameters, ServiceType},
 };
 use lb_cryptarchia_engine::Epoch;
 use lb_key_management_system_keys::keys::ZkPublicKey;
+use lb_serialization::bincode::SerializeOp as _;
 use thiserror::Error;
 
 use crate::EpochState;

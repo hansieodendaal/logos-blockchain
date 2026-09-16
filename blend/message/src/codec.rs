@@ -1,12 +1,12 @@
 //! Wire helpers for whole encapsulated messages.
 //!
-//! Thin wrappers over the [`lb_codec`] impls, kept here so a crate that only
-//! moves messages around — the network behaviours, say — does not have to
-//! depend on anything that knows how to *produce* one.
+//! Thin wrappers over the [`lb_serialization::canonical`] impls, kept here so a
+//! crate that only moves messages around — the network behaviours, say — does
+//! not have to depend on anything that knows how to *produce* one.
 
 use core::num::NonZeroU64;
 
-use lb_codec::{BinaryDecode as _, BinaryEncode as _};
+use lb_serialization::canonical::{BinaryDecode as _, BinaryEncode as _};
 
 use crate::{
     Error,

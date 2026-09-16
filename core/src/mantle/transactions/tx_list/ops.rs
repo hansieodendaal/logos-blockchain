@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use lb_codec::{BinaryDecode, BinaryEncode, DecodeError};
+use lb_serialization::canonical::{BinaryDecode, BinaryEncode, DecodeError};
 use lb_utils::bounded::UpperBoundedVec;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

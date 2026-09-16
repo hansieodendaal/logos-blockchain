@@ -1,7 +1,7 @@
 use ark_ff::PrimeField as _;
 use bytes::Bytes;
-use lb_codec::BinaryCodec;
 use lb_groth16::Fr;
+use lb_serialization::canonical::BinaryCodec;
 
 use crate::{
     crypto::Hash,

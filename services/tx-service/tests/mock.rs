@@ -11,7 +11,6 @@ use futures::{Stream, StreamExt as _, stream};
 use indexmap::IndexMap;
 use lb_core::{
     block::MAX_BLOCK_TRANSACTIONS_SIZE,
-    codec::{DeserializeOp as _, SerializeOp as _},
     header::HeaderId,
     mantle::{
         mock::{MockTransaction, MockTxId},
@@ -24,6 +23,7 @@ use lb_network_service::{
     config::NetworkConfig,
     message::NetworkMsg,
 };
+use lb_serialization::bincode::{DeserializeOp as _, SerializeOp as _};
 use lb_services_utils::overwatch::{
     RecoveryData, recovery::operators::RecoveryBackend as RecoveryBackendTrait,
 };

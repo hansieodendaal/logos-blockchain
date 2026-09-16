@@ -2,8 +2,8 @@ use generic_array::{
     GenericArray,
     typenum::{U32, U64},
 };
-use lb_codec::{BinaryDecode, BinaryEncode, DecodeError};
 use lb_groth16::COMPRESSED_PROOF_SIZE;
+use lb_serialization::canonical::{BinaryDecode, BinaryEncode, DecodeError};
 use lb_zksign::ZkSignProof;
 use serde::{Deserialize, Serialize};
 

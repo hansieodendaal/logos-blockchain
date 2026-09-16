@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use lb_codec::BinaryCodec;
 use lb_cryptarchia_engine::Slot;
+use lb_serialization::canonical::BinaryCodec;
 use serde::{Deserialize, Serialize};
 
 use crate::{

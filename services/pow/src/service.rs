@@ -19,7 +19,6 @@ use lb_chain_service::{
     api::{ApiError as ChainApiError, CryptarchiaServiceApi, CryptarchiaServiceData},
 };
 use lb_core::{
-    codec::{Error as CodecError, SerializeOp},
     events::{Event, TxEvent, TxEventPayload},
     header::HeaderId,
     mantle::{
@@ -46,6 +45,7 @@ use lb_key_management_system_keys::keys::{
 };
 use lb_ledger::LedgerState;
 use lb_log_targets::pow;
+use lb_serialization::bincode::{Error as CodecError, SerializeOp};
 use lb_services_utils::{
     overwatch::{RecoveryData, RecoveryOperator, StorageRecoverySettings},
     wait_until_services_are_ready,
@@ -1539,7 +1539,6 @@ mod tests {
 
     use lb_chain_service::Slot;
     use lb_core::{
-        codec::SerializeOp as _,
         header::HeaderId,
         mantle::{
             Note, NoteId, OpProofRef, OpRef, SignedOps, Utxo,
@@ -1554,6 +1553,7 @@ mod tests {
         },
     };
     use lb_key_management_system_keys::keys::{UnsecuredZkKey, ZkPublicKey};
+    use lb_serialization::bincode::SerializeOp as _;
 
     use super::{
         AutoClaimSettings, AutoClaimTick, ClaimTarget, MAX_CLAIMS_BY_PAYLOAD_SIZE,

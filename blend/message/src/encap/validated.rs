@@ -4,10 +4,10 @@ use lb_blend_proofs::{
     quota::{self, VerifiedProofOfQuota},
     selection::inputs::VerifyInputs,
 };
-use lb_codec::BinaryEncode;
 use lb_key_management_system_keys::keys::{
     Ed25519PublicKey, UnsecuredEd25519Key, X25519PrivateKey,
 };
+use lb_serialization::canonical::BinaryEncode;
 use serde::{Deserialize, Serialize};
 
 use crate::{

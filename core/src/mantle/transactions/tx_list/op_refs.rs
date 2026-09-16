@@ -1,4 +1,4 @@
-use lb_codec::BinaryEncode;
+use lb_serialization::canonical::BinaryEncode;
 use serde::{Serialize, Serializer};
 
 use crate::mantle::{

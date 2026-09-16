@@ -24,6 +24,7 @@ lb-key-management-system-keys = { workspace = true }
 lb-log-targets                = { workspace = true }
 lb-mmr                        = { workspace = true }
 lb-pol                        = { workspace = true }
+lb-serialization              = { workspace = true }
 lb-utils                      = { workspace = true }
 lb-utxotree                   = { workspace = true }
 num-bigint                    = { workspace = true }

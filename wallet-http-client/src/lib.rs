@@ -1,5 +1,5 @@
 use lb_common_http_client::{BasicAuthCredentials, CommonHttpClient, Error};
-use lb_core::{codec::SerializeOp as _, header::HeaderId};
+use lb_core::header::HeaderId;
 use lb_http_api_common::{
     bodies::{
         NoopBody,
@@ -11,6 +11,7 @@ use lb_http_api_common::{
     paths,
 };
 use lb_key_management_system_keys::keys::ZkPublicKey;
+use lb_serialization::bincode::SerializeOp as _;
 use url::Url;
 
 pub struct WalletHttpClient {
@@ -75,7 +76,7 @@ impl WalletHttpClient {
 
 #[cfg(test)]
 mod tests {
-    use lb_core::codec::DeserializeOp as _;
+    use lb_serialization::bincode::DeserializeOp as _;
 
     use super::*;
 

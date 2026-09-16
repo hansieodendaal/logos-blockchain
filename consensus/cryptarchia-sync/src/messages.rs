@@ -1,9 +1,7 @@
 use bytes::Bytes;
-use lb_core::{
-    codec::{BoundedSerializeOp, UpperBoundedVec},
-    header::HeaderId,
-};
+use lb_core::header::HeaderId;
 use lb_cryptarchia_engine::Slot;
+use lb_serialization::bincode::{BoundedSerializeOp, UpperBoundedVec};
 use serde::{Deserialize, Serialize};
 
 use crate::libp2p::MAX_MSG_LEN;

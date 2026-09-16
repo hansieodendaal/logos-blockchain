@@ -1,16 +1,18 @@
 use core::fmt::{self, Debug, Formatter};
 
 use blake2::Digest as _;
-use lb_codec::{BinaryCodec, BinaryDecode, BinaryEncode, DecodeError};
 use lb_cryptarchia_engine::Slot;
 use lb_groth16::fr_to_bytes;
 use lb_key_management_system_keys::keys::{Ed25519Key, Ed25519Signature};
+use lb_serialization::{
+    bincode::SerializeOp as _,
+    canonical::{BinaryCodec, BinaryDecode, BinaryEncode, DecodeError},
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 mod fixtures;
 
 use crate::{
-    codec::SerializeOp as _,
     crypto::Hasher,
     mantle::transactions::GenesisTx,
     proofs::leader_proof::{Groth16LeaderProof, LeaderProof as _},
@@ -288,7 +290,7 @@ pub enum Error {
 
 #[test]
 fn test_serde() {
-    use crate::codec::{DeserializeOp as _, SerializeOp as _};
+    use lb_serialization::bincode::{DeserializeOp as _, SerializeOp as _};
     let header = HeaderId([0; 32]);
     assert_eq!(
         HeaderId::from_bytes(

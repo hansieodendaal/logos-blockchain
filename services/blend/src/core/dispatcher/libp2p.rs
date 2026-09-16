@@ -7,7 +7,6 @@ use core::{
 use futures::{Stream, StreamExt as _, stream, stream::BoxStream};
 use lb_chain_network_service::Message as ChainNetworkMsg;
 use lb_core::{
-    codec::DeserializeOp,
     header::HeaderId,
     mantle::{traits::Hashable, transactions::hash::PrefixedKey},
 };
@@ -17,6 +16,7 @@ use lb_network_service::{
     backends::libp2p::{Command, Libp2p, Message as PubSubMessage, PubSubCommand},
     message::{ChainSyncEvent, NetworkMsg},
 };
+use lb_serialization::bincode::DeserializeOp;
 use lb_storage_service::StorageService;
 use lb_tx_service::{
     MempoolMsg, TxMempoolService, backend::RecoverableMempool,

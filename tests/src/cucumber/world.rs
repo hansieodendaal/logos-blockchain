@@ -12,7 +12,6 @@ use std::{
 use cucumber::World;
 use educe::Educe;
 use lb_core::{
-    codec::DeserializeOp as _,
     header::HeaderId,
     mantle::{
         GenesisTime, SignedOps, Utxo, Value,
@@ -30,6 +29,7 @@ use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsReque
 use lb_key_management_system_service::keys::{Ed25519Key, Ed25519PublicKey, ZkPublicKey};
 use lb_libp2p::{Multiaddr, PeerId};
 use lb_node::config::RunConfig;
+use lb_serialization::bincode::DeserializeOp as _;
 use lb_testing_framework::{
     LbcEnv, LbcK8sManualCluster, LbcManualCluster, NodeHttpClient, ScenarioBuilder,
     ScenarioBuilderExt as _,

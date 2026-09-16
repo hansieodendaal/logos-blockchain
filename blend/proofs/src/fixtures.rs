@@ -1,4 +1,4 @@
-use lb_codec::codec_fixtures;
+use lb_serialization::canonical::codec_fixtures;
 
 use crate::{
     quota::{ProofOfQuota, VerifiedProofOfQuota},

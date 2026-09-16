@@ -1,5 +1,5 @@
 use lb_blend_crypto::fill_random_bytes;
-use lb_codec::{BinaryDecode, BinaryEncode, DecodeError, take};
+use lb_serialization::canonical::{BinaryDecode, BinaryEncode, DecodeError, take};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 

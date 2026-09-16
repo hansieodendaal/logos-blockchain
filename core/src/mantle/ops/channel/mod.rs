@@ -7,7 +7,7 @@ pub mod withdraw;
 
 use std::fmt::{Display, Formatter};
 
-use lb_codec::BinaryCodec;
+use lb_serialization::canonical::BinaryCodec;
 
 use crate::utils::serde_bytes_newtype;
 

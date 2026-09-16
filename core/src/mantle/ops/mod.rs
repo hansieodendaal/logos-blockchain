@@ -63,10 +63,10 @@ mod mantle_test_vectors {
         quota::{PROOF_OF_QUOTA_SIZE, VerifiedProofOfQuota},
         selection::{PROOF_OF_SELECTION_SIZE, VerifiedProofOfSelection},
     };
-    use lb_codec::BinaryEncode as _;
     use lb_cryptarchia_engine::Epoch;
     use lb_key_management_system_keys::keys::{Ed25519Key, ZkPublicKey};
     use lb_poseidon2::{Fr, ZkHash};
+    use lb_serialization::canonical::BinaryEncode as _;
 
     use super::*;
     use crate::{

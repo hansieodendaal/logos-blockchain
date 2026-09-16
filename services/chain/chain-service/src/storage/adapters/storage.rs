@@ -8,13 +8,13 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use lb_core::{
     block::Block,
-    codec::{DeserializeOp as _, SerializeOp as _},
     events::Events,
     header::HeaderId,
     mantle::{traits::Hashable, transactions::hash::TxHash},
 };
 use lb_cryptarchia_engine::Slot;
 use lb_log_targets::chain;
+use lb_serialization::bincode::{DeserializeOp as _, SerializeOp as _};
 use lb_storage_service::{
     StorageMsg, StorageService, api::chain::StorageChainApi, backends::StorageBackend,
 };

@@ -38,8 +38,6 @@ members = [
   "blend/provers",
   "blend/scheduling",
   "c-bindings",
-  "codec",
-  "codec/macros",
   "consensus/cryptarchia-engine",
   "consensus/cryptarchia-sync",
   "core",
@@ -59,6 +57,8 @@ members = [
   "nodes/node/binary",
   "nodes/node/http-client",
   "nodes/version",
+  "serialization",
+  "serialization/macros",
   "services/api",
   "services/blend",
   "services/chain/broadcast-service",
@@ -122,8 +122,6 @@ lb-chain-leader-service            = { default-features = false, package = "logo
 lb-chain-network-service           = { default-features = false, package = "logos-blockchain-chain-network-service", path = "./services/chain/chain-network" }
 lb-chain-service                   = { default-features = false, package = "logos-blockchain-chain-service", path = "./services/chain/chain-service" }
 lb-circuits-prover                 = { default-features = false, package = "logos-blockchain-circuits-prover", path = "./zk/circuits/prover" }
-lb-codec                           = { default-features = false, package = "logos-blockchain-codec", path = "./codec" }
-lb-codec-macros                    = { default-features = false, package = "logos-blockchain-codec-macros", path = "./codec/macros" }
 lb-common-http-client              = { default-features = false, package = "logos-blockchain-common-http-client", path = "./nodes/node/http-client" }
 lb-config                          = { default-features = false, package = "logos-blockchain-config", path = "./tools/config" }
 lb-core                            = { default-features = false, package = "logos-blockchain-core", path = "./core" }
@@ -151,6 +149,8 @@ lb-poq                             = { default-features = false, package = "logo
 lb-poseidon2                       = { default-features = false, package = "logos-blockchain-poseidon2", path = "./zk/poseidon2" }
 lb-pow-service                     = { default-features = false, package = "logos-blockchain-pow-service", path = "./services/pow" }
 lb-sdp-service                     = { default-features = false, package = "logos-blockchain-sdp-service", path = "./services/sdp" }
+lb-serialization                   = { default-features = false, package = "logos-blockchain-serialization", path = "./serialization" }
+lb-serialization-macros            = { default-features = false, package = "logos-blockchain-serialization-macros", path = "./serialization/macros" }
 lb-services-utils                  = { default-features = false, package = "logos-blockchain-services-utils", path = "./services/utils" }
 lb-storage-service                 = { default-features = false, package = "logos-blockchain-storage-service", path = "./services/storage" }
 lb-system-sig-service              = { default-features = false, package = "logos-blockchain-system-sig-service", path = "./services/system-sig" }

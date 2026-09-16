@@ -5,7 +5,7 @@ use std::{error::Error, num::NonZeroUsize};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-pub use lb_core::codec::SerdeOp;
+pub use lb_serialization::bincode::SerdeOp;
 
 use crate::api::StorageBackendApi;
 
