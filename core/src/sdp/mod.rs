@@ -13,7 +13,7 @@ use lb_cryptarchia_engine::Epoch;
 use lb_groth16::fr_to_bytes;
 use lb_key_management_system_keys::keys::{Ed25519Signature, ZkPublicKey};
 use lb_serialization::{
-    bincode::{self, DeserializeOp as _, SerializeOp as _},
+    bincode::{self, BoundedSerializeOp, DeserializeOp as _, SerializeOp as _},
     canonical::{BinaryCodec, BinaryDecode, BinaryEncode, DecodeError},
 };
 use lb_utils::bounded::{BoundedVec, NonEmptyBoundedVec};
@@ -379,6 +379,10 @@ pub struct DeclarationId(pub [u8; 32]);
 serde_bytes_newtype!(DeclarationId, 32);
 display_hex_bytes_newtype!(DeclarationId);
 
+impl BoundedSerializeOp for DeclarationId {
+    type Bytes = [u8; 32];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declaration {
     pub service_type: ServiceType,
@@ -605,9 +609,12 @@ mod tests {
     use lb_cryptarchia_engine::Epoch;
     use lb_groth16::{AdditiveGroup as _, Fr};
     use lb_key_management_system_keys::keys::{Ed25519Key, ZkPublicKey};
+    use lb_serialization::bincode::{BoundedSerializeOp as _, SerializeOp as _};
     use multiaddr::Multiaddr;
 
-    use crate::sdp::{Declaration, DeclarationMessage, Locator, Locators, ServiceType};
+    use crate::sdp::{
+        Declaration, DeclarationId, DeclarationMessage, Locator, Locators, ServiceType,
+    };
 
     #[test]
     fn locator_rejects_multiaddr_with_peer_id() {
@@ -727,5 +734,15 @@ mod tests {
 
         assert_eq!(concatenated(&joined), concatenated(&split));
         assert_ne!(joined.id(), split.id());
+    }
+
+    #[test]
+    fn declaration_id_has_exact_bincode_size() {
+        let id = DeclarationId([0x66; 32]);
+        let ordinary = id.to_bytes().unwrap();
+        let bounded = id.to_bounded_bytes().unwrap();
+
+        assert_eq!(ordinary.len(), 32);
+        assert_eq!(bounded.as_ref(), ordinary.as_ref());
     }
 }

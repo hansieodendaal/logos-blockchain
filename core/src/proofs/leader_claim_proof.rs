@@ -1,7 +1,10 @@
 use lb_groth16::{COMPRESSED_PROOF_SIZE, Fr, serde::serde_fr};
 use lb_log_targets::proofs;
 use lb_mmr::MerklePath;
-use lb_serialization::canonical::{BinaryDecode, BinaryEncode, DecodeError};
+use lb_serialization::{
+    bincode::BoundedSerializeOp,
+    canonical::{BinaryDecode, BinaryEncode, DecodeError},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::error;
@@ -44,6 +47,10 @@ impl BinaryDecode for Groth16LeaderClaimProof {
             },
         ))
     }
+}
+
+impl BoundedSerializeOp for Groth16LeaderClaimProof {
+    type Bytes = [u8; COMPRESSED_PROOF_SIZE];
 }
 
 #[derive(Debug, Error)]
@@ -178,5 +185,23 @@ mod proof_serde {
     {
         let proof_array = lb_utils::serde::deserialize_bytes_array::<128, D>(deserializer)?;
         Ok(lb_poc::PoCProof::from_bytes(&proof_array))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lb_poc::PoCProof;
+    use lb_serialization::bincode::{BoundedSerializeOp as _, SerializeOp as _};
+
+    use super::Groth16LeaderClaimProof;
+
+    #[test]
+    fn proof_has_exact_bincode_size() {
+        let proof = Groth16LeaderClaimProof::new(PoCProof::from_bytes(&[0x44; 128]));
+        let ordinary = proof.to_bytes().unwrap();
+        let bounded = proof.to_bounded_bytes().unwrap();
+
+        assert_eq!(ordinary.len(), 128);
+        assert_eq!(bounded.as_ref(), ordinary.as_ref());
     }
 }

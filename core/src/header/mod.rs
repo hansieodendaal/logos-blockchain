@@ -5,7 +5,7 @@ use lb_cryptarchia_engine::Slot;
 use lb_groth16::fr_to_bytes;
 use lb_key_management_system_keys::keys::{Ed25519Key, Ed25519Signature};
 use lb_serialization::{
-    bincode::SerializeOp as _,
+    bincode::{BoundedSerializeOp, SerializeOp as _},
     canonical::{BinaryCodec, BinaryDecode, BinaryEncode, DecodeError},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub const BEDROCK_VERSION: u8 = 1;
+pub const HEADER_BINCODE_SIZE: usize = 297;
 
 #[derive(Clone, Eq, PartialEq, Copy, Hash, PartialOrd, Ord, BinaryCodec)]
 pub struct HeaderId([u8; 32]);
@@ -282,6 +283,22 @@ serde_bytes_newtype!(HeaderId, 32);
 serde_bytes_newtype!(ContentId, 32);
 serde_bytes_newtype!(Nonce, 32);
 
+impl BoundedSerializeOp for HeaderId {
+    type Bytes = [u8; 32];
+}
+
+impl BoundedSerializeOp for ContentId {
+    type Bytes = [u8; 32];
+}
+
+impl BoundedSerializeOp for Nonce {
+    type Bytes = [u8; 32];
+}
+
+impl BoundedSerializeOp for Header {
+    type Bytes = [u8; HEADER_BINCODE_SIZE];
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Invalid header id size: {0}")]
@@ -301,6 +318,39 @@ fn test_serde() {
         .unwrap(),
         HeaderId([0; 32])
     );
+}
+
+#[test]
+fn fixed_size_bincode_serialization_matches_for_header_types() {
+    use lb_serialization::canonical::CodecExamples as _;
+
+    let header_id = HeaderId([0x11; 32]);
+    let content_id = ContentId([0x22; 32]);
+    let nonce = Nonce([0x33; 32]);
+
+    for (ordinary, bounded) in [
+        (
+            header_id.to_bytes().unwrap(),
+            header_id.to_bounded_bytes().unwrap().to_vec(),
+        ),
+        (
+            content_id.to_bytes().unwrap(),
+            content_id.to_bounded_bytes().unwrap().to_vec(),
+        ),
+        (
+            nonce.to_bytes().unwrap(),
+            nonce.to_bounded_bytes().unwrap().to_vec(),
+        ),
+    ] {
+        assert_eq!(ordinary.len(), 32);
+        assert_eq!(ordinary.as_ref(), bounded.as_slice());
+    }
+
+    let header = Header::fixtures().into_iter().next().unwrap().value;
+    let ordinary = header.to_bytes().unwrap();
+    let bounded = header.to_bounded_bytes().unwrap();
+    assert_eq!(ordinary.len(), HEADER_BINCODE_SIZE);
+    assert_eq!(bounded.as_ref(), ordinary.as_ref());
 }
 
 #[test]
