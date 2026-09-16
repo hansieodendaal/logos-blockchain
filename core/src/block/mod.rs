@@ -33,6 +33,19 @@ const MAX_BLOCK_TRANSACTIONS: usize = 1024;
 /// Note: This is not the total block size.
 pub const MAX_BLOCK_TRANSACTIONS_SIZE: usize = 1024 * 1024 * 2;
 
+/// Maximum canonical encoded size of [`Proposal`].
+///
+/// The actual canonical encoding is:
+/// - header: `297` bytes;
+/// - uncle headers: `1 + MAX_UNCLES * 361` bytes;
+/// - transaction references: `2 + 1024 * 16` bytes;
+/// - signature: `64` bytes;
+/// - total: `18_192` bytes.
+///
+/// These values describe the canonical encoding, not the configured-bincode
+/// representation.
+pub const MAX_PROPOSAL_CANONICAL_SIZE: usize = 18_192;
+
 pub type BlockNumber = u64;
 
 #[derive(Debug, thiserror::Error)]
@@ -842,15 +855,11 @@ mod tests {
         assert!(matches!(err, Error::Header(HeaderError::GenesisSlot)));
     }
 
-    /// The specification fixes the maximum proposal at 18,192 bytes:
-    /// `header (297) || uncle_headers (1 + MAX_UNCLES * 361)
-    /// || references (2 + 16384) || signature (64)`.
+    /// The maximum-size proposal continues to match its canonical size bound.
     #[test]
     fn maximum_proposal_matches_the_specified_size() {
         use lb_cryptarchia_engine::MAX_UNCLES;
         use lb_serialization::canonical::BinaryEncode as _;
-
-        const SPECIFIED_MAX_PROPOSAL_SIZE: usize = 18_192;
 
         let proof = create_proof();
         let uncle = signed_uncle(1, &proof);
@@ -865,8 +874,8 @@ mod tests {
         .expect("valid block")
         .to_proposal();
 
-        assert_eq!(proposal.encoded_length(), SPECIFIED_MAX_PROPOSAL_SIZE);
-        assert_eq!(proposal.encode().len(), SPECIFIED_MAX_PROPOSAL_SIZE);
+        assert_eq!(proposal.encoded_length(), MAX_PROPOSAL_CANONICAL_SIZE);
+        assert_eq!(proposal.encode().len(), MAX_PROPOSAL_CANONICAL_SIZE);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use lb_blend_crypto::fill_random_bytes;
+use lb_core::block::MAX_PROPOSAL_CANONICAL_SIZE;
 use lb_serialization::canonical::{BinaryDecode, BinaryEncode, DecodeError, take};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -15,7 +16,7 @@ use crate::Error;
 /// - At most `MAX_BLOCK_TXS` transaction references of 16 bytes, behind a
 ///   2-byte count prefix.
 /// - A 64-byte signature
-pub const MAX_PAYLOAD_BODY_SIZE: usize = 18_192;
+pub const MAX_PAYLOAD_BODY_SIZE: usize = MAX_PROPOSAL_CANONICAL_SIZE;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]

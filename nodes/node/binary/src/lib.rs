@@ -10,11 +10,15 @@ use std::panic::set_hook;
 
 use color_eyre::eyre::{Result, eyre};
 pub use lb_blend_service::core::backends::libp2p::Libp2pBlendBackend as BlendBackend;
-use lb_core::mantle::{ledger::verification_mode::StandardMode, transactions::states::Preverified};
+use lb_core::{
+    block::MAX_PROPOSAL_CANONICAL_SIZE,
+    mantle::{ledger::verification_mode::StandardMode, transactions::states::Preverified},
+};
 pub use lb_core::{
     header::HeaderId,
     mantle::{SignedOps, traits::Hashable, transactions::hash::TxHash},
 };
+use lb_libp2p::behaviour::gossipsub::GossipsubTopicSizeLimit;
 pub use lb_network_service::backends::libp2p::Libp2p as NetworkBackend;
 pub use lb_storage_service::backends::{
     SerdeOp, StorageBackend,
@@ -24,7 +28,10 @@ use lb_storage_service::recovery::load_recovery_data;
 pub use lb_system_sig_service::SystemSig;
 use lb_time_service::backends::NtpTimeBackend;
 pub use lb_tracing_service::Tracing;
-use lb_tx_service::storage::adapters::RocksStorageAdapter;
+use lb_tx_service::{
+    network::adapters::libp2p::MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE,
+    storage::adapters::RocksStorageAdapter,
+};
 pub use lb_tx_service::{
     network::adapters::libp2p::{
         Libp2pAdapter as MempoolNetworkAdapter, Settings as MempoolAdapterSettings,
@@ -145,6 +152,9 @@ pub fn run_node_from_config(
     // front rather than querying a service for a value that cannot change.
     let chain_id = config.deployment.chain_id();
 
+    let transaction_topic = config.deployment.mempool.pubsub_topic.clone();
+    let proposal_topic = config.deployment.cryptarchia.gossipsub_protocol.clone();
+
     let blend_rewards_params = config.deployment.blend_reward_params();
 
     // The PoW mining service must use the same acceptance window as consensus;
@@ -191,7 +201,13 @@ pub fn run_node_from_config(
         user: config.user.network,
         deployment: config.deployment.network,
     }
-    .into();
+    .into_network_config([
+        GossipsubTopicSizeLimit::new(
+            transaction_topic,
+            MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE,
+        ),
+        GossipsubTopicSizeLimit::new(proposal_topic, MAX_PROPOSAL_CANONICAL_SIZE),
+    ])?;
 
     let wallet_config = WalletConfig {
         user: config.user.wallet,

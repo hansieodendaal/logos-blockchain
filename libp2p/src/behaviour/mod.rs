@@ -6,6 +6,7 @@
 use std::error::Error;
 
 use lb_cryptarchia_sync::ChainSyncError;
+use lb_utils::net::MAX_WIRE_MESSAGE_SIZE;
 use libp2p::{PeerId, StreamProtocol, autonat, identify, identity, kad, swarm::NetworkBehaviour};
 use rand::RngCore;
 use thiserror::Error;
@@ -18,8 +19,6 @@ pub mod chainsync;
 pub mod gossipsub;
 pub mod kademlia;
 pub mod nat;
-
-const DATA_LIMIT: usize = 16 * 1024 * 1024; // 16 MiB (gossipsub default is 64 KiB)
 
 pub(crate) struct BehaviourConfig {
     pub gossipsub_config: libp2p::gossipsub::Config,
@@ -74,7 +73,7 @@ impl<Rng: Clone + Send + RngCore + 'static> Behaviour<Rng> {
             libp2p::gossipsub::ConfigBuilder::from(gossipsub_config)
                 .validation_mode(libp2p::gossipsub::ValidationMode::None)
                 .message_id_fn(compute_message_id)
-                .max_transmit_size(DATA_LIMIT)
+                .max_transmit_size(MAX_WIRE_MESSAGE_SIZE)
                 .build()?,
         )?;
 
@@ -102,5 +101,62 @@ impl<Rng: Clone + Send + RngCore + 'static> Behaviour<Rng> {
             autonat_server,
             nat,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, time::Duration};
+
+    use lb_cryptarchia_sync::Config as ChainSyncConfig;
+    use libp2p::gossipsub as libp2p_gossipsub;
+    use rand::rngs::OsRng;
+
+    use super::*;
+    use crate::behaviour::gossipsub::{GossipsubTopicSizeLimit, configure_topic_size_limits};
+
+    #[tokio::test]
+    async fn final_behaviour_construction_preserves_topic_size_limits() {
+        let node_key = identity::ed25519::SecretKey::generate();
+        let keypair = identity::Keypair::from(identity::ed25519::Keypair::from(node_key));
+        let public_key = keypair.public();
+        let author = PeerId::from(public_key.clone());
+        let topic = "test";
+        let payload_size = 512;
+        let topic_hash = libp2p_gossipsub::IdentTopic::new(topic).hash();
+        let gossipsub_config = configure_topic_size_limits(
+            libp2p_gossipsub::Config::default(),
+            author,
+            [GossipsubTopicSizeLimit::new(topic, payload_size)],
+        )
+        .unwrap();
+        let topic_limit = gossipsub_config.max_transmit_size_for_topic(&topic_hash);
+
+        let mut behaviour = Behaviour::<OsRng>::new(
+            BehaviourConfig {
+                gossipsub_config,
+                kademlia_config: KademliaSettings::default(),
+                identify_config: IdentifySettings::default(),
+                nat_config: NatSettings::default(),
+                kad_protocol_name: StreamProtocol::new("/test/kad/1.0.0"),
+                identify_protocol_name: StreamProtocol::new("/test/identify/1.0.0"),
+                chain_sync_protocol_name: StreamProtocol::new("/test/chainsync/1.0.0"),
+                public_key,
+                chain_sync_config: ChainSyncConfig {
+                    peer_response_timeout: Duration::from_secs(1),
+                    max_inbound_requests: NonZeroUsize::new(1).unwrap(),
+                },
+            },
+            OsRng,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            behaviour.gossipsub.publish(
+                libp2p_gossipsub::IdentTopic::new(topic),
+                vec![0; topic_limit + 1]
+            ),
+            Err(libp2p_gossipsub::PublishError::MessageTooLarge)
+        ));
     }
 }

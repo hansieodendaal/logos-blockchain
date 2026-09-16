@@ -4553,6 +4553,7 @@ dependencies = [
  "logos-blockchain-cryptarchia-engine",
  "logos-blockchain-log-targets",
  "logos-blockchain-serialization",
+ "logos-blockchain-utils",
  "rand 0.8.6",
  "serde",
  "serde_with",

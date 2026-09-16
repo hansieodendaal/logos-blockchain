@@ -1,4 +1,5 @@
 use futures::Stream;
+use lb_core::block::MAX_BLOCK_TRANSACTIONS_SIZE;
 use lb_log_targets::mempool;
 use lb_network_service::{
     NetworkService,
@@ -13,6 +14,20 @@ use tokio_stream::StreamExt as _;
 use crate::network::NetworkAdapter;
 
 const LOG_TARGET: &str = mempool::network::LIBP2P;
+
+/// Direct transaction gossip carries canonical bytes in a configured-bincode
+/// byte envelope.
+///
+/// The mempool's existing transaction-content limit therefore leaves one
+/// bincode `u64` length prefix of overhead.
+/// This is the application payload limit, not the Gossipsub protobuf limit.
+pub const MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE: usize =
+    MAX_BLOCK_TRANSACTIONS_SIZE + size_of::<u64>();
+
+#[must_use]
+const fn transaction_gossip_size_is_valid(size: usize) -> bool {
+    size <= MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE
+}
 
 pub struct Libp2pAdapter<Item, Key, RuntimeServiceId> {
     network_relay:
@@ -67,7 +82,9 @@ where
 
         let stream = receiver.await.unwrap();
         Box::new(Box::pin(stream.filter_map(move |message| match message {
-            Ok(Message { data, topic, .. }) if topic == topic_hash => {
+            Ok(Message { data, topic, .. })
+                if topic == topic_hash && transaction_gossip_size_is_valid(data.len()) =>
+            {
                 match Item::from_bytes(&data) {
                     Ok(item) => Some((id(&item), item)),
                     Err(e) => {
@@ -75,6 +92,15 @@ where
                         None
                     }
                 }
+            }
+            Ok(Message { data, topic, .. }) if topic == topic_hash => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    size = data.len(),
+                    maximum = MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE,
+                    "Discarding oversized transaction gossip message"
+                );
+                None
             }
             _ => None,
         })))
@@ -84,6 +110,15 @@ where
         let serialized = item
             .to_bytes()
             .expect("Item should be able to be serialized");
+        if !transaction_gossip_size_is_valid(serialized.len()) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                size = serialized.len(),
+                maximum = MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE,
+                "Not broadcasting an oversized transaction"
+            );
+            return;
+        }
         {
             if let Err((e, _)) = self
                 .network_relay
@@ -105,4 +140,37 @@ where
 pub struct Settings<K, V> {
     pub topic: String,
     pub id: fn(&V) -> K,
+}
+
+#[cfg(test)]
+mod tests {
+    use lb_core::mantle::{
+        ledger::verification_mode::StandardMode,
+        traits::StorageSize as _,
+        transactions::{SignedOps, states::Preverified},
+    };
+
+    use super::*;
+
+    #[test]
+    fn transaction_gossipsub_bound_accounts_for_the_bincode_envelope() {
+        let transaction = SignedOps::<Preverified, StandardMode>::empty();
+        let bytes = <SignedOps<Preverified, StandardMode> as lb_serialization::bincode::SerializeOp>::to_bytes(&transaction).unwrap();
+
+        assert_eq!(bytes.len(), transaction.storage_size() + size_of::<u64>());
+        assert_eq!(
+            MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE,
+            MAX_BLOCK_TRANSACTIONS_SIZE + size_of::<u64>()
+        );
+    }
+
+    #[test]
+    fn transaction_gossip_guard_rejects_one_byte_over_the_bound() {
+        assert!(transaction_gossip_size_is_valid(
+            MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE
+        ));
+        assert!(!transaction_gossip_size_is_valid(
+            MAX_TRANSACTION_GOSSIP_BINCODE_PAYLOAD_SIZE + 1
+        ));
+    }
 }

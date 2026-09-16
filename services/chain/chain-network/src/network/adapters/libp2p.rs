@@ -2,7 +2,7 @@ use std::{collections::HashSet, fmt::Debug, hash::Hash, iter, marker::PhantomDat
 
 use futures::{FutureExt as _, TryStreamExt as _, future::select_ok, stream};
 use lb_core::{
-    block::{Block, Proposal},
+    block::{Block, MAX_PROPOSAL_CANONICAL_SIZE, Proposal},
     header::HeaderId,
     mantle::{
         ledger::verification_mode::StandardMode,
@@ -42,6 +42,11 @@ type FirstBlockResponse<Tx> = Result<Option<BlockStreamItem<Tx>>, DynError>;
 type BlockDownloadStream<Tx> = BoxedStream<BlockStreamItem<Tx>>;
 
 const LOG_TARGET: &str = chain::network::LIBP2P;
+
+#[must_use]
+const fn proposal_gossip_size_is_valid(size: usize) -> bool {
+    size <= MAX_PROPOSAL_CANONICAL_SIZE
+}
 
 #[derive(Clone)]
 pub struct LibP2pAdapter<Tx, RuntimeServiceId>
@@ -217,6 +222,10 @@ where
         }
     }
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "The stream validates topic, size, and canonical decoding together."
+    )]
     async fn proposals_stream(&self) -> Result<BoxedStream<Self::Proposal>, DynError> {
         let (sender, receiver) = oneshot::channel();
         if let Err((e, _)) = self
@@ -229,14 +238,24 @@ where
         let topic_hash = TopicHash::from_raw(self.settings.topic.clone());
         let stream = receiver.await.map_err(Box::new)?;
         Ok(Box::new(stream.filter_map(move |message| match message {
-            Ok(message) if message.topic == topic_hash => match Proposal::decode_all(&message.data)
-            {
-                Ok(proposal) => Some(proposal),
-                Err(e) => {
-                    tracing::debug!(target: LOG_TARGET, "unrecognized gossipsub message: {e}");
-                    None
+            Ok(message) if message.topic == topic_hash => {
+                if !proposal_gossip_size_is_valid(message.data.len()) {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        size = message.data.len(),
+                        maximum = MAX_PROPOSAL_CANONICAL_SIZE,
+                        "discarding oversized block proposal"
+                    );
+                    return None;
                 }
-            },
+                match Proposal::decode_all(&message.data) {
+                    Ok(proposal) => Some(proposal),
+                    Err(e) => {
+                        tracing::debug!(target: LOG_TARGET, "unrecognized gossipsub message: {e}");
+                        None
+                    }
+                }
+            }
             Ok(_) => None,
             Err(BroadcastStreamRecvError::Lagged(n)) => {
                 tracing::error!(target: LOG_TARGET, "lagged messages: {n}");
@@ -502,9 +521,7 @@ mod tests {
     fn validate_first_block_response_rejects_other_provider_errors() {
         let unknown = ChainSyncError::new(
             PeerId::random(),
-            ChainSyncErrorKind::BlockProviderUnavailable(BlocksUnavailableReason::Unknown(
-                "oops".to_owned(),
-            )),
+            ChainSyncErrorKind::BlockProviderUnavailable(BlocksUnavailableReason::Unknown),
         );
         let first_item: Result<(HeaderId, Block<()>), DynError> = Err(Box::new(unknown));
 
@@ -600,5 +617,13 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&[4; 32]));
         assert!(result.contains(&[5; 32]));
+    }
+
+    #[test]
+    fn proposal_gossip_guard_rejects_one_byte_over_the_bound() {
+        assert!(proposal_gossip_size_is_valid(MAX_PROPOSAL_CANONICAL_SIZE));
+        assert!(!proposal_gossip_size_is_valid(
+            MAX_PROPOSAL_CANONICAL_SIZE + 1
+        ));
     }
 }
