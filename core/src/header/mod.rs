@@ -20,7 +20,16 @@ use crate::{
 };
 
 pub const BEDROCK_VERSION: u8 = 1;
-pub const HEADER_BINCODE_SIZE: usize = 297;
+
+pub const HEADER_BINCODE_SIZE: usize = // = 297
+    1 + // version
+        32 +  // parent
+        8 +   // slot
+        32 +  // body root
+        128 + // PoL proof
+        32 +  // entropy
+        32 +  // leader key
+        32; // voucher commitment
 
 #[derive(Clone, Eq, PartialEq, Copy, Hash, PartialOrd, Ord, BinaryCodec)]
 pub struct HeaderId([u8; 32]);

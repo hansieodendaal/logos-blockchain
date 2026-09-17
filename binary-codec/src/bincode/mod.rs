@@ -57,12 +57,12 @@ impl<const N: usize> BoundedBytes for [u8; N] {
 
     fn serialize<T: Serialize>(value: &T) -> Result<Self> {
         let bytes = config::serialize_bounded::<_, N>(value)?;
-        let actual = bytes.len();
+        let serialized_len = bytes.len();
 
         bytes.into_inner().try_into().map_err(|_| {
             Error::Serialize(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("serialized size {actual} does not match required size {N}"),
+                format!("serialized size {serialized_len} does not match required size {N}"),
             )))
         })
     }
