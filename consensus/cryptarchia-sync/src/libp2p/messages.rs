@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
+use lb_binary_codec::bincode::{BoundedSerializeOp, UpperBoundedVec};
 use lb_core::header::HeaderId;
-use lb_serialization::bincode::{BoundedSerializeOp, UpperBoundedVec};
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 
 use crate::{
@@ -144,8 +144,8 @@ impl BoundedSerializeOp for DownloadBlocksResponse {
 mod tests {
     use std::collections::HashSet;
 
+    use lb_binary_codec::bincode::{DeserializeOp as _, SerializeOp as _};
     use lb_core::header::HeaderId;
-    use lb_serialization::bincode::{DeserializeOp as _, SerializeOp as _};
 
     use super::{DownloadBlocksRequest, KnownBlocks};
 

@@ -1,11 +1,11 @@
 use futures::Stream;
+use lb_binary_codec::bincode::{DeserializeOp as _, SerializeOp as _};
 use lb_log_targets::mempool;
 use lb_network_service::{
     NetworkService,
     backends::libp2p::{Command, Libp2p, Message, PubSubCommand, TopicHash},
     message::NetworkMsg,
 };
-use lb_serialization::bincode::{DeserializeOp as _, SerializeOp as _};
 use overwatch::services::{ServiceData, relay::OutboundRelay};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_stream::StreamExt as _;
