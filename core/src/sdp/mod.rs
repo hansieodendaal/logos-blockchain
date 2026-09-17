@@ -9,13 +9,13 @@ use std::{collections::HashMap, hash::Hash};
 
 use blake2::{Blake2b, Digest as _};
 use bytes::Bytes;
-use lb_cryptarchia_engine::Epoch;
-use lb_groth16::fr_to_bytes;
-use lb_key_management_system_keys::keys::{Ed25519Signature, ZkPublicKey};
-use lb_serialization::{
+use lb_binary_codec::{
     bincode::{self, DeserializeOp as _, SerializeOp as _},
     canonical::{BinaryCodec, BinaryDecode, BinaryEncode, DecodeError},
 };
+use lb_cryptarchia_engine::Epoch;
+use lb_groth16::fr_to_bytes;
+use lb_key_management_system_keys::keys::{Ed25519Signature, ZkPublicKey};
 use lb_utils::bounded::{BoundedVec, NonEmptyBoundedVec};
 use multiaddr::{Multiaddr, Protocol};
 use serde::{Deserialize, Serialize};
