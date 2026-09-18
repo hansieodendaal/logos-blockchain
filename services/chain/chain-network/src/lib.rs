@@ -332,12 +332,6 @@ where
         )
         .await;
 
-        if let Some(banning_service) = relays.banning_service().cloned() {
-            network_adapter
-                .configure_chain_sync_banning(banning_service.into_untyped())
-                .await;
-        }
-
         let initial_block_download = InitialBlockDownload::new(
             ChainNetworkIbdBlockProcessor::<_, Mempool> {
                 cryptarchia: relays.cryptarchia().clone(),

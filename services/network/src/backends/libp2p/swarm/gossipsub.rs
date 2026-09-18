@@ -123,11 +123,37 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         }
     }
 
-    pub(super) fn handle_gossipsub_event(&self, event: gossipsub::Event) {
-        if let gossipsub::Event::Message { message, .. } = event
-            && let Err(e) = self.pubsub_messages_tx.send(message)
-        {
-            tracing::error!(target: LOG_TARGET, "Failed to send gossipsub message event: {}", e);
+    pub(super) fn handle_gossipsub_event(&mut self, event: gossipsub::Event) {
+        match event {
+            gossipsub::Event::Message {
+                propagation_source,
+                message,
+                ..
+            } if !self.is_globally_blocked(propagation_source) => {
+                if let Err(e) = self.pubsub_messages_tx.send(message) {
+                    tracing::error!(
+                        target: LOG_TARGET,
+                        "Failed to send gossipsub message event: {}",
+                        e
+                    );
+                }
+            }
+            gossipsub::Event::Message {
+                propagation_source, ..
+            } => {
+                self.swarm.blacklist_peer(propagation_source);
+                let _ = self.swarm.disconnect_peer(propagation_source);
+            }
+            gossipsub::Event::Subscribed { peer_id, .. }
+            | gossipsub::Event::Unsubscribed { peer_id, .. }
+            | gossipsub::Event::GossipsubNotSupported { peer_id }
+            | gossipsub::Event::SlowPeer { peer_id, .. }
+                if self.is_globally_blocked(peer_id) =>
+            {
+                self.swarm.blacklist_peer(peer_id);
+                let _ = self.swarm.disconnect_peer(peer_id);
+            }
+            _ => {}
         }
     }
 }

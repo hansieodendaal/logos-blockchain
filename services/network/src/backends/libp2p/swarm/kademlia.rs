@@ -34,10 +34,17 @@ pub struct PendingQueryData {
 }
 
 impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "Retain the existing bootstrap validation and logging in one boundary."
+    )]
     pub(super) fn bootstrap_kad_from_peers(&mut self, initial_peers: &Vec<Multiaddr>) {
         for peer_addr in initial_peers {
             if let Some(Protocol::P2p(peer_id_bytes)) = peer_addr.iter().last() {
                 if let Ok(peer_id) = PeerId::from_multihash(peer_id_bytes.into()) {
+                    if self.is_globally_blocked(peer_id) {
+                        continue;
+                    }
                     self.swarm.kademlia_add_address(peer_id, peer_addr);
                     tracing::trace!(
                         target: LOG_TARGET,
@@ -80,21 +87,82 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                     .swarm
                     .kademlia_discovered_peers()
                     .into_iter()
+                    .filter(|peer_info| !self.is_globally_blocked(peer_info.peer_id))
                     .map(|peer_info| peer_info.peer_id)
                     .collect::<HashSet<_>>();
 
                 drop(reply.send(discovered_peers));
             }
             DiscoveryCommand::DumpRoutingTable { reply } => {
-                let result = self.swarm.kademlia_routing_table_dump();
+                let result = self
+                    .swarm
+                    .kademlia_routing_table_dump()
+                    .into_iter()
+                    .map(|(bucket, peers)| {
+                        (
+                            bucket,
+                            peers
+                                .into_iter()
+                                .filter(|peer_id| !self.is_globally_blocked(*peer_id))
+                                .collect(),
+                        )
+                    })
+                    .collect();
                 tracing::trace!(target: LOG_TARGET, "Routing table dump: {result:?}");
                 drop(reply.send(result));
             }
         }
     }
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "Keep current Kademlia event handling in one policy boundary."
+    )]
     pub(super) fn handle_kademlia_event(&mut self, event: kad::Event) {
         match event {
+            kad::Event::RoutablePeer { peer, address }
+            | kad::Event::PendingRoutablePeer { peer, address }
+                if self.is_globally_blocked(peer) =>
+            {
+                self.swarm.kademlia_remove_address(peer, &address);
+                let _ = self.swarm.disconnect_peer(peer);
+            }
+            kad::Event::UnroutablePeer { peer } if self.is_globally_blocked(peer) => {
+                let _ = self.swarm.disconnect_peer(peer);
+            }
+            kad::Event::InboundRequest {
+                request:
+                    kad::InboundRequest::PutRecord {
+                        source,
+                        record: Some(record),
+                        ..
+                    },
+            } if self.is_globally_blocked(source) => {
+                self.swarm.kademlia_remove_record(&record.key);
+                let _ = self.swarm.disconnect_peer(source);
+            }
+            kad::Event::InboundRequest {
+                request: kad::InboundRequest::PutRecord { source, .. },
+            } if self.is_globally_blocked(source) => {
+                let _ = self.swarm.disconnect_peer(source);
+            }
+            kad::Event::InboundRequest {
+                request:
+                    kad::InboundRequest::AddProvider {
+                        record: Some(record),
+                    },
+            } if self.is_globally_blocked(record.provider) => {
+                self.swarm
+                    .kademlia_remove_provider(&record.key, &record.provider);
+            }
+            kad::Event::InboundRequest { request } => {
+                // The current libp2p-kad event does not expose the authenticated
+                // request peer for FindNode/GetProvider/GetRecord/AddProvider.
+                // Those variants are not forwarded to application consumers;
+                // the common connection gate and reconciliation handle their
+                // peer-attributed admission boundary.
+                tracing::trace!(target: LOG_TARGET, "Handle Kademlia inbound request: {request:?}");
+            }
             kad::Event::OutboundQueryProgressed {
                 id, result, step, ..
             } => {
@@ -107,7 +175,14 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 is_new_peer,
                 ..
             } => {
-                log_routing_update(peer, &addresses.into_vec(), old_peer, is_new_peer);
+                if self.is_globally_blocked(peer) {
+                    for address in addresses.iter() {
+                        self.swarm.kademlia_remove_address(peer, address);
+                    }
+                    let _ = self.swarm.disconnect_peer(peer);
+                } else {
+                    log_routing_update(peer, &addresses.into_vec(), old_peer, is_new_peer);
+                }
             }
             kad::Event::ModeChanged { new_mode } => {
                 tracing::info!(target: LOG_TARGET, "Kademlia mode changed to {new_mode:?}");
@@ -126,8 +201,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
     ) {
         match result {
             kad::QueryResult::GetClosestPeers(Ok(result)) => {
+                let peers = result
+                    .peers
+                    .into_iter()
+                    .filter(|peer_info| !self.is_globally_blocked(peer_info.peer_id))
+                    .collect::<Vec<_>>();
                 if let Some(query_data) = self.pending_queries.get_mut(&id) {
-                    query_data.accumulated_results.extend(result.peers);
+                    query_data.accumulated_results.extend(peers);
 
                     if step.last
                         && let Some(query_data) = self.pending_queries.remove(&id)

@@ -1,7 +1,8 @@
 use std::fmt::{Debug, Display};
 
 use async_trait::async_trait;
-use backends::NetworkBackend;
+use backends::{BanningSynchronizer, NetworkBackend};
+use lb_banning_service::{BanningService, BanningServiceApi};
 use lb_log_targets::network_service;
 use overwatch::{
     OpaqueServiceResourcesHandle,
@@ -10,6 +11,7 @@ use overwatch::{
         state::{NoOperator, NoState},
     },
 };
+use tokio::time::{Duration, sleep, timeout};
 
 use crate::{config::NetworkConfig, message::BackendNetworkMsg};
 
@@ -22,6 +24,9 @@ mod metrics;
 pub use local_ban_view::LocalBanView;
 
 const LOG_TARGET: &str = network_service::ROOT;
+const BANNING_RELAY_TIMEOUT: Duration = Duration::from_secs(1);
+const BANNING_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BANNING_RETRY_MAX: Duration = Duration::from_secs(30);
 
 pub struct NetworkService<Backend, RuntimeServiceId>
 where
@@ -45,7 +50,7 @@ where
 impl<Backend, RuntimeServiceId> ServiceCore<RuntimeServiceId>
     for NetworkService<Backend, RuntimeServiceId>
 where
-    Backend: NetworkBackend<RuntimeServiceId> + Send + 'static,
+    Backend: BanningSynchronizer<RuntimeServiceId> + Send + 'static,
     RuntimeServiceId: AsServiceId<Self> + Clone + Display + Send,
 {
     fn init(
@@ -69,7 +74,9 @@ where
         let Self {
             service_resources_handle:
                 OpaqueServiceResourcesHandle::<Self, RuntimeServiceId> {
-                    mut inbound_relay, ..
+                    overwatch_handle,
+                    mut inbound_relay,
+                    ..
                 },
             mut backend,
         } = self;
@@ -81,11 +88,64 @@ where
             <RuntimeServiceId as AsServiceId<Self>>::SERVICE_ID
         );
 
-        while let Some(msg) = inbound_relay.recv().await {
-            Self::handle_network_service_message(msg, &mut backend).await;
+        let mut banning_configured = false;
+        let mut banning_synchronizer =
+            Box::pin(backend.start_banning_synchronizer(overwatch_handle));
+
+        loop {
+            tokio::select! {
+                Some(msg) = inbound_relay.recv() => {
+                    Self::handle_network_service_message(msg, &mut backend).await;
+                }
+                () = &mut banning_synchronizer, if !banning_configured => {
+                    banning_configured = true;
+                }
+                else => break,
+            }
         }
 
         Ok(())
+    }
+}
+
+pub(crate) async fn acquire_banning_service<RuntimeServiceId>(
+    overwatch_handle: overwatch::overwatch::handle::OverwatchHandle<RuntimeServiceId>,
+) -> BanningServiceApi<RuntimeServiceId>
+where
+    RuntimeServiceId:
+        AsServiceId<BanningService<RuntimeServiceId>> + Debug + Display + Send + Sync + 'static,
+{
+    let mut retry_backoff = BANNING_RETRY_INITIAL;
+    let mut reported_failure = false;
+
+    loop {
+        match timeout(
+            BANNING_RELAY_TIMEOUT,
+            overwatch_handle.relay::<BanningService<RuntimeServiceId>>(),
+        )
+        .await
+        {
+            Ok(Ok(relay)) => return BanningServiceApi::new(relay),
+            Ok(Err(error)) if !reported_failure => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    %error,
+                    "BanningService relay unavailable; network banning remains fail-open"
+                );
+                reported_failure = true;
+            }
+            Err(_) if !reported_failure => {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "BanningService relay acquisition timed out; network banning remains fail-open"
+                );
+                reported_failure = true;
+            }
+            Ok(Err(_)) | Err(_) => {}
+        }
+
+        sleep(retry_backoff).await;
+        retry_backoff = retry_backoff.saturating_mul(2).min(BANNING_RETRY_MAX);
     }
 }
 

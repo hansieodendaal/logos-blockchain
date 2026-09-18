@@ -4,7 +4,6 @@ use std::{
     hash::Hash,
     iter,
     marker::PhantomData,
-    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -30,7 +29,6 @@ use lb_network_service::{
     },
     message::{ChainSyncEvent, NetworkMsg},
 };
-use lb_utils::tokio::task::{CancellableHandle, spawn};
 use overwatch::{
     DynError,
     services::{ServiceData, relay::OutboundRelay},
@@ -52,9 +50,6 @@ type FirstBlockResponse<Tx> = Result<Option<BlockStreamItem<Tx>>, DynError>;
 type BlockDownloadStream<Tx> = BoxedStream<BlockStreamItem<Tx>>;
 
 const LOG_TARGET: &str = chain::network::LIBP2P;
-const BANNING_CONFIGURATION_TIMEOUT: Duration = Duration::from_secs(1);
-const BANNING_CONFIGURATION_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const BANNING_CONFIGURATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct LibP2pAdapter<Tx, RuntimeServiceId>
@@ -64,7 +59,6 @@ where
     network_relay:
         OutboundRelay<<NetworkService<Libp2p, RuntimeServiceId> as ServiceData>::Message>,
     chain_sync_ban_view: ChainSyncBanView,
-    banning_configuration_task: Arc<Mutex<Option<CancellableHandle<()>>>>,
     settings: LibP2pAdapterSettings,
     _phantom_tx: PhantomData<Tx>,
 }
@@ -235,7 +229,6 @@ where
         Self {
             network_relay,
             chain_sync_ban_view: ChainSyncBanView::new(banning_service, configured_ban_policy),
-            banning_configuration_task: Arc::new(Mutex::new(None)),
             settings,
             _phantom_tx: PhantomData,
         }
@@ -286,65 +279,6 @@ where
                 .map_err(|e| tracing::error!(target: LOG_TARGET, "lagged messages: {e}"))
                 .ok()
         })))
-    }
-
-    async fn configure_chain_sync_banning(&self, banning_service: BanningServiceApi<()>) {
-        let Ok(mut task) = self.banning_configuration_task.lock() else {
-            tracing::error!(target: LOG_TARGET, "failed to lock ChainSync banning configuration state");
-            return;
-        };
-
-        if task.is_some() {
-            return;
-        }
-
-        let network_relay = self.network_relay.clone();
-        *task = Some(CancellableHandle::new(spawn(
-            "logos/chain/chainsync-ban-config",
-            async move {
-                let mut backoff = BANNING_CONFIGURATION_INITIAL_BACKOFF;
-                let mut reported_failure = false;
-
-                loop {
-                    let send = network_relay.send(NetworkMsg::Process(Command::Network(
-                        NetworkCommand::ConfigureChainSyncBanning {
-                            api: banning_service.clone(),
-                        },
-                    )));
-                    let result = tokio::time::timeout(BANNING_CONFIGURATION_TIMEOUT, send).await;
-
-                    match result {
-                        Ok(Ok(())) => {
-                            tracing::info!(
-                                target: LOG_TARGET,
-                                "network ChainSync banning configuration delivered"
-                            );
-                            return;
-                        }
-                        Ok(Err((error, _))) if !reported_failure => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                "failed to configure network ChainSync banning; retrying: {error}"
-                            );
-                            reported_failure = true;
-                        }
-                        Err(_) if !reported_failure => {
-                            tracing::warn!(
-                                target: LOG_TARGET,
-                                "timed out configuring network ChainSync banning; retrying"
-                            );
-                            reported_failure = true;
-                        }
-                        Ok(Err(_)) | Err(_) => {}
-                    }
-
-                    tokio::time::sleep(backoff).await;
-                    backoff = backoff
-                        .saturating_mul(2)
-                        .min(BANNING_CONFIGURATION_MAX_BACKOFF);
-                }
-            },
-        )));
     }
 
     async fn request_tip(&self, peer: Self::PeerId) -> Result<GetTipResponse, DynError> {
@@ -815,7 +749,6 @@ mod tests {
         let adapter = LibP2pAdapter::<SignedOps<Preverified, StandardMode>, ()> {
             network_relay: OutboundRelay::new(sender),
             chain_sync_ban_view: ChainSyncBanView::new::<()>(None, ConfiguredBanPolicy::default()),
-            banning_configuration_task: Arc::new(Mutex::new(None)),
             settings: LibP2pAdapterSettings {
                 topic: "test".to_owned(),
                 max_connected_peers_to_try_download: 1,
@@ -842,7 +775,6 @@ mod tests {
         let adapter = LibP2pAdapter::<SignedOps<Preverified, StandardMode>, ()> {
             network_relay: OutboundRelay::new(sender),
             chain_sync_ban_view: ChainSyncBanView::new::<()>(None, configured_ban_policy),
-            banning_configuration_task: Arc::new(Mutex::new(None)),
             settings: LibP2pAdapterSettings {
                 topic: "test".to_owned(),
                 max_connected_peers_to_try_download: 1,
@@ -853,47 +785,6 @@ mod tests {
 
         assert!(adapter.request_tip(peer).await.is_err());
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn final_banning_configuration_retries_after_network_backpressure() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        let (prefilled_sender, _prefilled_receiver) = oneshot::channel();
-        sender
-            .send(NetworkMsg::SubscribeToPubSub {
-                sender: prefilled_sender,
-            })
-            .await
-            .expect("prefill network queue");
-
-        let (banning_sender, _banning_receiver) = mpsc::channel(1);
-        let banning_service = BanningServiceApi::<()>::new(OutboundRelay::new(banning_sender));
-        let adapter = LibP2pAdapter::<SignedOps<Preverified, StandardMode>, ()> {
-            network_relay: OutboundRelay::new(sender),
-            chain_sync_ban_view: ChainSyncBanView::new::<()>(None, ConfiguredBanPolicy::default()),
-            banning_configuration_task: Arc::new(Mutex::new(None)),
-            settings: LibP2pAdapterSettings {
-                topic: "test".to_owned(),
-                max_connected_peers_to_try_download: 1,
-                max_discovered_peers_to_try_download: 1,
-            },
-            _phantom_tx: PhantomData,
-        };
-
-        adapter.configure_chain_sync_banning(banning_service).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(BANNING_CONFIGURATION_TIMEOUT + BANNING_CONFIGURATION_INITIAL_BACKOFF)
-            .await;
-
-        let _prefilled = receiver.recv().await.expect("prefilled queue item");
-        tokio::task::yield_now().await;
-
-        assert!(matches!(
-            receiver.recv().await.expect("retry configuration item"),
-            NetworkMsg::Process(Command::Network(
-                NetworkCommand::ConfigureChainSyncBanning { .. }
-            ))
-        ));
     }
 
     #[tokio::test]
@@ -910,7 +801,6 @@ mod tests {
         let adapter = LibP2pAdapter::<SignedOps<Preverified, StandardMode>, ()> {
             network_relay: OutboundRelay::new(sender),
             chain_sync_ban_view: view.clone(),
-            banning_configuration_task: Arc::new(Mutex::new(None)),
             settings: LibP2pAdapterSettings {
                 topic: "test".to_owned(),
                 max_connected_peers_to_try_download: 1,

@@ -11,7 +11,10 @@ use lb_banning_service::{
 use lb_libp2p::PeerId;
 use lb_log_targets::network_service;
 use lb_utils::tokio::task::{CancellableHandle, spawn};
-use tokio::{sync::broadcast, time::Instant as TokioInstant};
+use tokio::{
+    sync::{broadcast, watch},
+    time::Instant as TokioInstant,
+};
 
 const LOG_TARGET: &str = network_service::ROOT;
 const DYNAMIC_AUTHORITY_LEASE: Duration = Duration::from_secs(10);
@@ -36,10 +39,22 @@ struct LocalBanViewInner {
     synchronizer: Mutex<Option<CancellableHandle<()>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct LocalBanViewState {
     dynamic_authority_valid_until: Option<TokioInstant>,
     dynamic_records: HashMap<(PeerId, BanScope), BanRecord>,
+    policy_changed: watch::Sender<()>,
+}
+
+impl Default for LocalBanViewState {
+    fn default() -> Self {
+        let (policy_changed, _) = watch::channel(());
+        Self {
+            dynamic_authority_valid_until: None,
+            dynamic_records: HashMap::new(),
+            policy_changed,
+        }
+    }
 }
 
 impl LocalBanView {
@@ -93,6 +108,17 @@ impl LocalBanView {
                 Self::run_synchronizer(banning_service, state).await;
             },
         )));
+    }
+
+    /// Subscribes to coalescing policy-change notifications for connection
+    /// reconciliation. The notification carries no state; consumers must
+    /// re-evaluate the current view after waking.
+    #[must_use]
+    pub fn subscribe_policy_changes(&self) -> watch::Receiver<()> {
+        self.inner.state.read().map_or_else(
+            |_| watch::channel(()).1,
+            |state| state.policy_changed.subscribe(),
+        )
     }
 
     /// Returns whether a peer is banned for the requested consumer scope.
@@ -163,37 +189,47 @@ impl LocalBanView {
     }
 
     fn install_snapshot_in(state: &Arc<RwLock<LocalBanViewState>>, records: Vec<BanRecord>) {
-        let Ok(mut state) = state.write() else {
+        let Ok(mut state_guard) = state.write() else {
             return;
         };
 
         let wall_now = SystemTime::now();
-        state.dynamic_records = records
+        state_guard.dynamic_records = records
             .into_iter()
             .filter(|record| {
                 record.source != BanSource::Configuration && Self::is_effective_at(record, wall_now)
             })
             .map(|record| ((record.peer_id, record.scope.clone()), record))
             .collect();
-        state.dynamic_authority_valid_until = Some(TokioInstant::now() + DYNAMIC_AUTHORITY_LEASE);
+        state_guard.dynamic_authority_valid_until =
+            Some(TokioInstant::now() + DYNAMIC_AUTHORITY_LEASE);
+        let policy_changed = state_guard.policy_changed.clone();
+        drop(state_guard);
+        policy_changed.send_modify(|()| {});
     }
 
     fn disable_in(state: &Arc<RwLock<LocalBanViewState>>) {
-        let Ok(mut state) = state.write() else {
+        let Ok(mut state_guard) = state.write() else {
             return;
         };
-        state.dynamic_authority_valid_until = None;
-        state.dynamic_records.clear();
+        state_guard.dynamic_authority_valid_until = None;
+        state_guard.dynamic_records.clear();
+        let policy_changed = state_guard.policy_changed.clone();
+        drop(state_guard);
+        policy_changed.send_modify(|()| {});
     }
 
     fn apply_event_in(state: &Arc<RwLock<LocalBanViewState>>, event: BanEvent) {
-        let Ok(mut state) = state.write() else {
+        let Ok(mut state_guard) = state.write() else {
             return;
         };
 
-        if !Self::authority_valid_at(&state, TokioInstant::now()) {
-            state.dynamic_authority_valid_until = None;
-            state.dynamic_records.clear();
+        if !Self::authority_valid_at(&state_guard, TokioInstant::now()) {
+            state_guard.dynamic_authority_valid_until = None;
+            state_guard.dynamic_records.clear();
+            let policy_changed = state_guard.policy_changed.clone();
+            drop(state_guard);
+            policy_changed.send_modify(|()| {});
             return;
         }
 
@@ -204,19 +240,22 @@ impl LocalBanView {
                 }
                 let key = (record.peer_id, record.scope.clone());
                 if Self::is_effective_at(&record, SystemTime::now()) {
-                    state.dynamic_records.insert(key, record);
+                    state_guard.dynamic_records.insert(key, record);
                 } else {
-                    state.dynamic_records.remove(&key);
+                    state_guard.dynamic_records.remove(&key);
                 }
             }
             BanEvent::Unbanned { record, .. } => {
                 if record.source != BanSource::Configuration {
-                    state
+                    state_guard
                         .dynamic_records
                         .remove(&(record.peer_id, record.scope));
                 }
             }
         }
+        let policy_changed = state_guard.policy_changed.clone();
+        drop(state_guard);
+        policy_changed.send_modify(|()| {});
     }
 
     async fn synchronize<RuntimeServiceId>(

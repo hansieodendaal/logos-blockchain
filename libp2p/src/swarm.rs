@@ -8,7 +8,6 @@ use std::{
     io,
     net::Ipv4Addr,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -17,12 +16,12 @@ use lb_log_targets::libp2p as lb_log_targets_libp2p;
 use libp2p::{
     Multiaddr, PeerId, TransportError,
     identity::ed25519,
-    swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
+    swarm::{ConnectionDenied, ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
 };
-use multiaddr::multiaddr;
+use multiaddr::{Protocol, multiaddr};
 use rand::RngCore;
 
-use crate::behaviour::BehaviourConfig;
+use crate::behaviour::{BehaviourConfig, GlobalPeerGate, GloballyBlockedPeer};
 pub use crate::{
     SwarmConfig,
     behaviour::{Behaviour, BehaviourEvent},
@@ -36,14 +35,15 @@ const LOG_TARGET: &str = lb_log_targets_libp2p::ROOT;
 /// Wraps [`libp2p::Swarm`], and config it for use within Logos blockchain.
 pub struct Swarm<R: Clone + Send + RngCore + 'static> {
     // A core libp2p swarm
-    pub(crate) swarm: libp2p::Swarm<Behaviour<R>>,
+    pub(crate) swarm: libp2p::Swarm<GlobalPeerGate<Behaviour<R>>>,
+    pub(crate) global_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
 }
 
 impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     /// Builds a [`Swarm`] configured for use with Logos blockchain on top of a
     /// tokio executor.
     pub fn build(config: SwarmConfig, rng: R) -> Result<Self, Box<dyn Error>> {
-        Self::build_with_chain_sync_admission(config, rng, None)
+        Self::build_with_peer_predicates(config, rng, None, None)
     }
 
     /// Builds a [`Swarm`] with an optional synchronous predicate for newly
@@ -51,7 +51,16 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     pub fn build_with_chain_sync_admission(
         config: SwarmConfig,
         rng: R,
-        chain_sync_peer_block_predicate: Option<Arc<dyn Fn(PeerId) -> bool + Send + Sync>>,
+        chain_sync_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::build_with_peer_predicates(config, rng, None, chain_sync_peer_block_predicate)
+    }
+
+    pub fn build_with_peer_predicates(
+        config: SwarmConfig,
+        rng: R,
+        global_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+        chain_sync_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
     ) -> Result<Self, Box<dyn Error>> {
         let keypair =
             libp2p::identity::Keypair::from(ed25519::Keypair::from(config.node_key.clone()));
@@ -72,34 +81,41 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             ..
         } = config;
 
+        let global_predicate_for_behaviour = global_peer_block_predicate.clone();
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
             .with_dns()?
             .with_behaviour(move |keypair| {
-                Behaviour::new(
-                    BehaviourConfig {
-                        gossipsub_config,
-                        kademlia_config: kademlia_config.clone(),
-                        identify_config,
-                        nat_config,
-                        kad_protocol_name: kad_protocol_name.into(),
-                        identify_protocol_name: identify_protocol_name.into(),
-                        chain_sync_protocol_name: chain_sync_protocol_name.into(),
-                        public_key: keypair.public(),
-                        chain_sync_config,
-                        chain_sync_peer_block_predicate,
-                    },
-                    rng,
+                GlobalPeerGate::new(
+                    Behaviour::new(
+                        BehaviourConfig {
+                            gossipsub_config,
+                            kademlia_config: kademlia_config.clone(),
+                            identify_config,
+                            nat_config,
+                            kad_protocol_name: kad_protocol_name.into(),
+                            identify_protocol_name: identify_protocol_name.into(),
+                            chain_sync_protocol_name: chain_sync_protocol_name.into(),
+                            public_key: keypair.public(),
+                            chain_sync_config,
+                            chain_sync_peer_block_predicate,
+                        },
+                        rng,
+                    )
+                    .expect("Behaviour should not fail to set up."),
+                    global_predicate_for_behaviour.clone(),
                 )
-                .expect("Behaviour should not fail to set up.")
             })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONN_TIMEOUT))
             .build();
 
         let lb_swarm = {
             let listen_addr = multiaddr(host, port);
-            let mut s = Self { swarm };
+            let mut s = Self {
+                swarm,
+                global_peer_block_predicate,
+            };
             // We start listening on the provided address, which triggers the Identify flow,
             // which in turn triggers our NAT traversal state machine.
             s.start_listening_on(listen_addr.clone())
@@ -112,6 +128,16 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
 
     /// Initiates a connection attempt to a peer
     pub fn connect(&mut self, peer_addr: &Multiaddr) -> Result<ConnectionId, DialError> {
+        if let Some(peer_id) = peer_id_from_multiaddr(peer_addr)
+            && self
+                .global_peer_block_predicate
+                .as_ref()
+                .is_some_and(|predicate| predicate(peer_id))
+        {
+            return Err(DialError::Denied {
+                cause: ConnectionDenied::new(GloballyBlockedPeer { peer_id }),
+            });
+        }
         let opt = DialOpts::from(peer_addr.clone());
         let connection_id = opt.connection_id();
 
@@ -128,10 +154,21 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         Ok(())
     }
 
+    pub fn disconnect_peer(&mut self, peer_id: PeerId) -> bool {
+        self.swarm.disconnect_peer_id(peer_id).is_ok()
+    }
+
     /// Returns a reference to the underlying [`libp2p::Swarm`]
-    pub const fn swarm(&self) -> &libp2p::Swarm<Behaviour<R>> {
+    pub const fn swarm(&self) -> &libp2p::Swarm<GlobalPeerGate<Behaviour<R>>> {
         &self.swarm
     }
+}
+
+fn peer_id_from_multiaddr(peer_addr: &Multiaddr) -> Option<PeerId> {
+    peer_addr.iter().find_map(|protocol| match protocol {
+        Protocol::P2p(multihash) => PeerId::from_multihash(multihash.into()).ok(),
+        _ => None,
+    })
 }
 
 impl<R: Clone + Send + RngCore + 'static> futures::Stream for Swarm<R> {

@@ -3,10 +3,23 @@
     reason = "We split the `Behaviour` impls into different modules for better code modularity."
 )]
 
-use std::error::Error;
+use std::{
+    error::Error,
+    fmt,
+    task::{Context, Poll},
+};
 
 use lb_cryptarchia_sync::ChainSyncError;
-use libp2p::{PeerId, StreamProtocol, autonat, identify, identity, kad, swarm::NetworkBehaviour};
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, autonat,
+    core::{Endpoint, transport::PortUse},
+    identify, identity, kad,
+    swarm::{
+        ConnectionDenied, ConnectionId, FromSwarm, NetworkBehaviour, THandler, THandlerInEvent,
+        THandlerOutEvent, ToSwarm,
+    },
+};
+use multiaddr::Protocol;
 use rand::RngCore;
 use thiserror::Error;
 
@@ -32,6 +45,153 @@ pub(crate) struct BehaviourConfig {
     pub public_key: identity::PublicKey,
     pub chain_sync_config: lb_cryptarchia_sync::Config,
     pub chain_sync_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+}
+
+/// Common synchronous policy boundary for every protocol in the composite
+/// behaviour.
+///
+/// It must not make network progress depend on an async banning-service
+/// request.
+pub struct GlobalPeerGate<B> {
+    pub(crate) inner: B,
+    block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GloballyBlockedPeer {
+    pub(crate) peer_id: PeerId,
+}
+
+impl fmt::Display for GloballyBlockedPeer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "peer {} is globally blocked", self.peer_id)
+    }
+}
+
+impl Error for GloballyBlockedPeer {}
+
+impl<B> GlobalPeerGate<B> {
+    pub(crate) fn new(
+        inner: B,
+        block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+    ) -> Self {
+        Self {
+            inner,
+            block_predicate,
+        }
+    }
+
+    fn check(&self, peer_id: PeerId) -> Result<(), ConnectionDenied> {
+        if self
+            .block_predicate
+            .as_ref()
+            .is_some_and(|predicate| predicate(peer_id))
+        {
+            return Err(ConnectionDenied::new(GloballyBlockedPeer { peer_id }));
+        }
+
+        Ok(())
+    }
+}
+
+impl<B> NetworkBehaviour for GlobalPeerGate<B>
+where
+    B: NetworkBehaviour,
+{
+    type ConnectionHandler = B::ConnectionHandler;
+    type ToSwarm = B::ToSwarm;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<(), ConnectionDenied> {
+        self.inner
+            .handle_pending_inbound_connection(connection_id, local_addr, remote_addr)
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        local_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.check(peer)?;
+        self.inner.handle_established_inbound_connection(
+            connection_id,
+            peer,
+            local_addr,
+            remote_addr,
+        )
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[Multiaddr],
+        effective_role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if let Some(peer) = maybe_peer {
+            self.check(peer)?;
+        } else if let Some(peer) = addresses.iter().find_map(peer_id_from_multiaddr) {
+            self.check(peer)?;
+        }
+        self.inner.handle_pending_outbound_connection(
+            connection_id,
+            maybe_peer,
+            addresses,
+            effective_role,
+        )
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        addr: &Multiaddr,
+        role_override: Endpoint,
+        port_use: PortUse,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.check(peer)?;
+        self.inner.handle_established_outbound_connection(
+            connection_id,
+            peer,
+            addr,
+            role_override,
+            port_use,
+        )
+    }
+
+    fn on_swarm_event(&mut self, event: FromSwarm) {
+        self.inner.on_swarm_event(event);
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        event: THandlerOutEvent<Self>,
+    ) {
+        self.inner
+            .on_connection_handler_event(peer_id, connection_id, event);
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        self.inner.poll(cx)
+    }
+}
+
+fn peer_id_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
+    address.iter().find_map(|protocol| match protocol {
+        Protocol::P2p(multihash) => PeerId::from_multihash(multihash.into()).ok(),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Error)]

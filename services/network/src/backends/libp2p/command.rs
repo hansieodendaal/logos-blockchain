@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use lb_banning_service::BanningServiceApi;
 use lb_libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -11,9 +10,6 @@ pub use crate::backends::libp2p::swarm::{ChainSyncCommand, DiscoveryCommand, Pub
 #[non_exhaustive]
 pub enum NetworkCommand {
     Connect(Dial),
-    ConfigureChainSyncBanning {
-        api: BanningServiceApi<()>,
-    },
     Info {
         reply: oneshot::Sender<Libp2pInfo>,
     },

@@ -31,7 +31,7 @@ use lb_libp2p::{
 use lb_log_targets::network_service;
 use lb_utils::tokio::task::spawn;
 use rand::RngCore;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::StreamExt as _;
 
 use super::{
@@ -61,6 +61,7 @@ pub struct SwarmHandler<R: Clone + Send + RngCore + 'static> {
     pub pubsub_messages_tx: broadcast::Sender<Message>,
     pub chainsync_events_tx: broadcast::Sender<ChainSyncEvent>,
     pub chainsync_ban_view: LocalBanView,
+    policy_changes: watch::Receiver<()>,
 
     pending_queries: HashMap<QueryId, PendingQueryData>,
 }
@@ -102,16 +103,21 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         chainsync_ban_view: LocalBanView,
         rng: R,
     ) -> Self {
-        let admission_view = chainsync_ban_view.clone();
+        let global_view = chainsync_ban_view.clone();
+        let global_peer_block_predicate =
+            Arc::new(move |peer_id| global_view.is_banned_for(peer_id, &BanScope::Global));
+        let chain_sync_view = chainsync_ban_view.clone();
         let chain_sync_peer_block_predicate = Arc::new(move |peer_id| {
-            admission_view.is_banned_for(peer_id, &BanScope::Service(Subsystem::ChainSync))
+            chain_sync_view.is_banned_for(peer_id, &BanScope::Service(Subsystem::ChainSync))
         });
-        let swarm = Swarm::build_with_chain_sync_admission(
+        let swarm = Swarm::build_with_peer_predicates(
             config.inner,
             rng,
+            Some(global_peer_block_predicate),
             Some(chain_sync_peer_block_predicate),
         )
         .unwrap();
+        let policy_changes = chainsync_ban_view.subscribe_policy_changes();
 
         // Keep the dialing history since swarm.connect doesn't return the result
         // synchronously
@@ -125,14 +131,21 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             pubsub_messages_tx: pubsub_events_tx,
             chainsync_events_tx,
             chainsync_ban_view,
+            policy_changes,
             pending_queries: HashMap::new(),
         }
     }
 
     pub async fn run(&mut self, initial_peers: Vec<Multiaddr>) {
+        self.reconcile_global_bans();
         self.bootstrap_kad_from_peers(&initial_peers);
 
         for initial_peer in &initial_peers {
+            if Self::peer_id_from_address(initial_peer)
+                .is_some_and(|peer_id| self.is_globally_blocked(peer_id))
+            {
+                continue;
+            }
             let (tx, _) = oneshot::channel();
             let dial = Dial {
                 addr: initial_peer.clone(),
@@ -149,6 +162,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 }
                 Some(command) = self.commands_rx.recv() => {
                     self.handle_command(command);
+                }
+                changed = self.policy_changes.changed() => {
+                    if changed.is_ok() {
+                        self.reconcile_global_bans();
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -179,7 +199,12 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             BehaviourEvent::ChainSync(event) => {
                 self.handle_chainsync_event(event);
             }
-            BehaviourEvent::AutonatServer(_) | BehaviourEvent::Nat(_) => {}
+            BehaviourEvent::AutonatServer(event) => {
+                if self.is_globally_blocked(event.client) {
+                    let _ = self.swarm.disconnect_peer(event.client);
+                }
+            }
+            BehaviourEvent::Nat(_) => {}
         }
     }
 
@@ -195,6 +220,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 endpoint,
                 ..
             } => {
+                if self.is_globally_blocked(peer_id) {
+                    self.swarm.blacklist_peer(peer_id);
+                    let _ = self.swarm.disconnect_peer(peer_id);
+                    self.pending_dials.remove(&connection_id);
+                    return;
+                }
+                self.swarm.remove_blacklisted_peer(peer_id);
                 tracing::trace!(
                     target: LOG_TARGET,
                     "connected to peer:{peer_id}, connection_id:{connection_id:?}"
@@ -212,6 +244,14 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 cause,
                 ..
             } => {
+                if !self
+                    .swarm
+                    .swarm()
+                    .connected_peers()
+                    .any(|connected_peer| *connected_peer == peer_id)
+                {
+                    self.swarm.remove_blacklisted_peer(peer_id);
+                }
                 tracing::trace!(
                     target: LOG_TARGET,
                     "connection closed from peer: {peer_id} {connection_id:?} due to {cause:?}"
@@ -219,6 +259,16 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
 
                 let swarm = self.swarm.swarm();
                 crate::metrics::consensus_report_connectivity(swarm);
+            }
+            SwarmEvent::Dialing {
+                peer_id: Some(peer_id),
+                connection_id,
+                ..
+            } if self.is_globally_blocked(peer_id) => {
+                // This is a defense-in-depth signal: the common behaviour
+                // gate should reject before dialing. Drop any explicit dial
+                // result so this path cannot be retried or exposed as usable.
+                self.pending_dials.remove(&connection_id);
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id,
@@ -258,8 +308,39 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             SwarmEvent::ExternalAddrConfirmed { address } => {
                 self.handle_external_addr_confirmed(&address);
             }
+            SwarmEvent::NewExternalAddrOfPeer { peer_id, .. }
+                if self.is_globally_blocked(peer_id) => {}
             _ => {}
         }
+    }
+
+    fn is_globally_blocked(&self, peer_id: PeerId) -> bool {
+        self.chainsync_ban_view
+            .is_banned_for(peer_id, &BanScope::Global)
+    }
+
+    fn reconcile_global_bans(&mut self) {
+        let connected_peers = self
+            .swarm
+            .swarm()
+            .connected_peers()
+            .copied()
+            .collect::<Vec<_>>();
+        for peer_id in connected_peers {
+            if self.is_globally_blocked(peer_id) {
+                self.swarm.blacklist_peer(peer_id);
+                let _ = self.swarm.disconnect_peer(peer_id);
+            } else {
+                self.swarm.remove_blacklisted_peer(peer_id);
+            }
+        }
+    }
+
+    fn peer_id_from_address(address: &Multiaddr) -> Option<PeerId> {
+        address.iter().find_map(|protocol| match protocol {
+            Protocol::P2p(multihash) => PeerId::from_multihash(multihash.into()).ok(),
+            _ => None,
+        })
     }
 
     fn handle_external_addr_confirmed(&mut self, address: &Multiaddr) {
@@ -301,24 +382,27 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             NetworkCommand::Connect(dial) => {
                 self.connect(dial);
             }
-            NetworkCommand::ConfigureChainSyncBanning { api } => {
-                self.chainsync_ban_view.start_synchronizer(api);
-            }
             NetworkCommand::Info { reply } => {
                 let discovered_peers: Vec<PeerId> = self
                     .swarm
                     .kademlia_discovered_peers()
                     .into_iter()
+                    .filter(|peer_info| !self.is_globally_blocked(peer_info.peer_id))
                     .map(|peer_info| peer_info.peer_id)
                     .collect();
                 let n_discovered_peers = discovered_peers.len();
                 let swarm = self.swarm.swarm();
                 let network_info = swarm.network_info();
                 let counters = network_info.connection_counters();
+                let connected_peers = swarm
+                    .connected_peers()
+                    .copied()
+                    .filter(|peer_id| !self.is_globally_blocked(*peer_id))
+                    .collect();
                 let info = Libp2pInfo {
                     listen_addresses: swarm.listeners().cloned().collect(),
                     peer_id: *swarm.local_peer_id(),
-                    connected_peers: swarm.connected_peers().copied().collect(),
+                    connected_peers,
                     n_peers: network_info.num_peers(),
                     n_connections: counters.num_connections(),
                     n_pending_connections: counters.num_pending(),
@@ -328,7 +412,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 log_error!(reply.send(info));
             }
             NetworkCommand::ConnectedPeers { reply } => {
-                let connected_peers = self.swarm.swarm().connected_peers().copied().collect();
+                let connected_peers = self
+                    .swarm
+                    .swarm()
+                    .connected_peers()
+                    .copied()
+                    .filter(|peer_id| !self.is_globally_blocked(*peer_id))
+                    .collect();
                 log_error!(reply.send(connected_peers));
             }
         }
@@ -376,6 +466,16 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         let Some(mut dial) = self.pending_dials.remove(&connection_id) else {
             return;
         };
+        if peer_id.is_some_and(|peer_id| self.is_globally_blocked(peer_id))
+            || Self::peer_id_from_address(&dial.addr)
+                .is_some_and(|peer_id| self.is_globally_blocked(peer_id))
+        {
+            self.remove_kademlia_address_for_dial(peer_id, &dial.addr);
+            // The original dial already failed. Dropping the result sender
+            // terminates the caller's retry path without scheduling another
+            // attempt for a peer that is no longer eligible.
+            return;
+        }
         let Some(new_retry_count) = dial.retry_count.checked_add(1) else {
             tracing::debug!(target: LOG_TARGET, "Retry count overflow.");
             return;
@@ -997,6 +1097,164 @@ mod tests {
                 .expect("local rejection reply")
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn configured_global_gate_rejects_direct_dial_without_banning_service() {
+        let peer = PeerId::random();
+        let policy = ConfiguredBanPolicy::from_config(&BanningConfig {
+            blacklist: vec![peer],
+            ..Default::default()
+        });
+        let mut handler = handler_with_ban_view(LocalBanView::new::<()>(None, policy));
+        let address = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{peer}",
+            get_available_udp_port().unwrap()
+        )
+        .parse()
+        .expect("peer multiaddr");
+
+        assert!(matches!(
+            handler.swarm.connect(&address),
+            Err(DialError::Denied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chain_sync_only_ban_does_not_reject_generic_dial() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            peer,
+            BanScope::Service(Subsystem::ChainSync),
+        )]);
+        let mut handler = handler_with_ban_view(view);
+        let address = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{peer}",
+            get_available_udp_port().unwrap()
+        )
+        .parse()
+        .expect("peer multiaddr");
+
+        assert!(handler.swarm.connect(&address).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dynamic_global_gate_rejects_direct_dial() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        let mut handler = handler_with_ban_view(view);
+        let address = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{peer}",
+            get_available_udp_port().unwrap()
+        )
+        .parse()
+        .expect("peer multiaddr");
+
+        assert!(matches!(
+            handler.swarm.connect(&address),
+            Err(DialError::Denied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_global_peer_is_not_bootstrapped_into_kademlia() {
+        let peer = PeerId::random();
+        let policy = ConfiguredBanPolicy::from_config(&BanningConfig {
+            blacklist: vec![peer],
+            ..Default::default()
+        });
+        let mut handler = handler_with_ban_view(LocalBanView::new::<()>(None, policy));
+        let address = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{peer}",
+            get_available_udp_port().unwrap()
+        )
+        .parse()
+        .expect("peer multiaddr");
+
+        handler.bootstrap_kad_from_peers(&vec![address]);
+
+        assert!(
+            !handler
+                .swarm
+                .kademlia_discovered_peers()
+                .iter()
+                .any(|info| info.peer_id == peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn closest_peer_lookup_is_not_rejected_for_a_banned_lookup_key() {
+        let peer = PeerId::random();
+        let policy = ConfiguredBanPolicy::from_config(&BanningConfig {
+            blacklist: vec![peer],
+            ..Default::default()
+        });
+        let mut handler = handler_with_ban_view(LocalBanView::new::<()>(None, policy));
+        let (reply, _receiver) = oneshot::channel();
+
+        handler.handle_discovery_command(DiscoveryCommand::GetClosestPeers {
+            peer_id: peer,
+            reply,
+        });
+
+        assert_eq!(handler.pending_queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_identify_peer_does_not_enter_kademlia() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        let mut handler = handler_with_ban_view(view);
+        let public_key = lb_libp2p::identity::Keypair::generate_ed25519().public();
+        let info = lb_libp2p::libp2p::identify::Info {
+            public_key,
+            protocol_version: "test".to_owned(),
+            agent_version: "test".to_owned(),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/1".parse().expect("listen address")],
+            protocols: vec![lb_libp2p::libp2p::StreamProtocol::new("/kademlia/test")],
+            observed_addr: "/ip4/127.0.0.1/tcp/2".parse().expect("observed address"),
+            signed_peer_record: None,
+        };
+
+        handler.handle_behaviour_event(BehaviourEvent::Identify(
+            lb_libp2p::libp2p::identify::Event::Received {
+                connection_id: ConnectionId::new_unchecked(1),
+                peer_id: peer,
+                info,
+            },
+        ));
+
+        assert!(handler.swarm.kademlia_discovered_peers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_gossipsub_message_is_not_delivered() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        let mut handler = handler_with_ban_view(view);
+        let mut events = handler.pubsub_messages_tx.subscribe();
+
+        handler.handle_behaviour_event(BehaviourEvent::Gossipsub(
+            lb_libp2p::libp2p::gossipsub::Event::Message {
+                propagation_source: peer,
+                message_id: lb_libp2p::libp2p::gossipsub::MessageId::from("message"),
+                message: Message {
+                    source: Some(peer),
+                    data: vec![1, 2, 3],
+                    sequence_number: None,
+                    topic: lb_libp2p::libp2p::gossipsub::TopicHash::from_raw("test"),
+                },
+            },
+        ));
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

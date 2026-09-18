@@ -31,7 +31,6 @@ pub trait NetworkAdapter<RuntimeServiceId> {
         configured_ban_policy: ConfiguredBanPolicy,
     ) -> Self;
 
-    async fn configure_chain_sync_banning(&self, _banning_service: BanningServiceApi<()>) {}
     async fn proposals_stream(&self) -> Result<BoxedStream<Self::Proposal>, DynError>;
 
     async fn chainsync_events_stream(&self) -> Result<BoxedStream<ChainSyncEvent>, DynError>;

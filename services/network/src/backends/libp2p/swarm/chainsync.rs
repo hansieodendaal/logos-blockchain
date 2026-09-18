@@ -116,6 +116,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
     }
 
     pub(super) fn handle_chainsync_event(&self, event: lb_cryptarchia_sync::Event) {
+        let peer_id = match &event {
+            lb_cryptarchia_sync::Event::ProvideBlocksRequest { peer_id, .. }
+            | lb_cryptarchia_sync::Event::ProvideTipsRequest { peer_id, .. } => *peer_id,
+        };
+        if self.is_globally_blocked(peer_id) {
+            return;
+        }
         if let Err(e) = self.chainsync_events_tx.send(event.into()) {
             tracing::error!(target: LOG_TARGET, "failed to send chainsync event: {e:?}");
         }
