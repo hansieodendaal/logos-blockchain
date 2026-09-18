@@ -131,19 +131,13 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 let _ = self.swarm.disconnect_peer(peer);
             }
             kad::Event::InboundRequest {
-                request:
-                    kad::InboundRequest::PutRecord {
-                        source,
-                        record: Some(record),
-                        ..
-                    },
-            } if self.is_globally_blocked(source) => {
-                self.swarm.kademlia_remove_record(&record.key);
-                let _ = self.swarm.disconnect_peer(source);
-            }
-            kad::Event::InboundRequest {
                 request: kad::InboundRequest::PutRecord { source, .. },
             } if self.is_globally_blocked(source) => {
+                // The common GlobalPeerGate drops authenticated handler
+                // traffic before Kademlia sees it. Keep this event-level
+                // branch as a defensive disconnect for any event already
+                // queued by Kademlia; do not remove by record key because
+                // that could delete an unrelated local record.
                 let _ = self.swarm.disconnect_peer(source);
             }
             kad::Event::InboundRequest {

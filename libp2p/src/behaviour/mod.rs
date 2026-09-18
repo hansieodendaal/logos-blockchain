@@ -82,15 +82,17 @@ impl<B> GlobalPeerGate<B> {
     }
 
     fn check(&self, peer_id: PeerId) -> Result<(), ConnectionDenied> {
-        if self
-            .block_predicate
-            .as_ref()
-            .is_some_and(|predicate| predicate(peer_id))
-        {
+        if self.is_blocked(peer_id) {
             return Err(ConnectionDenied::new(GloballyBlockedPeer { peer_id }));
         }
 
         Ok(())
+    }
+
+    fn is_blocked(&self, peer_id: PeerId) -> bool {
+        self.block_predicate
+            .as_ref()
+            .is_some_and(|predicate| predicate(peer_id))
     }
 }
 
@@ -175,6 +177,13 @@ where
         connection_id: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
+        // The connection handler callback is the lowest common point at which
+        // every protocol event has an authenticated peer identity.  Drop
+        // handler traffic from a newly blocked peer before it can reach any
+        // protocol behaviour, even while connection teardown is in progress.
+        if self.is_blocked(peer_id) {
+            return;
+        }
         self.inner
             .on_connection_handler_event(peer_id, connection_id, event);
     }
@@ -183,7 +192,27 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
-        self.inner.poll(cx)
+        loop {
+            let action = match self.inner.poll(cx) {
+                Poll::Ready(action) => action,
+                Poll::Pending => return Poll::Pending,
+            };
+
+            let blocked = match &action {
+                ToSwarm::Dial { opts } => opts
+                    .get_peer_id()
+                    .is_some_and(|peer_id| self.is_blocked(peer_id)),
+                ToSwarm::NotifyHandler { peer_id, .. }
+                | ToSwarm::NewExternalAddrOfPeer { peer_id, .. } => self.is_blocked(*peer_id),
+                // This includes CloseConnection: a blocked peer must still
+                // be allowed to close, otherwise teardown is prolonged.
+                _ => false,
+            };
+
+            if !blocked {
+                return Poll::Ready(action);
+            }
+        }
     }
 }
 
@@ -267,5 +296,87 @@ impl<Rng: Clone + Send + RngCore + 'static> Behaviour<Rng> {
             autonat_server,
             nat,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use libp2p::swarm::dial_opts::DialOpts;
+
+    use super::*;
+
+    struct KnownPeerDialBehaviour {
+        peer_id: PeerId,
+        emitted: bool,
+    }
+
+    impl NetworkBehaviour for KnownPeerDialBehaviour {
+        type ConnectionHandler = libp2p::swarm::dummy::ConnectionHandler;
+        type ToSwarm = ();
+
+        fn handle_established_inbound_connection(
+            &mut self,
+            _: ConnectionId,
+            _: PeerId,
+            _: &Multiaddr,
+            _: &Multiaddr,
+        ) -> Result<THandler<Self>, ConnectionDenied> {
+            Ok(libp2p::swarm::dummy::ConnectionHandler)
+        }
+
+        fn handle_established_outbound_connection(
+            &mut self,
+            _: ConnectionId,
+            _: PeerId,
+            _: &Multiaddr,
+            _: Endpoint,
+            _: PortUse,
+        ) -> Result<THandler<Self>, ConnectionDenied> {
+            Ok(libp2p::swarm::dummy::ConnectionHandler)
+        }
+
+        fn on_swarm_event(&mut self, _: FromSwarm) {}
+
+        fn on_connection_handler_event(
+            &mut self,
+            _: PeerId,
+            _: ConnectionId,
+            event: THandlerOutEvent<Self>,
+        ) {
+            match event {}
+        }
+
+        fn poll(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+            if self.emitted {
+                Poll::Pending
+            } else {
+                self.emitted = true;
+                Poll::Ready(ToSwarm::Dial {
+                    opts: DialOpts::peer_id(self.peer_id).build(),
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn behavior_originated_dial_is_filtered_by_global_gate() {
+        let peer_id = PeerId::random();
+        let predicate = Arc::new(move |candidate| candidate == peer_id);
+        let mut gate = GlobalPeerGate::new(
+            KnownPeerDialBehaviour {
+                peer_id,
+                emitted: false,
+            },
+            Some(predicate),
+        );
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(matches!(gate.poll(&mut context), Poll::Pending));
     }
 }

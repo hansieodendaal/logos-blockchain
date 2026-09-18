@@ -37,6 +37,7 @@ pub struct Swarm<R: Clone + Send + RngCore + 'static> {
     // A core libp2p swarm
     pub(crate) swarm: libp2p::Swarm<GlobalPeerGate<Behaviour<R>>>,
     pub(crate) global_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
+    pub(crate) chain_sync_peer_block_predicate: Option<lb_cryptarchia_sync::PeerBlockPredicate>,
 }
 
 impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
@@ -82,6 +83,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
         } = config;
 
         let global_predicate_for_behaviour = global_peer_block_predicate.clone();
+        let chain_sync_predicate_for_behaviour = chain_sync_peer_block_predicate.clone();
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
@@ -99,7 +101,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                             chain_sync_protocol_name: chain_sync_protocol_name.into(),
                             public_key: keypair.public(),
                             chain_sync_config,
-                            chain_sync_peer_block_predicate,
+                            chain_sync_peer_block_predicate: chain_sync_predicate_for_behaviour,
                         },
                         rng,
                     )
@@ -115,6 +117,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             let mut s = Self {
                 swarm,
                 global_peer_block_predicate,
+                chain_sync_peer_block_predicate,
             };
             // We start listening on the provided address, which triggers the Identify flow,
             // which in turn triggers our NAT traversal state machine.

@@ -59,6 +59,12 @@ impl<R: Clone + Send + RngCore + 'static> Behaviour<R> {
         }
     }
 
+    pub(crate) fn kademlia_remove_peer(&mut self, peer_id: &PeerId) {
+        if self.kademlia.remove_peer(peer_id).is_some() {
+            tracing::debug!(target: LOG_TARGET, "Removed peer {peer_id} from Kademlia");
+        }
+    }
+
     pub(crate) fn kademlia_remove_record(&mut self, key: &RecordKey) {
         self.kademlia.store_mut().remove(key);
     }

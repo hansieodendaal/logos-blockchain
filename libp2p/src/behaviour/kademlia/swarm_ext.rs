@@ -41,6 +41,13 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             .kademlia_remove_address(peer_id, addr);
     }
 
+    pub fn kademlia_remove_peer(&mut self, peer_id: PeerId) {
+        self.swarm
+            .behaviour_mut()
+            .inner
+            .kademlia_remove_peer(&peer_id);
+    }
+
     pub fn kademlia_remove_record(&mut self, key: &RecordKey) {
         self.swarm.behaviour_mut().inner.kademlia_remove_record(key);
     }
@@ -53,10 +60,7 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
     }
 
     pub fn kademlia_routing_table_dump(&mut self) -> HashMap<u32, Vec<PeerId>> {
-        self.swarm
-            .behaviour_mut()
-            .inner
-            .kademlia_routing_table_dump()
+        self.kademlia_routing_table_dump_unfiltered()
             .into_iter()
             .map(|(bucket, peers)| {
                 (
@@ -75,11 +79,15 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
             .collect()
     }
 
-    pub fn kademlia_discovered_peers(&mut self) -> Vec<PeerInfo> {
+    pub fn kademlia_routing_table_dump_unfiltered(&mut self) -> HashMap<u32, Vec<PeerId>> {
         self.swarm
             .behaviour_mut()
             .inner
-            .kademlia_discovered_peers()
+            .kademlia_routing_table_dump()
+    }
+
+    pub fn kademlia_discovered_peers(&mut self) -> Vec<PeerInfo> {
+        self.kademlia_discovered_peers_unfiltered()
             .into_iter()
             .filter(|peer_info| {
                 !self
@@ -88,5 +96,9 @@ impl<R: Clone + Send + RngCore + 'static> Swarm<R> {
                     .is_some_and(|predicate| predicate(peer_info.peer_id))
             })
             .collect()
+    }
+
+    pub fn kademlia_discovered_peers_unfiltered(&mut self) -> Vec<PeerInfo> {
+        self.swarm.behaviour_mut().inner.kademlia_discovered_peers()
     }
 }

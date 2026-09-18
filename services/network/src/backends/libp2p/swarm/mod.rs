@@ -326,6 +326,27 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             .connected_peers()
             .copied()
             .collect::<Vec<_>>();
+
+        let kademlia_peers = self
+            .swarm
+            .kademlia_routing_table_dump_unfiltered()
+            .into_values()
+            .flatten()
+            .chain(
+                self.swarm
+                    .kademlia_discovered_peers_unfiltered()
+                    .into_iter()
+                    .map(|peer_info| peer_info.peer_id),
+            )
+            .chain(connected_peers.iter().copied())
+            .collect::<std::collections::HashSet<_>>();
+
+        for peer_id in kademlia_peers {
+            if self.is_globally_blocked(peer_id) {
+                self.swarm.kademlia_remove_peer(peer_id);
+            }
+        }
+
         for peer_id in connected_peers {
             if self.is_globally_blocked(peer_id) {
                 self.swarm.blacklist_peer(peer_id);
@@ -1156,6 +1177,83 @@ mod tests {
             handler.swarm.connect(&address),
             Err(DialError::Denied { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn global_ban_reconciliation_purges_kademlia_state() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        let mut handler = handler_with_ban_view(view.clone());
+        let address = format!(
+            "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{peer}",
+            get_available_udp_port().unwrap()
+        )
+        .parse()
+        .expect("peer multiaddr");
+
+        handler.bootstrap_kad_from_peers(&vec![address]);
+        assert!(
+            handler
+                .swarm
+                .kademlia_discovered_peers_unfiltered()
+                .iter()
+                .any(|info| info.peer_id == peer)
+        );
+
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        handler.reconcile_global_bans();
+
+        assert!(
+            !handler
+                .swarm
+                .kademlia_discovered_peers_unfiltered()
+                .iter()
+                .any(|info| info.peer_id == peer)
+        );
+        assert!(
+            !handler
+                .swarm
+                .kademlia_routing_table_dump_unfiltered()
+                .values()
+                .flatten()
+                .any(|known_peer| *known_peer == peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn low_level_chainsync_helpers_enforce_global_and_scoped_bans() {
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(
+            peer,
+            BanScope::Service(Subsystem::ChainSync),
+        )]);
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+
+        assert!(handler.swarm.request_tip(peer, reply_sender).is_err());
+        assert!(
+            reply_receiver
+                .await
+                .expect("low-level rejection reply")
+                .is_err()
+        );
+
+        let peer = PeerId::random();
+        let view = LocalBanView::new::<()>(None, ConfiguredBanPolicy::default());
+        view.replace_dynamic_snapshot(vec![test_ban_record(peer, BanScope::Global)]);
+        let handler = handler_with_ban_view(view);
+        let (reply_sender, reply_receiver) = oneshot::channel();
+        let block = lb_libp2p::cryptarchia_sync::HeaderId::from([0; 32]);
+
+        assert!(
+            handler
+                .swarm
+                .start_blocks_download(peer, block, block, block, HashSet::new(), reply_sender,)
+                .is_err()
+        );
+        let mut stream = reply_receiver.await.expect("low-level rejection stream");
+        assert!(stream.next().await.expect("rejection item").is_err());
     }
 
     #[tokio::test]
