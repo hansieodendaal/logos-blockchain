@@ -199,9 +199,6 @@ where
             };
 
             let blocked = match &action {
-                ToSwarm::Dial { opts } => opts
-                    .get_peer_id()
-                    .is_some_and(|peer_id| self.is_blocked(peer_id)),
                 ToSwarm::NotifyHandler { peer_id, .. }
                 | ToSwarm::NewExternalAddrOfPeer { peer_id, .. } => self.is_blocked(*peer_id),
                 // This includes CloseConnection: a blocked peer must still
@@ -301,15 +298,26 @@ impl<Rng: Clone + Send + RngCore + 'static> Behaviour<Rng> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-    use libp2p::swarm::dial_opts::DialOpts;
+    use libp2p::{
+        Transport as _,
+        swarm::{Swarm, dial_opts::DialOpts},
+    };
 
     use super::*;
 
     struct KnownPeerDialBehaviour {
         peer_id: PeerId,
         emitted: bool,
+        dial_failures: Arc<AtomicUsize>,
+        denied_failures: Arc<AtomicUsize>,
     }
 
     impl NetworkBehaviour for KnownPeerDialBehaviour {
@@ -337,7 +345,14 @@ mod tests {
             Ok(libp2p::swarm::dummy::ConnectionHandler)
         }
 
-        fn on_swarm_event(&mut self, _: FromSwarm) {}
+        fn on_swarm_event(&mut self, event: FromSwarm) {
+            if let FromSwarm::DialFailure(failure) = event {
+                self.dial_failures.fetch_add(1, Ordering::Relaxed);
+                if matches!(failure.error, libp2p::swarm::DialError::Denied { .. }) {
+                    self.denied_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
 
         fn on_connection_handler_event(
             &mut self,
@@ -364,19 +379,35 @@ mod tests {
     }
 
     #[test]
-    fn behavior_originated_dial_is_filtered_by_global_gate() {
+    fn behavior_originated_dial_uses_swarm_denial_lifecycle() {
         let peer_id = PeerId::random();
         let predicate = Arc::new(move |candidate| candidate == peer_id);
-        let mut gate = GlobalPeerGate::new(
+        let dial_failures = Arc::new(AtomicUsize::new(0));
+        let denied_failures = Arc::new(AtomicUsize::new(0));
+        let gate = GlobalPeerGate::new(
             KnownPeerDialBehaviour {
                 peer_id,
                 emitted: false,
+                dial_failures: Arc::clone(&dial_failures),
+                denied_failures: Arc::clone(&denied_failures),
             },
             Some(predicate),
+        );
+        let transport = libp2p::core::transport::dummy::DummyTransport::new().boxed();
+        let mut swarm = Swarm::new(
+            transport,
+            gate,
+            PeerId::random(),
+            libp2p::swarm::Config::with_tokio_executor(),
         );
         let waker = futures::task::noop_waker();
         let mut context = Context::from_waker(&waker);
 
-        assert!(matches!(gate.poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            futures::Stream::poll_next(Pin::new(&mut swarm), &mut context),
+            Poll::Pending
+        ));
+        assert_eq!(dial_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(denied_failures.load(Ordering::Relaxed), 1);
     }
 }
