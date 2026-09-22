@@ -113,9 +113,8 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             ..
         } = config;
         let protocol_contract = ProtocolContract::from_config(&inner);
-        let allow_non_public_identify_addresses = inner
-            .identify_config
-            .allow_non_public_identify_addresses;
+        let allow_non_public_identify_addresses =
+            inner.identify_config.allow_non_public_identify_addresses;
         let swarm = Swarm::build(inner, max_data_size_by_topic.clone(), rng).unwrap();
 
         // Keep the dialing history since swarm.connect doesn't return the result
