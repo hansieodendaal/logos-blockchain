@@ -227,6 +227,7 @@ fn scanner_seed_for_group(
     {
         let ScannerSeed::Snapshot {
             wallet_utxos,
+            accounting,
             tip,
             height,
             slot,
@@ -240,6 +241,7 @@ fn scanner_seed_for_group(
 
         let seed = merged_seed.get_or_insert_with(|| ScannerSeed::Snapshot {
             wallet_utxos: HashMap::default(),
+            accounting: None,
             tip,
             height,
             slot,
@@ -250,6 +252,7 @@ fn scanner_seed_for_group(
 
         let ScannerSeed::Snapshot {
             wallet_utxos: merged_wallet_utxos,
+            accounting: merged_accounting,
             tip: merged_tip,
             height: merged_height,
             slot: merged_slot,
@@ -271,6 +274,13 @@ fn scanner_seed_for_group(
         }
 
         merged_wallet_utxos.extend(wallet_utxos);
+        if let Some(accounting) = accounting {
+            if let Some(merged_accounting) = merged_accounting {
+                merged_accounting.extend(*accounting);
+            } else {
+                *merged_accounting = Some(accounting);
+            }
+        }
         merged_source_node_names.extend(source_node_names);
         *merged_rescan_blocks = (*merged_rescan_blocks).max(rescan_blocks);
         reassemble_fallback_checkpoints(merged_fallback_checkpoints, fallback_checkpoints)?;
@@ -311,6 +321,7 @@ fn reassemble_fallback_checkpoints(
                     });
                 }
                 existing.wallet_utxos.extend(checkpoint.wallet_utxos);
+                existing.accounting.extend(checkpoint.accounting);
             }
         }
     }
@@ -330,6 +341,7 @@ mod tests {
             tip: HeaderId::from([tip_byte; 32]),
             height,
             slot,
+            accounting: super::super::accounting::ScannerAccountingSnapshot::default(),
         }
     }
 

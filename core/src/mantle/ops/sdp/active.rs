@@ -84,11 +84,18 @@ impl VerifiableOperation<StandardMode> for SignedOperation<SDPActiveOp, Preverif
             });
         }
 
-        // Check the nonce is increasing
-        if operation.nonce <= declaration.nonce {
-            return Err(SdpError::InvalidNonce {
-                message_nonce: operation.nonce,
-                declaration_nonce: declaration.nonce,
+        // The signed nonce commits to the declaration lifecycle. Compare that
+        // lifecycle explicitly before checking the sequence within it.
+        if operation.nonce.lifecycle_epoch() != declaration.created {
+            return Err(SdpError::InvalidNonceLifecycle {
+                message_epoch: operation.nonce.lifecycle_epoch(),
+                declaration_created: declaration.created,
+            });
+        }
+        if operation.nonce.sequence() <= declaration.nonce.sequence() {
+            return Err(SdpError::InvalidNonceSequence {
+                message_sequence: operation.nonce.sequence(),
+                declaration_sequence: declaration.nonce.sequence(),
             });
         }
 
@@ -162,7 +169,8 @@ mod tests {
             },
         },
         sdp::{
-            ActivityMetadata, Declaration, DeclarationMessage, ServiceType, blend::ActivityProof,
+            ActivityMetadata, Declaration, DeclarationMessage, Nonce, ServiceType,
+            blend::ActivityProof,
         },
     };
 
@@ -282,9 +290,92 @@ mod tests {
                     epoch: Epoch::from(0),
                 })
                 .unwrap_err(),
-            SdpError::InvalidNonce {
-                message_nonce: declaration_nonce,
-                declaration_nonce,
+            SdpError::InvalidNonceSequence {
+                message_sequence: declaration_nonce.sequence(),
+                declaration_sequence: declaration_nonce.sequence(),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_nonce_from_another_declaration_lifecycle() {
+        let (message, declaration_a) = declaration();
+        let declaration_id = message.id();
+        let declaration_b = Declaration::new(Epoch::new(3), &message);
+        let declarations = Declarations::new_sync().insert(declaration_id, declaration_b.clone());
+        let operation = SDPActiveOp {
+            declaration_id,
+            nonce: Nonce::new(declaration_a.created, 1),
+            ..SDPActiveOp::sample()
+        };
+        let signed_view = TxHashView::from(TxHash::from([9u8; 32]));
+
+        assert_eq!(
+            preverified(operation, &signed_view)
+                .verify(&SDPActiveValidationContext {
+                    declarations: &declarations,
+                    tx_hash_view: &signed_view,
+                    epoch: declaration_b.created,
+                })
+                .unwrap_err(),
+            SdpError::InvalidNonceLifecycle {
+                message_epoch: declaration_a.created,
+                declaration_created: declaration_b.created,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_accepts_a_sequence_jump_within_the_same_lifecycle() {
+        let (message, declaration) = declaration();
+        let declaration_id = message.id();
+        let declarations = Declarations::new_sync().insert(declaration_id, declaration.clone());
+        let operation = SDPActiveOp {
+            declaration_id,
+            nonce: Nonce::new(declaration.created, 100),
+            ..SDPActiveOp::sample()
+        };
+        let signed_view = TxHashView::from(TxHash::from([9u8; 32]));
+
+        assert!(
+            preverified(operation, &signed_view)
+                .verify(&SDPActiveValidationContext {
+                    declarations: &declarations,
+                    tx_hash_view: &signed_view,
+                    epoch: declaration.created,
+                })
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_lower_sequence_in_the_same_lifecycle() {
+        let (message, declaration) = declaration();
+        let declaration_id = message.id();
+        let declaration = Declaration {
+            nonce: Nonce::new(declaration.created, 4),
+            ..declaration
+        };
+        let declarations = Declarations::new_sync().insert(declaration_id, declaration.clone());
+        let operation = SDPActiveOp {
+            declaration_id,
+            nonce: Nonce::new(declaration.created, 3),
+            ..SDPActiveOp::sample()
+        };
+        let signed_view = TxHashView::from(TxHash::from([9u8; 32]));
+
+        assert_eq!(
+            preverified(operation, &signed_view)
+                .verify(&SDPActiveValidationContext {
+                    declarations: &declarations,
+                    tx_hash_view: &signed_view,
+                    epoch: declaration.created,
+                })
+                .unwrap_err(),
+            SdpError::InvalidNonceSequence {
+                message_sequence: 3,
+                declaration_sequence: 4,
             }
         );
     }
@@ -445,7 +536,7 @@ mod tests {
 
         let active_op = SDPActiveOp {
             declaration_id: declare_op.id(),
-            nonce: 1,
+            nonce: Nonce::new(Epoch::new(0), 1),
             metadata: ActivityMetadata::Blend(Box::new(ActivityProof {
                 epoch: Epoch::new(0),
                 signing_key: signing_key.public_key(),

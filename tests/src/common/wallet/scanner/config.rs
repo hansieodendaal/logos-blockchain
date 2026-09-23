@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use lb_core::{header::HeaderId, mantle::Utxo};
 use lb_testing_framework::NodeHttpClient;
 
-use super::state::{ScannerStateCheckpoint, SharedWalletScannerState};
+use super::{
+    accounting::ScannerAccountingSnapshot,
+    state::{ScannerStateCheckpoint, SharedWalletScannerState},
+};
 use crate::{
     common::wallet::{TrackedWalletKeys, WalletUtxos},
     cucumber::{
@@ -47,6 +50,9 @@ pub enum ScannerSeed {
     Snapshot {
         /// UTXOs restored for wallets tracked by this scanner.
         wallet_utxos: WalletUtxos,
+        /// Full scanner accounting state. Missing only in older wallet
+        /// snapshots, which recorded spendable UTXOs but not SDP lock state.
+        accounting: Option<Box<ScannerAccountingSnapshot>>,
         /// Snapshot chain tip.
         tip: HeaderId,
         /// Snapshot chain height.
@@ -69,6 +75,7 @@ impl ScannerSeed {
     pub fn filtered_for_wallets(&self, wallet_keys: &[TrackedWalletKeys]) -> Self {
         let Self::Snapshot {
             wallet_utxos,
+            accounting,
             tip,
             height,
             slot,
@@ -94,10 +101,14 @@ impl ScannerSeed {
         };
 
         let wallet_utxos = filter_utxos(wallet_utxos);
+        let accounting = accounting
+            .as_ref()
+            .map(|accounting| Box::new(accounting.filtered_for_wallets(&wallet_ids)));
         let fallback_checkpoints = fallback_checkpoints
             .iter()
             .map(|checkpoint| ScannerStateCheckpoint {
                 wallet_utxos: filter_utxos(&checkpoint.wallet_utxos),
+                accounting: checkpoint.accounting.filtered_for_wallets(&wallet_ids),
                 tip: checkpoint.tip,
                 height: checkpoint.height,
                 slot: checkpoint.slot,
@@ -106,6 +117,7 @@ impl ScannerSeed {
 
         Self::Snapshot {
             wallet_utxos,
+            accounting,
             tip: *tip,
             height: *height,
             slot: *slot,
