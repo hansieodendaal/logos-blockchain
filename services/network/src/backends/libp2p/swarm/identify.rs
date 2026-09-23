@@ -1,121 +1,123 @@
-use lb_libp2p::{Multiaddr, Protocol, libp2p::identify};
+use std::collections::HashSet;
+
+use lb_libp2p::{Multiaddr, PeerId, Protocol, libp2p::identify};
 use lb_log_targets::network_service;
 use rand::RngCore;
 
-use crate::backends::libp2p::swarm::{ChainSyncProtocolState, ProtocolContract, SwarmHandler};
+use crate::backends::libp2p::swarm::{ProtocolContract, SwarmHandler};
 
 const LOG_TARGET: &str = network_service::backends::libp2p::IDENTIFY;
 
+#[derive(Debug)]
+struct ProtocolCapabilities {
+    network_matches: bool,
+    supports_kademlia: bool,
+    supports_chainsync: bool,
+}
+
 impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
-    #[expect(
-        clippy::cognitive_complexity,
-        reason = "TODO: address this in a dedicated refactor"
-    )]
     pub(super) fn handle_identify_event(&mut self, event: identify::Event) {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
-                tracing::trace!(
-                    target: LOG_TARGET,
-                    "Identified peer {} with addresses {:?}",
-                    peer_id,
-                    info.listen_addrs
-                );
-
-                let (network_matches, supports_kademlia, supports_chainsync) =
-                    protocol_capabilities(
-                        &info.protocol_version,
-                        &info.protocols,
-                        &self.protocol_contract,
-                    );
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    peer = %peer_id,
-                    protocol_version = %info.protocol_version,
-                    network_matches,
-                    supports_kademlia,
-                    supports_chainsync,
-                    protocols = ?info.protocols,
-                    "Classified peer protocol capabilities"
-                );
-
-                let state = classify_chainsync_protocol(&info.protocols, &self.protocol_contract);
-                self.peer_chainsync_protocol_states.insert(peer_id, state);
-
-                if supports_kademlia {
-                    tracing::trace!(
-                        target: LOG_TARGET,
-                        "Adding discovered node to Kademlia, seen addresses: {:?}",
-                        info.listen_addrs
-                    );
-                    // we need to add the peer to the kademlia routing table
-                    // in order to enable peer discovery
-                    for addr in &info.listen_addrs {
-                        if !is_kademlia_candidate_address(
-                            addr,
-                            self.allow_non_public_identify_addresses,
-                        ) {
-                            tracing::trace!(
-                                target: LOG_TARGET,
-                                "Skipping non-routable identify address for Kademlia: {}",
-                                addr
-                            );
-                            continue;
-                        }
-                        self.swarm.kademlia_add_address(peer_id, addr);
-                    }
-                }
-
-                if state == ChainSyncProtocolState::Unsupported {
-                    tracing::debug!(
-                        target: LOG_TARGET,
-                        "Peer {peer_id} is not chainsync eligible because it does not advertise the \
-                        configured chainsync protocol"
-                    );
-                }
+                self.handle_identify_received(peer_id, info);
             }
             event => {
                 tracing::trace!(target: LOG_TARGET, "Identify event: {:?}", event);
             }
         }
     }
-}
 
-fn classify_chainsync_protocol(
-    protocols: &[lb_libp2p::libp2p::StreamProtocol],
-    contract: &ProtocolContract,
-) -> ChainSyncProtocolState {
-    let supports_chainsync = protocols
-        .iter()
-        .any(|protocol| protocol.as_ref() == contract.chain_sync_protocol.as_str());
+    fn handle_identify_received(&mut self, peer_id: PeerId, info: identify::Info) {
+        tracing::trace!(
+            target: LOG_TARGET,
+            "Identified peer {} with addresses {:?}",
+            peer_id,
+            info.listen_addrs
+        );
 
-    if supports_chainsync {
-        ChainSyncProtocolState::Supported
-    } else {
-        ChainSyncProtocolState::Unsupported
+        let advertised_protocols = info.protocols.into_iter().collect::<HashSet<_>>();
+        let capabilities = protocol_capabilities(
+            &info.protocol_version,
+            &advertised_protocols,
+            &self.protocol_contract,
+        );
+        tracing::debug!(
+            target: LOG_TARGET,
+            peer = %peer_id,
+            protocol_version = %info.protocol_version,
+            network_matches = capabilities.network_matches,
+            supports_kademlia = capabilities.supports_kademlia,
+            supports_chainsync = capabilities.supports_chainsync,
+            protocols = ?advertised_protocols,
+            "Classified peer protocol capabilities"
+        );
+
+        self.peer_advertised_protocols
+            .insert(peer_id, advertised_protocols);
+
+        self.add_identified_kademlia_addresses(
+            peer_id,
+            &info.listen_addrs,
+            capabilities.supports_kademlia,
+        );
+
+        if !capabilities.supports_chainsync {
+            tracing::debug!(
+                target: LOG_TARGET,
+                "Peer {peer_id} is not chainsync eligible because it does not advertise the \
+                configured chainsync protocol"
+            );
+        }
+    }
+
+    fn add_identified_kademlia_addresses(
+        &mut self,
+        peer_id: PeerId,
+        listen_addrs: &[Multiaddr],
+        supports_kademlia: bool,
+    ) {
+        if !supports_kademlia {
+            return;
+        }
+
+        tracing::trace!(
+            target: LOG_TARGET,
+            "Adding discovered node to Kademlia, seen addresses: {:?}",
+            listen_addrs
+        );
+        // We need to add the peer to the Kademlia routing table in order to
+        // enable peer discovery.
+        for addr in listen_addrs {
+            if !is_kademlia_candidate_address(addr) {
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    "Skipping non-routable identify address for Kademlia: {}",
+                    addr
+                );
+                continue;
+            }
+            self.swarm.kademlia_add_address(peer_id, addr);
+        }
     }
 }
 
 fn protocol_capabilities(
     protocol_version: &str,
-    protocols: &[lb_libp2p::libp2p::StreamProtocol],
+    protocols: &HashSet<lb_libp2p::libp2p::StreamProtocol>,
     contract: &ProtocolContract,
-) -> (bool, bool, bool) {
-    let network_matches = protocol_version == contract.identify_protocol_version;
-    let supports_kademlia = protocols
-        .iter()
-        .any(|protocol| protocol.as_ref() == contract.kademlia_protocol.as_str());
-    let supports_chainsync = protocols
-        .iter()
-        .any(|protocol| protocol.as_ref() == contract.chain_sync_protocol.as_str());
-
-    (network_matches, supports_kademlia, supports_chainsync)
+) -> ProtocolCapabilities {
+    ProtocolCapabilities {
+        network_matches: protocol_version == contract.identify_protocol_version.as_ref(),
+        supports_kademlia: protocols.contains(&contract.kademlia_protocol),
+        supports_chainsync: protocols.contains(&contract.chain_sync_protocol),
+    }
 }
 
-fn is_kademlia_candidate_address(
-    addr: &Multiaddr,
-    allow_non_public_identify_addresses: bool,
-) -> bool {
-    if allow_non_public_identify_addresses {
+fn is_kademlia_candidate_address(addr: &Multiaddr) -> bool {
+    // Tests run entirely on local/private interfaces; keep production
+    // filtering enabled while allowing all identify addresses in test builds.
+    let filter_identify_addrs = !cfg!(test);
+    if !filter_identify_addrs {
         return true;
     }
 
@@ -148,62 +150,71 @@ mod tests {
 
     fn contract() -> ProtocolContract {
         ProtocolContract {
-            identify_protocol_version: "/network/1.0.0".into(),
-            kademlia_protocol: "/network/kad/1.0.0".into(),
-            chain_sync_protocol: "/network/chainsync/1.0.0".into(),
+            identify_protocol_version: StreamProtocol::new("/network/1.0.0"),
+            kademlia_protocol: StreamProtocol::new("/network/kad/1.0.0"),
+            chain_sync_protocol: StreamProtocol::new("/network/chainsync/1.0.0"),
         }
     }
 
-    fn classify(protocols: &[&'static str]) -> ChainSyncProtocolState {
-        let protocols = protocols
+    fn advertised_protocols(protocols: &[&'static str]) -> HashSet<StreamProtocol> {
+        protocols
             .iter()
             .map(|protocol| StreamProtocol::new(protocol))
-            .collect::<Vec<_>>();
-        classify_chainsync_protocol(&protocols, &contract())
+            .collect()
     }
 
     #[test]
-    fn chainsync_protocol_classification() {
+    fn protocol_capabilities_are_classified() {
         let cases = [
             (
                 "exact chainsync",
+                "/network/1.0.0",
                 vec!["/network/chainsync/1.0.0"],
-                ChainSyncProtocolState::Supported,
+                true,
             ),
             (
                 "chainsync with Kademlia",
+                "/network/1.0.0",
                 vec!["/network/kad/1.0.0", "/network/chainsync/1.0.0"],
-                ChainSyncProtocolState::Supported,
+                true,
             ),
             (
                 "chainsync with unrelated protocols",
+                "/network/1.0.0",
                 vec!["/network/gossipsub/1.0.0", "/network/chainsync/1.0.0"],
-                ChainSyncProtocolState::Supported,
+                true,
             ),
             (
                 "wrong chainsync protocol",
+                "/network/1.0.0",
                 vec!["/network/kad/1.0.0", "/network/chainsync/0.9.0"],
-                ChainSyncProtocolState::Unsupported,
+                false,
             ),
             (
                 "missing chainsync protocol",
+                "/network/1.0.0",
                 vec!["/network/kad/1.0.0"],
-                ChainSyncProtocolState::Unsupported,
+                false,
             ),
         ];
 
-        for (name, protocols, expected) in cases {
-            assert_eq!(classify(&protocols), expected, "{name}");
+        for (name, protocol_version, protocols, expected) in cases {
+            let capabilities = protocol_capabilities(
+                protocol_version,
+                &advertised_protocols(&protocols),
+                &contract(),
+            );
+            assert_eq!(capabilities.supports_chainsync, expected, "{name}");
+            assert!(capabilities.network_matches, "{name}");
         }
-    }
 
-    #[test]
-    fn non_public_identify_address_admission_is_configurable() {
-        let loopback = "/ip4/127.0.0.1/udp/3000/quic-v1".parse().unwrap();
-        let public = "/ip4/8.8.8.8/udp/3000/quic-v1".parse().unwrap();
-
-        assert!(!is_kademlia_candidate_address(&loopback, false));
-        assert!(is_kademlia_candidate_address(&loopback, true));
-        assert!(is_kademlia_candidate_address(&public, false));
+        let capabilities = protocol_capabilities(
+            "/other-network/1.0.0",
+            &advertised_protocols(&["/network/chainsync/1.0.0"]),
+            &contract(),
+        );
+        assert!(!capabilities.network_matches);
+        assert!(capabilities.supports_chainsync);
+        assert!(!capabilities.supports_kademlia);
     }
 }

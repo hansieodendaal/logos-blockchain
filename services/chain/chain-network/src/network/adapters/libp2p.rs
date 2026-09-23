@@ -423,6 +423,7 @@ where
         // All peers we know about, including those that are not connected.
         let discovered_peers = Self::get_discovered_peers(&self.network_relay).await?;
 
+        // Discovery membership and protocol capability are independent.
         let peers_to_request = choose_eligible_peers_to_request_download(
             &connected_peers,
             &discovered_peers,
@@ -430,8 +431,6 @@ where
             self.settings.max_connected_peers_to_try_download,
             self.settings.max_discovered_peers_to_try_download,
         );
-        let eligible_connected_count = connected_peers.intersection(&chainsync_peers).count();
-        let eligible_discovered_count = discovered_peers.intersection(&chainsync_peers).count();
         tracing::debug!(
             target: LOG_TARGET,
             "Selecting peers for target block {target_block:?} from local tip {local_tip:?} with \
@@ -440,8 +439,8 @@ where
             additional_blocks={}",
             connected_peers.len(),
             discovered_peers.len(),
-            eligible_connected_count,
-            eligible_discovered_count,
+            connected_peers.intersection(&chainsync_peers).count(),
+            discovered_peers.intersection(&chainsync_peers).count(),
             additional_blocks.len()
         );
 
@@ -452,8 +451,8 @@ where
                 eligible_discovered={})",
                 connected_peers.len(),
                 discovered_peers.len(),
-                eligible_connected_count,
-                eligible_discovered_count
+                connected_peers.intersection(&chainsync_peers).count(),
+                discovered_peers.intersection(&chainsync_peers).count()
             )
             .into());
         }

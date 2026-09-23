@@ -110,7 +110,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 let addresses = addresses.into_vec();
                 log_routing_update(peer, &addresses, old_peer, is_new_peer);
                 if let Some(old_peer) = old_peer {
-                    self.prune_chainsync_protocol_state(old_peer);
+                    self.prune_peer_advertised_protocols(old_peer);
                 }
             }
             kad::Event::ModeChanged { new_mode } => {

@@ -26,6 +26,7 @@ use lb_libp2p::{
     Multiaddr, PeerId, Protocol, Swarm, SwarmEvent,
     behaviour::BehaviourEvent,
     libp2p::{
+        StreamProtocol as Libp2pStreamProtocol,
         kad::QueryId,
         swarm::{ConnectionId, DialError},
     },
@@ -55,25 +56,19 @@ use crate::message::ChainSyncEvent;
 
 const LOG_TARGET: &str = network_service::backends::libp2p::ROOT;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChainSyncProtocolState {
-    Supported,
-    Unsupported,
-}
-
 #[derive(Debug)]
 struct ProtocolContract {
-    identify_protocol_version: String,
-    kademlia_protocol: String,
-    chain_sync_protocol: String,
+    identify_protocol_version: Libp2pStreamProtocol,
+    kademlia_protocol: Libp2pStreamProtocol,
+    chain_sync_protocol: Libp2pStreamProtocol,
 }
 
 impl ProtocolContract {
     fn from_config(config: &lb_libp2p::SwarmConfig) -> Self {
         Self {
-            identify_protocol_version: config.identify_protocol_name.to_string(),
-            kademlia_protocol: config.kad_protocol_name.to_string(),
-            chain_sync_protocol: config.chain_sync_protocol_name.to_string(),
+            identify_protocol_version: config.identify_protocol_name.clone().into_inner(),
+            kademlia_protocol: config.kad_protocol_name.clone().into_inner(),
+            chain_sync_protocol: config.chain_sync_protocol_name.clone().into_inner(),
         }
     }
 }
@@ -89,8 +84,7 @@ pub struct SwarmHandler<R: Clone + Send + RngCore + 'static> {
 
     pending_queries: HashMap<QueryId, PendingQueryData>,
     protocol_contract: ProtocolContract,
-    allow_non_public_identify_addresses: bool,
-    peer_chainsync_protocol_states: HashMap<PeerId, ChainSyncProtocolState>,
+    peer_advertised_protocols: HashMap<PeerId, HashSet<Libp2pStreamProtocol>>,
 }
 
 // TODO: make this configurable
@@ -113,8 +107,6 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             ..
         } = config;
         let protocol_contract = ProtocolContract::from_config(&inner);
-        let allow_non_public_identify_addresses =
-            inner.identify_config.allow_non_public_identify_addresses;
         let swarm = Swarm::build(inner, max_data_size_by_topic.clone(), rng).unwrap();
 
         // Keep the dialing history since swarm.connect doesn't return the result
@@ -131,8 +123,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             max_data_size_by_topic,
             pending_queries: HashMap::new(),
             protocol_contract,
-            allow_non_public_identify_addresses,
-            peer_chainsync_protocol_states: HashMap::new(),
+            peer_advertised_protocols: HashMap::new(),
         }
     }
 
@@ -226,7 +217,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 );
 
                 if num_established == 0 {
-                    self.prune_chainsync_protocol_state(peer_id);
+                    self.prune_peer_advertised_protocols(peer_id);
                 }
 
                 let swarm = self.swarm.swarm();
@@ -294,7 +285,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         };
 
         self.swarm.kademlia_remove_address(peer_id, dial_addr);
-        self.prune_chainsync_protocol_state(peer_id);
+        self.prune_peer_advertised_protocols(peer_id);
     }
 
     fn handle_command(&mut self, command: Command) {
@@ -342,16 +333,18 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
     }
 
     fn chainsync_eligible_peers(&self) -> HashSet<PeerId> {
-        self.peer_chainsync_protocol_states
+        self.peers_supporting_protocol(&self.protocol_contract.chain_sync_protocol)
+    }
+
+    fn peers_supporting_protocol(&self, protocol: &Libp2pStreamProtocol) -> HashSet<PeerId> {
+        self.peer_advertised_protocols
             .iter()
-            .filter_map(|(peer_id, state)| {
-                (*state == ChainSyncProtocolState::Supported).then_some(*peer_id)
-            })
+            .filter_map(|(peer_id, protocols)| protocols.contains(protocol).then_some(*peer_id))
             .collect()
     }
 
-    fn prune_chainsync_protocol_state(&mut self, peer_id: PeerId) {
-        if !self.peer_chainsync_protocol_states.contains_key(&peer_id) {
+    fn prune_peer_advertised_protocols(&mut self, peer_id: PeerId) {
+        if !self.peer_advertised_protocols.contains_key(&peer_id) {
             return;
         }
 
@@ -366,7 +359,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             .iter()
             .any(|peer| peer.peer_id == peer_id);
         if !is_connected && !is_in_kademlia {
-            self.peer_chainsync_protocol_states.remove(&peer_id);
+            self.peer_advertised_protocols.remove(&peer_id);
         }
     }
 
@@ -482,10 +475,7 @@ mod tests {
             kad_protocol_name: StreamProtocol::new("/kademlia/test"),
             identify_protocol_name: StreamProtocol::new("/identify/test"),
             chain_sync_protocol_name: StreamProtocol::new("/chainsync/test"),
-            identify_config: lb_libp2p::IdentifySettings {
-                allow_non_public_identify_addresses: true,
-                ..Default::default()
-            },
+            identify_config: lb_libp2p::IdentifySettings::default(),
             chain_sync_config: lb_cryptarchia_sync::Config {
                 peer_response_timeout: Duration::from_secs(5),
                 max_inbound_requests: 10.try_into().unwrap(),
@@ -550,6 +540,15 @@ mod tests {
                 signed_peer_record: None,
             },
         }
+    }
+
+    fn advertised_protocols(
+        protocols: &[&'static str],
+    ) -> HashSet<lb_libp2p::libp2p::StreamProtocol> {
+        protocols
+            .iter()
+            .map(|protocol| lb_libp2p::libp2p::StreamProtocol::new(protocol))
+            .collect()
     }
 
     fn create_gossipsub_handler(
@@ -795,16 +794,16 @@ mod tests {
     const NODE_COUNT: usize = 10;
 
     #[tokio::test]
-    async fn only_supported_peers_are_chainsync_eligible() {
+    async fn only_peers_advertising_chainsync_are_eligible() {
         let mut handler = create_handler();
         let supported = PeerId::random();
         let unsupported = PeerId::random();
         handler
-            .peer_chainsync_protocol_states
-            .insert(supported, ChainSyncProtocolState::Supported);
+            .peer_advertised_protocols
+            .insert(supported, advertised_protocols(&["/chainsync/test"]));
         handler
-            .peer_chainsync_protocol_states
-            .insert(unsupported, ChainSyncProtocolState::Unsupported);
+            .peer_advertised_protocols
+            .insert(unsupported, advertised_protocols(&["/kademlia/test"]));
 
         assert_eq!(
             handler.chainsync_eligible_peers(),
@@ -813,7 +812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identify_updates_chainsync_protocol_state_without_kademlia_eviction() {
+    async fn identify_updates_advertised_protocols_without_kademlia_eviction() {
         let mut handler = create_handler();
         let peer_id = PeerId::random();
         let address = create_test_address().with(Protocol::P2p(peer_id));
@@ -824,15 +823,18 @@ mod tests {
             &["/kademlia/test", "/chainsync/test"],
         ));
         assert_eq!(
-            handler.peer_chainsync_protocol_states.get(&peer_id),
-            Some(&ChainSyncProtocolState::Supported)
+            handler.peer_advertised_protocols.get(&peer_id),
+            Some(&advertised_protocols(&[
+                "/kademlia/test",
+                "/chainsync/test"
+            ]))
         );
         assert!(handler.chainsync_eligible_peers().contains(&peer_id));
 
         handler.handle_identify_event(identify_event(peer_id, &["/kademlia/test"]));
         assert_eq!(
-            handler.peer_chainsync_protocol_states.get(&peer_id),
-            Some(&ChainSyncProtocolState::Unsupported)
+            handler.peer_advertised_protocols.get(&peer_id),
+            Some(&advertised_protocols(&["/kademlia/test"]))
         );
         assert!(!handler.chainsync_eligible_peers().contains(&peer_id));
         assert!(
@@ -852,59 +854,51 @@ mod tests {
         handler.handle_identify_event(identify_event(peer_id, &["/chainsync/test"]));
 
         assert_eq!(
-            handler.peer_chainsync_protocol_states.get(&peer_id),
-            Some(&ChainSyncProtocolState::Supported)
+            handler.peer_advertised_protocols.get(&peer_id),
+            Some(&advertised_protocols(&["/chainsync/test"]))
         );
         assert!(handler.chainsync_eligible_peers().contains(&peer_id));
         assert!(handler.swarm.kademlia_discovered_peers().is_empty());
     }
 
     #[tokio::test]
-    async fn chainsync_protocol_state_is_pruned_only_when_peer_is_no_longer_known() {
+    async fn advertised_protocols_are_pruned_only_when_peer_is_no_longer_known() {
         let mut handler = create_handler();
         let peer_id = PeerId::random();
         let address = create_test_address();
 
         handler
-            .peer_chainsync_protocol_states
-            .insert(peer_id, ChainSyncProtocolState::Supported);
-        handler.prune_chainsync_protocol_state(peer_id);
-        assert!(
-            !handler
-                .peer_chainsync_protocol_states
-                .contains_key(&peer_id)
-        );
+            .peer_advertised_protocols
+            .insert(peer_id, advertised_protocols(&["/chainsync/test"]));
+        handler.prune_peer_advertised_protocols(peer_id);
+        assert!(!handler.peer_advertised_protocols.contains_key(&peer_id));
 
         handler.swarm.kademlia_add_address(peer_id, &address);
         handler
-            .peer_chainsync_protocol_states
-            .insert(peer_id, ChainSyncProtocolState::Supported);
-        handler.prune_chainsync_protocol_state(peer_id);
+            .peer_advertised_protocols
+            .insert(peer_id, advertised_protocols(&["/chainsync/test"]));
+        handler.prune_peer_advertised_protocols(peer_id);
         assert_eq!(
-            handler.peer_chainsync_protocol_states.get(&peer_id),
-            Some(&ChainSyncProtocolState::Supported)
+            handler.peer_advertised_protocols.get(&peer_id),
+            Some(&advertised_protocols(&["/chainsync/test"]))
         );
     }
 
     #[tokio::test]
-    async fn removing_last_kademlia_address_prunes_disconnected_chainsync_protocol_state() {
+    async fn removing_last_kademlia_address_prunes_disconnected_peer_protocols() {
         let mut handler = create_handler();
         let peer_id = PeerId::random();
         let address = create_test_address().with(Protocol::P2p(peer_id));
 
         handler.swarm.kademlia_add_address(peer_id, &address);
         handler
-            .peer_chainsync_protocol_states
-            .insert(peer_id, ChainSyncProtocolState::Supported);
+            .peer_advertised_protocols
+            .insert(peer_id, advertised_protocols(&["/chainsync/test"]));
 
         handler.remove_kademlia_address_for_dial(Some(peer_id), &address);
 
         assert!(handler.swarm.kademlia_discovered_peers().is_empty());
-        assert!(
-            !handler
-                .peer_chainsync_protocol_states
-                .contains_key(&peer_id)
-        );
+        assert!(!handler.peer_advertised_protocols.contains_key(&peer_id));
     }
 
     #[tokio::test]
