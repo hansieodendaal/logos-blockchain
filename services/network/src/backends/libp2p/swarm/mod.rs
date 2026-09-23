@@ -341,6 +341,10 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             .collect()
     }
 
+    /// A peer can be disconnected but still remain known through Kademlia and therefore appear
+    /// among discovered peers. We retain its latest advertised protocols so we can still filter
+    /// it for chainsync before attempting a new connection. We only prune that information once
+    /// the peer is both disconnected and no longer known through discovery.
     fn prune_peer_advertised_protocols(&mut self, peer_id: PeerId) {
         if !self.peer_advertised_protocols.contains_key(&peer_id) {
             return;
