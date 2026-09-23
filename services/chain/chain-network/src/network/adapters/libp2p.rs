@@ -161,13 +161,13 @@ where
         relay: &Relay<Libp2p, RuntimeServiceId>,
     ) -> Result<HashSet<PeerId>, DynError> {
         let (reply_sender, receiver) = oneshot::channel();
-        if let Err((e, _)) = relay
+        if let Err(error) = relay
             .send(NetworkMsg::Process(Command::ChainSync(
                 ChainSyncCommand::EligiblePeers { reply_sender },
             )))
             .await
         {
-            return Err(Box::new(e));
+            return Err(Box::new(error));
         }
 
         receiver.await.map_err(|e| Box::new(e) as DynError)
