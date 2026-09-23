@@ -36,6 +36,7 @@ members = [
   "blend/membership",
   "blend/message",
   "blend/network",
+  "blend/primitives",
   "blend/proofs",
   "blend/provers",
   "blend/scheduling",
@@ -115,6 +116,7 @@ lb-blend-crypto                    = { default-features = false, package = "logo
 lb-blend-membership                = { default-features = false, package = "logos-blockchain-blend-membership", path = "./blend/membership" }
 lb-blend-message                   = { default-features = false, package = "logos-blockchain-blend-message", path = "./blend/message" }
 lb-blend-network                   = { default-features = false, package = "logos-blockchain-blend-network", path = "./blend/network" }
+lb-blend-primitives                = { default-features = false, package = "logos-blockchain-blend-primitives", path = "./blend/primitives" }
 lb-blend-proofs                    = { default-features = false, package = "logos-blockchain-blend-proofs", path = "./blend/proofs" }
 lb-blend-provers                   = { default-features = false, package = "logos-blockchain-blend-provers", path = "./blend/provers" }
 lb-blend-scheduling                = { default-features = false, package = "logos-blockchain-blend-scheduling", path = "./blend/scheduling" }
@@ -242,8 +244,8 @@ opentelemetry-http                 = { default-features = false, version = "0.32
 opentelemetry-otlp                 = { default-features = false, version = "0.32.0" }
 opentelemetry-semantic-conventions = { default-features = false, version = "0.32.1" }
 opentelemetry_sdk                  = { default-features = false, version = "0.32.1" }
-overwatch                          = { default-features = false, git = "https://github.com/logos-co/Overwatch", rev = "ae887f41f5a626c341179026ad7f03953ff2072e" }
-overwatch-derive                   = { default-features = false, git = "https://github.com/logos-co/Overwatch", rev = "ae887f41f5a626c341179026ad7f03953ff2072e" }
+overwatch                          = { default-features = false, git = "https://github.com/logos-co/Overwatch", rev = "8f06c685948620d5d9931ed8f5bdb86e6cbffcd9" }
+overwatch-derive                   = { default-features = false, git = "https://github.com/logos-co/Overwatch", rev = "8f06c685948620d5d9931ed8f5bdb86e6cbffcd9" }
 owo-colors                         = { default-features = false, version = "4.2.3" }
 pprof                              = { default-features = false, version = "0.15" }
 proc-macro2                        = { default-features = false, version = "1" }

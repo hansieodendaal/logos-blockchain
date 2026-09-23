@@ -1,7 +1,5 @@
 use std::collections::HashSet;
 
-use bytes::Bytes;
-
 use crate::{
     mantle::{
         VerificationError, ops::channel::ChannelId, transactions::OperationVerificationHelper,
@@ -12,7 +10,7 @@ use crate::{
 pub fn verify_channel_multi_sig(
     channel_id: &ChannelId,
     proof: &ChannelMultiSigProof,
-    tx_hash_bytes: &Bytes,
+    tx_hash_bytes: &[u8],
     helper: &dyn OperationVerificationHelper,
     op_index: usize,
 ) -> Result<(), VerificationError> {
@@ -73,7 +71,7 @@ pub mod test_utils {
             .map(|(index, key)| {
                 IndexedSignature::new(
                     index as ChannelKeyIndex,
-                    key.sign_payload(tx_hash.as_signing_bytes().as_ref()),
+                    key.sign_payload(tx_hash.as_signing_bytes()),
                 )
             })
             .collect::<Vec<_>>()
@@ -113,7 +111,7 @@ mod tests {
 
         let helper = TestOperationVerificationHelper::new(Channels::new(), []);
 
-        let result = verify_channel_multi_sig(&channel_id, &proof, &tx_hash_bytes, &helper, 0);
+        let result = verify_channel_multi_sig(&channel_id, &proof, tx_hash_bytes, &helper, 0);
 
         assert_eq!(
             result,
@@ -139,7 +137,7 @@ mod tests {
         let helper =
             TestOperationVerificationHelper::new(channels, [((channel_id, 0), key0.public_key())]);
 
-        let result = verify_channel_multi_sig(&channel_id, &proof, &tx_hash_bytes, &helper, 0);
+        let result = verify_channel_multi_sig(&channel_id, &proof, tx_hash_bytes, &helper, 0);
 
         assert_eq!(
             result,
@@ -168,13 +166,56 @@ mod tests {
         };
         let helper = TestOperationVerificationHelper::new(channels, []);
 
-        let result = verify_channel_multi_sig(&channel_id, &proof, &tx_hash_bytes, &helper, 0);
+        let result = verify_channel_multi_sig(&channel_id, &proof, tx_hash_bytes, &helper, 0);
 
         assert_eq!(
             result,
             Err(VerificationError::KeyNotFound {
                 channel_id,
                 key_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_signature_over_another_transaction() {
+        let channel_id = ChannelId::from([4u8; 32]);
+        let signed_hash = TxHash::from([9u8; 32]);
+        let other_hash = TxHash::from([10u8; 32]);
+        let key = Ed25519Key::from_bytes(&[0; 32]);
+        let proof = create_channel_multi_sig_proof(&signed_hash, &[&key]);
+
+        let channels = {
+            let mut channels = Channels::new();
+            channels
+                .channels
+                .insert_mut(channel_id, make_channel_state(1, None));
+            channels
+        };
+        let helper =
+            TestOperationVerificationHelper::new(channels, [((channel_id, 0), key.public_key())]);
+
+        assert_eq!(
+            verify_channel_multi_sig(
+                &channel_id,
+                &proof,
+                signed_hash.as_signing_bytes().as_ref(),
+                &helper,
+                0
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_channel_multi_sig(
+                &channel_id,
+                &proof,
+                other_hash.as_signing_bytes().as_ref(),
+                &helper,
+                0
+            ),
+            Err(VerificationError::ChannelMultiSigProofInvalidSignature {
+                op_index: 0,
+                signature_index: 0,
             })
         );
     }
@@ -200,7 +241,7 @@ mod tests {
             [((channel_id, 0), expected_key.public_key())],
         );
 
-        let result = verify_channel_multi_sig(&channel_id, &proof, &tx_hash_bytes, &helper, 0);
+        let result = verify_channel_multi_sig(&channel_id, &proof, tx_hash_bytes, &helper, 0);
 
         assert_eq!(
             result,

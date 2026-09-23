@@ -72,7 +72,7 @@ use overwatch::{
     overwatch::OverwatchHandle,
     services::{
         AsServiceId, ServiceCore, ServiceData,
-        relay::{OutboundRelay, RelayError},
+        relay::{OutboundRelay, OutboundRelayError},
         state::StateUpdater,
     },
 };
@@ -467,7 +467,7 @@ where
         } else {
             Some(FailureDetector::new(
                 running_blend_config.max_data_message_delay_in_rounds(),
-                running_blend_config.time.round_duration,
+                running_blend_config.time.round_duration_in_seconds,
                 payload_dispatcher.observe_broadcasts().await,
             ))
         };
@@ -2679,7 +2679,7 @@ where
 async fn submit_activity_proof(
     proof: ActivityProof,
     sdp_relay: &OutboundRelay<SdpMessage>,
-) -> Result<(), RelayError> {
+) -> Result<(), OutboundRelayError<SdpMessage>> {
     let proof_epoch = proof.epoch();
     debug!(
         target: LOG_TARGET,
@@ -2693,8 +2693,7 @@ async fn submit_activity_proof(
         .send(SdpMessage::PostActivity {
             metadata: ActivityMetadata::Blend(Box::new((&proof).into())),
         })
-        .await
-        .map_err(|(e, _)| e);
+        .await;
     match &result {
         Ok(()) => debug!(
             target: LOG_TARGET,

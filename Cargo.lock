@@ -4032,6 +4032,7 @@ dependencies = [
  "logos-blockchain-blend-membership",
  "logos-blockchain-blend-message",
  "logos-blockchain-blend-network",
+ "logos-blockchain-blend-primitives",
  "logos-blockchain-blend-proofs",
  "logos-blockchain-blend-provers",
  "logos-blockchain-blend-scheduling",
@@ -4105,6 +4106,7 @@ dependencies = [
  "libp2p-swarm-test",
  "logos-blockchain-blend-membership",
  "logos-blockchain-blend-message",
+ "logos-blockchain-blend-primitives",
  "logos-blockchain-blend-proofs",
  "logos-blockchain-blend-provers",
  "logos-blockchain-cryptarchia-engine",
@@ -4115,8 +4117,15 @@ dependencies = [
  "logos-blockchain-utils",
  "test-log",
  "tokio",
- "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "logos-blockchain-blend-primitives"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "tokio",
 ]
 
 [[package]]
@@ -4176,6 +4185,7 @@ dependencies = [
  "futures",
  "logos-blockchain-blend-membership",
  "logos-blockchain-blend-message",
+ "logos-blockchain-blend-primitives",
  "logos-blockchain-blend-proofs",
  "logos-blockchain-blend-provers",
  "logos-blockchain-cryptarchia-engine",
@@ -5260,7 +5270,6 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -6239,8 +6248,8 @@ dependencies = [
 
 [[package]]
 name = "overwatch"
-version = "0.1.0"
-source = "git+https://github.com/logos-co/Overwatch?rev=ae887f41f5a626c341179026ad7f03953ff2072e#ae887f41f5a626c341179026ad7f03953ff2072e"
+version = "0.2.0"
+source = "git+https://github.com/logos-co/Overwatch?rev=8f06c685948620d5d9931ed8f5bdb86e6cbffcd9#8f06c685948620d5d9931ed8f5bdb86e6cbffcd9"
 dependencies = [
  "async-trait",
  "futures",
@@ -6254,8 +6263,8 @@ dependencies = [
 
 [[package]]
 name = "overwatch-derive"
-version = "0.1.0"
-source = "git+https://github.com/logos-co/Overwatch?rev=ae887f41f5a626c341179026ad7f03953ff2072e#ae887f41f5a626c341179026ad7f03953ff2072e"
+version = "0.2.0"
+source = "git+https://github.com/logos-co/Overwatch?rev=8f06c685948620d5d9931ed8f5bdb86e6cbffcd9#8f06c685948620d5d9931ed8f5bdb86e6cbffcd9"
 dependencies = [
  "convert_case 0.8.0",
  "manyhow",

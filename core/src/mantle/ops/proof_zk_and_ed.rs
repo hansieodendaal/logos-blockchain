@@ -17,3 +17,10 @@ impl ZkAndEd25519Proof {
         }
     }
 }
+
+#[cfg(any(test, feature = "test-utils"))]
+impl crate::mantle::ops::op_proof::samples::SampleProof for ZkAndEd25519Proof {
+    fn sample() -> Self {
+        Self::new(ZkSignature::sample(), Ed25519Signature::sample())
+    }
+}

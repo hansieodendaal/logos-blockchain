@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use lb_binary_codec::canonical::{BinaryCodec, BinaryEncode as _};
 use lb_cryptarchia_engine::Slot;
+#[cfg(any(test, feature = "test-utils"))]
+use lb_key_management_system_keys::keys::Ed25519Key;
 use lb_key_management_system_keys::keys::Ed25519Signature;
 use lb_utils::bounded::UpperBoundedVec;
 use serde::{Deserialize, Serialize};
@@ -72,6 +74,17 @@ impl InscriptionOp {
         let mut hasher = Hasher::new();
         hasher.update(self.encode().as_ref());
         MsgId(hasher.finalize().into())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn sample() -> Self {
+        Self {
+            channel_id: ChannelId::from([14u8; 32]),
+            inscription: b"hello logos".into(),
+            parent: MsgId::root(),
+            signer: Ed25519Key::from_bytes(&[15; 32]).public_key(),
+        }
     }
 }
 
@@ -223,6 +236,34 @@ mod tests {
     use lb_utils::bounded::BoundedError;
 
     use super::*;
+    use crate::{
+        crypto::Hash,
+        mantle::{
+            TxHash, gas::test_utils::FixedThresholds, ops::op_proof::samples::SampleProof as _,
+            transactions::tx_list::signed_ops::test_utils::make_channel_state,
+        },
+    };
+
+    fn preverified(
+        operation: InscriptionOp,
+    ) -> SignedOperation<InscriptionOp, Preverified, StandardMode> {
+        let tx_hash_view = TxHashView::from(TxHash::from([9u8; 32]));
+        let proof =
+            Ed25519Key::from_bytes(&[15; 32]).sign_payload(tx_hash_view.as_bytes().as_ref());
+
+        SignedOperation::<_, Unverified, StandardMode>::new(operation, proof)
+            .into_preverified(&InscriptionPreverificationContext {
+                tx_hash_view: &tx_hash_view,
+            })
+            .expect("the sample signer signed this transaction hash")
+    }
+
+    fn channels(channel_id: ChannelId, state: ChannelState) -> Channels {
+        let mut channels = Channels::new();
+        channels.channels.insert_mut(channel_id, state);
+
+        channels
+    }
 
     fn sample() -> InscriptionOp {
         InscriptionOp {
@@ -277,5 +318,306 @@ mod tests {
         let bytes = bincode::serialize(&op).unwrap();
         let recovered: InscriptionOp = bincode::deserialize(&bytes).unwrap();
         assert_eq!(op, recovered);
+    }
+
+    #[test]
+    fn preverify_rejects_a_signature_over_another_transaction() {
+        let signing_key = Ed25519Key::from_bytes(&[15; 32]);
+        let signed_hash: Hash = Hasher::digest(b"signed").into();
+        let other_hash: Hash = Hasher::digest(b"other").into();
+        let signed_view = TxHashView::new(TxHash::from(signed_hash));
+        let other_view = TxHashView::new(TxHash::from(other_hash));
+
+        let signed_operation = SignedOperation::<_, Unverified, StandardMode>::new(
+            InscriptionOp::sample(),
+            signing_key.sign_payload(signed_view.as_bytes().as_ref()),
+        );
+
+        assert_eq!(
+            signed_operation.preverify(&InscriptionPreverificationContext {
+                tx_hash_view: &signed_view
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            signed_operation.preverify(&InscriptionPreverificationContext {
+                tx_hash_view: &other_view
+            }),
+            Err(Error::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn preverify_rejects_a_signature_unrelated_to_the_op() {
+        let tx_hash_view = TxHashView::from(TxHash::from([9u8; 32]));
+        let proof =
+            Ed25519Key::from_bytes(&[16; 32]).sign_payload(tx_hash_view.as_bytes().as_ref());
+
+        let signed_operation =
+            SignedOperation::<_, Unverified, StandardMode>::new(InscriptionOp::sample(), proof);
+
+        assert_eq!(
+            signed_operation.preverify(&InscriptionPreverificationContext {
+                tx_hash_view: &tx_hash_view
+            }),
+            Err(Error::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn has_no_deferred_zkp() {
+        let signed_operation = preverified(InscriptionOp::sample());
+
+        assert!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &Channels::new(),
+                    block_slot: Slot::from(0),
+                })
+                .expect("an inscription rooted at the genesis message opens a new channel")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verify_accepts_an_unregistered_channel_rooted_inscription() {
+        let signed_operation = preverified(InscriptionOp::sample());
+
+        assert!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &Channels::new(),
+                    block_slot: Slot::from(0),
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_rejects_an_unrooted_inscription_on_an_unregistered_channel() {
+        let operation = InscriptionOp {
+            parent: MsgId([1u8; 32]),
+            ..InscriptionOp::sample()
+        };
+        let channel_id = operation.channel_id;
+        let parent = operation.parent;
+        let signed_operation = preverified(operation);
+
+        assert_eq!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &Channels::new(),
+                    block_slot: Slot::from(0),
+                })
+                .unwrap_err(),
+            Error::InvalidParent {
+                channel_id,
+                parent: parent.into(),
+                actual: MsgId::root().into(),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_an_inscription_that_does_not_follow_the_channel_tip() {
+        let operation = InscriptionOp::sample();
+        let channel_id = operation.channel_id;
+        let parent = operation.parent;
+        let signed_operation = preverified(operation);
+
+        let tip_message = MsgId([2u8; 32]);
+        let channels = channels(
+            channel_id,
+            ChannelState {
+                tip_message,
+                ..make_channel_state(
+                    1,
+                    Some(
+                        Keys::try_from(vec![Ed25519Key::from_bytes(&[15; 32]).public_key()])
+                            .expect("one key is within bounds"),
+                    ),
+                )
+            },
+        );
+
+        assert_eq!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &channels,
+                    block_slot: Slot::from(0),
+                })
+                .unwrap_err(),
+            Error::InvalidParent {
+                channel_id,
+                parent: parent.into(),
+                actual: tip_message.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_an_inscription_from_a_key_the_channel_does_not_accredit() {
+        let operation = InscriptionOp::sample();
+        let channel_id = operation.channel_id;
+        let signer = operation.signer;
+        let signed_operation = preverified(operation);
+
+        let channels = channels(
+            channel_id,
+            make_channel_state(
+                1,
+                Some(
+                    Keys::try_from(vec![Ed25519Key::from_bytes(&[16; 32]).public_key()])
+                        .expect("one key is within bounds"),
+                ),
+            ),
+        );
+
+        assert_eq!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &channels,
+                    block_slot: Slot::from(0),
+                })
+                .unwrap_err(),
+            Error::UnauthorizedSigner {
+                channel_id,
+                signer: format!("{signer:?}"),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_accepts_an_inscription_from_the_sequencer_on_duty() {
+        let operation = InscriptionOp::sample();
+        let channel_id = operation.channel_id;
+        let signer = operation.signer;
+        let signed_operation = preverified(operation);
+
+        let channels = channels(
+            channel_id,
+            ChannelState {
+                tip_sequencer: 1,
+                ..make_channel_state(
+                    1,
+                    Some(
+                        Keys::try_from(vec![
+                            Ed25519Key::from_bytes(&[16; 32]).public_key(),
+                            signer,
+                        ])
+                        .expect("two keys are within bounds"),
+                    ),
+                )
+            },
+        );
+
+        assert!(
+            signed_operation
+                .verify(&InscriptionValidationContext {
+                    channels: &channels,
+                    block_slot: Slot::from(0),
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn execute_bootstraps_a_channel_the_ledger_does_not_hold_yet() {
+        let operation = InscriptionOp::sample();
+        let channel_id = operation.channel_id;
+        let signer = operation.signer;
+        let message_id = operation.id();
+        let block_slot = Slot::from(7u64);
+
+        let signed_operation: SignedOperation<_, _, StandardMode> = SignedOperation::new(
+            operation,
+            <InscriptionOp as ProvableOperation>::Proof::sample(),
+        )
+        .into_state_trusted();
+
+        let (context, events) = signed_operation
+            .execute(InscriptionExecutionContext {
+                channels: Channels::new(),
+                block_slot,
+            })
+            .expect("inscribing never fails");
+
+        assert_eq!(
+            context.channels.channel_state(&channel_id),
+            Some(&ChannelState {
+                accredited_keys: Arc::new(Keys::from(signer)),
+                configuration_threshold: 1,
+                tip_message: message_id,
+                config_tip_hash: MsgId::root(),
+                tip_slot: block_slot,
+                tip_sequencer: 0,
+                tip_sequencer_starting_slot: block_slot,
+                posting_timeframe: 0.into(),
+                posting_timeout: 0.into(),
+                transfer_threshold: crate::mantle::channel::DEFAULT_TRANSFER_THRESHOLD,
+            })
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn execute_rotates_the_sequencer_of_an_existing_channel() {
+        let operation = InscriptionOp::sample();
+        let channel_id = operation.channel_id;
+        let message_id = operation.id();
+        let keys = Keys::try_from(vec![
+            Ed25519Key::from_bytes(&[16; 32]).public_key(),
+            operation.signer,
+        ])
+        .expect("two keys are within bounds");
+
+        let channels = channels(
+            channel_id,
+            ChannelState {
+                configuration_threshold: 2,
+                posting_timeframe: 1.into(),
+                ..make_channel_state(3, Some(keys.clone()))
+            },
+        );
+
+        let signed_operation: SignedOperation<_, _, StandardMode> = SignedOperation::new(
+            operation,
+            <InscriptionOp as ProvableOperation>::Proof::sample(),
+        )
+        .into_state_trusted();
+
+        let (context, events) = signed_operation
+            .execute(InscriptionExecutionContext {
+                channels,
+                block_slot: Slot::from(1u64),
+            })
+            .expect("inscribing never fails");
+
+        assert_eq!(
+            context.channels.channel_state(&channel_id),
+            Some(&ChannelState {
+                accredited_keys: Arc::new(keys),
+                configuration_threshold: 2,
+                tip_message: message_id,
+                config_tip_hash: MsgId::root(),
+                tip_slot: Slot::from(1u64),
+                tip_sequencer: 1,
+                tip_sequencer_starting_slot: Slot::from(1u64),
+                posting_timeframe: 1.into(),
+                posting_timeout: 0.into(),
+                transfer_threshold: 3,
+            })
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn inscription_op_execution_gas_does_not_scale_with_the_threshold() {
+        for threshold in [0, 1, 3] {
+            assert_eq!(
+                InscriptionOp::sample().execution_gas(&FixedThresholds(threshold)),
+                Ok(Gas::new(56))
+            );
+        }
     }
 }
