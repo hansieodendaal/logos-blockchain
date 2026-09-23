@@ -4,16 +4,9 @@ use lb_libp2p::{Multiaddr, PeerId, Protocol, libp2p::identify};
 use lb_log_targets::network_service;
 use rand::RngCore;
 
-use crate::backends::libp2p::swarm::{ProtocolContract, SwarmHandler};
+use crate::backends::libp2p::swarm::SwarmHandler;
 
 const LOG_TARGET: &str = network_service::backends::libp2p::IDENTIFY;
-
-#[derive(Debug)]
-struct ProtocolCapabilities {
-    network_matches: bool,
-    supports_kademlia: bool,
-    supports_chainsync: bool,
-}
 
 impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
     pub(super) fn handle_identify_event(&mut self, event: identify::Event) {
@@ -36,18 +29,16 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         );
 
         let advertised_protocols = info.protocols.into_iter().collect::<HashSet<_>>();
-        let capabilities = protocol_capabilities(
-            &info.protocol_version,
-            &advertised_protocols,
-            &self.protocol_contract,
-        );
+        let supports_kademlia =
+            advertised_protocols.contains(&self.protocol_contract.kademlia_protocol);
+        let supports_chainsync =
+            advertised_protocols.contains(&self.protocol_contract.chain_sync_protocol);
         tracing::debug!(
             target: LOG_TARGET,
             peer = %peer_id,
             protocol_version = %info.protocol_version,
-            network_matches = capabilities.network_matches,
-            supports_kademlia = capabilities.supports_kademlia,
-            supports_chainsync = capabilities.supports_chainsync,
+            supports_kademlia,
+            supports_chainsync,
             protocols = ?advertised_protocols,
             "Classified peer protocol capabilities"
         );
@@ -55,13 +46,11 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         self.peer_advertised_protocols
             .insert(peer_id, advertised_protocols);
 
-        self.add_identified_kademlia_addresses(
-            peer_id,
-            &info.listen_addrs,
-            capabilities.supports_kademlia,
-        );
+        if supports_kademlia {
+            self.add_identified_kademlia_addresses(peer_id, &info.listen_addrs);
+        }
 
-        if !capabilities.supports_chainsync {
+        if !supports_chainsync {
             tracing::debug!(
                 target: LOG_TARGET,
                 "Peer {peer_id} is not chainsync eligible because it does not advertise the \
@@ -70,16 +59,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         }
     }
 
-    fn add_identified_kademlia_addresses(
-        &mut self,
-        peer_id: PeerId,
-        listen_addrs: &[Multiaddr],
-        supports_kademlia: bool,
-    ) {
-        if !supports_kademlia {
-            return;
-        }
-
+    fn add_identified_kademlia_addresses(&mut self, peer_id: PeerId, listen_addrs: &[Multiaddr]) {
         tracing::trace!(
             target: LOG_TARGET,
             "Adding discovered node to Kademlia, seen addresses: {:?}",
@@ -98,18 +78,6 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             }
             self.swarm.kademlia_add_address(peer_id, addr);
         }
-    }
-}
-
-fn protocol_capabilities(
-    protocol_version: &str,
-    protocols: &HashSet<lb_libp2p::libp2p::StreamProtocol>,
-    contract: &ProtocolContract,
-) -> ProtocolCapabilities {
-    ProtocolCapabilities {
-        network_matches: protocol_version == contract.identify_protocol_version.as_ref(),
-        supports_kademlia: protocols.contains(&contract.kademlia_protocol),
-        supports_chainsync: protocols.contains(&contract.chain_sync_protocol),
     }
 }
 
@@ -140,81 +108,4 @@ fn is_kademlia_candidate_address(addr: &Multiaddr) -> bool {
     }
 
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use lb_libp2p::libp2p::StreamProtocol;
-
-    use super::*;
-
-    fn contract() -> ProtocolContract {
-        ProtocolContract {
-            identify_protocol_version: StreamProtocol::new("/network/1.0.0"),
-            kademlia_protocol: StreamProtocol::new("/network/kad/1.0.0"),
-            chain_sync_protocol: StreamProtocol::new("/network/chainsync/1.0.0"),
-        }
-    }
-
-    fn advertised_protocols(protocols: &[&'static str]) -> HashSet<StreamProtocol> {
-        protocols
-            .iter()
-            .map(|protocol| StreamProtocol::new(protocol))
-            .collect()
-    }
-
-    #[test]
-    fn protocol_capabilities_are_classified() {
-        let cases = [
-            (
-                "exact chainsync",
-                "/network/1.0.0",
-                vec!["/network/chainsync/1.0.0"],
-                true,
-            ),
-            (
-                "chainsync with Kademlia",
-                "/network/1.0.0",
-                vec!["/network/kad/1.0.0", "/network/chainsync/1.0.0"],
-                true,
-            ),
-            (
-                "chainsync with unrelated protocols",
-                "/network/1.0.0",
-                vec!["/network/gossipsub/1.0.0", "/network/chainsync/1.0.0"],
-                true,
-            ),
-            (
-                "wrong chainsync protocol",
-                "/network/1.0.0",
-                vec!["/network/kad/1.0.0", "/network/chainsync/0.9.0"],
-                false,
-            ),
-            (
-                "missing chainsync protocol",
-                "/network/1.0.0",
-                vec!["/network/kad/1.0.0"],
-                false,
-            ),
-        ];
-
-        for (name, protocol_version, protocols, expected) in cases {
-            let capabilities = protocol_capabilities(
-                protocol_version,
-                &advertised_protocols(&protocols),
-                &contract(),
-            );
-            assert_eq!(capabilities.supports_chainsync, expected, "{name}");
-            assert!(capabilities.network_matches, "{name}");
-        }
-
-        let capabilities = protocol_capabilities(
-            "/other-network/1.0.0",
-            &advertised_protocols(&["/network/chainsync/1.0.0"]),
-            &contract(),
-        );
-        assert!(!capabilities.network_matches);
-        assert!(capabilities.supports_chainsync);
-        assert!(!capabilities.supports_kademlia);
-    }
 }

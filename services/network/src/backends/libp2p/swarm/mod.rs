@@ -58,7 +58,6 @@ const LOG_TARGET: &str = network_service::backends::libp2p::ROOT;
 
 #[derive(Debug)]
 struct ProtocolContract {
-    identify_protocol_version: Libp2pStreamProtocol,
     kademlia_protocol: Libp2pStreamProtocol,
     chain_sync_protocol: Libp2pStreamProtocol,
 }
@@ -66,7 +65,6 @@ struct ProtocolContract {
 impl ProtocolContract {
     fn from_config(config: &lb_libp2p::SwarmConfig) -> Self {
         Self {
-            identify_protocol_version: config.identify_protocol_name.clone().into_inner(),
             kademlia_protocol: config.kad_protocol_name.clone().into_inner(),
             chain_sync_protocol: config.chain_sync_protocol_name.clone().into_inner(),
         }
