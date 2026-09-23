@@ -14,6 +14,7 @@ use crate::{
     common::wallet::{
         TrackedWallets, TrackedWalletsState, WalletId, WalletUtxos,
         scanner::{
+            accounting::ScannerAccountingSnapshot,
             config::{DEFAULT_SCANNER_SNAPSHOT_RESCAN_BLOCKS, ScannerSeed},
             state::ScannerStateCheckpoint,
         },
@@ -48,6 +49,10 @@ struct WalletNodeSnapshot {
     #[serde(default)]
     slot: Option<u64>,
     tracked_wallets: TrackedWalletsState,
+    /// Full scanner seed, including service-locked UTXOs and lock markers.
+    /// Older snapshots lack this and can only restore their spendable UTXOs.
+    #[serde(default)]
+    accounting: Option<ScannerAccountingSnapshot>,
     /// Older scanner checkpoints, newest first, used as fallback seed
     /// positions when the snapshot tip is not found on the restored chain.
     #[serde(default)]
@@ -60,6 +65,9 @@ struct WalletSnapshotCheckpoint {
     height: u64,
     slot: u64,
     tracked_wallets: TrackedWalletsState,
+    /// Full scanner seed for correct rollback across a restored snapshot.
+    #[serde(default)]
+    accounting: Option<ScannerAccountingSnapshot>,
 }
 
 impl WalletSnapshot {
@@ -112,6 +120,17 @@ impl WalletSnapshot {
                     group.group_id
                 ),
             })?;
+            let accounting = group
+                .recent_checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.tip == tip)
+                .map(|checkpoint| checkpoint.accounting.clone())
+                .ok_or_else(|| StepError::LogicalError {
+                    message: format!(
+                        "wallet scanner group `{}` has no accounting checkpoint at its applied tip",
+                        group.group_id
+                    ),
+                })?;
             let tip = tip.to_string();
             let checkpoints = group
                 .recent_checkpoints
@@ -123,6 +142,7 @@ impl WalletSnapshot {
                     tracked_wallets: TrackedWalletsState::from_wallet_utxos(
                         checkpoint.wallet_utxos.clone(),
                     ),
+                    accounting: Some(checkpoint.accounting.clone()),
                 })
                 .collect::<Vec<_>>();
             let group_nodes = scanner_group_node_names(world, &group.group_id);
@@ -132,6 +152,7 @@ impl WalletSnapshot {
                     height: group.applied_height,
                     slot: Some(slot),
                     tracked_wallets: scanner_wallets.clone(),
+                    accounting: Some(accounting.clone()),
                     checkpoints: checkpoints.clone(),
                 };
                 filter_node_snapshot_wallets(world, &node_name, &mut node_snapshot)?;
@@ -196,6 +217,10 @@ impl WalletSnapshot {
             .into_iter()
             .filter(|(wallet_id, _)| runtime_wallet_ids.contains(wallet_id))
             .collect::<WalletUtxos>();
+        let accounting = node_snapshot
+            .accounting
+            .as_ref()
+            .map(|accounting| Box::new(accounting.filtered_for_wallets(&runtime_wallet_ids)));
         let tip = parse_header_id(&node_snapshot.tip)?;
         let slot = match node_snapshot.slot {
             Some(slot) => slot,
@@ -206,13 +231,17 @@ impl WalletSnapshot {
             .iter()
             .filter(|checkpoint| checkpoint.tip != node_snapshot.tip)
             .map(|checkpoint| {
+                let wallet_utxos = checkpoint.tracked_wallets.to_wallet_utxos();
+                let accounting = checkpoint
+                    .accounting
+                    .clone()
+                    .unwrap_or_else(|| {
+                        ScannerAccountingSnapshot::from_wallet_utxos(wallet_utxos.clone())
+                    })
+                    .filtered_for_wallets(&runtime_wallet_ids);
                 Ok(ScannerStateCheckpoint {
-                    wallet_utxos: checkpoint
-                        .tracked_wallets
-                        .to_wallet_utxos()
-                        .into_iter()
-                        .filter(|(wallet_id, _)| runtime_wallet_ids.contains(wallet_id))
-                        .collect(),
+                    wallet_utxos,
+                    accounting,
                     tip: parse_header_id(&checkpoint.tip)?,
                     height: checkpoint.height,
                     slot: checkpoint.slot,
@@ -238,6 +267,7 @@ impl WalletSnapshot {
             runtime_node_name.to_owned(),
             ScannerSeed::Snapshot {
                 wallet_utxos: runtime_wallet_utxos,
+                accounting,
                 tip,
                 height: node_snapshot.height,
                 slot,
@@ -395,8 +425,16 @@ fn filter_node_snapshot_wallets(
     node_snapshot.tracked_wallets = node_snapshot
         .tracked_wallets
         .filtered_to_wallets(&wallet_ids);
+    node_snapshot.accounting = node_snapshot
+        .accounting
+        .as_ref()
+        .map(|accounting| accounting.filtered_for_wallets(&wallet_ids));
     for checkpoint in &mut node_snapshot.checkpoints {
         checkpoint.tracked_wallets = checkpoint.tracked_wallets.filtered_to_wallets(&wallet_ids);
+        checkpoint.accounting = checkpoint
+            .accounting
+            .as_ref()
+            .map(|accounting| accounting.filtered_for_wallets(&wallet_ids));
     }
     Ok(())
 }

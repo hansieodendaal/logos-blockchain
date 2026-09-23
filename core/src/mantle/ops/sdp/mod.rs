@@ -5,13 +5,12 @@ pub mod withdraw;
 pub use active::{SDPActiveExecutionContext, SDPActiveValidationContext};
 pub use declare::{SDPDeclareExecutionContext, SDPDeclareVerificationContext};
 use lb_cryptarchia_engine::Epoch;
-use lb_key_management_system_keys::keys::ZkPublicKey;
 use thiserror::Error;
 pub use withdraw::{SDPWithdrawExecutionContext, SDPWithdrawValidationContext};
 
 use crate::{
     mantle::NoteId,
-    sdp::{DeclarationId, Nonce, ProviderId, ServiceType},
+    sdp::{DeclarationId, ProviderId, ServiceType},
 };
 
 pub type SDPDeclareOp = crate::sdp::DeclarationMessage;
@@ -34,11 +33,6 @@ pub enum SdpError {
     DuplicateProviderId {
         service_type: ServiceType,
         provider_id: Box<ProviderId>,
-    },
-    #[error("Duplicate zk_id within service {service_type:?}: {zk_id:?}")]
-    DuplicateZkId {
-        service_type: ServiceType,
-        zk_id: ZkPublicKey,
     },
     #[error("Note {note_id:?} insufficient value: {value}")]
     NoteInsufficientValue { note_id: NoteId, value: u64 },
@@ -63,11 +57,18 @@ pub enum SdpError {
         withdraw_at: Epoch,
     },
     #[error(
-        "Invalid sdp message nonce: message_nonce={message_nonce:?}, declaration_nonce={declaration_nonce:?}"
+        "Invalid SDP nonce lifecycle: message_epoch={message_epoch:?}, declaration_created={declaration_created:?}"
     )]
-    InvalidNonce {
-        message_nonce: Nonce,
-        declaration_nonce: Nonce,
+    InvalidNonceLifecycle {
+        message_epoch: Epoch,
+        declaration_created: Epoch,
+    },
+    #[error(
+        "Invalid SDP nonce sequence: message_sequence={message_sequence}, declaration_sequence={declaration_sequence}"
+    )]
+    InvalidNonceSequence {
+        message_sequence: u32,
+        declaration_sequence: u32,
     },
     #[error("Note is not a service note: {0:?}")]
     NotAServiceNote(NoteId),
@@ -76,6 +77,4 @@ pub enum SdpError {
         note_id: NoteId,
         service_type: ServiceType,
     },
-    #[error("Note {note_id:?} is not corresponding to the one in the declaration {expected:?}")]
-    InvalidServiceNote { note_id: NoteId, expected: NoteId },
 }

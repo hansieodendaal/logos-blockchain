@@ -13,7 +13,7 @@ use lb_core::{
         },
         transactions::{OperationVerificationHelper, VerificationError},
     },
-    sdp::{DeclarationId, MinStake, ServiceType, service_notes::ServiceNotes},
+    sdp::{DeclarationId, MinStake, Providers, ServiceType, service_notes::ServiceNotes},
 };
 use lb_cryptarchia_engine::{Epoch, Slot};
 use lb_key_management_system_keys::keys::UnverifiedEd25519PublicKey;
@@ -62,6 +62,18 @@ impl OperationVerificationHelper for MantleOperationVerificationHelper<'_> {
         self.ledger_state
             .sdp_ledger()
             .get_declarations_by_service(service)
+            .ok_or(VerificationError::SDPVerificationError(
+                SdpError::ServiceNotFound(service),
+            ))
+    }
+
+    fn get_providers_by_service(
+        &self,
+        service: ServiceType,
+    ) -> Result<&Providers, VerificationError> {
+        self.ledger_state
+            .sdp_ledger()
+            .get_providers_by_service(service)
             .ok_or(VerificationError::SDPVerificationError(
                 SdpError::ServiceNotFound(service),
             ))

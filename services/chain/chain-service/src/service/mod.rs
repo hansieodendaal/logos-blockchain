@@ -20,7 +20,7 @@ use lb_core::{
         traits::{Hashable, MantleTx, PreverifiedMantleTransaction, SignedMantleTx, StorageSize},
         transactions::states::Preverified,
     },
-    sdp::ServiceType,
+    sdp::{Declaration, DeclarationId, ServiceType},
 };
 use lb_cryptarchia_engine::{Epoch, PrunedBlocks, Slot};
 use lb_cryptarchia_sync::{BlocksUnavailableReason, GetTipResponseReason, ProviderResponse};
@@ -55,6 +55,93 @@ pub struct ProcessBlockOutcome<Tx> {
 // limits also protect the diagnostic path during a long LIB stall.
 const MAX_QUERY_SOURCES_PER_TIP: usize = 8;
 const MAX_QUERY_SOURCE_TIPS: usize = 64;
+
+#[derive(Clone, Copy)]
+enum SdpQuerySnapshot {
+    Tip,
+    Lib,
+}
+
+/// Selects the ledger snapshot for SDP queries. The Cryptarchia query methods
+/// below use this helper so the finalized-vs-tip choice is independently
+/// regression-tested without mocking those methods themselves.
+const fn select_sdp_query_state_id(
+    snapshot: SdpQuerySnapshot,
+    tip: HeaderId,
+    lib: HeaderId,
+) -> HeaderId {
+    match snapshot {
+        SdpQuerySnapshot::Tip => tip,
+        SdpQuerySnapshot::Lib => lib,
+    }
+}
+
+/// The declaration queries deliberately distinguish the mutable tip registry
+/// from the finalized (LIB) registry. Keep the selection here so the RFC
+/// handlers and their state-source regression share the same path.
+trait SdpQuerySource {
+    type Declaration: Clone;
+
+    fn live_sdp_declarations(&self) -> HashMap<DeclarationId, Self::Declaration>;
+    fn finalized_sdp_declaration(&self, id: &DeclarationId) -> Option<Self::Declaration>;
+    fn finalized_sdp_declarations(
+        &self,
+        service_type: ServiceType,
+    ) -> Option<HashMap<DeclarationId, Self::Declaration>>;
+}
+
+impl SdpQuerySource for Cryptarchia {
+    type Declaration = Declaration;
+
+    fn live_sdp_declarations(&self) -> HashMap<DeclarationId, Self::Declaration> {
+        let state_id = select_sdp_query_state_id(SdpQuerySnapshot::Tip, self.tip(), self.lib());
+        self.ledger
+            .state(&state_id)
+            .map(|ledger_state| {
+                ledger_state
+                    .mantle_ledger()
+                    .sdp
+                    .declarations()
+                    .iter()
+                    .flat_map(|(_, declarations)| {
+                        declarations
+                            .iter()
+                            .map(|(id, declaration)| (*id, declaration.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn finalized_sdp_declaration(&self, id: &DeclarationId) -> Option<Self::Declaration> {
+        let state_id = select_sdp_query_state_id(SdpQuerySnapshot::Lib, self.tip(), self.lib());
+        self.ledger
+            .state(&state_id)?
+            .mantle_ledger()
+            .sdp
+            .get_declaration(id)
+            .cloned()
+    }
+
+    fn finalized_sdp_declarations(
+        &self,
+        service_type: ServiceType,
+    ) -> Option<HashMap<DeclarationId, Self::Declaration>> {
+        let state_id = select_sdp_query_state_id(SdpQuerySnapshot::Lib, self.tip(), self.lib());
+        let declarations = self
+            .ledger
+            .state(&state_id)?
+            .mantle_ledger()
+            .sdp
+            .get_declarations_by_service(service_type)?;
+        Some(
+            declarations
+                .iter()
+                .map(|(id, declaration)| (*id, declaration.clone()))
+                .collect(),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EpochStateQuerySource {
@@ -332,22 +419,27 @@ where
                 });
             }
             Query::GetSdpDeclarations { reply_channel } => {
-                let tip = self.cryptarchia.tip();
-                let declarations = self
-                    .cryptarchia
-                    .ledger
-                    .state(&tip)
-                    .map(|ledger_state| ledger_state.mantle_ledger().sdp.declarations())
-                    .unwrap_or_default()
-                    .iter()
-                    .flat_map(|(_, declarations)| {
-                        declarations
-                            .iter()
-                            .map(|(id, declaration)| (*id, declaration.clone()))
-                    })
-                    .collect();
+                let declarations = self.cryptarchia.live_sdp_declarations();
                 reply_channel.send(declarations).unwrap_or_else(|_| {
                     error!(target: LOG_TARGET, "Could not send SDP declarations through channel");
+                });
+            }
+            Query::GetFinalizedSdpDeclaration {
+                declaration_id,
+                reply_channel,
+            } => {
+                let declaration = self.cryptarchia.finalized_sdp_declaration(&declaration_id);
+                reply_channel.send(declaration).unwrap_or_else(|_| {
+                    error!(target: LOG_TARGET, "Could not send finalized SDP declaration through channel");
+                });
+            }
+            Query::GetFinalizedSdpDeclarations {
+                service_type,
+                reply_channel,
+            } => {
+                let declarations = self.cryptarchia.finalized_sdp_declarations(service_type);
+                reply_channel.send(declarations).unwrap_or_else(|_| {
+                    error!(target: LOG_TARGET, "Could not send finalized SDP declarations through channel");
                 });
             }
             Query::GetSdpSnapshot { reply_channel } => {
@@ -1243,6 +1335,95 @@ fn log_lib_advanced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC declaration queries must read LIB state while the internal registry
+    /// query remains tip-based. This exercises the same state-ID selector used
+    /// by `SdpQuerySource for Cryptarchia`, with A at LIB and B at tip; absent
+    /// values preserve the API's error semantics while an empty registry stays
+    /// a successful empty result.
+    #[test]
+    fn finalized_sdp_queries_are_distinct_from_tip_registry_queries() {
+        #[derive(Default)]
+        struct Snapshot {
+            by_id: HashMap<DeclarationId, &'static str>,
+            by_service: HashMap<ServiceType, HashMap<DeclarationId, &'static str>>,
+        }
+
+        let id = DeclarationId([9; 32]);
+        let tip_id = HeaderId::from([2; 32]);
+        let lib_id = HeaderId::from([1; 32]);
+        let snapshots = HashMap::from([
+            (
+                tip_id,
+                Snapshot {
+                    by_id: HashMap::from([(id, "tip declaration B")]),
+                    by_service: HashMap::from([(
+                        ServiceType::BlendNetwork,
+                        HashMap::from([(id, "tip declaration B")]),
+                    )]),
+                },
+            ),
+            (
+                lib_id,
+                Snapshot {
+                    by_id: HashMap::from([(id, "finalized declaration A")]),
+                    by_service: HashMap::from([(
+                        ServiceType::BlendNetwork,
+                        HashMap::from([(id, "finalized declaration A")]),
+                    )]),
+                },
+            ),
+        ]);
+
+        let live_state_id = select_sdp_query_state_id(SdpQuerySnapshot::Tip, tip_id, lib_id);
+        let finalized_state_id = select_sdp_query_state_id(SdpQuerySnapshot::Lib, tip_id, lib_id);
+        let live = snapshots.get(&live_state_id).expect("tip state exists");
+        let finalized = snapshots
+            .get(&finalized_state_id)
+            .expect("LIB state exists");
+
+        assert_eq!(
+            finalized.by_id.get(&id),
+            Some(&"finalized declaration A"),
+            "GetDeclarationInfo must return LIB state A, not tip state B"
+        );
+        assert_eq!(
+            live.by_id.get(&id),
+            Some(&"tip declaration B"),
+            "the existing internal tip query continues to expose B"
+        );
+        assert_eq!(
+            finalized.by_service.get(&ServiceType::BlendNetwork),
+            Some(&HashMap::from([(id, "finalized declaration A")]))
+        );
+        assert_eq!(
+            finalized.by_id.get(&DeclarationId([8; 32])),
+            None,
+            "a missing declaration is an absence/error, not an empty result"
+        );
+        let finalized_without_service = Snapshot::default();
+        assert_eq!(
+            finalized_without_service
+                .by_service
+                .get(&ServiceType::BlendNetwork),
+            None,
+            "a missing service registry is an absence/error"
+        );
+        let finalized_with_empty_service = Snapshot {
+            by_service: HashMap::from([(
+                ServiceType::BlendNetwork,
+                HashMap::<DeclarationId, &'static str>::new(),
+            )]),
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            finalized_with_empty_service
+                .by_service
+                .get(&ServiceType::BlendNetwork),
+            Some(&HashMap::<DeclarationId, &'static str>::new()),
+            "an existing service with no declarations is distinct from absence"
+        );
+    }
 
     #[test]
     fn epoch_state_query_sources_are_bounded_and_retired_after_lib() {

@@ -16,7 +16,7 @@ use crate::{
             pow::{PowNullifier, PowReward, PowTarget},
         },
     },
-    sdp::{DeclarationId, MinStake, ServiceType, service_notes::ServiceNotes},
+    sdp::{DeclarationId, MinStake, Providers, ServiceType, service_notes::ServiceNotes},
 };
 
 pub trait OperationVerificationHelper {
@@ -30,6 +30,11 @@ pub trait OperationVerificationHelper {
         &self,
         service: ServiceType,
     ) -> Result<&Declarations, VerificationError>;
+
+    fn get_providers_by_service(
+        &self,
+        service: ServiceType,
+    ) -> Result<&Providers, VerificationError>;
 
     fn get_declarations_by_id(
         &self,
@@ -114,7 +119,7 @@ pub mod test_utils {
             },
             transactions::OperationVerificationHelper,
         },
-        sdp::{DeclarationId, MinStake, ServiceType, service_notes::ServiceNotes},
+        sdp::{DeclarationId, MinStake, Providers, ServiceType, service_notes::ServiceNotes},
     };
 
     pub struct TestOperationVerificationHelper {
@@ -123,6 +128,7 @@ pub mod test_utils {
         service_notes: ServiceNotes,
         utxos: Utxos,
         declarations: Declarations,
+        providers: Providers,
         min_stake: MinStake,
         epoch: Epoch,
         block_slot: Slot,
@@ -150,6 +156,7 @@ pub mod test_utils {
                 service_notes: ServiceNotes::new(),
                 utxos: Utxos::new(),
                 declarations: Declarations::new_sync(),
+                providers: Providers::new_sync(),
                 min_stake: MinStake {
                     threshold: 0,
                     timestamp: 0,
@@ -256,6 +263,13 @@ pub mod test_utils {
             _service: ServiceType,
         ) -> Result<&Declarations, VerificationError> {
             Ok(&self.declarations)
+        }
+
+        fn get_providers_by_service(
+            &self,
+            _service: ServiceType,
+        ) -> Result<&Providers, VerificationError> {
+            Ok(&self.providers)
         }
 
         fn get_declarations_by_id(

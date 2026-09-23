@@ -274,12 +274,17 @@ impl SignedOp<Preverified, StandardMode> {
                         Ok(declarations) => declarations,
                         Err(error) => return Err(map_verify_failure((op, error))),
                     };
+                let providers = match helper.get_providers_by_service(op.operation().service_type) {
+                    Ok(providers) => providers,
+                    Err(error) => return Err(map_verify_failure((op, error))),
+                };
                 let context = SDPDeclareVerificationContext {
                     utxo_tree: helper.get_utxos(),
                     channels: helper.get_channels(),
                     service_notes: helper.get_service_notes(),
                     tx_hash_view,
                     declarations,
+                    providers,
                     min_stake: helper.get_min_stake(),
                 };
                 op.into_verified(&context)

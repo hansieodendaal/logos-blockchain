@@ -20,7 +20,7 @@ use crate::{
             states::{Preverified, Unverified, Verified},
         },
     },
-    sdp::{Declaration, MinStake, service_notes::ServiceNotes},
+    sdp::{Declaration, MinStake, Providers, service_notes::ServiceNotes},
 };
 
 trait SDPDeclareValidationExt {
@@ -29,6 +29,7 @@ trait SDPDeclareValidationExt {
         note: Note,
         channels: &Channels,
         declarations: &Declarations,
+        providers: &Providers,
         service_notes: &ServiceNotes,
         min_stake: &MinStake,
     ) -> Result<(), SdpError>;
@@ -45,6 +46,7 @@ impl SDPDeclareValidationExt for SDPDeclareOp {
         note: Note,
         channels: &Channels,
         declarations: &Declarations,
+        providers: &Providers,
         service_notes: &ServiceNotes,
         min_stake: &MinStake,
     ) -> Result<(), SdpError> {
@@ -52,7 +54,7 @@ impl SDPDeclareValidationExt for SDPDeclareOp {
         if declarations.contains_key(&self.id()) {
             return Err(SdpError::DuplicateDeclaration(self.id()));
         }
-        validate_service_scoped_uniqueness(self, declarations)?;
+        validate_service_scoped_uniqueness(self, providers)?;
 
         // A channel note cannot be used as collateral for a service declaration.
         if channels.is_channel_note(&self.service_note_id) {
@@ -85,6 +87,7 @@ impl SDPDeclareValidationExt for SDPDeclareOp {
         let declaration_id = self.id();
         let declaration = Declaration::new(context.epoch, self);
         context.declarations = context.declarations.insert(declaration_id, declaration);
+        context.providers = context.providers.insert(self.provider_id, declaration_id);
         let utxo = context
             .utxo_tree
             .utxos()
@@ -97,6 +100,7 @@ impl SDPDeclareValidationExt for SDPDeclareOp {
             .lock(
                 &context.min_stake,
                 self.service_type,
+                declaration_id,
                 utxo.note,
                 &self.service_note_id,
             )
@@ -106,29 +110,19 @@ impl SDPDeclareValidationExt for SDPDeclareOp {
     }
 }
 
-/// `provider_id` and `zk_id` must each be unique within the same service.
+/// The declaration-ID lookup enforces `zk_id` uniqueness; this index enforces
+/// `provider_id` uniqueness without scanning the service's declarations.
 fn validate_service_scoped_uniqueness(
     op: &SDPDeclareOp,
-    declarations: &Declarations,
+    providers: &Providers,
 ) -> Result<(), SdpError> {
-    declarations
-        .values()
-        .filter(|d| d.service_type == op.service_type)
-        .try_for_each(|existing| {
-            if existing.provider_id == op.provider_id {
-                Err(SdpError::DuplicateProviderId {
-                    service_type: op.service_type,
-                    provider_id: Box::new(op.provider_id),
-                })
-            } else if existing.zk_id == op.zk_id {
-                Err(SdpError::DuplicateZkId {
-                    service_type: op.service_type,
-                    zk_id: op.zk_id,
-                })
-            } else {
-                Ok(())
-            }
-        })
+    if providers.contains_key(&op.provider_id) {
+        return Err(SdpError::DuplicateProviderId {
+            service_type: op.service_type,
+            provider_id: Box::new(op.provider_id),
+        });
+    }
+    Ok(())
 }
 
 pub struct SDPDeclarePreverificationContext<'a> {
@@ -141,6 +135,7 @@ pub struct SDPDeclareVerificationContext<'a> {
     pub service_notes: &'a ServiceNotes,
     pub tx_hash_view: &'a TxHashView,
     pub declarations: &'a Declarations,
+    pub providers: &'a Providers,
     pub min_stake: &'a MinStake,
 }
 
@@ -149,6 +144,7 @@ pub struct SDPDeclareGenesisValidationContext<'a> {
     pub channels: &'a Channels,
     pub service_notes: &'a ServiceNotes,
     pub declarations: &'a Declarations,
+    pub providers: &'a Providers,
     pub min_stake: &'a MinStake,
 }
 
@@ -156,6 +152,7 @@ pub struct SDPDeclareExecutionContext {
     pub utxo_tree: Utxos,
     pub epoch: Epoch,
     pub declarations: Declarations,
+    pub providers: Providers,
     pub service_notes: ServiceNotes,
     pub min_stake: MinStake,
 }
@@ -215,6 +212,7 @@ impl VerifiableOperation<StandardMode>
             note,
             context.channels,
             context.declarations,
+            context.providers,
             context.service_notes,
             context.min_stake,
         )?;
@@ -260,6 +258,7 @@ impl VerifiableOperation<GenesisMode> for SignedOperation<SDPDeclareOp, Preverif
             note,
             context.channels,
             context.declarations,
+            context.providers,
             context.service_notes,
             context.min_stake,
         )?;
@@ -301,7 +300,7 @@ mod tests {
             ledger::Declarations,
             ops::{channel::ChannelId, op_proof::samples::SampleProof as _},
         },
-        sdp::{Declaration, ServiceType},
+        sdp::{Declaration, Providers, ServiceType},
     };
 
     fn locked_utxo(zk_key: &ZkKey) -> Utxo {
@@ -332,30 +331,21 @@ mod tests {
         let declare_a = declare_op(1, 1, "/ip4/1.1.1.1/udp/0");
         let declare_b = declare_op(1, 2, "/ip4/2.2.2.2/udp/0");
 
-        let declarations = Declarations::new_sync()
-            .insert(declare_a.id(), Declaration::new(Epoch::new(0), &declare_a));
+        let providers = Providers::new_sync().insert(declare_a.provider_id, declare_a.id());
 
         assert!(matches!(
-            validate_service_scoped_uniqueness(&declare_b, &declarations),
+            validate_service_scoped_uniqueness(&declare_b, &providers),
             Err(SdpError::DuplicateProviderId { .. })
         ));
     }
 
-    /// Two declarations in the same service sharing the same `zk_id`
-    /// (different `provider_id` and locators) must be rejected by the SDP
-    /// per-service uniqueness check.
+    /// The declaration ID itself is the per-service `zk_id` uniqueness key.
     #[test]
-    fn rejects_duplicate_zk_id_within_service() {
+    fn same_service_and_zk_id_produce_the_same_declaration_id() {
         let declare_a = declare_op(1, 1, "/ip4/1.1.1.1/udp/0");
         let declare_b = declare_op(2, 1, "/ip4/2.2.2.2/udp/0");
 
-        let declarations = Declarations::new_sync()
-            .insert(declare_a.id(), Declaration::new(Epoch::new(0), &declare_a));
-
-        assert!(matches!(
-            validate_service_scoped_uniqueness(&declare_b, &declarations),
-            Err(SdpError::DuplicateZkId { .. })
-        ));
+        assert_eq!(declare_a.id(), declare_b.id());
     }
 
     mod standard_mode {
@@ -427,6 +417,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
@@ -466,6 +457,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &declarations,
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
@@ -506,6 +498,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
@@ -542,6 +535,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: utxo.note.value + 1,
                             timestamp: 0,
@@ -581,6 +575,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: utxo.note.value,
                             timestamp: 0,
@@ -612,7 +607,13 @@ mod tests {
                 timestamp: 0,
             };
             let locked_notes = ServiceNotes::new()
-                .lock(&min_stake, ServiceType::BlendNetwork, utxo.note, &utxo.id())
+                .lock(
+                    &min_stake,
+                    ServiceType::BlendNetwork,
+                    operation.id(),
+                    utxo.note,
+                    &utxo.id(),
+                )
                 .expect("the note covers the minimum stake");
 
             let signed_operation = preverified(operation, zk_sig, &tx_hash_view);
@@ -625,6 +626,7 @@ mod tests {
                         service_notes: &locked_notes,
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &min_stake,
                     })
                     .unwrap_err(),
@@ -661,6 +663,7 @@ mod tests {
                     service_notes: &ServiceNotes::new(),
                     tx_hash_view: &tx_hash_view,
                     declarations: &Declarations::new_sync(),
+                    providers: &Providers::new_sync(),
                     min_stake: &MinStake {
                         threshold: 0,
                         timestamp: 0,
@@ -710,6 +713,7 @@ mod tests {
                         service_notes: &ServiceNotes::new(),
                         tx_hash_view: &tx_hash_view,
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
@@ -750,6 +754,7 @@ mod tests {
                     utxo_tree: utxos,
                     epoch,
                     declarations: Declarations::new_sync(),
+                    providers: Providers::new_sync(),
                     service_notes: ServiceNotes::new(),
                     min_stake: MinStake {
                         threshold: 0,
@@ -780,6 +785,7 @@ mod tests {
                 utxo_tree: Utxos::new(),
                 epoch: Epoch::new(4),
                 declarations: Declarations::new_sync(),
+                providers: Providers::new_sync(),
                 service_notes: ServiceNotes::new(),
                 min_stake: MinStake {
                     threshold: 0,
@@ -805,6 +811,7 @@ mod tests {
                         utxo_tree: utxos,
                         epoch: Epoch::new(4),
                         declarations: Declarations::new_sync(),
+                        providers: Providers::new_sync(),
                         service_notes: ServiceNotes::new(),
                         min_stake: MinStake {
                             threshold: utxo.note.value + 1,
@@ -867,6 +874,7 @@ mod tests {
                         channels: &Channels::new(),
                         service_notes: &ServiceNotes::new(),
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
@@ -926,6 +934,7 @@ mod tests {
                         channels: &Channels::new(),
                         service_notes: &ServiceNotes::new(),
                         declarations: &Declarations::new_sync(),
+                        providers: &Providers::new_sync(),
                         min_stake: &MinStake {
                             threshold: 0,
                             timestamp: 0,
