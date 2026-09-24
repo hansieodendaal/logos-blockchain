@@ -47,6 +47,8 @@ pub(super) struct BlockEventResult {
     /// inscription+withdraw bundle).
     pub(super) finalized_items: Vec<FinalizedTx>,
     pub(super) channel_update: Option<ChannelUpdateInfo>,
+    /// The view above LIB minus `adopted`, in lineage order.
+    pub(super) common_prefix: Vec<ChannelUpdateTx>,
     /// Inscriptions that appeared in this block. Surfaced so a consumer learns
     /// its tx reached the chain (`OnChain` status) even when the tx didn't move
     /// the canonical channel chain.
@@ -302,10 +304,10 @@ fn apply_prepared_block_event(
 
     mirror_branch_from_store(s, tip, channel_id);
 
-    // Detect channel changes.
-    // On first event (old_tip is None), check for existing inscriptions on
-    // the channel — this handles clean start on an existing channel.
-    // On subsequent events, diff the channel view on every block.
+    // Detect channel changes by diffing the channel view on every block. On
+    // the first event there is no old tip: what restored pending chains on
+    // was the view before the restart, and the rest of the channel is new
+    // (a clean start on an existing channel).
     let finalized_now: HashSet<MsgId> = finalized_batch
         .items
         .iter()
@@ -316,8 +318,8 @@ fn apply_prepared_block_event(
         })
         .collect();
 
-    let channel_update =
-        s.detect_channel_update(&old_lineage.unwrap_or_default(), tip, &finalized_now);
+    let old_lineage = old_lineage.unwrap_or_else(|| s.lineage_under(tip, &tracked_before));
+    let channel_update = s.detect_channel_update(&old_lineage, tip, &finalized_now);
 
     // On a pure extension (nothing orphaned — including the first event,
     // whose `orphaned` is empty by construction), report only entries the
@@ -333,9 +335,21 @@ fn apply_prepared_block_event(
         update
     });
 
+    // LIB to the fork point, then the pending tail still chaining on it: what
+    // the view had before this event. A pending entry survives a branch
+    // change only by chaining on the fork point, since anything adopted
+    // above it takes its slot and sheds it.
+    let old_txs: HashSet<TxHash> = old_lineage.iter().map(|info| info.tx_hash).collect();
+    let common_prefix = s
+        .channel_view_txs(tip, &finalized_now)
+        .into_iter()
+        .filter(|tx| old_txs.contains(&tx.tx_hash()))
+        .collect();
+
     BlockEventResult {
         finalized_items: finalized_batch.items,
         channel_update,
+        common_prefix,
         mined_inscriptions,
         adopted_deposits,
     }
@@ -2601,6 +2615,154 @@ mod tests {
         assert_eq!(adopted, vec![rival_hash]);
     }
 
+    /// After a checkpoint restore the first event's view carries the restored
+    /// pending publish, which `adopted` never echoes.
+    #[tokio::test]
+    async fn first_event_after_restore_keeps_restored_pending_in_the_prefix() {
+        let ch = ChannelId::from([0u8; 32]);
+        let (p_id, p_tx) = ins(ch, MsgId::root(), b"p");
+        let p_hash = p_tx.hash();
+        let mut state = TxState::new(header_id(0), MsgId::root());
+        state
+            .submit_inscription(
+                p_tx,
+                MsgId::root(),
+                p_id,
+                Inscription::new_unchecked(b"p".to_vec()),
+            )
+            .unwrap();
+        let b1 = api_block(1, 0, 1, Vec::new());
+
+        let r = drive(&mut Some(state), ch, &[live_event(&b1)]).await;
+
+        let prefix: Vec<TxHash> = r[0]
+            .result
+            .common_prefix
+            .iter()
+            .map(ChannelUpdateTx::tx_hash)
+            .collect();
+        assert_eq!(prefix, vec![p_hash]);
+        assert!(
+            r[0].result
+                .channel_update
+                .as_ref()
+                .is_none_or(|u| u.adopted.is_empty())
+        );
+    }
+
+    /// `common_prefix ++ adopted` keeps each lineage in order; the message and
+    /// config lineages are not interleaved with each other.
+    #[tokio::test]
+    async fn view_split_keeps_each_lineage_in_order() {
+        // Pending config C in the view; B1 adopts M1 <- M2.
+        let ch = ChannelId::from([0u8; 32]);
+        let cfg =
+            unverified_tx_with_ops(vec![Op::ChannelConfig(channel_config(ch, MsgId::root()))]);
+        let cfg_hash = cfg.hash();
+        let mut state = TxState::new(header_id(0), MsgId::root());
+        state.submit_other(cfg, ch).unwrap();
+        let (m1_id, m1) = ins(ch, MsgId::root(), b"m1");
+        let (m2_id, m2) = ins(ch, m1_id, b"m2");
+        let b1 = api_block(1, 0, 1, vec![m1, m2]);
+
+        let r = drive(&mut Some(state), ch, &[live_event(&b1)]).await;
+
+        let prefix: Vec<TxHash> = r[0]
+            .result
+            .common_prefix
+            .iter()
+            .map(ChannelUpdateTx::tx_hash)
+            .collect();
+        assert_eq!(prefix, vec![cfg_hash]);
+        let u = r[0].result.channel_update.as_ref().expect("M1, M2 adopted");
+        assert_eq!(msg_ids(&u.adopted), vec![m1_id, m2_id]);
+    }
+
+    /// After a restore, a pending P whose unfinalized parent M is rediscovered
+    /// on the first event: P proves M was the view before the restart, so
+    /// nothing is adopted, shed or orphaned; the view is M <- P, and P lands
+    /// next.
+    #[tokio::test]
+    async fn restored_pending_survives_its_parent_being_rediscovered() {
+        let ch = ChannelId::from([0u8; 32]);
+        let (m_id, m_tx) = ins(ch, MsgId::root(), b"m");
+        let (p_id, p_tx) = ins(ch, m_id, b"p");
+        let (m_hash, p_hash) = (m_tx.hash(), p_tx.hash());
+        let mut restored = TxState::new(header_id(0), MsgId::root());
+        restored
+            .submit_inscription(
+                p_tx.clone(),
+                m_id,
+                p_id,
+                Inscription::new_unchecked(b"p".to_vec()),
+            )
+            .unwrap();
+        let b1 = api_block(1, 0, 1, vec![m_tx]);
+        let b2 = api_block(2, 1, 2, vec![p_tx]);
+
+        let r = drive(&mut Some(restored), ch, &[live_event(&b1), live_event(&b2)]).await;
+
+        assert!(r[0].shed.is_empty(), "P chains on M, so it stays pending");
+        assert!(
+            r[0].result.channel_update.is_none(),
+            "M was the view P chained on: nothing changed"
+        );
+        assert_eq!(
+            hashes(&r[0].result.common_prefix),
+            vec![m_hash, p_hash],
+            "the view in lineage order"
+        );
+
+        // P lands on its parent: an own publish is not echoed as adopted, so
+        // no update; the view is now M <- P, both mined.
+        assert!(r[1].shed.is_empty());
+        assert!(
+            r[1].result.channel_update.is_none(),
+            "nothing new to report"
+        );
+        assert_eq!(hashes(&r[1].result.common_prefix), vec![m_hash, p_hash]);
+    }
+
+    /// After a restore, a pending P whose parent M is never mined is shed the
+    /// moment a rival takes M's slot: a conflict, P is orphaned and not in
+    /// the prefix.
+    #[tokio::test]
+    async fn restored_pending_is_orphaned_when_a_rival_takes_its_parents_slot() {
+        let ch = ChannelId::from([0u8; 32]);
+        let (m_id, _m_tx) = ins(ch, MsgId::root(), b"m");
+        let (p_id, p_tx) = ins(ch, m_id, b"p");
+        let (_rival_id, rival_tx) = ins(ch, MsgId::root(), b"rival");
+        let (p_hash, rival_hash) = (p_tx.hash(), rival_tx.hash());
+        let mut restored = TxState::new(header_id(0), MsgId::root());
+        restored
+            .submit_inscription(p_tx, m_id, p_id, Inscription::new_unchecked(b"p".to_vec()))
+            .unwrap();
+        let b1 = api_block(1, 0, 1, vec![rival_tx]);
+
+        let r = drive(&mut Some(restored), ch, &[live_event(&b1)]).await;
+
+        // The actor reports the shed as orphaned (`build_channel_update`).
+        let shed: Vec<ChannelUpdateTx> = r[0]
+            .shed
+            .clone()
+            .into_iter()
+            .map(orphan_from_shed)
+            .collect();
+        assert_eq!(hashes(&shed), vec![p_hash], "P no longer chains on the tip");
+        let u = r[0]
+            .result
+            .channel_update
+            .as_ref()
+            .expect("rival is adopted");
+        assert!(u.orphaned.is_empty(), "nothing mined was dropped");
+        assert_eq!(hashes(&u.adopted), vec![rival_hash]);
+        assert!(r[0].result.common_prefix.is_empty());
+    }
+
+    fn hashes(txs: &[ChannelUpdateTx]) -> Vec<TxHash> {
+        txs.iter().map(ChannelUpdateTx::tx_hash).collect()
+    }
+
     /// A shed bundle the consumer was told to revert can still land: its bytes
     /// stay in the L1 mempool. When it does, on a pure extension, it must be
     /// reported adopted — the shed removed it from pending, so the consumer
@@ -2736,6 +2898,11 @@ mod tests {
             r[8].result.channel_update.is_none(),
             "bare un-mine of B: i2 is pending again"
         );
+        // `common_prefix ++ adopted` is the view above LIB on every event.
+        assert!(r[0].result.common_prefix.is_empty());
+        assert_eq!(msg_ids(&r[1].result.common_prefix), vec![i1_id]);
+        assert_eq!(msg_ids(&r[3].result.common_prefix), vec![i1_id]);
+        assert_eq!(msg_ids(&r[8].result.common_prefix), vec![i1_id, i2_id]);
         // Each switch sheds only the loser; the winner, re-mirrored from the
         // store, reads as mined on its branch.
         let shed: Vec<TxHash> = r[3].shed.iter().map(PendingTx::tx_hash).collect();
