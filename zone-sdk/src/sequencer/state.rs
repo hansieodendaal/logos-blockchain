@@ -29,7 +29,7 @@ fn inscription_signer(
 }
 
 use super::{
-    block_fetch::{channel_inscriptions, channel_transfers},
+    block_fetch::{channel_configs, channel_inscriptions, channel_transfers, is_pure_config},
     channel_wallet::{ChannelWallet, NoteOp},
     types::{
         AtomicWithdrawInfo, ChannelNote, ChannelUpdateTx, ChannelWalletView, Error,
@@ -64,6 +64,11 @@ struct PendingOtherTx {
     signed_tx: SignedOps<Unverified, StandardMode>,
     /// The tx's channel inscriptions in op order.
     infos: Vec<InscriptionInfo>,
+    /// The tx's channel configs in op order, on the config lineage.
+    config_infos: Vec<InscriptionInfo>,
+    /// Classified as a single config with at most one funding transfer, the
+    /// shape reported as [`ChannelUpdateTx::Config`].
+    pure_config: bool,
     first_parent: Option<MsgId>,
     last_msg: Option<MsgId>,
     config_parent: Option<MsgId>,
@@ -72,10 +77,25 @@ struct PendingOtherTx {
     seq: u64,
 }
 
+/// Where an opaque tx sits in the two lineages, see [`PendingOtherTx`].
+#[derive(Clone, Copy)]
+struct OpaqueLineage {
+    /// Parent of the tx's first inscription: where it attaches to the
+    /// message lineage.
+    first_parent: Option<MsgId>,
+    /// Id of the tx's last inscription: the message tip it leaves behind.
+    last_msg: Option<MsgId>,
+    /// Parent of the tx's first config: where it attaches to the config
+    /// lineage.
+    config_parent: Option<MsgId>,
+    /// Id of the tx's last config: the config tip it leaves behind.
+    last_config: Option<MsgId>,
+}
+
 fn opaque_lineage(
     tx: &SignedOps<Unverified, StandardMode>,
     channel_id: ChannelId,
-) -> (Option<MsgId>, Option<MsgId>, Option<MsgId>, Option<MsgId>) {
+) -> OpaqueLineage {
     let mut first_parent = None;
     let mut last_msg = None;
     let mut config_parent = None;
@@ -97,7 +117,12 @@ fn opaque_lineage(
             _ => {}
         }
     }
-    (first_parent, last_msg, config_parent, last_config)
+    OpaqueLineage {
+        first_parent,
+        last_msg,
+        config_parent,
+        last_config,
+    }
 }
 
 /// A local submission chained on a channel position that already has a
@@ -179,8 +204,8 @@ pub struct TxState {
     /// that reports them orphaned.
     displaced: Vec<PendingTx>,
     displaced_other: Vec<SignedOps<Unverified, StandardMode>>,
-    /// Opaque pending txs (`channel_config`, raw `submit_signed_tx`):
-    /// retried byte-identically until finalized or shed.
+    /// Opaque pending txs, ours or mirrored: retried byte-identically until
+    /// finalized or shed.
     pending_other: HashMap<TxHash, PendingOtherTx>,
     /// Bounded insertion-ordered tx hashes accepted locally by this sequencer
     /// runtime or restored from its checkpoint.
@@ -247,13 +272,13 @@ pub enum BlockChannelTx {
     Config(InscriptionInfo),
     /// A shape the SDK cannot produce (bundled deposits, multi-inscribe,
     /// custom-built txs). Kept whole — updates hand the tx back to the
-    /// caller's own recovery logic — along with its tip-advancing entries
-    /// in op order. `config_entries` holds any `ChannelConfig` ops it carries,
-    /// which sit on the separate config lineage and never advance the message
-    /// tip.
+    /// caller's own recovery logic — along with its inscriptions in op order
+    /// (`message_entries`) and any `ChannelConfig` ops it carries
+    /// (`config_entries`), which sit on the separate config lineage and never
+    /// advance the message tip.
     Custom {
         tx: SignedOps<Unverified, StandardMode>,
-        entries: Vec<InscriptionInfo>,
+        message_entries: Vec<InscriptionInfo>,
         config_entries: Vec<InscriptionInfo>,
     },
 }
@@ -266,7 +291,9 @@ impl BlockChannelTx {
             Self::AtomicWithdraw(a) => std::slice::from_ref(&a.inscription),
             Self::PinDeposit(a) => std::slice::from_ref(&a.inscription),
             Self::Config(_) => &[],
-            Self::Custom { entries, .. } => entries,
+            Self::Custom {
+                message_entries, ..
+            } => message_entries,
         }
     }
 
@@ -566,16 +593,54 @@ impl TxState {
         channel_id: ChannelId,
     ) -> Result<Option<MsgId>, ParentTaken> {
         let tx_hash = signed_tx.hash();
-        let (first_parent, last_msg, config_parent, last_config) =
-            opaque_lineage(&signed_tx, channel_id);
-        let infos = channel_inscriptions(&signed_tx, channel_id);
-        if let Some(parent) = first_parent
+        let lineage = opaque_lineage(&signed_tx, channel_id);
+        if let Some(parent) = lineage.first_parent
             && let Some(by) = self.pending_child(parent)
             && by != tx_hash
         {
             return Err(ParentTaken { parent, by });
         }
         self.track_local_tx(tx_hash);
+        Ok(self.insert_other(signed_tx, channel_id, lineage))
+    }
+
+    /// Track an opaque tx observed on the canonical channel, the counterpart
+    /// of [`Self::observe_channel_inscription`]: no-op when already tracked,
+    /// displaces a pending continuation on its message parent.
+    pub fn observe_other_tx(
+        &mut self,
+        signed_tx: SignedOps<Unverified, StandardMode>,
+        channel_id: ChannelId,
+    ) {
+        let tx_hash = signed_tx.hash();
+        if self.is_tracked(&tx_hash) {
+            return;
+        }
+        let lineage = opaque_lineage(&signed_tx, channel_id);
+        if let Some(parent) = lineage.first_parent
+            && let Some(sibling) = self.pending_child(parent)
+        {
+            self.displace_chain(sibling);
+        }
+        self.insert_other(signed_tx, channel_id, lineage);
+    }
+
+    fn insert_other(
+        &mut self,
+        signed_tx: SignedOps<Unverified, StandardMode>,
+        channel_id: ChannelId,
+        lineage: OpaqueLineage,
+    ) -> Option<MsgId> {
+        let tx_hash = signed_tx.hash();
+        let OpaqueLineage {
+            first_parent,
+            last_msg,
+            config_parent,
+            last_config,
+        } = lineage;
+        let infos = channel_inscriptions(&signed_tx, channel_id);
+        let config_infos = channel_configs(&signed_tx, channel_id);
+        let pure_config = is_pure_config(&signed_tx, channel_id);
         if let Some(parent) = first_parent {
             self.pending_by_parent.insert(parent, tx_hash);
         }
@@ -586,6 +651,8 @@ impl TxState {
             PendingOtherTx {
                 signed_tx,
                 infos,
+                config_infos,
+                pure_config,
                 first_parent,
                 last_msg,
                 config_parent,
@@ -593,7 +660,7 @@ impl TxState {
                 seq,
             },
         );
-        Ok(last_msg)
+        last_msg
     }
 
     fn track_local_tx(&mut self, tx_hash: TxHash) {
@@ -1078,24 +1145,7 @@ impl TxState {
         // not the node's config tip, which can race ahead of the blocks we have
         // processed and falsely orphan a pending config that merely extends our
         // local tip (its block just hasn't arrived yet).
-        let mut landable: HashSet<MsgId> = HashSet::new();
-        landable.insert(self.config_tip_at(tip));
-        // A viable entry makes its own last config landable, so entries
-        // chained on it are kept too.
-        loop {
-            let mut changed = false;
-            for entry in self.pending_other.values() {
-                let viable = entry
-                    .config_parent
-                    .is_none_or(|parent| landable.contains(&parent));
-                if viable && let Some(last_config) = entry.last_config {
-                    changed |= landable.insert(last_config);
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        let landable = self.landable_configs(self.config_tip_at(tip));
         let safe = self.safe_at(tip);
 
         let mut shed: Vec<TxHash> = self
@@ -1318,10 +1368,11 @@ impl TxState {
 
     /// Detect a channel update between old and new L1 tips.
     ///
-    /// Diffs the two channel *lineages*. `old_lineage` must be captured by the
-    /// caller via [`Self::channel_lineage`] **before** this event's block is
-    /// inserted, so the "before" side isn't contaminated by the just-added
-    /// block; `new_lineage` is computed here, after the insert.
+    /// Diffs the two channel *lineages*, message and config entries alike.
+    /// `old_lineage` must be captured by the caller via
+    /// [`Self::channel_lineage`] **before** this event's block is inserted,
+    /// so the "before" side isn't contaminated by the just-added block;
+    /// `new_lineage` is computed here, after the insert.
     /// - `adopted`: txs that entered the channel branch (first mined).
     /// - `orphaned`: txs that left it (replaced by a conflict). A bare un-mine
     ///   is a no-op — the link stays in the lineage via its held block.
@@ -1384,27 +1435,28 @@ impl TxState {
         })
     }
 
-    /// Msg-ids of `lineage`'s prefix up to and including the finalized entry;
-    /// empty when the finalized boundary lies below the lineage's start.
-    /// The entry is matched as a `(this_msg, parent_msg)` pair, last
-    /// occurrence taken.
+    /// Msg-ids of `lineage`'s prefix up to and including the finalized
+    /// message or config entry, whichever comes later; empty when both lie
+    /// below the lineage's start. The message is matched as a
+    /// `(this_msg, parent_msg)` pair, last occurrence taken.
     ///
     /// An unknown parent (fresh state or checkpoint restore) matches
     /// nothing: every boundary move records the parent, so until one happens
     /// the boundary entry sits at-or-below the LIB and cannot appear in a
     /// lineage.
     fn finalized_prefix_ids(&self, lineage: &[InscriptionInfo]) -> HashSet<MsgId> {
-        lineage
+        let message = lineage.iter().rposition(|i| {
+            i.this_msg == self.finalized_msg
+                && self
+                    .finalized_parent_msg
+                    .is_some_and(|parent| i.parent_msg == parent)
+        });
+        let config = lineage
             .iter()
-            .rposition(|i| {
-                i.this_msg == self.finalized_msg
-                    && self
-                        .finalized_parent_msg
-                        .is_some_and(|parent| i.parent_msg == parent)
-            })
-            .map_or_else(HashSet::new, |pos| {
-                lineage[..=pos].iter().map(|i| i.this_msg).collect()
-            })
+            .rposition(|i| i.this_msg == self.finalized_config);
+        message.max(config).map_or_else(HashSet::new, |pos| {
+            lineage[..=pos].iter().map(|i| i.this_msg).collect()
+        })
     }
 
     /// One update entry per tx: a multi-op custom tx contributes several
@@ -1423,27 +1475,44 @@ impl TxState {
     /// `None` for entries with no payload to apply — their effects reach
     /// consumers through the channel view.
     fn to_update_tx(&self, info: &InscriptionInfo) -> Option<ChannelUpdateTx> {
-        if let Some(block_tx) = self
-            .block_txs
-            .values()
-            .flat_map(|block| &block.channel_txs)
-            .find(|tx| tx.tx_hash() == Some(info.tx_hash))
-        {
+        if let Some((block, block_tx)) = self.block_txs.values().find_map(|block| {
+            block
+                .channel_txs
+                .iter()
+                .find(|tx| tx.tx_hash() == Some(info.tx_hash))
+                .map(|tx| (block, tx))
+        }) {
             return match block_tx {
                 BlockChannelTx::AtomicWithdraw(a) => {
                     Some(ChannelUpdateTx::AtomicWithdraw(a.clone()))
                 }
                 BlockChannelTx::PinDeposit(a) => Some(ChannelUpdateTx::PinDeposit(a.clone())),
                 BlockChannelTx::Inscription(_) => Some(ChannelUpdateTx::Inscription(info.clone())),
-                // A pure config carries no message-lineage entry to report.
-                BlockChannelTx::Config(_) => None,
-                BlockChannelTx::Custom { tx, entries, .. } => entries
+                BlockChannelTx::Config(_) => block
+                    .signed_txs
+                    .iter()
+                    .find(|tx| tx.hash() == info.tx_hash)
+                    .map(|tx| ChannelUpdateTx::Config(tx.clone())),
+                BlockChannelTx::Custom {
+                    tx,
+                    message_entries,
+                    config_entries,
+                } => (message_entries
                     .iter()
                     .any(|entry| !entry.payload.is_empty())
-                    .then(|| ChannelUpdateTx::Custom(tx.clone())),
+                    || !config_entries.is_empty())
+                .then(|| ChannelUpdateTx::Custom(tx.clone())),
             };
         }
         // Not in any held block — the lineage bridged through a pending link.
+        if let Some(other) = self.pending_other.get(&info.tx_hash) {
+            let tx = other.signed_tx.clone();
+            return Some(if other.pure_config {
+                ChannelUpdateTx::Config(tx)
+            } else {
+                ChannelUpdateTx::Custom(tx)
+            });
+        }
         match self.pending.get(&info.tx_hash).map(|p| &p.bundle) {
             Some(PendingBundle::Withdraw { withdraws, outputs }) => {
                 Some(ChannelUpdateTx::AtomicWithdraw(AtomicWithdrawInfo {
@@ -1525,14 +1594,16 @@ impl TxState {
             .collect()
     }
 
-    /// The channel view at an L1 tip: mined inscriptions on its branch plus the
-    /// pending suffix chaining from the mined tip. Capture at the *old* tip
-    /// before storing a new block.
+    /// The channel view at an L1 tip: mined inscriptions and configs on its
+    /// branch plus the pending suffixes chaining from the mined tips of both
+    /// lineages. Capture at the *old* tip before storing a new block.
     #[must_use]
     pub(crate) fn channel_lineage(&self, tip: HeaderId) -> Vec<InscriptionInfo> {
         let mut lineage = self.infos_on_branch(tip);
         let mut ids: HashSet<MsgId> = lineage.iter().map(|i| i.this_msg).collect();
-        for info in self.collect_pending_suffix(self.channel_tip_at(tip)) {
+        let message_suffix = self.collect_pending_suffix(self.channel_tip_at(tip));
+        let config_suffix = self.collect_pending_config_suffix(self.config_tip_at(tip));
+        for info in message_suffix.into_iter().chain(config_suffix) {
             if ids.insert(info.this_msg) {
                 lineage.push(info);
             }
@@ -1566,7 +1637,48 @@ impl TxState {
         suffix
     }
 
-    /// All tip-advancing entries on a branch back to LIB, oldest first.
+    /// Config ids reachable from `config_tip` through pending opaque txs: a
+    /// viable entry makes its own last config landable, so entries chained
+    /// on it are viable too.
+    fn landable_configs(&self, config_tip: MsgId) -> HashSet<MsgId> {
+        let mut landable = HashSet::from([config_tip]);
+        loop {
+            let mut changed = false;
+            for entry in self.pending_other.values() {
+                let viable = entry
+                    .config_parent
+                    .is_some_and(|parent| landable.contains(&parent));
+                if viable && let Some(last_config) = entry.last_config {
+                    changed |= landable.insert(last_config);
+                }
+            }
+            if !changed {
+                return landable;
+            }
+        }
+    }
+
+    /// Pending config entries chaining from `config_tip`, in submission order.
+    fn collect_pending_config_suffix(&self, config_tip: MsgId) -> Vec<InscriptionInfo> {
+        let landable = self.landable_configs(config_tip);
+        let mut entries: Vec<&PendingOtherTx> = self
+            .pending_other
+            .values()
+            .filter(|entry| {
+                entry
+                    .config_parent
+                    .is_some_and(|parent| landable.contains(&parent))
+            })
+            .collect();
+        entries.sort_unstable_by_key(|entry| entry.seq);
+        entries
+            .into_iter()
+            .flat_map(|entry| entry.config_infos.iter().cloned())
+            .collect()
+    }
+
+    /// All tip-advancing entries on a branch back to LIB, oldest first:
+    /// message entries and config entries, in op order.
     fn infos_on_branch(&self, tip: HeaderId) -> Vec<InscriptionInfo> {
         let mut blocks = Vec::new();
         let mut current = tip;
@@ -1592,7 +1704,7 @@ impl TxState {
                         block
                             .channel_txs
                             .iter()
-                            .flat_map(BlockChannelTx::infos)
+                            .flat_map(|tx| tx.infos().iter().chain(tx.config_entries()))
                             .cloned()
                             .collect()
                     })
@@ -2206,6 +2318,99 @@ mod tests {
         assert_eq!(shed.len(), 1);
         assert_eq!(shed[0].hash(), stale_hash);
         assert!(!state.pending_other_contains(&stale_hash));
+    }
+
+    #[test]
+    fn finalized_prefix_masks_every_config_in_the_lib_block() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let b2 = header_id(2);
+        let mut state = TxState::new(genesis, MsgId::root());
+        let (c1_tx, c1) = config_tx(MsgId::root(), 1);
+        let (c2_tx, c2) = config_tx(c1, 2);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            vec![],
+            vec![
+                config_block_tx(&c1_tx, c1, MsgId::root()),
+                config_block_tx(&c2_tx, c2, c1),
+            ],
+            Vec::new(),
+        );
+        state.process_block(b2, b1, b1, vec![], vec![], Vec::new());
+        assert_eq!(state.finalized_config(), c2);
+        assert!(
+            state
+                .detect_channel_update(&[], b2, &HashSet::new())
+                .is_none(),
+            "finalized configs are not reported"
+        );
+    }
+
+    #[test]
+    fn finalized_configs_are_not_reported_orphaned_on_lib_advance() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let b2 = header_id(2);
+        let b3 = header_id(3);
+        let mut state = TxState::new(genesis, MsgId::root());
+        let (c1_tx, c1) = config_tx(MsgId::root(), 1);
+        let (c2_tx, c2) = config_tx(c1, 2);
+        state.process_block(
+            b1,
+            genesis,
+            genesis,
+            vec![],
+            vec![config_block_tx(&c1_tx, c1, MsgId::root())],
+            Vec::new(),
+        );
+        state.process_block(
+            b2,
+            b1,
+            genesis,
+            vec![],
+            vec![config_block_tx(&c2_tx, c2, c1)],
+            Vec::new(),
+        );
+        let old_lineage = state.channel_lineage(b2);
+        state.process_block(b3, b2, b2, vec![], vec![], Vec::new());
+        assert!(
+            state
+                .detect_channel_update(&old_lineage, b3, &HashSet::new())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn custom_tx_advancing_only_the_config_lineage_is_reported_as_custom() {
+        let genesis = header_id(0);
+        let b1 = header_id(1);
+        let mut state = TxState::new(genesis, MsgId::root());
+        let (tx, _) = config_tx(MsgId::root(), 1);
+        let config_entry = |parent: MsgId, this_msg: MsgId| InscriptionInfo {
+            tx_hash: tx.hash(),
+            parent_msg: parent,
+            this_msg,
+            payload: [].into(),
+            signer: None,
+        };
+        let custom = BlockChannelTx::Custom {
+            tx: tx.clone(),
+            message_entries: Vec::new(),
+            config_entries: vec![
+                config_entry(MsgId::root(), msg_id(1)),
+                config_entry(msg_id(1), msg_id(2)),
+            ],
+        };
+        state.process_block(b1, genesis, genesis, vec![], vec![custom], Vec::new());
+        let update = state
+            .detect_channel_update(&[], b1, &HashSet::new())
+            .expect("configs enter the view");
+        assert!(
+            matches!(update.adopted.as_slice(), [ChannelUpdateTx::Custom(t)] if t.hash() == tx.hash())
+        );
     }
 
     /// The finalized config tip must survive a warm restart. It lives only in
