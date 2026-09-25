@@ -155,6 +155,21 @@ impl BlendRelayRegistry {
             .map_err(|_| io::Error::other("Blend relay registry lock poisoned"))
     }
 
+    pub fn provider_reachability(&self) -> Result<Vec<(String, bool)>, io::Error> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("Blend relay registry lock poisoned"))?;
+        let mut providers = inner
+            .relays
+            .iter()
+            .map(|(node_name, entry)| (node_name.clone(), entry.enabled))
+            .collect::<Vec<_>>();
+        providers.sort_by(|left, right| left.0.cmp(&right.0));
+        drop(inner);
+        Ok(providers)
+    }
+
     pub fn remove_provider(&self, node_name: &str) -> Result<bool, io::Error> {
         let relay = {
             let mut inner = self
@@ -290,6 +305,20 @@ pub async fn set_blend_reachability(
         metadata.backend_addr,
         if reachable { "recovery" } else { "outage" },
     );
+    Ok(())
+}
+
+pub async fn restore_all_blend_reachability(world: &mut CucumberWorld) -> StepResult {
+    let unreachable_nodes = world
+        .blend_relays
+        .provider_reachability()?
+        .into_iter()
+        .filter_map(|(node_name, enabled)| (!enabled).then_some(node_name))
+        .collect::<Vec<_>>();
+
+    for node_name in unreachable_nodes {
+        set_blend_reachability(world, &node_name, true).await?;
+    }
     Ok(())
 }
 

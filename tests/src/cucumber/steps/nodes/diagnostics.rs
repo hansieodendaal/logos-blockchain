@@ -544,6 +544,7 @@ pub async fn observe_epoch_transitions(
 
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let initial_observation = loop {
+        world.ensure_background_tasks_healthy()?;
         if Instant::now() >= deadline {
             return Err(StepError::Timeout {
                 message: format!(
@@ -666,6 +667,7 @@ async fn wait_for_epoch_transitions(
     let geometry = DiagnosticGeometry::from_settings(settings);
     let mut completed_checkpoints = BTreeSet::new();
     loop {
+        world.ensure_background_tasks_healthy()?;
         if Instant::now() >= observation.deadline {
             return Err(StepError::Timeout {
                 message: format!(

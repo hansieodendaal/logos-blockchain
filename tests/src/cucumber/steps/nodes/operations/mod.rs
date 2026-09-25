@@ -103,7 +103,7 @@ mod resources;
 mod snapshots;
 mod synchronization;
 
-pub use blend_relay::{BlendRelayRegistry, set_blend_reachability};
+pub use blend_relay::{BlendRelayRegistry, restore_all_blend_reachability, set_blend_reachability};
 pub use consensus::{
     ensure_all_nodes_agree_on_lib, nodes_converged, poll_all_nodes_and_update_consensus_cache,
 };

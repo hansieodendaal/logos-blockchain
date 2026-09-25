@@ -2,8 +2,10 @@ use super::{
     CucumberWorld, Duration, ManualCommand, Step, StepError, StepResult, TARGET,
     execute_coin_splits_all_user_wallets, execute_continuous_next_wallet_user_wallet,
     execute_continuous_round_robin_user_wallets, info, parse_wallet_output_state,
-    perform_manual_step_control, timeout, verify_min_outputs_all_user_wallets, warn, when,
+    perform_manual_step_control, then, timeout, verify_min_outputs_all_user_wallets, warn, when,
 };
+
+const CONTINUOUS_NEXT_WALLET_LOAD_TASK: &str = "continuous next-wallet transaction load";
 
 #[when(expr = "I perform manual control of transactions for all wallets for {int} seconds")]
 async fn step_manual_control_transactions(
@@ -178,4 +180,80 @@ async fn step_perform_stress_continuous_cycles_next_user_wallet(
     })?;
 
     Ok(())
+}
+
+#[when(
+    expr = "I start continuous next-wallet transaction load with {int} transactions of {int} LGO and {int} epochs headroom"
+)]
+fn step_start_continuous_next_wallet_load(
+    world: &mut CucumberWorld,
+    step: &Step,
+    num_transactions: usize,
+    value: u64,
+    epochs_headroom: u32,
+) -> StepResult {
+    let load_nodes = ["NODE_9", "NODE_10", "NODE_11", "NODE_12"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut workload_world = world.background_workload_view(&load_nodes)?;
+    let wallet_nodes = workload_world
+        .all_user_wallets()
+        .into_iter()
+        .map(|wallet| wallet.node_name)
+        .collect::<std::collections::HashSet<_>>();
+    if let Some(node_name) = load_nodes
+        .iter()
+        .find(|node_name| !wallet_nodes.contains(*node_name))
+    {
+        return Err(StepError::InvalidArgument {
+            message: format!("load node `{node_name}` has no user wallet"),
+        });
+    }
+
+    let workload_step = step.value.clone();
+    let command = ManualCommand::ContinuousNextWalletUserWallets {
+        cycles: 1,
+        num_transactions,
+        value,
+        epochs_headroom,
+    };
+    info!(
+        target: TARGET,
+        "Starting background next-wallet transaction load across NODE_9..NODE_12: {num_transactions} transaction(s) per wallet per batch, {value} LGO each, {epochs_headroom} epochs headroom"
+    );
+
+    world.spawn_background_task(
+        CONTINUOUS_NEXT_WALLET_LOAD_TASK,
+        async move |cancellation| {
+            loop {
+                if *cancellation.borrow() {
+                    return Ok(());
+                }
+                execute_continuous_next_wallet_user_wallet(
+                    &mut workload_world,
+                    &workload_step,
+                    &command,
+                )
+                .await?;
+            }
+        },
+    )
+}
+
+#[then("the continuous transaction load is healthy")]
+#[when("the continuous transaction load is healthy")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step entrypoints must accept `&mut World`"
+)]
+fn step_continuous_transaction_load_is_healthy(world: &mut CucumberWorld) -> StepResult {
+    world.ensure_background_task_healthy(CONTINUOUS_NEXT_WALLET_LOAD_TASK)
+}
+
+#[when("I stop the continuous next-wallet transaction load")]
+async fn step_stop_continuous_next_wallet_load(world: &mut CucumberWorld) -> StepResult {
+    world
+        .stop_background_task(CONTINUOUS_NEXT_WALLET_LOAD_TASK)
+        .await
 }

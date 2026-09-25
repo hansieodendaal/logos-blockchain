@@ -4,13 +4,15 @@ use std::{
     fmt::Debug,
     hash::BuildHasher,
     num::NonZero,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicUsize},
     time::Duration,
 };
 
 use cucumber::World;
 use educe::Educe;
+use futures::FutureExt as _;
 use lb_binary_codec::bincode::DeserializeOp as _;
 use lb_core::{
     header::HeaderId,
@@ -42,7 +44,7 @@ use testing_framework_core::{
     scenario::{PeerSelection, Scenario, StartedNode},
     topology::DeploymentSeed,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::watch as tokio_watch, task::JoinHandle};
 use tracing::warn;
 
 use crate::{
@@ -63,7 +65,7 @@ use crate::{
         fee_reserve::{SCENARIO_FEE_ACCOUNT_NAME, ScenarioFeeState},
         logos_sql::LogosSqlState,
         steps::{
-            nodes::BlendRelayRegistry,
+            nodes::{BlendRelayRegistry, restore_all_blend_reachability},
             tokio_console::profile::TokioConsoleProfile,
             zone::runner::{
                 Event, IndexedSignature, InscriptionId, PreparedChannelConfig, SequencerCheckpoint,
@@ -1171,6 +1173,8 @@ pub struct WalletScanner {
     pub seeds: HashMap<String, ScannerSeed>,
     /// Manual: Transaction hashes observed in blocks by the wallet scanner.
     pub observed_transaction_hashes: SharedObservedTransactionHashes,
+    /// The scanner runtime is owned by another `CucumberWorld` view.
+    runtime_is_shared: bool,
 }
 
 impl WalletScanner {
@@ -1181,9 +1185,51 @@ impl WalletScanner {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BackgroundTaskStatus {
+    Running,
+    Failed(String),
+    Stopped,
+}
+
+struct BackgroundTaskHandle {
+    cancellation: tokio_watch::Sender<bool>,
+    join: JoinHandle<()>,
+    status: Arc<Mutex<BackgroundTaskStatus>>,
+}
+
+#[derive(Default)]
+struct BackgroundTasks {
+    tasks: HashMap<String, BackgroundTaskHandle>,
+}
+
+impl Debug for BackgroundTasks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut task_names = self.tasks.keys().collect::<Vec<_>>();
+        task_names.sort();
+        f.debug_struct("BackgroundTasks")
+            .field("task_names", &task_names)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BlendChurnProgress {
+    pub(crate) rows_applied: Arc<AtomicUsize>,
+    pub(crate) total_rows: usize,
+}
+
+impl BackgroundTasks {
+    fn abort_all(&mut self) {
+        for (_, task) in self.tasks.drain() {
+            task.join.abort();
+        }
+    }
+}
+
 /// Fork-group assignment of nodes: a forward map plus a reverse lookup kept in
 /// lockstep. Empty means "no groups defined" and all nodes participate.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ForkGroups {
     /// `group_name` -> set of `node_names`.
     node_groups: HashMap<String, BTreeSet<String>>,
@@ -1291,15 +1337,46 @@ pub struct CucumberWorld {
     /// the wallet's known keys at startup; the override is per-node because a
     /// target key a node's wallet does not track aborts that node's startup.
     pub auto_claim_overrides: HashMap<String, Vec<ConfigOverride>>,
+    /// Scenario-owned background diagnostics and transaction workloads.
+    background_tasks: BackgroundTasks,
+    /// Progress for the currently scheduled per-epoch Blend churn rows.
+    pub(crate) blend_churn_progress: Option<BlendChurnProgress>,
 }
 
 impl Drop for CucumberWorld {
     fn drop(&mut self) {
         self.logos_sql.clear();
         self.zone.clear();
+        self.background_tasks.abort_all();
         self.blend_relays.shutdown();
         self.scanner.shutdown();
         self.wallet_registry.shutdown();
+    }
+}
+
+async fn stop_background_task(name: &str, task: BackgroundTaskHandle) -> StepResult {
+    let _ = task.cancellation.send(true);
+    if let Err(error) = task.join.await {
+        let task_error = format!("background task `{name}` failed while joining: {error}");
+        if let Ok(mut status) = task.status.lock() {
+            *status = BackgroundTaskStatus::Failed(task_error.clone());
+        }
+        return Err(StepError::StepFail {
+            message: task_error,
+        });
+    }
+
+    let status = task.status.lock().map_err(|_| StepError::LogicalError {
+        message: format!("background task `{name}` status lock was poisoned"),
+    })?;
+    match &*status {
+        BackgroundTaskStatus::Stopped => Ok(()),
+        BackgroundTaskStatus::Failed(error) => Err(StepError::StepFail {
+            message: format!("background task `{name}` failed: {error}"),
+        }),
+        BackgroundTaskStatus::Running => Err(StepError::StepFail {
+            message: format!("background task `{name}` exited without recording its status"),
+        }),
     }
 }
 
@@ -1525,6 +1602,8 @@ impl Debug for CucumberWorld {
                 &self.blend_diagnostics.blend_unreachable_nodes,
             )
             .field("blend_relays", &self.blend_relays.is_enabled().ok())
+            .field("background_tasks", &self.background_tasks)
+            .field("blend_churn_progress", &self.blend_churn_progress)
             .field("sdp_funding_config", &self.cluster.sdp_funding_config)
             .field(
                 "deployment_config_override_path",
@@ -1682,6 +1761,7 @@ pub type ChainInfoMap = HashMap<u64, String>;
 pub type WalletInfoMap = HashMap<String, WalletInfo>;
 
 /// Information about a started node in the world
+#[derive(Clone)]
 pub struct NodeInfo {
     /// Node name
     pub name: String,
@@ -1721,6 +1801,203 @@ impl NodeInfo {
 }
 
 impl CucumberWorld {
+    /// Build an owned Cucumber world view for a detached transaction workload.
+    /// Node clients, wallet observations, and scanner observations remain
+    /// shared with the owning scenario world; only the selected user wallets
+    /// are visible to the workload.
+    pub(crate) fn background_workload_view(
+        &self,
+        user_wallet_node_names: &[String],
+    ) -> Result<Self, StepError> {
+        let selected_nodes = user_wallet_node_names
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if selected_nodes.is_empty() {
+            return Err(StepError::InvalidArgument {
+                message: "background transaction load requires at least one wallet node".to_owned(),
+            });
+        }
+        for node_name in &selected_nodes {
+            if !self.nodes_info.contains_key(node_name) {
+                return Err(StepError::LogicalError {
+                    message: format!(
+                        "background transaction load node `{node_name}` is not running"
+                    ),
+                });
+            }
+        }
+
+        let mut background = Self::default();
+        background.chain.slots_per_epoch = self.chain.slots_per_epoch;
+        background.nodes_info = self
+            .nodes_info
+            .iter()
+            .map(|(node_name, node_info)| (node_name.clone(), node_info.clone()))
+            .collect();
+        background.fork_groups = self.fork_groups.clone();
+        background.wallet_registry.wallet_info = self
+            .wallet_registry
+            .wallet_info
+            .iter()
+            .filter(|(_, wallet)| {
+                wallet.is_user_wallet() && selected_nodes.contains(&wallet.node_name)
+            })
+            .map(|(name, wallet)| (name.clone(), wallet.clone()))
+            .collect();
+        if background.wallet_registry.wallet_info.is_empty() {
+            return Err(StepError::InvalidArgument {
+                message: "background transaction load nodes have no user wallets".to_owned(),
+            });
+        }
+        background.wallet_registry.wallets = Arc::clone(&self.wallet_registry.wallets);
+        background.wallet_registry.fee_state = self.wallet_registry.fee_state.clone();
+        background.scanner.state = Arc::clone(&self.scanner.state);
+        background.scanner.observed_transaction_hashes =
+            Arc::clone(&self.scanner.observed_transaction_hashes);
+        background.scanner.runtime_is_shared = true;
+
+        Ok(background)
+    }
+
+    /// Spawn a scenario-owned task whose cancellation and result are tracked
+    /// until explicitly joined.
+    pub(crate) fn spawn_background_task<F, Fut>(&mut self, name: &str, task: F) -> StepResult
+    where
+        F: FnOnce(tokio_watch::Receiver<bool>) -> Fut + Send + 'static,
+        Fut: Future<Output = StepResult> + Send + 'static,
+    {
+        if self.background_tasks.tasks.contains_key(name) {
+            return Err(StepError::LogicalError {
+                message: format!("background task `{name}` is already registered"),
+            });
+        }
+
+        let (cancellation, receiver) = tokio_watch::channel(false);
+        let status = Arc::new(Mutex::new(BackgroundTaskStatus::Running));
+        let task_status = Arc::clone(&status);
+        let task_name = name.to_owned();
+        let join = tokio::spawn(async move {
+            let result = AssertUnwindSafe(task(receiver)).catch_unwind().await;
+            let outcome = match result {
+                Ok(Ok(())) => BackgroundTaskStatus::Stopped,
+                Ok(Err(error)) => BackgroundTaskStatus::Failed(error.to_string()),
+                Err(_) => BackgroundTaskStatus::Failed("task panicked".to_owned()),
+            };
+            if let Ok(mut status) = task_status.lock() {
+                *status = outcome;
+            } else {
+                warn!(target: TARGET, task = %task_name, "Background task status lock was poisoned");
+            }
+        });
+
+        self.background_tasks.tasks.insert(
+            name.to_owned(),
+            BackgroundTaskHandle {
+                cancellation,
+                join,
+                status,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn ensure_background_task_healthy(&self, name: &str) -> StepResult {
+        let task =
+            self.background_tasks
+                .tasks
+                .get(name)
+                .ok_or_else(|| StepError::LogicalError {
+                    message: format!("background task `{name}` is not running"),
+                })?;
+        let status = task.status.lock().map_err(|_| StepError::LogicalError {
+            message: format!("background task `{name}` status lock was poisoned"),
+        })?;
+        match &*status {
+            BackgroundTaskStatus::Running => Ok(()),
+            BackgroundTaskStatus::Failed(error) => Err(StepError::StepFail {
+                message: format!("background task `{name}` failed: {error}"),
+            }),
+            BackgroundTaskStatus::Stopped => Err(StepError::StepFail {
+                message: format!("background task `{name}` stopped unexpectedly"),
+            }),
+        }
+    }
+
+    pub(crate) fn ensure_background_tasks_healthy(&self) -> StepResult {
+        for (name, task) in &self.background_tasks.tasks {
+            let status = task.status.lock().map_err(|_| StepError::LogicalError {
+                message: format!("background task `{name}` status lock was poisoned"),
+            })?;
+            match &*status {
+                BackgroundTaskStatus::Running => {}
+                BackgroundTaskStatus::Failed(error) => {
+                    return Err(StepError::StepFail {
+                        message: format!("background task `{name}` failed: {error}"),
+                    });
+                }
+                BackgroundTaskStatus::Stopped => {
+                    return Err(StepError::StepFail {
+                        message: format!("background task `{name}` stopped unexpectedly"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn stop_background_task(&mut self, name: &str) -> StepResult {
+        let task =
+            self.background_tasks
+                .tasks
+                .remove(name)
+                .ok_or_else(|| StepError::LogicalError {
+                    message: format!("background task `{name}` is not registered"),
+                })?;
+        stop_background_task(name, task).await
+    }
+
+    pub(crate) async fn stop_all_background_tasks(&mut self) -> StepResult {
+        let mut tasks = self.background_tasks.tasks.drain().collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut errors = Vec::new();
+        for (name, task) in tasks {
+            if let Err(error) = stop_background_task(&name, task).await {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(StepError::StepFail {
+                message: errors.join("; "),
+            })
+        }
+    }
+
+    /// Join scenario-owned tasks, restore provider reachability, then close
+    /// controllable Blend relays. The Cucumber after-hook also calls this so
+    /// failed scenarios do not leave background work running into the next.
+    pub async fn stop_background_activity(&mut self) -> StepResult {
+        let mut errors = Vec::new();
+        if let Err(error) = self.stop_all_background_tasks().await {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = restore_all_blend_reachability(self).await {
+            errors.push(error.to_string());
+        }
+        self.blend_relays.shutdown();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(StepError::StepFail {
+                message: errors.join("; "),
+            })
+        }
+    }
+
     /// Return the stable deployment seed for this manual-cluster scenario,
     /// generating it on first use.
     pub fn manual_cluster_deployment_seed(&mut self) -> DeploymentSeed {
@@ -1840,7 +2117,7 @@ impl CucumberWorld {
     }
 
     pub async fn ensure_wallet_scanner_started(&mut self) -> StepResult {
-        if self.scanner.runtime.is_some() {
+        if self.scanner.runtime.is_some() || self.scanner.runtime_is_shared {
             tokio::task::yield_now().await;
             return Ok(());
         }
@@ -2963,6 +3240,38 @@ mod node_wallet_tests {
         assert!(!node_wallet(NodeWalletKeyRole::VoucherMaster).is_scanner_tracked_wallet());
         assert!(!node_wallet(NodeWalletKeyRole::BlendZk).is_scanner_tracked_wallet());
         assert!(!node_wallet(NodeWalletKeyRole::General).is_scanner_tracked_wallet());
+    }
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    use super::CucumberWorld;
+    use crate::cucumber::error::StepError;
+
+    #[tokio::test]
+    async fn reports_background_task_failure_to_health_check_and_join() {
+        let mut world = CucumberWorld::default();
+        world
+            .spawn_background_task("failing task", async move |_cancellation| {
+                Err(StepError::StepFail {
+                    message: "producer failed".to_owned(),
+                })
+            })
+            .expect("task should start");
+
+        tokio::task::yield_now().await;
+
+        let health = world.ensure_background_task_healthy("failing task");
+        assert!(matches!(
+            health,
+            Err(StepError::StepFail { message }) if message.contains("producer failed")
+        ));
+
+        let joined = world.stop_background_task("failing task").await;
+        assert!(matches!(
+            joined,
+            Err(StepError::StepFail { message }) if message.contains("producer failed")
+        ));
     }
 }
 

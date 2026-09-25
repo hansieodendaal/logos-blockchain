@@ -131,3 +131,124 @@ Feature: Blend diagnostics
       | parameter_set          |
       | fast_repro             |
       | testnet_representative |
+
+  @blend_debug @blend_stability
+  Scenario Outline: Blend stability with no application workload parameter_set=<parameter_set>
+
+    # Invariant:
+    # With the testnet-representative Blend configuration and no application
+    # transaction load, a stable Blend provider population must continue making
+    # canonical-chain progress across multiple Blend epochs without persistent
+    # divergence.
+
+    Given I have a cluster with capacity of 12 nodes
+    And the first 8 nodes are declared as blend providers
+    And the cluster uses Blend diagnostic parameter set "<parameter_set>"
+    And the cluster uses SDP funding of 10000000 per provider split across 5 notes
+    And Blend provider endpoints use controllable test relays
+
+    # Start all Blend providers before the non-provider EDGE population.
+    And I start node "NODE_2"
+    And I start peer node "NODE_1" connected to node "NODE_2"
+    And I start peer node "NODE_3" connected to node "NODE_2"
+    And I start peer node "NODE_4" connected to node "NODE_2"
+    And I start peer node "NODE_5" connected to node "NODE_2"
+    And I start peer node "NODE_6" connected to node "NODE_2"
+    And I start peer node "NODE_7" connected to node "NODE_2"
+    And I start peer node "NODE_8" connected to node "NODE_2"
+
+    And I start peer node "NODE_9" connected to node "NODE_2"
+    And I start peer node "NODE_10" connected to node "NODE_2"
+    And I start peer node "NODE_11" connected to node "NODE_9"
+    And I start peer node "NODE_12" connected to node "NODE_9"
+    And I log diagnostic identities
+
+    When I observe 12 epoch transitions on node "NODE_9"
+    Then all nodes have at least 20 blocks and converged to within 2 blocks in 600 seconds
+    And all nodes agree on LIB in 600 seconds
+    And I stop all nodes
+
+    Examples:
+      | parameter_set          |
+      | fast_repro             |
+      | testnet_representative |
+
+  @blend_debug @blend_stability
+  Scenario Outline: Blend stability with busy blockchain and unstable Blend providers parameter_set=<parameter_set>
+
+    # Invariant:
+    # Repeated loss and recovery of different subsets of otherwise-valid Blend
+    # providers across epoch boundaries must not prevent sustained transaction
+    # processing, canonical-chain progress, or eventual recovery/convergence of
+    # the non-provider EDGE population.
+    # Ordinary transaction load remains active during provider churn and the
+    # recovery/cool-down period.
+
+    Given the genesis block has the following wallet resources:
+      | account_index | token_count | token_amount |
+      | 9             | 2           | 110000000     |
+      | 10            | 2           | 110000000     |
+      | 11            | 2           | 110000000     |
+      | 12            | 2           | 110000000     |
+    And I have a cluster with capacity of 12 nodes
+    And the first 8 nodes are declared as blend providers
+    And the cluster uses Blend diagnostic parameter set "<parameter_set>"
+    And the cluster uses SDP funding of 10000000 per provider split across 5 notes
+    And Blend provider endpoints use controllable test relays
+
+    # Start the fault-injection population first.
+    And I start node "NODE_2"
+    And I start peer node "NODE_1" connected to node "NODE_2"
+    And I start peer node "NODE_3" connected to node "NODE_2"
+    And I start peer node "NODE_4" connected to node "NODE_2"
+    And I start peer node "NODE_5" connected to node "NODE_2"
+    And I start peer node "NODE_6" connected to node "NODE_2"
+    And I start peer node "NODE_7" connected to node "NODE_2"
+    And I start peer node "NODE_8" connected to node "NODE_2"
+
+    # Keep the non-provider EDGE/load nodes connected outside Blend.
+    And I start nodes with wallet resources:
+      | node_name | account_index | wallet_name    | connected_to |
+      | NODE_9    | 9             | LOAD_WALLET_09 | NODE_2       |
+      | NODE_10   | 10            | LOAD_WALLET_10 | NODE_2       |
+      | NODE_11   | 11            | LOAD_WALLET_11 | NODE_9        |
+      | NODE_12   | 12            | LOAD_WALLET_12 | NODE_9        |
+    And I log diagnostic identities
+
+    # Build 100 independent, high-value notes for each load wallet. Fees and
+    # tiny transfers leave ample change for repeated next-wallet batches.
+    When I perform 1 coin split transactions for each user wallet with 100 outputs of 1000000 LGO each
+    And I verify each wallet has minimum 100 outputs "available" in 300 seconds
+
+    And I start continuous next-wallet transaction load with 20 transactions of 1 LGO and 4 epochs headroom
+    When I observe 1 epoch transitions on node "NODE_9"
+    And the continuous transaction load is healthy
+
+    And I start epoch-driven Blend provider churn:
+      | unreachable          |
+      | NODE_1               |
+      | NODE_3,NODE_6        |
+      | NODE_2,NODE_5,NODE_8 |
+      | NODE_4,NODE_7        |
+      | NODE_1,NODE_3        |
+      | NODE_2,NODE_6        |
+      | NODE_4               |
+      | NODE_5,NODE_7        |
+
+    When I observe 8 epoch transitions on node "NODE_9"
+    And I stop Blend provider churn
+    And I restore all Blend provider reachability
+
+    # The transaction producer stays active through these recovery epochs.
+    And I observe 4 epoch transitions on node "NODE_9"
+    And the continuous transaction load is healthy
+    And I stop the continuous next-wallet transaction load
+
+    Then all nodes have at least 20 blocks and converged to within 5 blocks in 600 seconds
+    And all nodes agree on LIB in 600 seconds
+    And I stop all nodes
+
+    Examples:
+      | parameter_set          |
+      | fast_repro             |
+      | testnet_representative |
