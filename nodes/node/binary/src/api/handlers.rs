@@ -1468,6 +1468,24 @@ where
 
 #[utoipa::path(
     get,
+    path = paths::POW_STATUS,
+    responses(
+        (status = 200, description = "PoW mining and auto-claim state as the running node holds it"),
+        (status = 500, description = "Internal server error", body = ErrorBody),
+    )
+)]
+pub async fn pow_status<PoW, RuntimeServiceId>(
+    State(handle): State<OverwatchHandle<RuntimeServiceId>>,
+) -> Response
+where
+    PoW: PoWServiceData,
+    RuntimeServiceId: Debug + Send + Sync + Display + 'static + AsServiceId<PoW>,
+{
+    make_request_and_return_response!(pow::status::<PoW, RuntimeServiceId>(&handle))
+}
+
+#[utoipa::path(
+    get,
     path = paths::BLOCKS,
     params(BlockRangeQuery),
     responses(
@@ -2254,9 +2272,10 @@ mod tests {
         mantle::{
             channel::{ChannelState, SlotTimeframe, SlotTimeout},
             gas::GasCost,
-            ops::channel::{Ed25519PublicKey, MsgId, config::Keys},
+            ops::channel::{MsgId, UnverifiedChannelKeys},
         },
     };
+    use lb_key_management_system_service::keys::UnverifiedEd25519PublicKey;
 
     use super::{channel_response, validate_max_tx_fee};
     use crate::api::{
@@ -2293,9 +2312,10 @@ mod tests {
     }
 
     fn channel_state() -> ChannelState {
-        let accredited_keys: Keys =
-            [Ed25519PublicKey::from_bytes(&[0; 32]).expect("test public key should be valid")]
-                .into();
+        let accredited_keys: UnverifiedChannelKeys =
+            [UnverifiedEd25519PublicKey::from_bytes(&[0; 32])
+                .expect("test public key should be valid")]
+            .into();
 
         ChannelState {
             accredited_keys: Arc::new(accredited_keys),
