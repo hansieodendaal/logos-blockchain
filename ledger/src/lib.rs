@@ -2871,7 +2871,7 @@ mod tests {
             RewardPoWConfig {
                 reward_pool_genesis: 1_000_000_000,
                 epoch_reward_genesis: 1_000_000,
-                initial_difficulty: ModulusShift::new::<26>(),
+                minimum_difficulty: ModulusShift::new::<26>(),
                 ema_smoothing_factor: 9,
                 ema_smoothing_precision: NonZeroU64::new(10).expect("10 is non-zero"),
                 target_claims_per_block: 100,
@@ -2993,16 +2993,29 @@ mod tests {
         fn difficulty_is_seeded_at_genesis_and_the_controller_can_move_it() {
             // Genesis seeds a nonzero initial difficulty (zero would be an
             // absorbing state for the controller, with no ticket ever able
-            // to satisfy it), and the per-block retarget moves it: an empty
-            // block (no claims) eases the target upward.
+            // to satisfy it). It is also the minimum difficulty: an empty
+            // block (no claims) cannot ease the target past it. The per-block
+            // retarget still moves it the other way: excess claims harden it.
             let test_utxo = utxo();
-            let (mut test_ledger, genesis) = ledger(&[test_utxo], config());
+            let config = config();
+            let (mut test_ledger, genesis) = ledger(&[test_utxo], config.clone());
             let genesis_difficulty = difficulty_at(&test_ledger, genesis);
             assert_ne!(genesis_difficulty, Fr::ZERO);
 
             let block_1 = update_ledger(&mut test_ledger, genesis, 1, test_utxo)
                 .expect("empty block should apply");
-            assert!(difficulty_at(&test_ledger, block_1) > genesis_difficulty);
+            assert_eq!(difficulty_at(&test_ledger, block_1), genesis_difficulty);
+
+            let mut state = test_ledger
+                .state(&block_1)
+                .expect("block state should exist")
+                .clone();
+            state.update_pow_reward_difficulty(u64::MAX, &config);
+            let hardened = state.mantle_ledger.pow.reward_difficulty();
+            assert!(
+                BigUint::from_bytes_le(&lb_groth16::fr_to_bytes(&hardened))
+                    < BigUint::from_bytes_le(&lb_groth16::fr_to_bytes(&genesis_difficulty))
+            );
         }
 
         fn claim_tx() -> SignedOps<Preverified, StandardMode> {
