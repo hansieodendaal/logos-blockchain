@@ -1,23 +1,26 @@
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 use lb_libp2p::PeerId;
+use lb_services_utils::overwatch::recovery::RecoveryOperator;
 use overwatch::{
     OpaqueServiceResourcesHandle,
-    services::{
-        AsServiceId, ServiceCore, ServiceData,
-        state::{NoOperator, ServiceState},
-    },
+    services::{AsServiceId, ServiceCore, ServiceData},
 };
 use tokio::sync::broadcast;
 
 use crate::{
     BanningConfig,
     ban_store::{BanMutation, BanStore, Clock, SystemClock},
+    recovery::{BanningRecoveryBackend, BanningRecoveryState},
     types::{BanEvent, BanRecord, BanScope, BanningRequest, Violation},
 };
 
 const EVENT_BUFFER_SIZE: usize = 256;
+const RECOVERY_LOG_TARGET: &str = lb_log_targets::utils::RECOVERY;
 
 /// Mutable ban state retained by [`BanningService`].
 ///
@@ -30,9 +33,22 @@ pub struct BanningState<C = SystemClock> {
 }
 
 impl BanningState<SystemClock> {
-    pub(crate) fn from_config(config: &BanningConfig) -> Self {
-        Self::with_store(BanStore::from_config(config))
+    fn restore(config: &BanningConfig, recovery_state: BanningRecoveryState) -> Self {
+        let mut store = BanStore::from_config(config);
+        match recovery_state.runtime_records(config, SystemTime::now()) {
+            Ok(records) => store.restore_dynamic(records),
+            Err(error) => {
+                tracing::error!(target: RECOVERY_LOG_TARGET, %error, "invalid banning recovery state; starting with empty dynamic state");
+            }
+        }
+        Self::with_store(store)
     }
+}
+
+struct StateTransition<T> {
+    response: T,
+    events: Vec<BanEvent>,
+    recovery_changed: bool,
 }
 
 impl<C: Clock> BanningState<C> {
@@ -40,87 +56,91 @@ impl<C: Clock> BanningState<C> {
         Self { store }
     }
 
-    pub(crate) fn expire(&mut self) -> Vec<BanEvent> {
-        self.store
-            .expire()
-            .into_iter()
-            .map(|record| BanEvent::Unbanned {
-                record,
-                expired: true,
-            })
-            .collect()
+    fn expire(&mut self, events: &mut Vec<BanEvent>) -> bool {
+        let expired = self.store.expire();
+        let changed = !expired.is_empty();
+        events.extend(expired.into_iter().map(|record| BanEvent::Unbanned {
+            record,
+            expired: true,
+        }));
+        changed
     }
 
-    fn publish(sender: &broadcast::Sender<BanEvent>, events: impl IntoIterator<Item = BanEvent>) {
-        for event in events {
-            // A send error only means that there are no current subscribers;
-            // the authoritative state remains in the store.
-            let _unused = sender.send(event);
+    fn expire_transition(&mut self) -> StateTransition<()> {
+        let mut events = Vec::new();
+        let recovery_changed = self.expire(&mut events);
+        StateTransition {
+            response: (),
+            events,
+            recovery_changed,
         }
     }
 
-    pub(crate) fn report(
-        &mut self,
-        violation: Violation,
-        events: &broadcast::Sender<BanEvent>,
-    ) -> Option<BanRecord> {
-        Self::publish(events, self.expire());
+    fn report(&mut self, violation: Violation) -> StateTransition<Option<BanRecord>> {
+        let mut events = Vec::new();
+        let mut recovery_changed = self.expire(&mut events);
         let mutation = self.store.report(violation);
         if let Some(mutation) = &mutation
             && !matches!(mutation, BanMutation::Unchanged(_))
         {
-            Self::publish(events, [BanEvent::Banned(mutation.record().clone())]);
+            events.push(BanEvent::Banned(mutation.record().clone()));
+            recovery_changed = true;
         }
-        mutation.map(|mutation| mutation.record().clone())
+        StateTransition {
+            response: mutation.map(|mutation| mutation.record().clone()),
+            events,
+            recovery_changed,
+        }
     }
 
-    pub(crate) fn replace(
-        &mut self,
-        violation: Violation,
-        events: &broadcast::Sender<BanEvent>,
-    ) -> Option<BanRecord> {
-        Self::publish(events, self.expire());
+    fn replace(&mut self, violation: Violation) -> StateTransition<Option<BanRecord>> {
+        let mut events = Vec::new();
+        let mut recovery_changed = self.expire(&mut events);
         let mutation = self.store.replace(violation);
-        if let Some(mutation) = &mutation {
-            if matches!(mutation, BanMutation::Unchanged(_)) {
-                return Some(mutation.record().clone());
-            }
-            Self::publish(events, [BanEvent::Replaced(mutation.record().clone())]);
+        if let Some(mutation) = &mutation
+            && !matches!(mutation, BanMutation::Unchanged(_))
+        {
+            events.push(BanEvent::Replaced(mutation.record().clone()));
+            recovery_changed = true;
         }
-        mutation.map(|mutation| mutation.record().clone())
+        StateTransition {
+            response: mutation.map(|mutation| mutation.record().clone()),
+            events,
+            recovery_changed,
+        }
     }
 
-    pub(crate) fn active(&mut self, events: &broadcast::Sender<BanEvent>) -> Vec<BanRecord> {
-        Self::publish(events, self.expire());
-        self.store.active()
+    fn active(&mut self) -> StateTransition<Vec<BanRecord>> {
+        let mut events = Vec::new();
+        let recovery_changed = self.expire(&mut events);
+        StateTransition {
+            response: self.store.active(),
+            events,
+            recovery_changed,
+        }
     }
 
-    pub(crate) fn unban(
-        &mut self,
-        peer_id: PeerId,
-        scope: Option<&BanScope>,
-        events: &broadcast::Sender<BanEvent>,
-    ) -> bool {
-        Self::publish(events, self.expire());
+    fn unban(&mut self, peer_id: PeerId, scope: Option<&BanScope>) -> StateTransition<bool> {
+        let mut events = Vec::new();
+        let mut recovery_changed = self.expire(&mut events);
         let removed = self.store.unban(peer_id, scope);
         let was_unbanned = !removed.is_empty();
-        Self::publish(
+        if was_unbanned {
+            recovery_changed = true;
+        }
+        events.extend(removed.into_iter().map(|record| BanEvent::Unbanned {
+            record,
+            expired: false,
+        }));
+        StateTransition {
+            response: was_unbanned,
             events,
-            removed.into_iter().map(|record| BanEvent::Unbanned {
-                record,
-                expired: false,
-            }),
-        );
-        was_unbanned
+            recovery_changed,
+        }
     }
-}
 
-impl ServiceState for BanningState<SystemClock> {
-    type Settings = BanningConfig;
-    type Error = overwatch::DynError;
-
-    fn from_settings(settings: &Self::Settings) -> Result<Self, Self::Error> {
-        Ok(Self::from_config(settings))
+    fn recovery_state(&self) -> BanningRecoveryState {
+        BanningRecoveryState::from_store(&self.store)
     }
 }
 
@@ -133,24 +153,35 @@ pub struct BanningService<RuntimeServiceId> {
 
 impl<RuntimeServiceId> ServiceData for BanningService<RuntimeServiceId> {
     type Settings = BanningConfig;
-    type State = BanningState;
-    type StateOperator = NoOperator<Self::State>;
+    type State = BanningRecoveryState;
+    type StateOperator = RecoveryOperator<BanningRecoveryBackend<RuntimeServiceId>>;
     type Message = BanningRequest;
 }
 
 #[async_trait]
 impl<RuntimeServiceId> ServiceCore<RuntimeServiceId> for BanningService<RuntimeServiceId>
 where
-    RuntimeServiceId: AsServiceId<Self> + Clone + Display + Send + Sync + 'static + Debug,
+    RuntimeServiceId: AsServiceId<Self>
+        + AsServiceId<lb_storage_service::StorageService<RuntimeServiceId>>
+        + Clone
+        + Display
+        + Send
+        + Sync
+        + 'static
+        + Debug,
 {
     fn init(
         service_resources_handle: OpaqueServiceResourcesHandle<Self, RuntimeServiceId>,
         initial_state: Self::State,
     ) -> Result<Self, overwatch::DynError> {
+        let config = service_resources_handle
+            .settings_handle
+            .notifier()
+            .get_updated_settings();
         let events = broadcast::channel(EVENT_BUFFER_SIZE).0;
         Ok(Self {
             service_resources_handle,
-            state: initial_state,
+            state: BanningState::restore(&config, initial_state),
             events,
         })
     }
@@ -163,7 +194,8 @@ where
         loop {
             tokio::select! {
                 _ = expiry.tick() => {
-                    self.publish_expiry_events();
+                    let transition = self.state.expire_transition();
+                    self.commit(transition);
                 }
                 message = self.service_resources_handle.inbound_relay.recv() => {
                     let Some(message) = message else { break; };
@@ -183,27 +215,43 @@ impl<RuntimeServiceId> BanningService<RuntimeServiceId> {
         }
     }
 
-    fn publish_expiry_events(&mut self) {
-        Self::publish(&self.events, self.state.expire());
+    fn commit<T>(&self, transition: StateTransition<T>) -> T {
+        if transition.recovery_changed {
+            // Queue the full checkpoint before publishing the state transition
+            // or completing its request. Disk persistence remains asynchronous.
+            self.service_resources_handle
+                .state_updater
+                .update(Some(self.state.recovery_state()));
+        }
+        Self::publish(&self.events, transition.events);
+        transition.response
     }
 
     fn handle(&mut self, message: BanningRequest) {
         match message {
             BanningRequest::BanPeer { violation, reply } => {
-                let _unused = reply.send(self.state.report(violation, &self.events));
+                let transition = self.state.report(violation);
+                let response = self.commit(transition);
+                let _unused = reply.send(response);
             }
             BanningRequest::ReplaceBan { violation, reply } => {
-                let _unused = reply.send(self.state.replace(violation, &self.events));
+                let transition = self.state.replace(violation);
+                let response = self.commit(transition);
+                let _unused = reply.send(response);
             }
             BanningRequest::ListActive { reply } => {
-                let _unused = reply.send(self.state.active(&self.events));
+                let transition = self.state.active();
+                let response = self.commit(transition);
+                let _unused = reply.send(response);
             }
             BanningRequest::UnbanPeer {
                 peer_id,
                 scope,
                 reply,
             } => {
-                let _unused = reply.send(self.state.unban(peer_id, scope.as_ref(), &self.events));
+                let transition = self.state.unban(peer_id, scope.as_ref());
+                let response = self.commit(transition);
+                let _unused = reply.send(response);
             }
             BanningRequest::Subscribe { reply } => {
                 let _unused = reply.send(self.events.subscribe());
@@ -216,7 +264,7 @@ impl<RuntimeServiceId> BanningService<RuntimeServiceId> {
 mod tests {
     use std::{
         sync::{Arc, Mutex},
-        time::{Duration, SystemTime},
+        time::Duration,
     };
 
     use super::*;
@@ -237,6 +285,14 @@ mod tests {
         }
     }
 
+    fn publish_transition<T>(
+        sender: &broadcast::Sender<BanEvent>,
+        transition: StateTransition<T>,
+    ) -> T {
+        BanningService::<()>::publish(sender, transition.events);
+        transition.response
+    }
+
     #[test]
     fn events_retain_scope_for_report_and_expiry() {
         let config = BanningConfig::default();
@@ -248,17 +304,16 @@ mod tests {
         let scope = BanScope::Service(Subsystem::ChainSync);
         let source = BanSource::Service(Subsystem::Other("validator".to_owned()));
 
-        state.report(
-            Violation::new(
-                peer_id,
-                source.clone(),
-                scope.clone(),
-                OffenseKind::Other,
-                Duration::from_secs(5),
-                Some("bad chain response".to_owned()),
-            ),
-            &event_sender,
-        );
+        let transition = state.report(Violation::new(
+            peer_id,
+            source.clone(),
+            scope.clone(),
+            OffenseKind::Other,
+            Duration::from_secs(5),
+            Some("bad chain response".to_owned()),
+        ));
+        assert!(transition.recovery_changed);
+        let _unused = publish_transition(&event_sender, transition);
         let BanEvent::Banned(record) = events.try_recv().expect("ban event") else {
             panic!("expected ban event");
         };
@@ -267,7 +322,9 @@ mod tests {
         assert_eq!(record.context.as_deref(), Some("bad chain response"));
 
         *clock.0.lock().expect("clock lock") = record.expires_at.expect("expiry");
-        BanningState::<ManualClock>::publish(&event_sender, state.expire());
+        let expiry = state.expire_transition();
+        assert!(expiry.recovery_changed);
+        publish_transition(&event_sender, expiry);
         let BanEvent::Unbanned {
             record: expired_record,
             expired,
@@ -296,30 +353,26 @@ mod tests {
         let scope = BanScope::Service(Subsystem::ChainSync);
         let source = BanSource::Service(Subsystem::Other("operator".to_owned()));
 
-        state.report(
-            Violation::new(
-                peer_id,
-                source.clone(),
-                scope.clone(),
-                OffenseKind::InvalidSig,
-                Duration::from_secs(10),
-                Some("initial".to_owned()),
-            ),
-            &event_sender,
-        );
+        let initial = state.report(Violation::new(
+            peer_id,
+            source.clone(),
+            scope.clone(),
+            OffenseKind::InvalidSig,
+            Duration::from_secs(10),
+            Some("initial".to_owned()),
+        ));
+        let _unused = publish_transition(&event_sender, initial);
         let _unused = events.try_recv().expect("initial event");
 
-        state.replace(
-            Violation::new(
-                peer_id,
-                source.clone(),
-                scope.clone(),
-                OffenseKind::SpamMsg,
-                Duration::from_secs(5),
-                Some("replacement".to_owned()),
-            ),
-            &event_sender,
-        );
+        let replacement = state.replace(Violation::new(
+            peer_id,
+            source.clone(),
+            scope.clone(),
+            OffenseKind::SpamMsg,
+            Duration::from_secs(5),
+            Some("replacement".to_owned()),
+        ));
+        let _unused = publish_transition(&event_sender, replacement);
         let BanEvent::Replaced(replaced) = events.try_recv().expect("replacement event") else {
             panic!("expected replacement event");
         };
@@ -328,7 +381,9 @@ mod tests {
         assert_eq!(replaced.offense, OffenseKind::SpamMsg);
         assert_eq!(replaced.context.as_deref(), Some("replacement"));
 
-        assert!(state.unban(peer_id, Some(&scope), &event_sender));
+        let unban = state.unban(peer_id, Some(&scope));
+        assert!(unban.recovery_changed);
+        assert!(publish_transition(&event_sender, unban));
         let BanEvent::Unbanned {
             record: unbanned,
             expired,
@@ -356,21 +411,16 @@ mod tests {
         let missing_peer = PeerId::random();
         let chain_scope = BanScope::Service(Subsystem::ChainSync);
 
-        assert!(
-            state
-                .replace(
-                    Violation::new(
-                        missing_peer,
-                        BanSource::Service(Subsystem::ChainSync),
-                        chain_scope,
-                        OffenseKind::ProtocolViolation,
-                        Duration::from_secs(5),
-                        None,
-                    ),
-                    &event_sender,
-                )
-                .is_none()
-        );
+        let missing = state.replace(Violation::new(
+            missing_peer,
+            BanSource::Service(Subsystem::ChainSync),
+            chain_scope,
+            OffenseKind::ProtocolViolation,
+            Duration::from_secs(5),
+            None,
+        ));
+        assert!(!missing.recovery_changed);
+        assert!(publish_transition(&event_sender, missing).is_none());
         let records = state.store.active();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, blacklisted_peer);
@@ -379,25 +429,59 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
 
-        assert!(
-            state
-                .replace(
-                    Violation::new(
-                        blacklisted_peer,
-                        BanSource::Service(Subsystem::ChainSync),
-                        BanScope::Global,
-                        OffenseKind::ProtocolViolation,
-                        Duration::from_secs(5),
-                        None,
-                    ),
-                    &event_sender,
-                )
-                .is_none()
-        );
+        let blacklisted = state.replace(Violation::new(
+            blacklisted_peer,
+            BanSource::Service(Subsystem::ChainSync),
+            BanScope::Global,
+            OffenseKind::ProtocolViolation,
+            Duration::from_secs(5),
+            None,
+        ));
+        assert!(!blacklisted.recovery_changed);
+        assert!(publish_transition(&event_sender, blacklisted).is_none());
         assert_eq!(state.store.active().len(), 1);
         assert!(matches!(
             events.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn recovered_state_is_installed_with_current_configuration_before_service_run() {
+        let configured_peer = PeerId::random();
+        let dynamic_peer = PeerId::random();
+        let config = BanningConfig {
+            blacklist: vec![configured_peer],
+            ..BanningConfig::default()
+        };
+        let now = SystemTime::now();
+        let mut checkpoint_store = BanStore::from_config(&config);
+        checkpoint_store.restore_dynamic([BanRecord {
+            peer_id: dynamic_peer,
+            source: BanSource::Service(Subsystem::ChainSync),
+            scope: BanScope::Service(Subsystem::ChainSync),
+            offense: OffenseKind::ProtocolViolation,
+            context: Some("recovered".to_owned()),
+            reported_at: now,
+            expires_at: Some(now + Duration::from_secs(60)),
+        }]);
+
+        let state =
+            BanningState::restore(&config, BanningRecoveryState::from_store(&checkpoint_store));
+        let active = state.store.active();
+
+        assert!(
+            active
+                .iter()
+                .any(|record| record.peer_id == configured_peer)
+        );
+        assert!(active.iter().any(|record| record.peer_id == dynamic_peer));
+        assert_eq!(
+            active
+                .iter()
+                .find(|record| record.peer_id == dynamic_peer)
+                .and_then(|record| record.expires_at),
+            Some(now + Duration::from_secs(60))
+        );
     }
 }

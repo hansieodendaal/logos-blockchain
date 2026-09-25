@@ -181,6 +181,22 @@ impl<C: Clock> BanStore<C> {
         self.records.values().cloned().collect()
     }
 
+    /// Restore already-validated dynamic leases. Configured policy remains
+    /// synthesized from the current configuration and cannot be replaced by
+    /// recovered records.
+    pub(crate) fn restore_dynamic(&mut self, records: impl IntoIterator<Item = BanRecord>) {
+        for record in records {
+            if matches!(record.source, crate::BanSource::Service(_))
+                && record.expires_at.is_some()
+                && !self.config.whitelist.contains(&record.peer_id)
+                && !self.configured_policy.contains(&record.peer_id)
+            {
+                self.records
+                    .insert((record.peer_id, record.scope.clone()), record);
+            }
+        }
+    }
+
     #[expect(
         clippy::needless_collect,
         reason = "Keys must be snapshotted before mutating the map."

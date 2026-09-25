@@ -1,6 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use lb_libp2p::PeerId;
+use lb_services_utils::overwatch::{RecoveryData, StorageRecoverySettings};
 use lb_utils::bounded_duration::{MinimalBoundedDuration, SECOND};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -69,6 +70,9 @@ pub struct BanningConfig {
     pub blacklist: Vec<PeerId>,
     #[serde_as(as = "MinimalBoundedDuration<1, SECOND>")]
     pub expiry_check_interval: Duration,
+    /// Runtime recovery cache used by the `BanningService` state operator.
+    #[serde(skip)]
+    pub recovery_data: RecoveryData,
 }
 
 impl BanningConfig {
@@ -78,12 +82,21 @@ impl BanningConfig {
     }
 }
 
+impl StorageRecoverySettings for BanningConfig {
+    const RECOVERY_KEY_SUFFIX: &'static [u8] = b"banning";
+
+    fn recovery_data(&self) -> &RecoveryData {
+        &self.recovery_data
+    }
+}
+
 impl Default for BanningConfig {
     fn default() -> Self {
         Self {
             whitelist: Vec::new(),
             blacklist: Vec::new(),
             expiry_check_interval: Duration::from_secs(5),
+            recovery_data: RecoveryData::default(),
         }
     }
 }

@@ -189,6 +189,8 @@ pub fn run_node_from_config(
     .into_rocks_backend_settings(&config.user.state);
 
     let recovery_data = load_recovery_data(storage_config.clone())?;
+    let mut banning_config = config.user.banning;
+    banning_config.recovery_data = recovery_data.clone();
 
     let (blend_config, blend_core_config, blend_edge_config) = BlendConfig {
         user: config.user.blend,
@@ -206,7 +208,7 @@ pub fn run_node_from_config(
     }
     .into_time_service_settings(&config.deployment.cryptarchia);
 
-    let configured_ban_policy = config.user.banning.configured_ban_policy();
+    let configured_ban_policy = banning_config.configured_ban_policy();
     let (chain_service_config, chain_network_config, chain_leader_config) = CryptarchiaConfig {
         user: config.user.cryptarchia,
         deployment: config.deployment.cryptarchia,
@@ -265,7 +267,7 @@ pub fn run_node_from_config(
 
     let app = OverwatchRunner::<LogosBlockchain>::run(
         LogosBlockchainServiceSettings {
-            banning: config.user.banning,
+            banning: banning_config,
             network: network_service_config,
             blend: blend_config.clone(),
             blend_core: blend_core_config,

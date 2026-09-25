@@ -3989,8 +3989,11 @@ name = "logos-blockchain-banning-service"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "logos-blockchain-binary-codec",
  "logos-blockchain-libp2p",
  "logos-blockchain-log-targets",
+ "logos-blockchain-services-utils",
+ "logos-blockchain-storage-service",
  "logos-blockchain-utils",
  "overwatch",
  "serde",

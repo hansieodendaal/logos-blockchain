@@ -13,16 +13,19 @@ version     = { workspace = true }
 workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
-lb-libp2p   = { workspace = true }
-lb-log-targets = { workspace = true }
-lb-utils    = { features = ["time", "tokio"], workspace = true }
-overwatch   = { workspace = true }
-serde       = { features = ["derive"], workspace = true }
-serde_with  = { workspace = true }
-thiserror   = { workspace = true }
-tokio       = { features = ["macros", "sync", "time"], workspace = true }
-tracing     = { workspace = true }
+async-trait        = { workspace = true }
+lb-binary-codec    = { workspace = true }
+lb-libp2p          = { workspace = true }
+lb-log-targets     = { workspace = true }
+lb-services-utils  = { workspace = true }
+lb-storage-service = { workspace = true }
+lb-utils           = { features = ["time", "tokio"], workspace = true }
+overwatch          = { workspace = true }
+serde              = { features = ["derive"], workspace = true }
+serde_with         = { workspace = true }
+thiserror          = { workspace = true }
+tokio              = { features = ["macros", "sync", "time"], workspace = true }
+tracing            = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }
