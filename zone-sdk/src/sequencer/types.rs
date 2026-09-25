@@ -413,9 +413,9 @@ pub enum Event {
     BlocksProcessed {
         checkpoint: SequencerCheckpoint,
         channel_update: ChannelUpdate,
-        /// Channel deposits observed in this block, in op order. Surfaced
-        /// non-finalized so a consumer can pin a deposit without waiting for
-        /// finalization, via
+        /// Channel deposits observed in the blocks this event covers, in
+        /// block and op order. Surfaced non-finalized so a consumer can pin a
+        /// deposit without waiting for finalization, via
         /// [`publish_pin_deposit`](super::SequencerHandle::publish_pin_deposit).
         ///
         /// Observations, not view: reconcile against branch state, a branch

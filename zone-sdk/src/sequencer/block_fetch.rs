@@ -22,7 +22,7 @@ use lb_core::{
         },
     },
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use super::{
     TARGET,
@@ -53,7 +53,8 @@ pub(super) struct BlockEventResult {
     /// its tx reached the chain (`OnChain` status) even when the tx didn't move
     /// the canonical channel chain.
     pub(super) mined_inscriptions: Vec<InscriptionInfo>,
-    /// Channel deposits observed in this block, in op order. Surfaced
+    /// Channel deposits observed in the blocks this event covers (canonical
+    /// backfill first, then the live block), in block and op order. Surfaced
     /// non-finalized on `Event::BlocksProcessed` so a consumer can pin a
     /// deposit without waiting for finalization.
     pub(super) deposits: Vec<DepositInfo>,
@@ -134,12 +135,12 @@ where
         finalized.iter().map(|block| block.block_id).collect();
     let parent_id = event.block.header.parent_block;
     let parent_known = block_is_known(state, &finalized_block_ids, state_lib, parent_id);
-    let canonical_backfill = if parent_known {
-        Vec::new()
+    let (canonical_backfill, mut deposits) = if parent_known {
+        (Vec::new(), Vec::new())
     } else {
         let blocks =
-            walk_back_to_known(state, &finalized_block_ids, state_lib, parent_id, node).await;
-        prepare_backfill_note_ops(blocks, channel_id, node).await
+            walk_back_to_known(state, &finalized_block_ids, state_lib, parent_id, node).await?;
+        prepare_backfill_blocks(blocks, channel_id, node).await?
     };
 
     let our_txs: Vec<TxHash> = event
@@ -174,12 +175,12 @@ where
         &deposit_events,
         event.block.header.slot,
     );
-    let deposits = block_channel_deposits(
+    deposits.extend(block_channel_deposits(
         &event.block.transactions,
         channel_id,
         event.block.header.slot,
         &deposit_events,
-    );
+    ));
 
     Ok(PreparedBlockEvent {
         block: &event.block,
@@ -907,13 +908,17 @@ fn block_is_known(
         || state.is_some_and(|state| state.has_block(&block))
 }
 
+/// The unknown ancestors of `from` back to a known block, oldest first. A
+/// block that cannot be fetched fails the event: applying the live block over
+/// a hole would cut every branch walk short of LIB, and the hole would never
+/// be revisited since the next event's parent is then known.
 async fn walk_back_to_known<Node>(
     state: Option<&TxState>,
     additionally_known: &HashSet<HeaderId>,
     lib: HeaderId,
     from: HeaderId,
     node: &Node,
-) -> Vec<ApiBlock>
+) -> Result<Vec<ApiBlock>, Error>
 where
     Node: adapter::Node + Sync,
 {
@@ -923,82 +928,68 @@ where
     let mut current = from;
 
     while !block_is_known(state, additionally_known, lib, current) {
-        let Some(block) = fetch_backfill_block(node, current).await else {
-            break;
-        };
-
+        let block = fetch_backfill_block(node, current).await?;
         current = block.header.parent_block;
         blocks.push(block);
     }
 
     blocks.reverse();
     debug!(target: TARGET, blocks = blocks.len(), "Canonical backfill prepared");
-    blocks
+    Ok(blocks)
 }
 
-/// [`fetch_block_deposit_events`] with the canonical-backfill error contract:
-/// `None` (after a warn) tells the caller to stop applying blocks.
-async fn backfill_deposit_events<Node>(
-    node: &Node,
-    block: &ApiBlock,
-    channel_id: ChannelId,
-) -> Option<DepositEvents>
-where
-    Node: adapter::Node + Sync,
-{
-    match fetch_block_deposit_events(node, block.header.id, &block.transactions, channel_id).await {
-        Ok(events) => Some(events),
-        Err(e) => {
-            warn!(
-                target: TARGET,
-                "Failed to fetch deposit events during canonical backfill: {e}"
-            );
-            None
-        }
-    }
-}
-
-/// Prepare each canonical-backfill block with its channel-note ops. Each needs
+/// Prepare each canonical-backfill block with its channel-note ops, and
+/// collect the deposits those blocks carry, in block order. Each block needs
 /// a deposit-events fetch, so this runs in the prepare phase, keeping apply
-/// await-free. Best-effort: on a fetch failure, stop and keep the prefix
-/// already prepared — the rest is retried on the next event.
-async fn prepare_backfill_note_ops<Node>(
+/// await-free; a failed fetch fails the event, like the live block's.
+async fn prepare_backfill_blocks<Node>(
     blocks: Vec<ApiBlock>,
     channel_id: ChannelId,
     node: &Node,
-) -> Vec<(ApiBlock, Vec<NoteOp>)>
+) -> Result<(Vec<(ApiBlock, Vec<NoteOp>)>, Vec<DepositInfo>), Error>
 where
     Node: adapter::Node + Sync,
 {
     let mut prepared = Vec::with_capacity(blocks.len());
+    let mut deposits = Vec::new();
     for block in blocks {
-        let Some(deposit_events) = backfill_deposit_events(node, &block, channel_id).await else {
-            break;
-        };
+        let deposit_events =
+            fetch_block_deposit_events(node, block.header.id, &block.transactions, channel_id)
+                .await?;
         let note_ops = note_ops_from_txs(
             &block.transactions,
             channel_id,
             &deposit_events,
             block.header.slot,
         );
+        deposits.extend(block_channel_deposits(
+            &block.transactions,
+            channel_id,
+            block.header.slot,
+            &deposit_events,
+        ));
         prepared.push((block, note_ops));
     }
-    prepared
+    Ok((prepared, deposits))
 }
 
-async fn fetch_backfill_block<Node>(node: &Node, block_id: HeaderId) -> Option<ApiBlock>
+async fn fetch_backfill_block<Node>(node: &Node, block_id: HeaderId) -> Result<ApiBlock, Error>
 where
     Node: adapter::Node + Sync,
 {
     match node.block(block_id).await {
-        Ok(Some(block)) => Some(block),
+        Ok(Some(block)) => Ok(block),
         Ok(None) => {
-            warn!(target: TARGET, ?block_id, "Block not found during canonical backfill");
-            None
+            error!(target: TARGET, ?block_id, "Block not found during canonical backfill");
+            Err(Error::Network(format!(
+                "block {block_id} not found during canonical backfill"
+            )))
         }
         Err(error) => {
-            warn!(target: TARGET, ?block_id, %error, "Failed to fetch block during canonical backfill");
-            None
+            error!(target: TARGET, ?block_id, %error, "Failed to fetch block during canonical backfill");
+            Err(Error::Network(format!(
+                "failed to fetch block {block_id} during canonical backfill: {error}"
+            )))
         }
     }
 }
@@ -2059,6 +2050,197 @@ mod tests {
             }
             other => panic!("expected Config, got {other:?}"),
         }
+    }
+
+    /// A deposit mined in a block the stream skipped is observed when the
+    /// canonical backfill fetches that block, ahead of the live block's own.
+    #[tokio::test]
+    async fn canonical_backfill_gap_deposits_are_observed() {
+        // G(0) <- B1 (live) <- B2 (deposit D2, missed) <- B3 (deposit D3, live)
+        let ch = ChannelId::from([0u8; 32]);
+        let pk = lb_key_management_system_service::keys::ZkPublicKey::from(Fr::from(7u64));
+        let deposit = |n: u32| {
+            let tag = u8::try_from(n).unwrap();
+            let op = deposit_op(ch, n, Metadata::try_from(vec![tag]).unwrap());
+            let tx = unverified_tx_with_ops(vec![Op::ChannelDeposit(op.clone())]);
+            let note = DepositNote {
+                note_id: NoteId::from(Fr::from(1000 + u64::from(n))),
+                value: 50,
+                pk,
+            };
+            let event = deposit_event(&tx, &op, 50, vec![note]);
+            (op.op_id(), tx, event)
+        };
+        let (d2, d2_tx, d2_event) = deposit(2);
+        let (d3, d3_tx, d3_event) = deposit(3);
+        let b1 = api_block(1, 0, 1, Vec::new());
+        let b2 = api_block(2, 1, 2, vec![d2_tx]);
+        let b3 = api_block(3, 2, 3, vec![d3_tx]);
+        let node = MockNode {
+            blocks: vec![b2],
+            events: HashMap::from([(header_id(2), d2_event), (header_id(3), d3_event)]),
+            ..MockNode::default()
+        };
+
+        let mut state = None;
+        let r = drive_with(&node, &mut state, ch, &[live_event(&b1), live_event(&b3)]).await;
+
+        let observed: Vec<_> = r[1].result.deposits.iter().map(|d| d.op_id).collect();
+        assert_eq!(observed, vec![d2, d3]);
+    }
+
+    /// A deposit-events fetch failing on a later gap block, after an earlier
+    /// gap block was prepared, fails the event with nothing applied: no
+    /// partial deposits, no partial blocks, tip unchanged. The retry reports
+    /// every gap block's deposits and the live block's, in order.
+    #[tokio::test]
+    async fn deposit_events_failure_on_a_later_gap_block_applies_nothing() {
+        // G(0) <- B1 (live) <- B2 (D2, missed) <- B3 (D3, missed) <- B4 (D4, live)
+        let ch = ChannelId::from([0u8; 32]);
+        let pk = lb_key_management_system_service::keys::ZkPublicKey::from(Fr::from(7u64));
+        let deposit = |n: u32| {
+            let tag = u8::try_from(n).unwrap();
+            let op = deposit_op(ch, n, Metadata::try_from(vec![tag]).unwrap());
+            let tx = unverified_tx_with_ops(vec![Op::ChannelDeposit(op.clone())]);
+            let note = DepositNote {
+                note_id: NoteId::from(Fr::from(1000 + u64::from(n))),
+                value: 50,
+                pk,
+            };
+            let event = deposit_event(&tx, &op, 50, vec![note]);
+            (op.op_id(), tx, event)
+        };
+        let (d2, d2_tx, d2_event) = deposit(2);
+        let (d3, d3_tx, d3_event) = deposit(3);
+        let (d4, d4_tx, d4_event) = deposit(4);
+        let b1 = api_block(1, 0, 1, Vec::new());
+        let b2 = api_block(2, 1, 2, vec![d2_tx]);
+        let b3 = api_block(3, 2, 3, vec![d3_tx]);
+        let b4 = api_block(4, 3, 4, vec![d4_tx]);
+        let without_b3_events = MockNode {
+            blocks: vec![b2.clone(), b3.clone()],
+            events: HashMap::from([
+                (header_id(2), d2_event.clone()),
+                (header_id(4), d4_event.clone()),
+            ]),
+            ..MockNode::default()
+        };
+        let with_b3_events = MockNode {
+            blocks: vec![b2, b3],
+            events: HashMap::from([
+                (header_id(2), d2_event),
+                (header_id(3), d3_event),
+                (header_id(4), d4_event),
+            ]),
+            ..MockNode::default()
+        };
+        let mut state = None;
+        let mut current_tip = None;
+        let mut lib_slot = Slot::genesis();
+
+        handle_block_event(
+            &live_event(&b1),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &without_b3_events,
+        )
+        .await
+        .expect("B1 processes");
+        let failed = handle_block_event(
+            &live_event(&b4),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &without_b3_events,
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(Error::Network(_))),
+            "B3's deposit events cannot be served"
+        );
+        assert_eq!(current_tip, Some(header_id(1)), "tip unchanged");
+        assert!(
+            !state.as_ref().unwrap().has_block(&header_id(2)),
+            "the gap block prepared before the failure is not applied either"
+        );
+        let retried = handle_block_event(
+            &live_event(&b4),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &with_b3_events,
+        )
+        .await
+        .expect("B4 processes once B3's events are served");
+
+        let observed: Vec<_> = retried.deposits.iter().map(|d| d.op_id).collect();
+        assert_eq!(observed, vec![d2, d3, d4]);
+    }
+
+    /// A gap block the node cannot serve fails the event and leaves state
+    /// untouched, so the re-delivered event backfills the gap once the block
+    /// is available. Applying the live block over the hole instead would cut
+    /// every branch walk short of LIB and never revisit the gap.
+    #[tokio::test]
+    async fn unfetchable_gap_block_fails_the_event_until_it_is_served() {
+        // G(0) <- B1 (live) <- B2 (Y, missed) <- B3 (live)
+        let ch = ChannelId::from([0u8; 32]);
+        let (a_id, a_tx) = ins(ch, MsgId::root(), b"a");
+        let (y_id, y_tx) = ins(ch, a_id, b"y");
+        let b1 = api_block(1, 0, 1, vec![a_tx]);
+        let b2 = api_block(2, 1, 2, vec![y_tx]);
+        let b3 = api_block(3, 2, 3, Vec::new());
+        let mut state = None;
+        let mut current_tip = None;
+        let mut lib_slot = Slot::genesis();
+        let without_b2 = MockNode::default();
+        let with_b2 = MockNode {
+            blocks: vec![b2],
+            ..MockNode::default()
+        };
+
+        handle_block_event(
+            &live_event(&b1),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &without_b2,
+        )
+        .await
+        .expect("B1 processes");
+        let failed = handle_block_event(
+            &live_event(&b3),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &without_b2,
+        )
+        .await;
+        assert!(
+            matches!(failed, Err(Error::Network(_))),
+            "B2 cannot be served"
+        );
+        assert_eq!(current_tip, Some(header_id(1)), "state untouched");
+        let retried = handle_block_event(
+            &live_event(&b3),
+            &mut state,
+            &mut current_tip,
+            &mut lib_slot,
+            ch,
+            &with_b2,
+        )
+        .await
+        .expect("B3 processes once B2 is served");
+
+        assert_eq!(current_tip, Some(header_id(3)));
+        let u = retried.channel_update.expect("Y adopted from the gap");
+        assert_eq!(msg_ids(&u.adopted), vec![y_id]);
     }
 
     #[tokio::test]
