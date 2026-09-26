@@ -37,11 +37,11 @@ use crate::{
                 stop_active_manual_cluster,
             },
             nodes::{
-                NodesToStartUnordered,
+                BlendReachabilityTransition, NodesToStartUnordered, apply_blend_reachability_set,
                 config_override::{set_deployment_config_override, set_user_config_override},
                 create_snapshot_all_nodes_with_wallet_state,
                 create_snapshot_node_with_wallet_state, create_snapshots_all_nodes,
-                diagnostics::set_blend_diagnostic_parameter_set,
+                diagnostics::{BlendDiagnosticEventLogger, set_blend_diagnostic_parameter_set},
                 ensure_all_nodes_agree_on_lib,
                 ensure_fee_sponsorship_and_fork_groups_are_not_mixed,
                 get_cryptarchia_info_all_nodes, nodes_converged, parse_genesis_wallet_tokens_row,

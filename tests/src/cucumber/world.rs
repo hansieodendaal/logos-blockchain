@@ -1036,19 +1036,77 @@ impl NodeHeightSnapshots {
 /// scenarios.
 #[derive(Default)]
 pub struct BlendDiagnosticState {
-    /// Current phase of the diagnostic scenario.
-    pub phase: Option<BlendDiagnosticPhase>,
+    /// Shared phase and provider reachability state. Background diagnostics
+    /// can update it without borrowing the Cucumber world.
+    pub reachability: BlendDiagnosticReachability,
     /// Node whose Time-service clock drives the diagnostic observation.
     pub reference_node: Option<String>,
     /// Number of epoch-observation steps completed by the scenario.
     pub observation_count: u32,
     /// Nodes successfully stopped during the diagnostic outage phase.
     pub stopped_nodes: HashSet<String>,
-    /// Nodes whose Blend endpoint is intentionally unreachable during the
-    /// diagnostic outage phase while their processes remain running.
-    pub blend_unreachable_nodes: HashSet<String>,
     /// Whether this scenario has written its diagnostic timeline header.
-    pub timeline_header_written: Mutex<bool>,
+    pub timeline_header_written: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone, Default)]
+pub struct BlendDiagnosticReachability {
+    inner: Arc<Mutex<BlendDiagnosticReachabilityState>>,
+}
+
+#[derive(Default)]
+struct BlendDiagnosticReachabilityState {
+    phase: Option<BlendDiagnosticPhase>,
+    /// Nodes whose Blend endpoint is intentionally unreachable while their
+    /// processes remain running.
+    unreachable_nodes: HashSet<String>,
+}
+
+impl BlendDiagnosticReachability {
+    #[must_use]
+    pub fn phase(&self) -> Option<BlendDiagnosticPhase> {
+        self.lock().phase
+    }
+
+    pub fn set_phase(&self, phase: Option<BlendDiagnosticPhase>) {
+        self.lock().phase = phase;
+    }
+
+    pub fn set_reachable(&self, node_name: &str, reachable: bool) {
+        let mut state = self.lock();
+        if reachable {
+            state.unreachable_nodes.remove(node_name);
+            if state.phase == Some(BlendDiagnosticPhase::Outage) {
+                state.phase = Some(BlendDiagnosticPhase::Recovery);
+            }
+        } else {
+            if state.unreachable_nodes.is_empty() {
+                state.phase = Some(BlendDiagnosticPhase::Outage);
+            }
+            state.unreachable_nodes.insert(node_name.to_owned());
+        }
+    }
+
+    #[must_use]
+    pub fn unreachable_nodes(&self) -> HashSet<String> {
+        self.lock().unreachable_nodes.clone()
+    }
+
+    pub fn replace_unreachable_nodes(
+        &self,
+        unreachable_nodes: HashSet<String>,
+        phase: BlendDiagnosticPhase,
+    ) {
+        let mut state = self.lock();
+        state.unreachable_nodes = unreachable_nodes;
+        state.phase = Some(phase);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BlendDiagnosticReachabilityState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Node-startup configuration written by steps before nodes start and consumed
@@ -1219,6 +1277,78 @@ pub(crate) struct BlendChurnProgress {
     pub(crate) total_rows: usize,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct ContinuousTransactionLoadProgress {
+    completed_verified_transactions: Arc<AtomicUsize>,
+    checkpoint_transactions: Arc<AtomicUsize>,
+    transactions_per_round: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContinuousTransactionLoadCheckpoint {
+    pub(crate) completed_rounds: usize,
+    pub(crate) completed_verified_transactions: usize,
+    pub(crate) rounds_since_previous_check: usize,
+    pub(crate) verified_transactions_since_previous_check: usize,
+    pub(crate) transactions_per_round: usize,
+}
+
+impl ContinuousTransactionLoadProgress {
+    #[must_use]
+    pub(crate) fn new(transactions_per_round: usize) -> Self {
+        Self {
+            completed_verified_transactions: Arc::default(),
+            checkpoint_transactions: Arc::default(),
+            transactions_per_round,
+        }
+    }
+
+    pub(crate) fn record_completed_round(&self) {
+        self.completed_verified_transactions.fetch_add(
+            self.transactions_per_round,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> (usize, usize) {
+        let transactions = self
+            .completed_verified_transactions
+            .load(std::sync::atomic::Ordering::Acquire);
+        let rounds = transactions
+            .checked_div(self.transactions_per_round)
+            .unwrap_or_default();
+        (rounds, transactions)
+    }
+
+    #[must_use]
+    pub(crate) fn checkpoint(&self) -> ContinuousTransactionLoadCheckpoint {
+        let completed_verified_transactions = self
+            .completed_verified_transactions
+            .load(std::sync::atomic::Ordering::Acquire);
+        let previous_transactions = self.checkpoint_transactions.swap(
+            completed_verified_transactions,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        let verified_transactions_since_previous_check =
+            completed_verified_transactions.saturating_sub(previous_transactions);
+        let rounds_since_previous_check = verified_transactions_since_previous_check
+            .checked_div(self.transactions_per_round)
+            .unwrap_or_default();
+        let completed_rounds = completed_verified_transactions
+            .checked_div(self.transactions_per_round)
+            .unwrap_or_default();
+
+        ContinuousTransactionLoadCheckpoint {
+            completed_rounds,
+            completed_verified_transactions,
+            rounds_since_previous_check,
+            verified_transactions_since_previous_check,
+            transactions_per_round: self.transactions_per_round,
+        }
+    }
+}
+
 impl BackgroundTasks {
     fn abort_all(&mut self) {
         for (_, task) in self.tasks.drain() {
@@ -1341,6 +1471,8 @@ pub struct CucumberWorld {
     background_tasks: BackgroundTasks,
     /// Progress for the currently scheduled per-epoch Blend churn rows.
     pub(crate) blend_churn_progress: Option<BlendChurnProgress>,
+    /// Completed-batch counters for the continuous next-wallet load task.
+    pub(crate) continuous_transaction_load_progress: Option<ContinuousTransactionLoadProgress>,
 }
 
 impl Drop for CucumberWorld {
@@ -1584,7 +1716,10 @@ impl Debug for CucumberWorld {
                 "deployment_config_overrides",
                 &user_config_overrides_display(&self.startup.deployment_config_overrides),
             )
-            .field("blend_diagnostic_phase", &self.blend_diagnostics.phase)
+            .field(
+                "blend_diagnostic_phase",
+                &self.blend_diagnostics.reachability.phase(),
+            )
             .field(
                 "blend_diagnostic_reference_node",
                 &self.blend_diagnostics.reference_node,
@@ -1599,11 +1734,18 @@ impl Debug for CucumberWorld {
             )
             .field(
                 "blend_diagnostic_unreachable_nodes",
-                &self.blend_diagnostics.blend_unreachable_nodes,
+                &self.blend_diagnostics.reachability.unreachable_nodes(),
             )
             .field("blend_relays", &self.blend_relays.is_enabled().ok())
             .field("background_tasks", &self.background_tasks)
             .field("blend_churn_progress", &self.blend_churn_progress)
+            .field(
+                "continuous_transaction_load_progress",
+                &self
+                    .continuous_transaction_load_progress
+                    .as_ref()
+                    .map(ContinuousTransactionLoadProgress::snapshot),
+            )
             .field("sdp_funding_config", &self.cluster.sdp_funding_config)
             .field(
                 "deployment_config_override_path",
@@ -1924,6 +2066,24 @@ impl CucumberWorld {
         }
     }
 
+    pub(crate) fn background_task_status(&self, name: &str) -> Result<String, StepError> {
+        let task =
+            self.background_tasks
+                .tasks
+                .get(name)
+                .ok_or_else(|| StepError::LogicalError {
+                    message: format!("background task `{name}` is not registered"),
+                })?;
+        let status = task.status.lock().map_err(|_| StepError::LogicalError {
+            message: format!("background task `{name}` status lock was poisoned"),
+        })?;
+        Ok(match &*status {
+            BackgroundTaskStatus::Running => "Running".to_owned(),
+            BackgroundTaskStatus::Failed(error) => format!("Failed({error})"),
+            BackgroundTaskStatus::Stopped => "Stopped".to_owned(),
+        })
+    }
+
     pub(crate) fn ensure_background_tasks_healthy(&self) -> StepResult {
         for (name, task) in &self.background_tasks.tasks {
             let status = task.status.lock().map_err(|_| StepError::LogicalError {
@@ -1984,6 +2144,8 @@ impl CucumberWorld {
         if let Err(error) = self.stop_all_background_tasks().await {
             errors.push(error.to_string());
         }
+        self.continuous_transaction_load_progress = None;
+        self.blend_churn_progress = None;
         if let Err(error) = restore_all_blend_reachability(self).await {
             errors.push(error.to_string());
         }
@@ -3272,6 +3434,85 @@ mod background_task_tests {
             joined,
             Err(StepError::StepFail { message }) if message.contains("producer failed")
         ));
+    }
+}
+
+#[cfg(test)]
+mod blend_diagnostic_reachability_tests {
+    use super::{BlendDiagnosticPhase, BlendDiagnosticReachability};
+
+    #[test]
+    fn cloned_handle_tracks_relay_churn_and_recovery() {
+        let reachability = BlendDiagnosticReachability::default();
+        let background_handle = reachability.clone();
+        reachability.set_phase(Some(BlendDiagnosticPhase::Baseline));
+        background_handle.set_phase(Some(BlendDiagnosticPhase::Outage));
+        assert_eq!(reachability.phase(), Some(BlendDiagnosticPhase::Outage));
+
+        background_handle.set_reachable("NODE_1", false);
+        background_handle.set_reachable("NODE_3", false);
+        assert_eq!(reachability.phase(), Some(BlendDiagnosticPhase::Outage));
+        let unreachable = reachability.unreachable_nodes();
+        assert_eq!(unreachable.len(), 2);
+        assert!(unreachable.contains("NODE_1"));
+        assert!(unreachable.contains("NODE_3"));
+
+        background_handle.set_reachable("NODE_1", true);
+        assert_eq!(reachability.phase(), Some(BlendDiagnosticPhase::Recovery));
+        assert_eq!(
+            reachability
+                .unreachable_nodes()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["NODE_3".to_owned()]
+        );
+
+        background_handle.set_reachable("NODE_3", true);
+        assert_eq!(reachability.phase(), Some(BlendDiagnosticPhase::Recovery));
+        assert!(reachability.unreachable_nodes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod continuous_transaction_load_progress_tests {
+    use super::ContinuousTransactionLoadProgress;
+
+    #[test]
+    fn checkpoints_report_completed_rounds_and_verified_transaction_deltas() {
+        let progress = ContinuousTransactionLoadProgress::new(80);
+        assert_eq!(progress.snapshot(), (0, 0));
+        let empty_checkpoint = progress.checkpoint();
+        assert_eq!(empty_checkpoint.completed_rounds, 0);
+        assert_eq!(empty_checkpoint.completed_verified_transactions, 0);
+        assert_eq!(empty_checkpoint.rounds_since_previous_check, 0);
+        assert_eq!(
+            empty_checkpoint.verified_transactions_since_previous_check,
+            0
+        );
+
+        progress.record_completed_round();
+        assert_eq!(progress.snapshot(), (1, 80));
+        let first_round = progress.checkpoint();
+        assert_eq!(first_round.completed_rounds, 1);
+        assert_eq!(first_round.completed_verified_transactions, 80);
+        assert_eq!(first_round.rounds_since_previous_check, 1);
+        assert_eq!(first_round.verified_transactions_since_previous_check, 80);
+
+        progress.record_completed_round();
+        progress.record_completed_round();
+        assert_eq!(progress.snapshot(), (3, 240));
+        let later_rounds = progress.checkpoint();
+        assert_eq!(later_rounds.completed_rounds, 3);
+        assert_eq!(later_rounds.completed_verified_transactions, 240);
+        assert_eq!(later_rounds.rounds_since_previous_check, 2);
+        assert_eq!(later_rounds.verified_transactions_since_previous_check, 160);
+
+        let stalled_checkpoint = progress.checkpoint();
+        assert_eq!(stalled_checkpoint.rounds_since_previous_check, 0);
+        assert_eq!(
+            stalled_checkpoint.verified_transactions_since_previous_check,
+            0
+        );
     }
 }
 

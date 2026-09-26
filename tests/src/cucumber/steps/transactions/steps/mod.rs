@@ -38,7 +38,7 @@ use crate::{
             submissions::create_and_submit_transaction_hashes_with_utxo_cache,
             sync::{WalletSendReadiness, wait_wallet_send_ready},
         },
-        world::{CucumberWorld, WalletInfo, WalletType},
+        world::{ContinuousTransactionLoadProgress, CucumberWorld, WalletInfo, WalletType},
     },
     non_zero,
 };

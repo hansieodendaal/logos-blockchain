@@ -1,8 +1,9 @@
 use super::{
-    CucumberWorld, Duration, ManualCommand, Step, StepError, StepResult, TARGET,
-    execute_coin_splits_all_user_wallets, execute_continuous_next_wallet_user_wallet,
-    execute_continuous_round_robin_user_wallets, info, parse_wallet_output_state,
-    perform_manual_step_control, then, timeout, verify_min_outputs_all_user_wallets, warn, when,
+    ContinuousTransactionLoadProgress, CucumberWorld, Duration, ManualCommand, Step, StepError,
+    StepResult, TARGET, execute_coin_splits_all_user_wallets,
+    execute_continuous_next_wallet_user_wallet, execute_continuous_round_robin_user_wallets, info,
+    parse_wallet_output_state, perform_manual_step_control, then, timeout,
+    verify_min_outputs_all_user_wallets, warn, when,
 };
 
 const CONTINUOUS_NEXT_WALLET_LOAD_TASK: &str = "continuous next-wallet transaction load";
@@ -223,7 +224,10 @@ fn step_start_continuous_next_wallet_load(
         "Starting background next-wallet transaction load across NODE_9..NODE_12: {num_transactions} transaction(s) per wallet per batch, {value} LGO each, {epochs_headroom} epochs headroom"
     );
 
-    world.spawn_background_task(
+    let progress = ContinuousTransactionLoadProgress::new(wallet_nodes.len() * num_transactions);
+    let task_progress = progress.clone();
+    world.continuous_transaction_load_progress = Some(progress);
+    let spawn_result = world.spawn_background_task(
         CONTINUOUS_NEXT_WALLET_LOAD_TASK,
         async move |cancellation| {
             loop {
@@ -236,24 +240,68 @@ fn step_start_continuous_next_wallet_load(
                     &command,
                 )
                 .await?;
+                task_progress.record_completed_round();
             }
         },
-    )
+    );
+    if spawn_result.is_err() {
+        world.continuous_transaction_load_progress = None;
+    }
+    spawn_result
 }
 
-#[then("the continuous transaction load is healthy")]
-#[when("the continuous transaction load is healthy")]
+#[then("the continuous transaction load task is healthy and has made progress")]
+#[when("the continuous transaction load task is healthy and has made progress")]
 #[expect(
     clippy::needless_pass_by_ref_mut,
     reason = "Cucumber step entrypoints must accept `&mut World`"
 )]
-fn step_continuous_transaction_load_is_healthy(world: &mut CucumberWorld) -> StepResult {
-    world.ensure_background_task_healthy(CONTINUOUS_NEXT_WALLET_LOAD_TASK)
+fn step_continuous_transaction_load_is_healthy_and_has_made_progress(
+    world: &mut CucumberWorld,
+) -> StepResult {
+    let task_status = world.background_task_status(CONTINUOUS_NEXT_WALLET_LOAD_TASK)?;
+    let progress = world
+        .continuous_transaction_load_progress
+        .as_ref()
+        .ok_or_else(|| StepError::LogicalError {
+            message: "continuous transaction load has no progress state".to_owned(),
+        })?;
+    let checkpoint = progress.checkpoint();
+    info!(
+        target: TARGET,
+        event = "continuous_transaction_load_health_and_progress",
+        task_status,
+        completed_rounds = checkpoint.completed_rounds,
+        completed_verified_transactions = checkpoint.completed_verified_transactions,
+        rounds_since_previous_check = checkpoint.rounds_since_previous_check,
+        verified_transactions_since_previous_check =
+            checkpoint.verified_transactions_since_previous_check,
+        transactions_per_round = checkpoint.transactions_per_round,
+        "Continuous next-wallet transaction load health and progress"
+    );
+    world.ensure_background_task_healthy(CONTINUOUS_NEXT_WALLET_LOAD_TASK)?;
+    let expected_verified_transactions = checkpoint
+        .rounds_since_previous_check
+        .saturating_mul(checkpoint.transactions_per_round);
+    if checkpoint.rounds_since_previous_check == 0
+        || checkpoint.verified_transactions_since_previous_check != expected_verified_transactions
+    {
+        return Err(StepError::StepFail {
+            message: format!(
+                "continuous next-wallet transaction load made insufficient progress since the previous check: {} completed round(s), {} verified transaction(s); expected at least one round and {expected_verified_transactions} verified transaction(s)",
+                checkpoint.rounds_since_previous_check,
+                checkpoint.verified_transactions_since_previous_check,
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[when("I stop the continuous next-wallet transaction load")]
 async fn step_stop_continuous_next_wallet_load(world: &mut CucumberWorld) -> StepResult {
-    world
+    let result = world
         .stop_background_task(CONTINUOUS_NEXT_WALLET_LOAD_TASK)
-        .await
+        .await;
+    world.continuous_transaction_load_progress = None;
+    result
 }

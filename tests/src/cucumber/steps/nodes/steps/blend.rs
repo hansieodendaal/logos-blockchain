@@ -105,6 +105,8 @@ async fn step_start_epoch_driven_blend_churn(world: &mut CucumberWorld, step: &S
         .filter_map(|(node_name, enabled)| (!enabled).then_some(node_name))
         .collect::<BTreeSet<_>>();
     let relays = world.blend_relays.clone();
+    let reachability = world.blend_diagnostics.reachability.clone();
+    let event_logger = BlendDiagnosticEventLogger::from_world(world);
     let start_epoch = initial_time.current_epoch;
     if world.blend_churn_progress.is_some() {
         return Err(StepError::LogicalError {
@@ -117,7 +119,14 @@ async fn step_start_epoch_driven_blend_churn(world: &mut CucumberWorld, step: &S
         total_rows: schedule.len(),
     });
 
-    world.spawn_background_task(BLEND_CHURN_TASK, async move |mut cancellation| {
+    let previous_phase = reachability.phase();
+    reachability.set_phase(Some(crate::cucumber::world::BlendDiagnosticPhase::Outage));
+    let task_reachability = reachability.clone();
+    let start_logger = event_logger.clone();
+    let initial_unreachable = unreachable.iter().cloned().collect::<Vec<_>>();
+    let log_reference_node = reference_node.clone();
+    let schedule_rows = schedule.len();
+    let spawn_result = world.spawn_background_task(BLEND_CHURN_TASK, async move |mut cancellation| {
         let mut observed_epoch = start_epoch;
         let mut next_schedule_index = 0usize;
         let mut poll_interval = interval(BLEND_CHURN_POLL_INTERVAL);
@@ -125,9 +134,9 @@ async fn step_start_epoch_driven_blend_churn(world: &mut CucumberWorld, step: &S
         info!(
             target: TARGET,
             event = "blend_churn_started",
-            reference_node,
-            start_epoch,
-            schedule_rows = schedule.len(),
+                            reference_node,
+                            start_epoch,
+                            schedule_rows,
             "Started epoch-driven Blend provider churn"
         );
 
@@ -145,40 +154,56 @@ async fn step_start_epoch_driven_blend_churn(world: &mut CucumberWorld, step: &S
                         }
                     })?;
 
-                    while observed_epoch < time_info.current_epoch {
-                        observed_epoch = observed_epoch.saturating_add(1);
+                    if let Some(skipped_epochs) = skipped_churn_epochs(
+                        observed_epoch,
+                        time_info.current_epoch,
+                    ) && next_schedule_index < schedule.len() {
+                        warn!(
+                            target: TARGET,
+                            event = "blend_churn_epoch_gap",
+                            reference_node,
+                            previous_epoch = observed_epoch,
+                            current_epoch = time_info.current_epoch,
+                            skipped_epochs,
+                            next_transition_index = next_schedule_index + 1,
+                            "Failing Blend churn because a scheduled provider state was skipped"
+                        );
+                        event_logger.append_timeline_record(&serde_json::json!({
+                            "event": "blend_churn_epoch_gap",
+                            "timestamp": OffsetDateTime::now_utc().to_string(),
+                            "reference_node": reference_node,
+                            "diagnostic_phase": "outage",
+                            "previous_epoch": observed_epoch,
+                            "current_epoch": time_info.current_epoch,
+                            "skipped_epochs": skipped_epochs,
+                            "next_transition_index": next_schedule_index + 1,
+                        }));
+                        return Err(StepError::StepFail {
+                            message: format!(
+                                "epoch-driven Blend churn on `{reference_node}` skipped {skipped_epochs} epoch(s) between epoch {observed_epoch} and {} before schedule row {}",
+                                time_info.current_epoch,
+                                next_schedule_index + 1,
+                            ),
+                        });
+                    }
+
+                    if time_info.current_epoch > observed_epoch {
+                        observed_epoch = time_info.current_epoch;
                         let Some(desired_unreachable) = schedule.get(next_schedule_index) else {
                             continue;
                         };
                         let transition_index = next_schedule_index + 1;
                         let desired_unreachable = desired_unreachable.clone();
                         next_schedule_index += 1;
-
-                        let restored = unreachable
-                            .difference(&desired_unreachable)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let made_unreachable = desired_unreachable
-                            .difference(&unreachable)
-                            .cloned()
-                            .collect::<Vec<_>>();
-
-                        for node_name in &restored {
-                            relays.set_enabled(node_name, true).await.map_err(|error| {
-                                StepError::StepFail {
-                                    message: format!("failed to restore Blend reachability for `{node_name}`: {error}"),
-                                }
-                            })?;
-                            unreachable.remove(node_name);
-                        }
-                        for node_name in &made_unreachable {
-                            relays.set_enabled(node_name, false).await.map_err(|error| {
-                                StepError::StepFail {
-                                    message: format!("failed to make Blend unreachable for `{node_name}`: {error}"),
-                                }
-                            })?;
-                            unreachable.insert(node_name.clone());
-                        }
+                        let transition: BlendReachabilityTransition =
+                            apply_blend_reachability_set(
+                            &relays,
+                            &task_reachability,
+                            &event_logger,
+                            &mut unreachable,
+                            &desired_unreachable,
+                        )
+                        .await?;
 
                         let current_unreachable = unreachable.iter().cloned().collect::<Vec<_>>();
                         let current_reachable = provider_names
@@ -199,21 +224,78 @@ async fn step_start_epoch_driven_blend_churn(world: &mut CucumberWorld, step: &S
                             epoch = observed_epoch,
                             transition_index,
                             desired_unreachable = ?desired_unreachable,
-                            providers_restored = ?restored,
-                            providers_made_unreachable = ?made_unreachable,
+                            providers_restored = ?transition.restored,
+                            providers_made_unreachable = ?transition.made_unreachable,
                             current_reachable = ?current_reachable,
                             current_unreachable = ?current_unreachable,
+                            diagnostic_phase = task_reachability
+                                .phase()
+                                .map(crate::cucumber::world::BlendDiagnosticPhase::as_str),
                             chain_tip_height = chain.as_ref().map(|state| state.0),
                             chain_lib_slot = chain.as_ref().map(|state| state.1),
                             chain_lib_id = chain.as_ref().map(|state| state.2.as_str()),
                             "Applied complete Blend provider reachability set at epoch boundary"
                         );
+                        event_logger.append_timeline_record(&serde_json::json!({
+                            "event": "blend_churn_transition",
+                            "timestamp": OffsetDateTime::now_utc().to_string(),
+                            "reference_node": reference_node,
+                            "epoch": observed_epoch,
+                            "diagnostic_phase": task_reachability
+                                .phase()
+                                .map(crate::cucumber::world::BlendDiagnosticPhase::as_str),
+                            "transition_index": transition_index,
+                            "desired_unreachable": desired_unreachable,
+                            "providers_restored": transition.restored,
+                            "providers_made_unreachable": transition.made_unreachable,
+                            "current_reachable": current_reachable,
+                            "current_unreachable": current_unreachable,
+                            "chain_tip_height": chain.as_ref().map(|state| state.0),
+                            "chain_lib_slot": chain.as_ref().map(|state| state.1),
+                            "chain_lib_id": chain.as_ref().map(|state| state.2.as_str()),
+                        }));
                         rows_applied.fetch_add(1, Ordering::Release);
                     }
                 }
             }
         }
-    })
+    });
+
+    if let Err(error) = spawn_result {
+        reachability.set_phase(previous_phase);
+        world.blend_churn_progress = None;
+        return Err(error);
+    }
+    start_logger.append_timeline_record(&serde_json::json!({
+        "event": "blend_churn_started",
+        "timestamp": OffsetDateTime::now_utc().to_string(),
+        "reference_node": log_reference_node,
+        "start_epoch": start_epoch,
+        "schedule_rows": schedule_rows,
+        "diagnostic_phase": "outage",
+        "current_unreachable": initial_unreachable,
+    }));
+    Ok(())
+}
+
+fn skipped_churn_epochs(previous_epoch: u32, current_epoch: u32) -> Option<u32> {
+    current_epoch
+        .checked_sub(previous_epoch)
+        .filter(|distance| *distance > 1)
+        .map(|distance| distance - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skipped_churn_epochs;
+
+    #[test]
+    fn skipped_epoch_is_detected_instead_of_compressing_schedule_rows() {
+        assert_eq!(skipped_churn_epochs(4, 6), Some(1));
+        assert_eq!(skipped_churn_epochs(4, 5), None);
+        assert_eq!(skipped_churn_epochs(4, 4), None);
+        assert_eq!(skipped_churn_epochs(6, 4), None);
+    }
 }
 
 fn parse_blend_churn_schedule(
@@ -283,7 +365,22 @@ async fn step_stop_blend_provider_churn(world: &mut CucumberWorld) -> StepResult
     }
 
     world.blend_churn_progress = None;
-    world.stop_background_task(BLEND_CHURN_TASK).await
+    world.stop_background_task(BLEND_CHURN_TASK).await?;
+    BlendDiagnosticEventLogger::from_world(world).append_timeline_record(&serde_json::json!({
+        "event": "blend_churn_stopped",
+        "timestamp": OffsetDateTime::now_utc().to_string(),
+        "reference_node": world.blend_diagnostics.reference_node,
+        "diagnostic_phase": world
+            .blend_diagnostics
+            .reachability
+            .phase()
+            .map(crate::cucumber::world::BlendDiagnosticPhase::as_str),
+        "current_unreachable": world
+            .blend_diagnostics
+            .reachability
+            .unreachable_nodes(),
+    }));
+    Ok(())
 }
 
 #[when("I restore all Blend provider reachability")]

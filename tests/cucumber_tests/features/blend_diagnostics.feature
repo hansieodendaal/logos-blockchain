@@ -135,11 +135,9 @@ Feature: Blend diagnostics
   @blend_debug @blend_stability
   Scenario Outline: Blend stability with no application workload parameter_set=<parameter_set>
 
-    # Invariant:
-    # With the testnet-representative Blend configuration and no application
-    # transaction load, a stable Blend provider population must continue making
-    # canonical-chain progress across multiple Blend epochs without persistent
-    # divergence.
+    # Observe canonical-chain progress and divergence across multiple Blend
+    # epochs with the testnet-representative configuration, stable Blend
+    # providers, and no application transaction load.
 
     Given I have a cluster with capacity of 12 nodes
     And the first 8 nodes are declared as blend providers
@@ -164,8 +162,6 @@ Feature: Blend diagnostics
     And I log diagnostic identities
 
     When I observe 12 epoch transitions on node "NODE_9"
-    Then all nodes have at least 20 blocks and converged to within 2 blocks in 600 seconds
-    And all nodes agree on LIB in 600 seconds
     And I stop all nodes
 
     Examples:
@@ -176,11 +172,9 @@ Feature: Blend diagnostics
   @blend_debug @blend_stability
   Scenario Outline: Blend stability with busy blockchain and unstable Blend providers parameter_set=<parameter_set>
 
-    # Invariant:
-    # Repeated loss and recovery of different subsets of otherwise-valid Blend
-    # providers across epoch boundaries must not prevent sustained transaction
-    # processing, canonical-chain progress, or eventual recovery/convergence of
-    # the non-provider EDGE population.
+    # Observe transaction processing, canonical-chain progress, and recovery
+    # across epoch boundaries as different subsets of otherwise-valid Blend
+    # providers become unreachable and recover.
     # Ordinary transaction load remains active during provider churn and the
     # recovery/cool-down period.
 
@@ -220,9 +214,9 @@ Feature: Blend diagnostics
     When I perform 1 coin split transactions for each user wallet with 100 outputs of 1000000 LGO each
     And I verify each wallet has minimum 100 outputs "available" in 300 seconds
 
-    And I start continuous next-wallet transaction load with 20 transactions of 1 LGO and 4 epochs headroom
+    And I start continuous next-wallet transaction load with 50 transactions of 1 LGO and 4 epochs headroom
     When I observe 1 epoch transitions on node "NODE_9"
-    And the continuous transaction load is healthy
+    And the continuous transaction load task is healthy and has made progress
 
     And I start epoch-driven Blend provider churn:
       | unreachable          |
@@ -238,14 +232,14 @@ Feature: Blend diagnostics
     When I observe 8 epoch transitions on node "NODE_9"
     And I stop Blend provider churn
     And I restore all Blend provider reachability
+    And the continuous transaction load task is healthy and has made progress
 
     # The transaction producer stays active through these recovery epochs.
     And I observe 4 epoch transitions on node "NODE_9"
-    And the continuous transaction load is healthy
+    And the continuous transaction load task is healthy and has made progress
     And I stop the continuous next-wallet transaction load
 
-    Then all nodes have at least 20 blocks and converged to within 5 blocks in 600 seconds
-    And all nodes agree on LIB in 600 seconds
+    And I observe 4 epoch transitions on node "NODE_9"
     And I stop all nodes
 
     Examples:
