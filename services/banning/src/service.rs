@@ -20,7 +20,6 @@ use crate::{
 };
 
 const EVENT_BUFFER_SIZE: usize = 256;
-const RECOVERY_LOG_TARGET: &str = lb_log_targets::utils::RECOVERY;
 
 /// Mutable ban state retained by [`BanningService`].
 ///
@@ -35,12 +34,7 @@ pub struct BanningState<C = SystemClock> {
 impl BanningState<SystemClock> {
     fn restore(config: &BanningConfig, recovery_state: BanningRecoveryState) -> Self {
         let mut store = BanStore::from_config(config);
-        match recovery_state.runtime_records(config, SystemTime::now()) {
-            Ok(records) => store.restore_dynamic(records),
-            Err(error) => {
-                tracing::error!(target: RECOVERY_LOG_TARGET, %error, "invalid banning recovery state; starting with empty dynamic state");
-            }
-        }
+        store.restore_dynamic(recovery_state.runtime_records(config, SystemTime::now()));
         Self::with_store(store)
     }
 }
