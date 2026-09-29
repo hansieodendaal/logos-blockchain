@@ -4,12 +4,12 @@
 //! fee reserves, submits signed transactions, and records reservations.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     time::Duration,
 };
 
 use lb_core::mantle::{
-    SignedOps, TxHash, Utxo,
+    NoteId, SignedOps, TxHash, Utxo,
     gas::{MainnetGasProfile, TxGasCalculator as _},
     ledger::verification_mode::StandardMode,
     transactions::{GasPrices, OpProofs, states::Preverified, tx_list::ops::OpsGasContext},
@@ -17,6 +17,7 @@ use lb_core::mantle::{
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
 use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_testing_framework::{NodeHttpClient, configs::wallet::WalletAccount, is_truthy_env};
+use lb_wallet::WalletError;
 use tokio::{task::JoinSet, time::timeout};
 use tracing::{debug, info, warn};
 
@@ -25,10 +26,10 @@ use crate::{
         chain,
         wallet::{
             PreparedWalletTransaction, PreparedWalletTransactionWorkItem, SignedWalletTransaction,
-            TransactionFeePolicy, WalletFundingResources, WalletFundingSource,
+            TransactionFeePolicy, WalletFundingResources, WalletFundingSource, WalletId,
             WalletInputSelectionStrategy, WalletReservedInputs, WalletTransactionError,
-            WalletTransactionIntent, WalletUtxos, finalize_prepared_wallet_transaction,
-            prepare_wallet_transaction_work_item,
+            WalletTransactionIntent, WalletUtxos, estimate_workload_fee_requirements,
+            finalize_prepared_wallet_transaction, prepare_wallet_transaction_work_item,
         },
     },
     cucumber::{
@@ -68,6 +69,205 @@ pub(crate) struct SignedUserWalletSubmission {
 pub(crate) struct ReservedUserWalletSubmission {
     wallet: WalletInfo,
     submission: PreparedWalletTransactionWorkItem,
+}
+
+const CONTINUOUS_WORKLOAD_DUST_RATIO: u64 = 15;
+const MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS: usize = 10;
+
+const fn continuous_workload_dust_threshold(output_value: u64, base_tx_fee: u64) -> u64 {
+    let transfer_value_threshold = output_value / CONTINUOUS_WORKLOAD_DUST_RATIO;
+    if transfer_value_threshold > base_tx_fee {
+        transfer_value_threshold
+    } else {
+        base_tx_fee
+    }
+}
+
+/// Per-wallet UTXOs prepared for continuous workload transaction batches.
+///
+/// The ordered map provides the largest primary input and smallest dust
+/// candidates without rebuilding or sorting the wallet's full UTXO list for
+/// each transaction. The second map supports removal by reserved note ID.
+#[derive(Debug, Default)]
+struct WorkloadUtxoPool {
+    by_value: BTreeMap<u64, BTreeMap<NoteId, Utxo>>,
+    value_by_note_id: HashMap<NoteId, u64>,
+    candidate_count: usize,
+}
+
+impl WorkloadUtxoPool {
+    fn new(utxos: &[Utxo]) -> Self {
+        let mut pool = Self::default();
+        for utxo in utxos {
+            let note_id = utxo.id();
+            let value = utxo.note.value;
+            pool.by_value
+                .entry(value)
+                .or_default()
+                .insert(note_id, *utxo);
+            pool.value_by_note_id.insert(note_id, value);
+            pool.candidate_count += 1;
+        }
+        pool
+    }
+
+    const fn len(&self) -> usize {
+        self.candidate_count
+    }
+
+    fn remove(&mut self, note_id: NoteId) {
+        if let Some(value) = self.value_by_note_id.remove(&note_id) {
+            let remove_value_bucket = self.by_value.get_mut(&value).is_some_and(|bucket| {
+                bucket.remove(&note_id);
+                bucket.is_empty()
+            });
+            self.candidate_count -= 1;
+            if remove_value_bucket {
+                self.by_value.remove(&value);
+            }
+        }
+    }
+
+    fn primary(&self) -> Option<Utxo> {
+        let (_, primary_bucket) = self.by_value.last_key_value()?;
+        let (_, primary) = primary_bucket.last_key_value()?;
+        Some(*primary)
+    }
+
+    fn candidates(&self, output_value: u64, base_tx_fee: u64) -> Option<WorkloadCandidateSet> {
+        let (_, primary_bucket) = self.by_value.last_key_value()?;
+        let (primary_note_id, primary) = primary_bucket.last_key_value()?;
+        let dust_threshold = continuous_workload_dust_threshold(output_value, base_tx_fee);
+        let mut dust = Vec::with_capacity(MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS);
+
+        dust.extend(
+            self.by_value
+                .range(..=dust_threshold)
+                .flat_map(|(_, bucket)| bucket.values())
+                .filter(|utxo| utxo.id() != *primary_note_id)
+                .take(MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS)
+                .copied(),
+        );
+
+        Some(WorkloadCandidateSet {
+            primary: *primary,
+            dust,
+            dust_threshold,
+            available_candidate_count: self.len(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WorkloadCandidateSet {
+    primary: Utxo,
+    dust: Vec<Utxo>,
+    dust_threshold: u64,
+    available_candidate_count: usize,
+}
+
+impl WorkloadCandidateSet {
+    fn dust_value(&self, count: usize) -> u64 {
+        self.dust
+            .iter()
+            .take(count)
+            .map(|utxo| utxo.note.value)
+            .sum()
+    }
+
+    fn inputs(&self, dust_count: usize) -> Vec<Utxo> {
+        let dust_count = dust_count.min(self.dust.len());
+        let mut inputs = Vec::with_capacity(dust_count + 1);
+        inputs.push(self.primary);
+        inputs.extend_from_slice(&self.dust[..dust_count]);
+        inputs
+    }
+}
+
+/// Workload-only candidate pools plus an index for removing actual reserved
+/// inputs from the shared wallet cache in constant time.
+#[derive(Debug, Default)]
+pub struct WorkloadUtxoPools {
+    by_wallet: HashMap<WalletId, WorkloadUtxoPool>,
+    cache_positions: HashMap<NoteId, (WalletId, usize)>,
+}
+
+impl WorkloadUtxoPools {
+    #[must_use]
+    pub fn from_cache(cache: &WalletUtxos) -> Self {
+        let mut pools = Self::default();
+        for (wallet_name, utxos) in cache {
+            pools
+                .by_wallet
+                .insert(wallet_name.clone(), WorkloadUtxoPool::new(utxos));
+            for (index, utxo) in utxos.iter().enumerate() {
+                pools
+                    .cache_positions
+                    .insert(utxo.id(), (wallet_name.clone(), index));
+            }
+        }
+        pools
+    }
+
+    pub fn candidate_count(&self, wallet_name: &str) -> usize {
+        self.by_wallet
+            .get(wallet_name)
+            .map_or(0, WorkloadUtxoPool::len)
+    }
+
+    fn primary(&self, wallet_name: &str) -> Option<Utxo> {
+        self.by_wallet.get(wallet_name)?.primary()
+    }
+
+    fn candidates(
+        &self,
+        wallet_name: &str,
+        output_value: u64,
+        base_tx_fee: u64,
+    ) -> Option<WorkloadCandidateSet> {
+        self.by_wallet
+            .get(wallet_name)?
+            .candidates(output_value, base_tx_fee)
+    }
+
+    fn remove_reserved_inputs(
+        &mut self,
+        cache: &mut WalletUtxos,
+        reserved_inputs: WalletReservedInputs,
+    ) -> Result<(), StepError> {
+        let (sender_inputs, fee_sponsor_inputs) =
+            reserved_inputs.into_sender_and_fee_sponsor_inputs();
+        for input in sender_inputs.into_iter().chain(fee_sponsor_inputs) {
+            let note_id = input.id();
+            let Some((wallet_name, index)) = self.cache_positions.remove(&note_id) else {
+                continue;
+            };
+            let Some(utxos) = cache.get_mut(&wallet_name) else {
+                return Err(StepError::LogicalError {
+                    message: format!(
+                        "Workload reservation index refers to missing wallet '{wallet_name}'"
+                    ),
+                });
+            };
+            if utxos.get(index).is_none_or(|cached| cached.id() != note_id) {
+                return Err(StepError::LogicalError {
+                    message: format!(
+                        "Workload reservation index is stale for wallet '{wallet_name}' and input {note_id:?}"
+                    ),
+                });
+            }
+
+            let removed = utxos.swap_remove(index);
+            if let Some(moved) = utxos.get(index) {
+                self.cache_positions
+                    .insert(moved.id(), (wallet_name.clone(), index));
+            }
+            if let Some(pool) = self.by_wallet.get_mut(&wallet_name) {
+                pool.remove(removed.id());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl PreparedUserWalletSubmission {
@@ -116,12 +316,38 @@ pub(crate) async fn reserve_user_wallet_transaction_submission_with_utxo_cache(
     gas_prices: Option<GasPrices>,
     priority_fee_percent: u64,
 ) -> Result<ReservedUserWalletSubmission, StepError> {
+    let transaction_intent =
+        WalletTransactionIntent::transfer(receivers).map_err(wallet_transaction_error)?;
+    reserve_user_wallet_transaction_intent_with_utxo_cache(
+        world,
+        step,
+        sender_wallet_name,
+        transaction_intent,
+        available_utxos,
+        gas_prices,
+        priority_fee_percent,
+    )
+    .await
+}
+
+/// Reserve inputs for a caller-provided user-wallet transaction intent and
+/// immediately update the caller's UTXO cache.
+pub(crate) async fn reserve_user_wallet_transaction_intent_with_utxo_cache(
+    world: &mut CucumberWorld,
+    step: &str,
+    sender_wallet_name: &str,
+    transaction_intent: WalletTransactionIntent,
+    available_utxos: &mut WalletUtxos,
+    gas_prices: Option<GasPrices>,
+    priority_fee_percent: u64,
+) -> Result<ReservedUserWalletSubmission, StepError> {
     let reserved = reserve_user_wallet_transaction_submission(
         world,
         step,
         sender_wallet_name,
-        WalletTransactionIntent::transfer(receivers).map_err(wallet_transaction_error)?,
+        transaction_intent,
         Some(available_utxos),
+        None,
         None,
         WalletInputSelectionStrategy::LargestFirst,
         gas_prices,
@@ -130,6 +356,164 @@ pub(crate) async fn reserve_user_wallet_transaction_submission_with_utxo_cache(
     .await?;
     apply_reserved_inputs_to_utxo_cache(available_utxos, reserved.reserved_inputs());
     Ok(reserved)
+}
+
+/// Reserve a continuous workload transaction from its largest input and a
+/// bounded set of the smallest qualifying dust inputs.
+///
+/// These stress workloads deliberately create a large source UTXO per
+/// transaction. They may consume small historical outputs alongside it, but
+/// they never fall back to the wallet's full UTXO set.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Workload transaction reservation inputs"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep bounded workload retries and funding diagnostics together"
+)]
+pub(crate) async fn reserve_workload_transaction_intent_with_primary_and_dust(
+    world: &mut CucumberWorld,
+    step: &str,
+    sender_wallet_name: &str,
+    transaction_intent: WalletTransactionIntent,
+    output_value: u64,
+    available_utxos: &mut WalletUtxos,
+    workload_pools: &mut WorkloadUtxoPools,
+    gas_prices: Option<GasPrices>,
+    priority_fee_percent: u64,
+) -> Result<ReservedUserWalletSubmission, StepError> {
+    let Some(primary) = workload_pools.primary(sender_wallet_name) else {
+        return Err(StepError::LogicalError {
+            message: format!(
+                "Workload funding failed for wallet '{sender_wallet_name}': no primary UTXO is \
+                available; output value={output_value}, available candidate count={}",
+                workload_pools.candidate_count(sender_wallet_name)
+            ),
+        });
+    };
+
+    let primary_value = primary.note.value;
+    let fee_intent = gas_prices.as_ref().map_or_else(
+        || transaction_intent.clone(),
+        |gas_prices| {
+            transaction_intent
+                .clone()
+                .with_gas_prices(gas_prices.clone())
+        },
+    );
+    let (_, base_tx_fee) = estimate_workload_fee_requirements(&fee_intent, &[primary], 0).map_err(
+        |error| StepError::LogicalError {
+            message: format!(
+                "Continuous workload funding failed for wallet '{sender_wallet_name}': could not \
+                estimate primary-only base transaction fee for output value={output_value}, primary \
+                value={primary_value}: {error}"
+            ),
+        },
+    )?;
+    let candidates = workload_pools
+        .candidates(sender_wallet_name, output_value, base_tx_fee)
+        .expect("workload primary was just read from the same candidate pool");
+
+    let eligible_dust_count = candidates.dust.len();
+    let max_dust_count = candidates.dust.len();
+    let max_dust_value = candidates.dust_value(max_dust_count);
+    let dust_threshold = candidates.dust_threshold;
+    let dust_candidate_values = candidates
+        .dust
+        .iter()
+        .map(|utxo| utxo.note.value)
+        .collect::<Vec<_>>();
+    let available_candidate_count = candidates.available_candidate_count;
+    let mut last_insufficient_funds = None;
+
+    // Requiring each bounded candidate set lets the real wallet funding
+    // calculation account for the additional input fees. Dropping dust from
+    // largest selected dust to smallest preserves the smallest cleanup inputs.
+    for dust_count in (0..=max_dust_count).rev() {
+        let candidate_inputs = candidates.inputs(dust_count);
+        match reserve_user_wallet_transaction_submission(
+            world,
+            step,
+            sender_wallet_name,
+            transaction_intent.clone(),
+            Some(available_utxos),
+            Some(&candidate_inputs),
+            None,
+            WalletInputSelectionStrategy::AllProvided,
+            gas_prices.clone(),
+            priority_fee_percent,
+        )
+        .await
+        {
+            Ok(reserved) => {
+                workload_pools
+                    .remove_reserved_inputs(available_utxos, reserved.reserved_inputs())?;
+                return Ok(reserved);
+            }
+            Err(error) if is_user_wallet_funds_deficit(&error) => {
+                last_insufficient_funds = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let final_error = last_insufficient_funds.map_or_else(
+        || "no funding attempt was made".to_owned(),
+        |error| error.to_string(),
+    );
+    let (fee_without_change, fee_with_change, fee_shortfall_without_change) =
+        estimate_workload_fee_requirements(
+            &fee_intent,
+            &[candidates.primary],
+            priority_fee_percent,
+        )
+        .map_or_else(
+            |error| {
+                (
+                    format!("unavailable ({error})"),
+                    "unavailable".to_owned(),
+                    "unavailable".to_owned(),
+                )
+            },
+            |(without_change, with_change)| {
+                let fee_shortfall =
+                    without_change.saturating_sub(primary_value.saturating_sub(output_value));
+                (
+                    without_change.to_string(),
+                    with_change.to_string(),
+                    fee_shortfall.to_string(),
+                )
+            },
+        );
+    let dust_attempt_counts = (0..=max_dust_count).rev().collect::<Vec<_>>();
+    Err(StepError::LogicalError {
+        message: format!(
+            "Continuous workload funding failed for wallet '{sender_wallet_name}': output value=\
+            {output_value}, largest primary value={primary_value}, primary fee headroom={} (primary \
+            minus outputs), base transaction fee including change and excluding priority reserve=\
+            {base_tx_fee}, required fee without \
+            change={fee_without_change}, required fee with \
+            change={fee_with_change}, fee shortfall without change={fee_shortfall_without_change}; \
+            selector=largest primary + dust values <= max(output/{CONTINUOUS_WORKLOAD_DUST_RATIO}=\
+            {}, base transaction fee={base_tx_fee})={dust_threshold}, max dust inputs=\
+            {MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS}, eligible \
+            bounded dust candidates={eligible_dust_count}, attempted dust values={:?}, attempted \
+            dust total={max_dust_value}; tried dust input counts={dust_attempt_counts:?}, available \
+            candidate count={available_candidate_count}; primary-only funding attempt failed: {final_error}",
+            primary_value.saturating_sub(output_value),
+            output_value / CONTINUOUS_WORKLOAD_DUST_RATIO,
+            &dust_candidate_values[..max_dust_count],
+        ),
+    })
+}
+
+const fn is_user_wallet_funds_deficit(error: &StepError) -> bool {
+    matches!(
+        error,
+        StepError::WalletError(WalletError::InsufficientFunds { .. })
+            | StepError::FundsDeficit { .. }
+    )
 }
 
 /// Finalize reserved transactions in blocking worker tasks.
@@ -744,6 +1128,7 @@ pub(crate) async fn prepare_user_wallet_transaction_submission_with_change_and_s
         sender_wallet_name,
         transaction_intent,
         in_memory_available_utxos,
+        None,
         change_public_key,
         input_selection_strategy,
         None,
@@ -767,6 +1152,7 @@ async fn reserve_user_wallet_transaction_submission(
     sender_wallet_name: &str,
     transaction_intent: WalletTransactionIntent,
     in_memory_available_utxos: Option<&WalletUtxos>,
+    sender_candidate_utxos: Option<&[Utxo]>,
     change_public_key: Option<ZkPublicKey>,
     input_selection_strategy: WalletInputSelectionStrategy,
     gas_prices: Option<GasPrices>,
@@ -795,13 +1181,16 @@ async fn reserve_user_wallet_transaction_submission(
         &synced_available_utxos
     };
 
-    let sender_available_utxos =
+    let sender_available_utxos = if let Some(candidates) = sender_candidate_utxos {
+        candidates.to_vec()
+    } else {
         available_utxos
             .get(sender_wallet_name)
             .cloned()
             .ok_or(StepError::LogicalError {
                 message: format!("Wallet '{sender_wallet_name}' not found in updated balances"),
-            })?;
+            })?
+    };
 
     let scenario_fee_funds =
         scenario_fee_account_state(world, sender_wallet_name, available_utxos)?;
@@ -909,6 +1298,11 @@ fn wallet_transaction_error(error: WalletTransactionError) -> StepError {
                 message: error.to_string(),
             }
         }
+        error @ WalletTransactionError::InvalidLeadingInscriptionSigner => {
+            StepError::LogicalError {
+                message: error.to_string(),
+            }
+        }
         error @ (WalletTransactionError::MissingFundingInput { .. }
         | WalletTransactionError::MissingSigningKey { .. }) => StepError::LogicalError {
             message: error.to_string(),
@@ -990,6 +1384,44 @@ pub fn apply_reserved_inputs_to_utxo_cache(
     }
 }
 
+#[cfg(test)]
+fn apply_reserved_inputs_to_wallet_utxo_cache(
+    cache: &mut WalletUtxos,
+    sender_wallet_name: &str,
+    selected_input_index: Option<usize>,
+    reserved_inputs: WalletReservedInputs,
+) {
+    let (sender_inputs, fee_sponsor_inputs) = reserved_inputs.into_sender_and_fee_sponsor_inputs();
+
+    if fee_sponsor_inputs.is_empty() {
+        if let (Some(index), [reserved_input]) = (selected_input_index, sender_inputs.as_slice())
+            && let Some(sender_utxos) = cache.get_mut(sender_wallet_name)
+            && sender_utxos
+                .get(index)
+                .is_some_and(|cached_input| cached_input.id() == reserved_input.id())
+        {
+            sender_utxos.remove(index);
+            return;
+        }
+
+        let spent_note_ids = sender_inputs.iter().map(Utxo::id).collect::<HashSet<_>>();
+        if let Some(sender_utxos) = cache.get_mut(sender_wallet_name) {
+            sender_utxos.retain(|utxo| !spent_note_ids.contains(&utxo.id()));
+        }
+        return;
+    }
+
+    let spent_note_ids = sender_inputs
+        .into_iter()
+        .chain(fee_sponsor_inputs)
+        .map(|utxo| utxo.id())
+        .collect::<HashSet<_>>();
+
+    for utxos in cache.values_mut() {
+        utxos.retain(|utxo| !spent_note_ids.contains(&utxo.id()));
+    }
+}
+
 fn scenario_fee_account_state(
     world: &CucumberWorld,
     wallet_name: &str,
@@ -1020,4 +1452,407 @@ fn group_key_for_wallet(world: &CucumberWorld, wallet_name: &str) -> Result<Stri
         .get(&wallet.node_name)
         .cloned()
         .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod cache_removal_tests {
+    use lb_core::mantle::Note;
+
+    use super::*;
+
+    fn utxo(value: u64, output_index: usize) -> Utxo {
+        Utxo::new(
+            [output_index as u8; 32],
+            output_index,
+            Note::new(value, ZkPublicKey::new(1u8.into())),
+        )
+    }
+
+    #[test]
+    fn workload_retry_recognizes_both_funds_deficit_errors() {
+        assert!(is_user_wallet_funds_deficit(&StepError::WalletError(
+            WalletError::InsufficientFunds { available: 1 }
+        )));
+        assert!(is_user_wallet_funds_deficit(&StepError::FundsDeficit {
+            available: 1,
+            num_utxos_required: 1,
+            value_per_utxos_required: 1,
+        }));
+        assert!(!is_user_wallet_funds_deficit(&StepError::LogicalError {
+            message: "not a funding failure".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn removes_a_reserved_single_input_from_its_known_wallet_and_index() {
+        let mut cache = HashMap::from([
+            (
+                WalletId::from("sender"),
+                vec![utxo(10, 0), utxo(30, 1), utxo(20, 2)],
+            ),
+            (WalletId::from("other"), vec![utxo(40, 3), utxo(50, 4)]),
+        ]);
+        let reserved_input = cache["sender"][1];
+
+        apply_reserved_inputs_to_wallet_utxo_cache(
+            &mut cache,
+            "sender",
+            Some(1),
+            WalletReservedInputs::new(vec![reserved_input], Vec::new()),
+        );
+
+        assert_eq!(
+            cache["sender"]
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(
+            cache["other"]
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![40, 50]
+        );
+    }
+
+    fn workload_account() -> WalletAccount {
+        WalletAccount::deterministic(100, 1_000_000, false)
+            .expect("workload test account should build")
+    }
+
+    fn workload_utxo(value: u64, output_index: usize) -> Utxo {
+        let account = workload_account();
+        Utxo::new(
+            [output_index as u8; 32],
+            output_index,
+            Note::new(value, account.public_key()),
+        )
+    }
+
+    fn prepare_all_provided(
+        utxos: &[Utxo],
+        output_value: u64,
+        gas_prices: GasPrices,
+        priority_fee_percent: u64,
+    ) -> Result<PreparedWalletTransactionWorkItem, WalletTransactionError> {
+        let account = workload_account();
+        let public_key = account.public_key();
+        let source = WalletFundingSource::with_change_pk_and_strategy(
+            account,
+            utxos.to_vec(),
+            public_key,
+            WalletInputSelectionStrategy::AllProvided,
+        );
+        let intent = WalletTransactionIntent::transfer(&[(ZkPublicKey::zero(), output_value)])?
+            .with_gas_prices(gas_prices);
+        prepare_wallet_transaction_work_item(
+            intent,
+            WalletFundingResources::new(source),
+            priority_fee_percent,
+        )
+    }
+
+    fn input_values(work_item: &PreparedWalletTransactionWorkItem) -> Vec<u64> {
+        let (sender_inputs, fee_sponsor_inputs) = work_item
+            .reserved_inputs()
+            .into_sender_and_fee_sponsor_inputs();
+        assert!(fee_sponsor_inputs.is_empty());
+        sender_inputs
+            .into_iter()
+            .map(|utxo| utxo.note.value)
+            .collect()
+    }
+
+    #[test]
+    fn workload_selection_uses_only_the_primary_when_no_dust_qualifies() {
+        let pool = WorkloadUtxoPool::new(&[
+            workload_utxo(10_000, 0),
+            workload_utxo(9_000, 1),
+            workload_utxo(8_000, 2),
+        ]);
+        let candidates = pool.candidates(8_000, 0).expect("primary should exist");
+        let inputs = candidates.inputs(0);
+
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![10_000]
+        );
+        let work_item = prepare_all_provided(&inputs, 8_000, GasPrices::default(), 0)
+            .expect("primary should fund the transfer");
+        assert_eq!(input_values(&work_item), vec![10_000]);
+    }
+
+    #[test]
+    fn workload_fee_diagnostic_exposes_insufficient_headroom_for_11000_primary() {
+        let primary = workload_utxo(11_000, 0);
+        let intent = WalletTransactionIntent::transfer(&[(ZkPublicKey::zero(), 8_000)])
+            .expect("round-robin transfer intent")
+            .with_gas_prices(GasPrices::new(1, 3));
+
+        let (fee_without_change, fee_with_change) =
+            estimate_workload_fee_requirements(&intent, &[primary], 200)
+                .expect("workload fees should be estimable");
+
+        assert!(fee_without_change > 3_000);
+        assert!(fee_with_change >= fee_without_change);
+    }
+
+    #[test]
+    fn workload_selection_adds_smallest_dust_and_excludes_medium_inputs() {
+        let pool = WorkloadUtxoPool::new(&[
+            workload_utxo(10_000, 0),
+            workload_utxo(9_000, 1),
+            workload_utxo(500, 2),
+            workload_utxo(100, 3),
+            workload_utxo(10, 4),
+            workload_utxo(1, 5),
+        ]);
+        let candidates = pool.candidates(8_000, 0).expect("primary should exist");
+        let inputs = candidates.inputs(candidates.dust.len());
+
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![10_000, 1, 10, 100, 500]
+        );
+        let work_item = prepare_all_provided(&inputs, 8_000, GasPrices::default(), 0)
+            .expect("bounded primary and dust set should fund the transfer");
+        assert_eq!(input_values(&work_item), vec![10_000, 1, 10, 100, 500]);
+    }
+
+    #[test]
+    fn workload_selection_caps_dust_inputs_at_ten() {
+        let mut utxos = vec![workload_utxo(10_000, 0)];
+        utxos.extend((1..=20).map(|index| workload_utxo(index as u64, index)));
+        let pool = WorkloadUtxoPool::new(&utxos);
+        let candidates = pool.candidates(8_000, 0).expect("primary should exist");
+
+        assert_eq!(candidates.dust.len(), MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS);
+        assert_eq!(candidates.inputs(candidates.dust.len()).len(), 11);
+        assert_eq!(candidates.dust_value(candidates.dust.len()), 55);
+    }
+
+    #[test]
+    fn workload_selection_measures_dust_against_transfer_value() {
+        let mut utxos = vec![
+            workload_utxo(1_200_000, 0),
+            workload_utxo(1_200_000, 1),
+            workload_utxo(200_000, 2),
+            workload_utxo(1_000, 3),
+            workload_utxo(500, 4),
+            workload_utxo(1, 5),
+        ];
+        utxos.extend((0..50).map(|index| workload_utxo(20_000, index + 6)));
+        let pool = WorkloadUtxoPool::new(&utxos);
+        let candidates = pool.candidates(8_000, 0).expect("primary should exist");
+
+        assert_eq!(candidates.primary.note.value, 1_200_000);
+        assert_eq!(
+            candidates.dust_threshold,
+            8_000 / CONTINUOUS_WORKLOAD_DUST_RATIO
+        );
+        assert_eq!(
+            candidates
+                .dust
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![1, 500]
+        );
+        assert_eq!(candidates.inputs(candidates.dust.len()).len(), 3);
+        assert_eq!(pool.len(), utxos.len());
+    }
+
+    #[test]
+    fn workload_dust_threshold_uses_the_larger_transfer_fraction_or_base_fee() {
+        assert_eq!(continuous_workload_dust_threshold(8_000, 700), 700);
+        assert_eq!(continuous_workload_dust_threshold(15_000, 700), 1_000);
+    }
+
+    #[test]
+    fn workload_selection_drops_dust_until_actual_funding_succeeds() {
+        let primary = workload_utxo(1_000_000_000, 0);
+        let dust = (1..=10)
+            .map(|index| workload_utxo(1, index))
+            .collect::<Vec<_>>();
+        let mut all_utxos = vec![primary];
+        all_utxos.extend_from_slice(&dust);
+        let pool = WorkloadUtxoPool::new(&all_utxos);
+
+        let gas_prices = GasPrices::new(1, 1);
+        let mut low = 0;
+        let mut high = primary.note.value;
+        while low < high {
+            let output_value = low + (high - low).div_ceil(2);
+            if prepare_all_provided(&[primary], output_value, gas_prices.clone(), 200).is_ok() {
+                low = output_value;
+            } else {
+                high = output_value - 1;
+            }
+        }
+        assert!(low > 0, "primary-only transfer should be fundable");
+        let candidates = pool.candidates(low, 0).expect("primary should exist");
+        assert!(
+            prepare_all_provided(
+                &candidates.inputs(candidates.dust.len()),
+                low,
+                gas_prices.clone(),
+                200,
+            )
+            .is_err(),
+            "all dust should exceed the fee headroom at the primary-only limit"
+        );
+
+        let mut successful_dust_count = None;
+        let mut reserved_inputs = None;
+        for dust_count in (0..=candidates.dust.len()).rev() {
+            let inputs = candidates.inputs(dust_count);
+            if let Ok(work_item) = prepare_all_provided(&inputs, low, gas_prices.clone(), 200) {
+                successful_dust_count = Some(dust_count);
+                reserved_inputs = Some(work_item.reserved_inputs());
+                break;
+            }
+        }
+
+        let successful_dust_count =
+            successful_dust_count.expect("primary-only attempt should eventually succeed");
+        assert!(successful_dust_count < candidates.dust.len());
+        let dropped_dust_ids = candidates.dust[successful_dust_count..]
+            .iter()
+            .map(Utxo::id)
+            .collect::<HashSet<_>>();
+
+        let mut cache = HashMap::from([(WalletId::from("sender"), all_utxos)]);
+        let mut pools = WorkloadUtxoPools::from_cache(&cache);
+        pools
+            .remove_reserved_inputs(
+                &mut cache,
+                reserved_inputs.expect("successful work item should have reservations"),
+            )
+            .expect("reserved inputs should be removed from indexed cache");
+
+        let remaining_ids = cache["sender"].iter().map(Utxo::id).collect::<HashSet<_>>();
+        assert!(dropped_dust_ids.is_subset(&remaining_ids));
+        assert_eq!(pools.candidate_count("sender"), remaining_ids.len());
+    }
+
+    #[test]
+    fn workload_selection_fails_after_bounded_candidates_when_primary_is_insufficient() {
+        let utxos = [
+            workload_utxo(10_000, 0),
+            workload_utxo(9_000, 1),
+            workload_utxo(100, 2),
+            workload_utxo(10, 3),
+            workload_utxo(1, 4),
+        ];
+        let pool = WorkloadUtxoPool::new(&utxos);
+        let candidates = pool.candidates(15_000, 0).expect("primary should exist");
+        let mut attempts = 0;
+
+        for dust_count in (0..=candidates.dust.len()).rev() {
+            attempts += 1;
+            assert!(
+                prepare_all_provided(
+                    &candidates.inputs(dust_count),
+                    15_000,
+                    GasPrices::default(),
+                    0,
+                )
+                .is_err()
+            );
+        }
+
+        assert_eq!(attempts, candidates.dust.len() + 1);
+        assert_eq!(
+            pool.candidates(15_000, 0)
+                .expect("failed attempts do not mutate the pool")
+                .inputs(candidates.dust.len())
+                .iter()
+                .map(|utxo| utxo.note.value)
+                .collect::<Vec<_>>(),
+            vec![10_000, 1, 10, 100]
+        );
+        assert!(pool.value_by_note_id.contains_key(&utxos[1].id()));
+    }
+
+    #[test]
+    fn repeated_workload_reservations_use_unique_primary_and_dust_inputs() {
+        let mut utxos = vec![
+            workload_utxo(400_000, 0),
+            workload_utxo(400_000, 1),
+            workload_utxo(400_000, 2),
+        ];
+        utxos.extend((1..=15).map(|index| workload_utxo(1, index + 2)));
+        let mut cache = HashMap::from([(WalletId::from("sender"), utxos)]);
+        let mut pools = WorkloadUtxoPools::from_cache(&cache);
+        let mut reserved_ids = HashSet::new();
+
+        for expected_primary in [400_000, 400_000] {
+            let candidates = pools
+                .candidates("sender", 8_000, 0)
+                .expect("primary should exist");
+            let inputs = candidates.inputs(candidates.dust.len());
+            assert_eq!(inputs[0].note.value, expected_primary);
+            let work_item = prepare_all_provided(&inputs, 8_000, GasPrices::default(), 0)
+                .expect("large primary should fund the workload transaction");
+            let reserved = work_item.reserved_inputs();
+            let (sender_inputs, fee_sponsor_inputs) = reserved.into_sender_and_fee_sponsor_inputs();
+            assert!(fee_sponsor_inputs.is_empty());
+            for input in &sender_inputs {
+                assert!(reserved_ids.insert(input.id()), "workload input was reused");
+            }
+            pools
+                .remove_reserved_inputs(
+                    &mut cache,
+                    WalletReservedInputs::new(sender_inputs, Vec::new()),
+                )
+                .expect("reserved inputs should be removed incrementally");
+        }
+
+        assert_eq!(pools.candidate_count("sender"), cache["sender"].len());
+        let next_candidates = pools
+            .candidates("sender", 8_000, 0)
+            .expect("next primary remains");
+        assert_eq!(next_candidates.primary.note.value, 400_000);
+        assert_eq!(next_candidates.dust.len(), 0);
+    }
+
+    #[test]
+    fn one_lgo_workload_uses_base_fee_as_the_dust_threshold() {
+        let mut utxos = vec![workload_utxo(430_000, 0), workload_utxo(410_000, 1)];
+        utxos.extend((1..=12).map(|index| workload_utxo(1, index + 1)));
+        let pool = WorkloadUtxoPool::new(&utxos);
+
+        let primary = pool.primary().expect("primary should exist");
+        let intent = WalletTransactionIntent::transfer(&[(ZkPublicKey::zero(), 1)])
+            .expect("one-LGO workload transfer intent")
+            .with_gas_prices(GasPrices::default());
+        let (_, base_tx_fee) = estimate_workload_fee_requirements(&intent, &[primary], 0)
+            .expect("base transaction fee should be estimable");
+        let candidates = pool
+            .candidates(1, base_tx_fee)
+            .expect("primary should exist");
+        let inputs = candidates.inputs(candidates.dust.len());
+
+        assert_eq!(inputs[0].note.value, 430_000);
+        assert!(base_tx_fee >= 1);
+        assert_eq!(candidates.dust_threshold, base_tx_fee);
+        assert_eq!(candidates.dust.len(), MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS);
+        assert!(candidates.dust.iter().all(|utxo| utxo.note.value == 1));
+        let work_item = prepare_all_provided(&inputs, 1, GasPrices::default(), 0)
+            .expect("large primary plus bounded dust should fund the transfer");
+        assert_eq!(
+            input_values(&work_item).len(),
+            MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS + 1
+        );
+        assert_eq!(input_values(&work_item)[0], 430_000);
+        assert_eq!(pool.len(), utxos.len());
+    }
 }
