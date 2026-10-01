@@ -1,0 +1,200 @@
+name: Merge queue telemetry
+
+# Documentation:
+#
+# This workflow is observational only. The merge_group path captures raw event,
+# Git, PR, stack, queue, timeline, check, and composition evidence. The
+# workflow_run path captures completed workflow/job/step timing and runner
+# metadata. The pull_request path observes merged PRs and only records full
+# queue metrics when the resolved trunk is master. The collector always comes
+# from trusted master; queued PR code is treated as Git data and is never
+# executed here.
+#
+# Artifacts are retained for 30 days. summary.json and the Actions step summary
+# contain derived values, while event.json and api/ preserve their raw source
+# responses. Queue topology comes from the repository trunk; candidate entry
+# and lifecycle data are PR-specific. Candidate entry and repository topology
+# queries are independent, and their reconciliation source/conflicts are kept.
+# The event's raw merge_group.base_ref is preserved; the collector normalizes
+# refs/heads/ only when a branch name is needed for queue queries. Completion
+# telemetry retains attempts 1..run_attempt for runner-cost totals while its
+# latest-workflow view reports the latest attempt's result.
+# Workflow completion and runner-cost completeness are separate; partial cost
+# accounting means runner_time_seconds is an observed lower bound.
+# Final-merge checks are stored separately as a point-in-time snapshot from
+# merge-group candidate checks. Missing or ambiguous GitHub data is
+# recorded as unresolved with a warning. No path creates statuses, comments,
+# settings changes, or required checks. Permissions are read-only (including
+# checks/statuses), and no telemetry job uses a self-hosted runner.
+# This is broad, temporary evidence collection for the initial production
+# measurement period; exploratory fields are expected to be trimmed after
+# representative queue data is available.
+
+on:
+  merge_group:
+    types: [checks_requested]
+  workflow_run:
+    workflows:
+      - Code checks
+      - Cucumber integration tests
+      - End-to-end integration tests
+    types: [completed]
+    branches:
+      - 'gh-readonly-queue/**'
+  # Do not filter by the PR's direct base branch: native stack members may
+  # target another stack branch while their resolved trunk is master. The
+  # trusted collector resolves the trunk and skips definitely non-master or
+  # unresolved closures without claiming master queue metrics.
+  pull_request:
+    types: [closed]
+
+# Each job grants only read permissions. This workflow is observational and is
+# not referenced by branch protection or merge-queue requirements.
+permissions: {}
+
+jobs:
+  merge-group-snapshot:
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Capture raw event
+        run: |
+          mkdir -p "$RUNNER_TEMP/merge-queue-telemetry"
+          cp "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/merge-queue-telemetry/event.json"
+
+      # Use the trusted default branch version of the collector. The candidate
+      # is fetched as Git data only; no code from the candidate is executed.
+      - name: Checkout trusted collector
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2 # Version 4.2.2
+        with:
+          ref: master
+          path: repo
+          fetch-depth: 1
+
+      - name: Collect merge-group snapshot
+        id: collect_snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! -f repo/scripts/ci/merge_queue_telemetry.py ]]; then
+            message="Merge queue telemetry bootstrap: the trusted collector is not on master yet. Telemetry will become active after this change lands on master."
+            echo "$message"
+            printf '## Merge queue telemetry bootstrap\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+            echo "collector_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "collector_available=true" >> "$GITHUB_OUTPUT"
+          python3 repo/scripts/ci/merge_queue_telemetry.py snapshot \
+            --event "$RUNNER_TEMP/merge-queue-telemetry/event.json" \
+            --repo repo \
+            --output telemetry
+
+      - name: Upload merge-group telemetry
+        if: ${{ always() && steps.collect_snapshot.outputs.collector_available == 'true' }}
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47 # Version 4.6.2
+        with:
+          name: merge-queue-telemetry-merge-group-${{ github.run_id }}-${{ github.run_attempt }}
+          path: telemetry
+          if-no-files-found: warn
+          retention-days: 30
+
+  workflow-completion-timings:
+    if: ${{ github.event.workflow_run.event == 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Capture raw event
+        run: |
+          mkdir -p "$RUNNER_TEMP/merge-queue-telemetry"
+          mkdir -p "$GITHUB_WORKSPACE/telemetry"
+          cp "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/merge-queue-telemetry/event.json"
+          cp "$GITHUB_EVENT_PATH" "$GITHUB_WORKSPACE/telemetry/event.json"
+
+      # workflow_run executes with elevated event context. Check out only the
+      # trusted master collector, never the source run's head branch or SHA.
+      - name: Checkout trusted collector
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2 # Version 4.2.2
+        with:
+          ref: master
+          path: repo
+          fetch-depth: 1
+
+      - name: Collect completed merge-group workflow timings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 repo/scripts/ci/merge_queue_telemetry.py timing \
+            --event "$RUNNER_TEMP/merge-queue-telemetry/event.json" \
+            --output telemetry
+
+      - name: Upload workflow timing telemetry
+        if: always()
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47 # Version 4.6.2
+        with:
+          name: merge-queue-telemetry-completion-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}-collector-${{ github.run_id }}-${{ github.run_attempt }}
+          path: telemetry
+          if-no-files-found: warn
+          retention-days: 30
+
+  pull-request-finalization:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Capture raw event
+        run: |
+          mkdir -p "$RUNNER_TEMP/merge-queue-telemetry"
+          cp "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/merge-queue-telemetry/event.json"
+
+      # Use only the trusted default branch collector. The closed PR revision
+      # is never checked out or executed.
+      - name: Checkout trusted collector
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2 # Version 4.2.2
+        with:
+          ref: master
+          path: repo
+          fetch-depth: 1
+
+      - name: Collect merged pull-request telemetry
+        id: collect_finalization
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! -f repo/scripts/ci/merge_queue_telemetry.py ]]; then
+            message="Merge queue finalization bootstrap: the trusted collector is not on master yet. Finalization telemetry will become active after this change lands on master."
+            echo "$message"
+            printf '## Merge queue finalization bootstrap\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+            echo "collector_available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "collector_available=true" >> "$GITHUB_OUTPUT"
+          python3 repo/scripts/ci/merge_queue_telemetry.py finalize \
+            --event "$RUNNER_TEMP/merge-queue-telemetry/event.json" \
+            --output telemetry
+
+      - name: Upload merged pull-request telemetry
+        if: ${{ always() && steps.collect_finalization.outputs.collector_available == 'true' }}
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47 # Version 4.6.2
+        with:
+          name: merge-queue-telemetry-finalization-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: telemetry
+          if-no-files-found: warn
+          retention-days: 30
