@@ -5,14 +5,14 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use futures::future::join_all;
 use lb_core::mantle::{
     NoteId, SignedOps, TxHash, Utxo,
-    gas::{MainnetGasProfile, TxGasCalculator as _},
     ledger::verification_mode::StandardMode,
-    transactions::{GasPrices, OpProofs, states::Preverified, tx_list::ops::OpsGasContext},
+    transactions::{GasPrices, OpProofs, states::Preverified},
 };
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
 use lb_key_management_system_service::keys::ZkPublicKey;
@@ -60,6 +60,21 @@ pub struct PreparedUserWalletSubmission {
 pub(crate) struct SignedUserWalletSubmission {
     wallet: WalletInfo,
     submission: SignedWalletTransaction,
+}
+
+/// Result of the network-only phase for a batch of signed submissions.
+///
+/// A transaction is accepted when at least one selected fan-out node accepts
+/// it. `first_error` is populated when one or more transactions failed on all
+/// selected nodes; accepted transactions are retained so callers can preserve
+/// the existing post-attempt bookkeeping behavior before returning that error.
+pub(crate) struct SignedUserWalletSubmissionNetworkResult {
+    pub(crate) accepted: Vec<SignedUserWalletSubmission>,
+    pub(crate) first_error: Option<StepError>,
+    pub(crate) fanout_node_names: Vec<String>,
+    pub(crate) node_selection_duration: Duration,
+    pub(crate) preflight_duration: Duration,
+    pub(crate) network_submission_duration: Duration,
 }
 
 /// Transaction whose inputs are selected but whose proofs are not finalized.
@@ -288,10 +303,6 @@ impl SignedUserWalletSubmission {
     #[must_use]
     pub fn reserved_inputs(&self) -> WalletReservedInputs {
         self.submission.reserved_inputs()
-    }
-
-    pub(crate) const fn paid_fee(&self) -> u64 {
-        self.submission.paid_fee()
     }
 }
 
@@ -607,28 +618,84 @@ async fn get_best_n_nodes_for_submissions(
     Ok(started_nodes)
 }
 
+fn summarize_fanout_attempts(
+    attempts: impl IntoIterator<Item = (String, Result<(), String>)>,
+) -> Result<Vec<String>, String> {
+    let mut submitted_nodes = Vec::new();
+    let mut submission_errors = Vec::new();
+    for (node_name, result) in attempts {
+        match result {
+            Ok(()) => submitted_nodes.push(node_name),
+            Err(error) => submission_errors.push(error),
+        }
+    }
+
+    if submitted_nodes.is_empty() {
+        Err(submission_errors.join("; "))
+    } else {
+        Ok(submitted_nodes)
+    }
+}
+
+fn validate_submission_epoch(
+    current_epoch: u64,
+    fee_policy: Option<&TransactionFeePolicy>,
+) -> Result<(), StepError> {
+    let Some(policy) = fee_policy else {
+        return Ok(());
+    };
+    let valid_through_epoch = u64::from(policy.horizon.valid_through_epoch.into_inner());
+    if current_epoch > valid_through_epoch {
+        return Err(StepError::FeeHorizonExceeded {
+            current_epoch,
+            prepared_at_epoch: policy.horizon.prepared_at_epoch.into_inner(),
+            valid_through_epoch: policy.horizon.valid_through_epoch.into_inner(),
+        });
+    }
+    Ok(())
+}
+
 /// Submit signed transactions to several nodes sharing the selected majority
 /// tip.
 ///
 /// Fanout makes manual/stress scenarios less sensitive to one slow node while
 /// still avoiding nodes from a different fork group.
-pub(crate) async fn submit_signed_user_wallet_submissions_concurrently(
-    world: &mut CucumberWorld,
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Bounded fan-out submission workflow"
+)]
+pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
+    world: &CucumberWorld,
     signed_submissions: Vec<SignedUserWalletSubmission>,
     fee_policy: Option<&TransactionFeePolicy>,
-) -> Result<Vec<(String, TxHash)>, StepError> {
+) -> Result<SignedUserWalletSubmissionNetworkResult, StepError> {
     if signed_submissions.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SignedUserWalletSubmissionNetworkResult {
+            accepted: Vec::new(),
+            first_error: None,
+            fanout_node_names: Vec::new(),
+            node_selection_duration: Duration::ZERO,
+            preflight_duration: Duration::ZERO,
+            network_submission_duration: Duration::ZERO,
+        });
     }
-    let same_tip_nodes = get_best_n_nodes_for_submissions(world, &signed_submissions, 3).await?;
-    validate_signed_submissions_against_live_prices(
-        world,
-        &signed_submissions,
-        &same_tip_nodes[0].1,
-        fee_policy,
-    )
-    .await?;
 
+    let node_selection_started = Instant::now();
+    let same_tip_nodes = get_best_n_nodes_for_submissions(world, &signed_submissions, 3).await?;
+    let node_selection_duration = node_selection_started.elapsed();
+    let fanout_node_names = same_tip_nodes
+        .iter()
+        .map(|(node_name, _)| node_name.clone())
+        .collect::<Vec<_>>();
+    info!(target: TARGET, fanout_nodes = ?fanout_node_names, "Selected burst submission fan-out nodes");
+
+    let preflight_started = Instant::now();
+    validate_submission_fee_horizon(world, &same_tip_nodes[0].1, fee_policy).await?;
+    let preflight_duration = preflight_started.elapsed();
+    info!(target: TARGET, preflight_ms = preflight_duration.as_millis(), "Burst fee-horizon preflight completed");
+
+    let network_submission_started = Instant::now();
+    info!(target: TARGET, "Burst network submission started");
     let mut join_set = JoinSet::new();
 
     for signed_submission in signed_submissions {
@@ -637,49 +704,52 @@ pub(crate) async fn submit_signed_user_wallet_submissions_concurrently(
 
         join_set.spawn(async move {
             let tx_hash = signed_submission.tx_hash();
-            let mut submission_errors = Vec::new();
-
-            // Try to submit to each node in same_tip_nodes.
-            let mut submitted_nodes = Vec::new();
-            for (node_name, node_client) in &same_tip_nodes {
-                match timeout(
-                    Duration::from_secs(15),
-                    node_client.submit_transaction(signed_submission.signed_tx()),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        submitted_nodes.push(node_name.clone());
-                    }
-                    Ok(Err(err)) => {
-                        submission_errors.push(format!("{node_name}: {err}"));
-                    }
-                    Err(_) => {
-                        submission_errors.push(format!("{node_name}: timeout"));
-                    }
+            let signed_tx = signed_submission.signed_tx();
+            let attempts = join_all(same_tip_nodes.iter().map(|(node_name, node_client)| {
+                let node_name = node_name.clone();
+                async move {
+                    let result = timeout(
+                        Duration::from_secs(15),
+                        node_client.submit_transaction(signed_tx),
+                    )
+                    .await;
+                    (node_name, result)
                 }
-            }
-            if !submitted_nodes.is_empty() {
-                if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
-                    info!(
-                        target: TARGET,
-                        "Transaction {} submitted successfully to {submitted_nodes:?}",
-                        hex::encode(tx_hash.0)
+            }))
+            .await;
+
+            let attempt_outcome =
+                summarize_fanout_attempts(attempts.into_iter().map(|(node_name, result)| {
+                    let result = match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(err)) => Err(format!("{node_name}: {err}")),
+                        Err(_) => Err(format!("{node_name}: timeout")),
+                    };
+                    (node_name, result)
+                }));
+
+            match attempt_outcome {
+                Ok(submitted_nodes) => {
+                    if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
+                        info!(
+                            target: TARGET,
+                            "Transaction {} submitted successfully to {submitted_nodes:?}",
+                            hex::encode(tx_hash.0)
+                        );
+                    }
+                    Ok::<_, StepError>(signed_submission)
+                }
+                Err(errors) => {
+                    let message = format!(
+                        "Transaction {tx_hash:?} for '{}' failed on all {} nodes: {errors}",
+                        wallet.wallet_name,
+                        same_tip_nodes.len(),
                     );
+                    warn!(target: TARGET, "{message}");
+
+                    Err(StepError::LogicalError { message })
                 }
-                return Ok::<_, StepError>(signed_submission);
             }
-
-            // All nodes failed; log and return error.
-            let message = format!(
-                "Transaction {tx_hash:?} for '{}' failed on all {} nodes: {}",
-                wallet.wallet_name,
-                same_tip_nodes.len(),
-                submission_errors.join("; ")
-            );
-            warn!(target: TARGET, "{message}");
-
-            Err(StepError::LogicalError { message })
         });
     }
 
@@ -700,25 +770,57 @@ pub(crate) async fn submit_signed_user_wallet_submissions_concurrently(
         }
     }
 
+    Ok(SignedUserWalletSubmissionNetworkResult {
+        accepted,
+        first_error,
+        fanout_node_names,
+        node_selection_duration,
+        preflight_duration,
+        network_submission_duration: network_submission_started.elapsed(),
+    })
+}
+
+/// Submit a batch and preserve the legacy convenience behavior of recording
+/// accepted submissions before returning any all-nodes failure.
+pub(crate) async fn submit_signed_user_wallet_submissions_concurrently(
+    world: &mut CucumberWorld,
+    signed_submissions: Vec<SignedUserWalletSubmission>,
+    fee_policy: Option<&TransactionFeePolicy>,
+) -> Result<Vec<(String, TxHash)>, StepError> {
+    let result =
+        submit_signed_user_wallet_submissions_to_nodes(&*world, signed_submissions, fee_policy)
+            .await?;
+    let SignedUserWalletSubmissionNetworkResult {
+        accepted,
+        first_error,
+        ..
+    } = result;
+    let submitted_hashes = record_accepted_signed_user_wallet_submissions(world, &accepted)?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(submitted_hashes)
+}
+
+/// Record accepted network submissions after any caller-specific diagnostic
+/// boundary has been crossed.
+pub(crate) fn record_accepted_signed_user_wallet_submissions(
+    world: &mut CucumberWorld,
+    accepted: &[SignedUserWalletSubmission],
+) -> Result<Vec<(String, TxHash)>, StepError> {
     let mut tx_hashes = Vec::with_capacity(accepted.len());
-    for signed_submission in &accepted {
+    for signed_submission in accepted {
         tx_hashes.push((
             signed_submission.wallet.wallet_name.clone(),
             signed_submission.tx_hash(),
         ));
         record_signed_user_wallet_submission(world, signed_submission)?;
     }
-
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-
     Ok(tx_hashes)
 }
 
-async fn validate_signed_submissions_against_live_prices(
+async fn validate_submission_fee_horizon(
     world: &CucumberWorld,
-    signed_submissions: &[SignedUserWalletSubmission],
     client: &NodeHttpClient,
     fee_policy: Option<&TransactionFeePolicy>,
 ) -> Result<(), StepError> {
@@ -726,64 +828,19 @@ async fn validate_signed_submissions_against_live_prices(
         .consensus_info()
         .await
         .map_err(|source| StepError::StepFail {
-            message: format!("live fee validation consensus query failed: {source}"),
+            message: format!("submission fee-horizon consensus query failed: {source}"),
         })?;
     if let Some(policy) = fee_policy {
         let current_epoch =
             consensus.cryptarchia_info.slot.into_inner() / world.chain.slots_per_epoch.get();
-        let valid_through_epoch = u64::from(policy.horizon.valid_through_epoch.into_inner());
-        if current_epoch > valid_through_epoch {
-            return Err(StepError::FeeHorizonExceeded {
-                current_epoch,
-                prepared_at_epoch: policy.horizon.prepared_at_epoch.into_inner(),
-                valid_through_epoch: policy.horizon.valid_through_epoch.into_inner(),
-            });
-        }
-    }
-    let prices = client
-        .gas_prices(Some(consensus.cryptarchia_info.tip))
-        .await
-        .map_err(|source| StepError::StepFail {
-            message: format!("live fee validation gas price query failed: {source}"),
-        })?;
-    for submission in signed_submissions {
-        let gas_context = OpsGasContext::new(
-            HashMap::new(),
-            HashMap::new(),
-            GasPrices {
-                execution_base_gas_price: prices.execution_base_gas_price,
-                storage_gas_price: prices.storage_gas_price,
-            },
-        );
-        let required_fee = submission
-            .signed_tx()
-            .op_refs()
-            .total_gas_cost::<MainnetGasProfile>(&gas_context)
-            .map_err(|source| StepError::LogicalError {
-                message: format!("live fee validation failed: {source}"),
-            })?
-            .into_inner();
-        if submission.paid_fee() < required_fee {
-            let (prepared_at_epoch, valid_through_epoch) = fee_policy.map_or((0, 0), |policy| {
-                (
-                    policy.horizon.prepared_at_epoch.into_inner(),
-                    policy.horizon.valid_through_epoch.into_inner(),
-                )
-            });
-            return Err(StepError::FeeHorizonExpired {
-                paid_fee: submission.paid_fee(),
-                required_fee,
-                prepared_at_epoch,
-                valid_through_epoch,
-            });
-        }
+        validate_submission_epoch(current_epoch, Some(policy))?;
     }
     Ok(())
 }
 
 /// Check whether a prepared wallet batch can still be submitted under the
 /// cycle's fee horizon. This deliberately queries only the current majority
-/// consensus tip; the final submission validation still checks live gas prices.
+/// consensus tip.
 pub(crate) async fn validate_fee_horizon_after_wallet_batch(
     world: &CucumberWorld,
     policy: &TransactionFeePolicy,
@@ -1456,9 +1513,11 @@ fn group_key_for_wallet(world: &CucumberWorld, wallet_name: &str) -> Result<Stri
 
 #[cfg(test)]
 mod cache_removal_tests {
-    use lb_core::mantle::Note;
+    use lb_chain_service::Epoch;
+    use lb_core::{header::HeaderId, mantle::Note};
 
     use super::*;
+    use crate::common::wallet::TransactionFeeHorizon;
 
     fn utxo(value: u64, output_index: usize) -> Utxo {
         Utxo::new(
@@ -1481,6 +1540,77 @@ mod cache_removal_tests {
         assert!(!is_user_wallet_funds_deficit(&StepError::LogicalError {
             message: "not a funding failure".to_owned(),
         }));
+    }
+
+    #[test]
+    fn fanout_accepts_when_all_nodes_succeed() {
+        let accepted = summarize_fanout_attempts([
+            ("NODE_A".to_owned(), Ok(())),
+            ("NODE_B".to_owned(), Ok(())),
+            ("NODE_C".to_owned(), Ok(())),
+        ])
+        .expect("all successful fan-out attempts should be accepted");
+
+        assert_eq!(accepted, ["NODE_A", "NODE_B", "NODE_C"]);
+    }
+
+    #[test]
+    fn fanout_accepts_when_any_node_succeeds() {
+        let accepted = summarize_fanout_attempts([
+            ("NODE_A".to_owned(), Err("connection refused".to_owned())),
+            ("NODE_B".to_owned(), Ok(())),
+            ("NODE_C".to_owned(), Err("timeout".to_owned())),
+        ])
+        .expect("one successful fan-out attempt should be accepted");
+
+        assert_eq!(accepted, ["NODE_B"]);
+    }
+
+    #[test]
+    fn fanout_rejects_when_all_nodes_fail() {
+        let error = summarize_fanout_attempts([
+            ("NODE_A".to_owned(), Err("connection refused".to_owned())),
+            ("NODE_B".to_owned(), Err("timeout".to_owned())),
+            ("NODE_C".to_owned(), Err("rejected".to_owned())),
+        ])
+        .expect_err("all failed fan-out attempts should fail");
+
+        assert_eq!(error, "connection refused; timeout; rejected");
+    }
+
+    fn fee_policy_through_epoch(valid_through_epoch: u32) -> TransactionFeePolicy {
+        TransactionFeePolicy {
+            horizon: TransactionFeeHorizon {
+                prepared_at_tip: HeaderId::from([0; 32]),
+                prepared_at_epoch: Epoch::new(2),
+                valid_through_epoch: Epoch::new(valid_through_epoch),
+                live_prices: GasPrices::default(),
+                ceiling_prices: GasPrices::default(),
+            },
+            priority_fee_percent: 0,
+        }
+    }
+
+    #[test]
+    fn submission_fee_horizon_allows_current_epoch() {
+        let policy = fee_policy_through_epoch(4);
+
+        validate_submission_epoch(4, Some(&policy))
+            .expect("submission should remain valid through the horizon");
+    }
+
+    #[test]
+    fn submission_fee_horizon_rejects_late_current_epoch() {
+        let policy = fee_policy_through_epoch(4);
+
+        assert!(matches!(
+            validate_submission_epoch(5, Some(&policy)),
+            Err(StepError::FeeHorizonExceeded {
+                current_epoch: 5,
+                prepared_at_epoch: 2,
+                valid_through_epoch: 4,
+            })
+        ));
     }
 
     #[test]

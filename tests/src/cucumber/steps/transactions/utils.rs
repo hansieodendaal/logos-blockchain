@@ -22,11 +22,12 @@ pub(crate) use crate::cucumber::wallet::{
     best_node::BestNodeInfo,
     submissions::{
         WorkloadUtxoPools, finalize_reserved_user_wallet_submissions_concurrently,
-        prepare_user_wallet_transaction_submission,
+        prepare_user_wallet_transaction_submission, record_accepted_signed_user_wallet_submissions,
         reserve_user_wallet_transaction_submission_with_utxo_cache,
         reserve_workload_transaction_intent_with_primary_and_dust,
         submit_prepared_user_wallet_transaction,
         submit_signed_user_wallet_submissions_concurrently,
+        submit_signed_user_wallet_submissions_to_nodes,
     },
 };
 use crate::cucumber::{

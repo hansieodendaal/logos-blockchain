@@ -16,7 +16,13 @@ use super::{
     wait_for_all_nodes_to_be_synced_to_chain, wait_for_observed_transaction_hashes,
     wait_for_observed_transaction_hashes_cancellable,
 };
-use crate::cucumber::steps::nodes::diagnostics::BlendDiagnosticEventLogger;
+use crate::cucumber::{
+    steps::{
+        mempool::steps::record_mempool_pending_counts,
+        nodes::diagnostics::BlendDiagnosticEventLogger,
+    },
+    wallet::submissions::SignedUserWalletSubmissionNetworkResult,
+};
 
 pub async fn execute_manual_command(
     world: &mut CucumberWorld,
@@ -464,7 +470,7 @@ async fn execute_continuous_next_wallet_user_wallet_inner(
         .await?;
         let verification_duration = verification_started.elapsed();
         if mempool_diagnostics {
-            crate::cucumber::steps::mempool::steps::record_mempool_pending_counts(
+            record_mempool_pending_counts(
                 world,
                 workload_mode,
                 &format!("round_{round_number}_included"),
@@ -724,15 +730,76 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
         preparation_and_signing_ms = preparation_duration.as_millis(),
         "Finished transaction preparation before burst submission"
     );
-    let submission_started = Instant::now();
-    let submitted_hashes = utils::submit_signed_user_wallet_submissions_concurrently(
-        world,
+    let workload_mode = if dependent_state.is_some() {
+        "dependent"
+    } else {
+        "independent"
+    };
+    info!(
+        target: TARGET,
+        workload_mode,
+        burst = round_number,
+        transaction_count = signed_submissions.len(),
+        "Starting burst submission phase"
+    );
+    let network_result = utils::submit_signed_user_wallet_submissions_to_nodes(
+        &*world,
         signed_submissions,
         Some(&policy),
     )
     .await?;
-    let submission_duration = submission_started.elapsed();
+    let SignedUserWalletSubmissionNetworkResult {
+        accepted,
+        first_error,
+        fanout_node_names,
+        node_selection_duration,
+        preflight_duration,
+        network_submission_duration,
+    } = network_result;
+    info!(
+        target: TARGET,
+        workload_mode,
+        burst = round_number,
+        accepted = accepted.len(),
+        failed = first_error.is_some(),
+        fanout_nodes = ?fanout_node_names,
+        network_submission_ms = network_submission_duration.as_millis(),
+        "Burst network submission completed"
+    );
     let mut submitted_counts = BTreeMap::new();
+    if mempool_diagnostics && first_error.is_none() {
+        info!(
+            target: TARGET,
+            workload_mode,
+            burst = round_number,
+            "Capturing post-network mempool pending snapshot before wallet bookkeeping"
+        );
+        record_mempool_pending_counts(
+            world,
+            workload_mode,
+            &format!("burst_{round_number}_submitted"),
+        )
+        .await?;
+    }
+
+    info!(
+        target: TARGET,
+        workload_mode,
+        burst = round_number,
+        transaction_count = accepted.len(),
+        "Starting burst wallet bookkeeping"
+    );
+    let bookkeeping_started = Instant::now();
+    let submitted_hashes = utils::record_accepted_signed_user_wallet_submissions(world, &accepted)?;
+    let bookkeeping_duration = bookkeeping_started.elapsed();
+    info!(
+        target: TARGET,
+        workload_mode,
+        burst = round_number,
+        transaction_count = submitted_hashes.len(),
+        wallet_bookkeeping_ms = bookkeeping_duration.as_millis(),
+        "Completed burst wallet bookkeeping"
+    );
     for (sender, _) in &submitted_hashes {
         *submitted_counts.entry(sender.clone()).or_insert(0usize) += 1;
     }
@@ -743,18 +810,12 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
         "submitted",
         &submitted_counts,
     );
-    let workload_mode = if dependent_state.is_some() {
-        "dependent"
-    } else {
-        "independent"
-    };
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
     if mempool_diagnostics {
-        crate::cucumber::steps::mempool::steps::record_mempool_pending_counts(
-            world,
-            workload_mode,
-            &format!("burst_{round_number}_submitted"),
-        )
-        .await?;
         let dependent_diagnostics =
             dependent_state.and_then(DependentTransactionLoadState::last_burst_diagnostics);
         BlendDiagnosticEventLogger::from_world(world).append_named_timeline_record(
@@ -765,7 +826,17 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
                 "transaction_count": submitted_hashes.len(),
                 "preparation_and_signing_ms": preparation_duration.as_millis(),
                 "shuffle_seed": dependent_diagnostics.as_ref().and_then(|diagnostics| diagnostics.shuffle_seed),
-                "submission_ms": submission_duration.as_millis(),
+                "node_selection_ms": node_selection_duration.as_millis(),
+                "fanout_nodes": fanout_node_names,
+                "preflight_ms": preflight_duration.as_millis(),
+                "network_submission_ms": network_submission_duration.as_millis(),
+                "submission_ms": network_submission_duration.as_millis(),
+                "wallet_bookkeeping_ms": bookkeeping_duration.as_millis(),
+                "total_submit_and_record_ms": node_selection_duration
+                    .saturating_add(preflight_duration)
+                    .saturating_add(network_submission_duration)
+                    .saturating_add(bookkeeping_duration)
+                    .as_millis(),
                 "lineage_counter_start": dependent_diagnostics.as_ref().and_then(|diagnostics| diagnostics.lineage_counter_start),
                 "lineage_counter_end": dependent_diagnostics.as_ref().and_then(|diagnostics| diagnostics.lineage_counter_end),
             }),
