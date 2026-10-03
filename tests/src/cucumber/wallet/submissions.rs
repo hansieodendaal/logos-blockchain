@@ -5,13 +5,14 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use futures::future::join_all;
+use futures::{StreamExt as _, stream::FuturesUnordered};
 use lb_core::mantle::{
     NoteId, SignedOps, TxHash, Utxo,
-    ledger::verification_mode::StandardMode,
+    ledger::{MAX_TRANSACTION_INPUTS, verification_mode::StandardMode},
     transactions::{GasPrices, OpProofs, states::Preverified},
 };
 use lb_http_api_common::bodies::wallet::transfer_funds::WalletTransferFundsRequestBody;
@@ -71,6 +72,7 @@ pub(crate) struct SignedUserWalletSubmission {
 pub(crate) struct SignedUserWalletSubmissionNetworkResult {
     pub(crate) accepted: Vec<SignedUserWalletSubmission>,
     pub(crate) first_error: Option<StepError>,
+    pub(crate) failed_transaction_count: usize,
     pub(crate) fanout_node_names: Vec<String>,
     pub(crate) node_selection_duration: Duration,
     pub(crate) preflight_duration: Duration,
@@ -100,9 +102,10 @@ const fn continuous_workload_dust_threshold(output_value: u64, base_tx_fee: u64)
 
 /// Per-wallet UTXOs prepared for continuous workload transaction batches.
 ///
-/// The ordered map provides the largest primary input and smallest dust
-/// candidates without rebuilding or sorting the wallet's full UTXO list for
-/// each transaction. The second map supports removal by reserved note ID.
+/// The ordered map provides the bounded largest-first primary prefix and
+/// smallest dust candidates without rebuilding or sorting the wallet's full
+/// UTXO list for each transaction. The second map supports removal by
+/// reserved note ID.
 #[derive(Debug, Default)]
 struct WorkloadUtxoPool {
     by_value: BTreeMap<u64, BTreeMap<NoteId, Utxo>>,
@@ -143,42 +146,61 @@ impl WorkloadUtxoPool {
         }
     }
 
-    fn primary(&self) -> Option<Utxo> {
-        let (_, primary_bucket) = self.by_value.last_key_value()?;
-        let (_, primary) = primary_bucket.last_key_value()?;
-        Some(*primary)
+    fn primary_candidates(&self) -> Vec<Utxo> {
+        self.by_value
+            .iter()
+            .rev()
+            .flat_map(|(_, bucket)| bucket.values().rev())
+            .take(MAX_TRANSACTION_INPUTS)
+            .copied()
+            .collect()
     }
 
+    #[cfg(test)]
+    fn primary(&self) -> Option<Utxo> {
+        self.primary_candidates().first().copied()
+    }
+
+    #[cfg(test)]
     fn candidates(&self, output_value: u64, base_tx_fee: u64) -> Option<WorkloadCandidateSet> {
-        let (_, primary_bucket) = self.by_value.last_key_value()?;
-        let (primary_note_id, primary) = primary_bucket.last_key_value()?;
+        let primary = self.primary()?;
+        Some(self.candidates_for_primary(&[primary], output_value, base_tx_fee))
+    }
+
+    fn candidates_for_primary(
+        &self,
+        primary_inputs: &[Utxo],
+        output_value: u64,
+        base_tx_fee: u64,
+    ) -> WorkloadCandidateSet {
         let dust_threshold = continuous_workload_dust_threshold(output_value, base_tx_fee);
-        let mut dust = Vec::with_capacity(MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS);
+        let primary_note_ids = primary_inputs.iter().map(Utxo::id).collect::<HashSet<_>>();
+        let dust_input_limit = MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS
+            .min(MAX_TRANSACTION_INPUTS.saturating_sub(primary_inputs.len()));
+        let mut dust = Vec::with_capacity(dust_input_limit);
 
         dust.extend(
             self.by_value
                 .range(..=dust_threshold)
                 .flat_map(|(_, bucket)| bucket.values())
-                .filter(|utxo| utxo.id() != *primary_note_id)
-                .take(MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS)
+                .filter(|utxo| !primary_note_ids.contains(&utxo.id()))
+                .take(dust_input_limit)
                 .copied(),
         );
 
-        Some(WorkloadCandidateSet {
-            primary: *primary,
+        WorkloadCandidateSet {
+            primary_inputs: primary_inputs.to_vec(),
             dust,
             dust_threshold,
-            available_candidate_count: self.len(),
-        })
+        }
     }
 }
 
 #[derive(Debug)]
 struct WorkloadCandidateSet {
-    primary: Utxo,
+    primary_inputs: Vec<Utxo>,
     dust: Vec<Utxo>,
     dust_threshold: u64,
-    available_candidate_count: usize,
 }
 
 impl WorkloadCandidateSet {
@@ -192,8 +214,8 @@ impl WorkloadCandidateSet {
 
     fn inputs(&self, dust_count: usize) -> Vec<Utxo> {
         let dust_count = dust_count.min(self.dust.len());
-        let mut inputs = Vec::with_capacity(dust_count + 1);
-        inputs.push(self.primary);
+        let mut inputs = Vec::with_capacity(dust_count + self.primary_inputs.len());
+        inputs.extend_from_slice(&self.primary_inputs);
         inputs.extend_from_slice(&self.dust[..dust_count]);
         inputs
     }
@@ -230,19 +252,24 @@ impl WorkloadUtxoPools {
             .map_or(0, WorkloadUtxoPool::len)
     }
 
-    fn primary(&self, wallet_name: &str) -> Option<Utxo> {
-        self.by_wallet.get(wallet_name)?.primary()
+    fn primary_candidates(&self, wallet_name: &str) -> Vec<Utxo> {
+        self.by_wallet
+            .get(wallet_name)
+            .map_or_else(Vec::new, WorkloadUtxoPool::primary_candidates)
     }
 
     fn candidates(
         &self,
         wallet_name: &str,
+        primary_inputs: &[Utxo],
         output_value: u64,
         base_tx_fee: u64,
     ) -> Option<WorkloadCandidateSet> {
-        self.by_wallet
-            .get(wallet_name)?
-            .candidates(output_value, base_tx_fee)
+        Some(self.by_wallet.get(wallet_name)?.candidates_for_primary(
+            primary_inputs,
+            output_value,
+            base_tx_fee,
+        ))
     }
 
     fn remove_reserved_inputs(
@@ -369,8 +396,9 @@ pub(crate) async fn reserve_user_wallet_transaction_intent_with_utxo_cache(
     Ok(reserved)
 }
 
-/// Reserve a continuous workload transaction from its largest input and a
-/// bounded set of the smallest qualifying dust inputs.
+/// Reserve a continuous workload transaction from its smallest sufficient
+/// largest-first primary prefix and a bounded set of the smallest qualifying
+/// dust inputs.
 ///
 /// These stress workloads deliberately create a large source UTXO per
 /// transaction. They may consume small historical outputs alongside it, but
@@ -394,17 +422,17 @@ pub(crate) async fn reserve_workload_transaction_intent_with_primary_and_dust(
     gas_prices: Option<GasPrices>,
     priority_fee_percent: u64,
 ) -> Result<ReservedUserWalletSubmission, StepError> {
-    let Some(primary) = workload_pools.primary(sender_wallet_name) else {
+    let primary_candidates = workload_pools.primary_candidates(sender_wallet_name);
+    let available_candidate_count = workload_pools.candidate_count(sender_wallet_name);
+    if primary_candidates.is_empty() {
         return Err(StepError::LogicalError {
             message: format!(
                 "Workload funding failed for wallet '{sender_wallet_name}': no primary UTXO is \
-                available; output value={output_value}, available candidate count={}",
-                workload_pools.candidate_count(sender_wallet_name)
+                available; output value={output_value}, primary input limit={MAX_TRANSACTION_INPUTS}, \
+                available candidate count={available_candidate_count}"
             ),
         });
-    };
-
-    let primary_value = primary.note.value;
+    }
     let fee_intent = gas_prices.as_ref().map_or_else(
         || transaction_intent.clone(),
         |gas_prices| {
@@ -413,35 +441,105 @@ pub(crate) async fn reserve_workload_transaction_intent_with_primary_and_dust(
                 .with_gas_prices(gas_prices.clone())
         },
     );
-    let (_, base_tx_fee) = estimate_workload_fee_requirements(&fee_intent, &[primary], 0).map_err(
-        |error| StepError::LogicalError {
+
+    let mut primary_reserved = None;
+    let mut selected_primary_count = 0;
+    let mut last_primary_funding_error = None;
+    for primary_count in 1..=primary_candidates.len() {
+        match reserve_user_wallet_transaction_submission(
+            world,
+            step,
+            sender_wallet_name,
+            transaction_intent.clone(),
+            Some(available_utxos),
+            Some(&primary_candidates[..primary_count]),
+            None,
+            WalletInputSelectionStrategy::AllProvided,
+            gas_prices.clone(),
+            priority_fee_percent,
+        )
+        .await
+        {
+            Ok(reserved) => {
+                primary_reserved = Some(reserved);
+                selected_primary_count = primary_count;
+                break;
+            }
+            Err(error) if is_user_wallet_funds_deficit(&error) => {
+                last_primary_funding_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let Some(primary_reserved) = primary_reserved else {
+        let attempted_primary_value = primary_candidates
+            .iter()
+            .map(|utxo| utxo.note.value)
+            .sum::<u64>();
+        let largest_primary_value = primary_candidates[0].note.value;
+        let primary_count = primary_candidates.len();
+        let (required_fee_without_change, required_fee_with_change, fee_estimate_error) =
+            estimate_workload_fee_requirements(
+                &fee_intent,
+                &primary_candidates,
+                priority_fee_percent,
+            )
+            .map_or_else(
+                |error| (None, None, Some(format!("unavailable ({error})"))),
+                |(without_change, with_change)| (Some(without_change), Some(with_change), None),
+            );
+        let required_fee_without_change = required_fee_without_change
+            .map_or_else(|| "unavailable".to_owned(), |fee| fee.to_string());
+        let required_fee_with_change = required_fee_with_change
+            .map_or_else(|| "unavailable".to_owned(), |fee| fee.to_string());
+        let fee_estimate_error = fee_estimate_error.unwrap_or_default();
+        let last_error = last_primary_funding_error.map_or_else(
+            || "no primary funding attempt was made".to_owned(),
+            |e| e.to_string(),
+        );
+        return Err(StepError::LogicalError {
             message: format!(
-                "Continuous workload funding failed for wallet '{sender_wallet_name}': could not \
-                estimate primary-only base transaction fee for output value={output_value}, primary \
-                value={primary_value}: {error}"
+                "Continuous workload funding failed for wallet '{sender_wallet_name}': output \
+                value={output_value}, largest primary value={largest_primary_value}, bounded \
+                largest-first primary candidates attempted={primary_count}, primary input \
+                limit={MAX_TRANSACTION_INPUTS}, total candidate value in that prefix=\
+                {attempted_primary_value}, primary fee headroom={} (prefix minus output), required \
+                fee without change={required_fee_without_change}, required fee with change=\
+                {required_fee_with_change}{fee_estimate_error}, \
+                available candidate count={available_candidate_count}; no bounded primary prefix \
+                funded the transaction: {last_error}",
+                attempted_primary_value.saturating_sub(output_value)
             ),
-        },
-    )?;
+        });
+    };
+
+    let primary_inputs = &primary_candidates[..selected_primary_count];
+    let (_, base_tx_fee) = estimate_workload_fee_requirements(&fee_intent, primary_inputs, 0)
+        .map_err(|error| StepError::LogicalError {
+            message: format!(
+                "Continuous workload funding reserved a {selected_primary_count}-input primary \
+                prefix for wallet '{sender_wallet_name}', but its base transaction fee could not \
+                be estimated: {error}"
+            ),
+        })?;
     let candidates = workload_pools
-        .candidates(sender_wallet_name, output_value, base_tx_fee)
-        .expect("workload primary was just read from the same candidate pool");
+        .candidates(
+            sender_wallet_name,
+            primary_inputs,
+            output_value,
+            base_tx_fee,
+        )
+        .expect("workload primary prefix was read from the same candidate pool");
 
     let eligible_dust_count = candidates.dust.len();
     let max_dust_count = candidates.dust.len();
-    let max_dust_value = candidates.dust_value(max_dust_count);
-    let dust_threshold = candidates.dust_threshold;
-    let dust_candidate_values = candidates
-        .dust
-        .iter()
-        .map(|utxo| utxo.note.value)
-        .collect::<Vec<_>>();
-    let available_candidate_count = candidates.available_candidate_count;
-    let mut last_insufficient_funds = None;
+    let mut last_dust_funding_error = None;
 
     // Requiring each bounded candidate set lets the real wallet funding
     // calculation account for the additional input fees. Dropping dust from
     // largest selected dust to smallest preserves the smallest cleanup inputs.
-    for dust_count in (0..=max_dust_count).rev() {
+    for dust_count in (1..=max_dust_count).rev() {
         let candidate_inputs = candidates.inputs(dust_count);
         match reserve_user_wallet_transaction_submission(
             world,
@@ -463,60 +561,28 @@ pub(crate) async fn reserve_workload_transaction_intent_with_primary_and_dust(
                 return Ok(reserved);
             }
             Err(error) if is_user_wallet_funds_deficit(&error) => {
-                last_insufficient_funds = Some(error);
+                last_dust_funding_error = Some(error);
             }
             Err(error) => return Err(error),
         }
     }
 
-    let final_error = last_insufficient_funds.map_or_else(
-        || "no funding attempt was made".to_owned(),
-        |error| error.to_string(),
-    );
-    let (fee_without_change, fee_with_change, fee_shortfall_without_change) =
-        estimate_workload_fee_requirements(
-            &fee_intent,
-            &[candidates.primary],
-            priority_fee_percent,
-        )
-        .map_or_else(
-            |error| {
-                (
-                    format!("unavailable ({error})"),
-                    "unavailable".to_owned(),
-                    "unavailable".to_owned(),
-                )
-            },
-            |(without_change, with_change)| {
-                let fee_shortfall =
-                    without_change.saturating_sub(primary_value.saturating_sub(output_value));
-                (
-                    without_change.to_string(),
-                    with_change.to_string(),
-                    fee_shortfall.to_string(),
-                )
-            },
+    // The primary-only funding attempt already succeeded, so rejected dust
+    // remains available and the validated primary reservation is still valid.
+    workload_pools.remove_reserved_inputs(available_utxos, primary_reserved.reserved_inputs())?;
+    if max_dust_count > 0 && last_dust_funding_error.is_some() {
+        debug!(
+            target: TARGET,
+            wallet = sender_wallet_name,
+            selected_primary_count,
+            eligible_dust_count,
+            dust_threshold = candidates.dust_threshold,
+            attempted_dust_value = candidates.dust_value(max_dust_count),
+            "Bounded workload dust candidates exceeded funding headroom; using primary prefix"
         );
-    let dust_attempt_counts = (0..=max_dust_count).rev().collect::<Vec<_>>();
-    Err(StepError::LogicalError {
-        message: format!(
-            "Continuous workload funding failed for wallet '{sender_wallet_name}': output value=\
-            {output_value}, largest primary value={primary_value}, primary fee headroom={} (primary \
-            minus outputs), base transaction fee including change and excluding priority reserve=\
-            {base_tx_fee}, required fee without \
-            change={fee_without_change}, required fee with \
-            change={fee_with_change}, fee shortfall without change={fee_shortfall_without_change}; \
-            selector=largest primary + dust values <= max(output/{CONTINUOUS_WORKLOAD_DUST_RATIO}=\
-            {}, base transaction fee={base_tx_fee})={dust_threshold}, max dust inputs=\
-            {MAX_CONTINUOUS_WORKLOAD_DUST_INPUTS}, eligible \
-            bounded dust candidates={eligible_dust_count}, attempted dust values={:?}, attempted \
-            dust total={max_dust_value}; tried dust input counts={dust_attempt_counts:?}, available \
-            candidate count={available_candidate_count}; primary-only funding attempt failed: {final_error}",
-            primary_value.saturating_sub(output_value),
-            output_value / CONTINUOUS_WORKLOAD_DUST_RATIO,
-            &dust_candidate_values[..max_dust_count],
-        ),
-    })
+    }
+
+    Ok(primary_reserved)
 }
 
 const fn is_user_wallet_funds_deficit(error: &StepError) -> bool {
@@ -618,22 +684,30 @@ async fn get_best_n_nodes_for_submissions(
     Ok(started_nodes)
 }
 
-fn summarize_fanout_attempts(
-    attempts: impl IntoIterator<Item = (String, Result<(), String>)>,
-) -> Result<Vec<String>, String> {
-    let mut submitted_nodes = Vec::new();
-    let mut submission_errors = Vec::new();
-    for (node_name, result) in attempts {
-        match result {
-            Ok(()) => submitted_nodes.push(node_name),
-            Err(error) => submission_errors.push(error),
+async fn wait_for_first_fanout_success(
+    attempts: Vec<tokio::task::JoinHandle<(String, Result<(), String>)>>,
+) -> Result<String, String> {
+    let mut pending = FuturesUnordered::new();
+    pending.extend(attempts);
+    let mut errors = Vec::new();
+
+    while let Some(attempt) = pending.next().await {
+        match attempt {
+            Ok((node_name, Ok(()))) => {
+                // Keep every request that was started in flight. The detached
+                // JoinHandles detach on drop, so remaining node submissions
+                // continue and complete naturally.
+                return Ok(node_name);
+            }
+            Ok((_, Err(error))) => errors.push(error),
+            Err(error) => errors.push(format!("fan-out task failed: {error}")),
         }
     }
 
-    if submitted_nodes.is_empty() {
-        Err(submission_errors.join("; "))
+    if errors.is_empty() {
+        Err("no fan-out node attempts were started".to_owned())
     } else {
-        Ok(submitted_nodes)
+        Err(errors.join("; "))
     }
 }
 
@@ -664,6 +738,10 @@ fn validate_submission_epoch(
     clippy::cognitive_complexity,
     reason = "Bounded fan-out submission workflow"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep the per-burst network lifecycle and timing boundary explicit"
+)]
 pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
     world: &CucumberWorld,
     signed_submissions: Vec<SignedUserWalletSubmission>,
@@ -673,6 +751,7 @@ pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
         return Ok(SignedUserWalletSubmissionNetworkResult {
             accepted: Vec::new(),
             first_error: None,
+            failed_transaction_count: 0,
             fanout_node_names: Vec::new(),
             node_selection_duration: Duration::ZERO,
             preflight_duration: Duration::ZERO,
@@ -701,39 +780,38 @@ pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
     for signed_submission in signed_submissions {
         let wallet = signed_submission.wallet.clone();
         let same_tip_nodes = same_tip_nodes.clone();
+        let same_tip_node_count = same_tip_nodes.len();
 
         join_set.spawn(async move {
             let tx_hash = signed_submission.tx_hash();
-            let signed_tx = signed_submission.signed_tx();
-            let attempts = join_all(same_tip_nodes.iter().map(|(node_name, node_client)| {
-                let node_name = node_name.clone();
-                async move {
-                    let result = timeout(
-                        Duration::from_secs(15),
-                        node_client.submit_transaction(signed_tx),
-                    )
-                    .await;
-                    (node_name, result)
-                }
-            }))
-            .await;
+            let signed_tx = Arc::new(signed_submission.signed_tx().clone());
+            let attempts = same_tip_nodes
+                .into_iter()
+                .map(|(node_name, node_client)| {
+                    let node_client = node_client;
+                    let signed_tx = Arc::clone(&signed_tx);
+                    tokio::spawn(async move {
+                        let result = timeout(
+                            Duration::from_secs(15),
+                            node_client.submit_transaction(signed_tx.as_ref()),
+                        )
+                        .await;
+                        let result = match result {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(err)) => Err(format!("{node_name}: {err}")),
+                            Err(_) => Err(format!("{node_name}: timeout")),
+                        };
+                        (node_name, result)
+                    })
+                })
+                .collect::<Vec<_>>();
 
-            let attempt_outcome =
-                summarize_fanout_attempts(attempts.into_iter().map(|(node_name, result)| {
-                    let result = match result {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(format!("{node_name}: {err}")),
-                        Err(_) => Err(format!("{node_name}: timeout")),
-                    };
-                    (node_name, result)
-                }));
-
-            match attempt_outcome {
-                Ok(submitted_nodes) => {
+            match wait_for_first_fanout_success(attempts).await {
+                Ok(accepted_node) => {
                     if is_truthy_env(CUCUMBER_VERBOSE_CONSOLE) {
                         info!(
                             target: TARGET,
-                            "Transaction {} submitted successfully to {submitted_nodes:?}",
+                            "Transaction {} accepted by {accepted_node}",
                             hex::encode(tx_hash.0)
                         );
                     }
@@ -742,8 +820,7 @@ pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
                 Err(errors) => {
                     let message = format!(
                         "Transaction {tx_hash:?} for '{}' failed on all {} nodes: {errors}",
-                        wallet.wallet_name,
-                        same_tip_nodes.len(),
+                        wallet.wallet_name, same_tip_node_count,
                     );
                     warn!(target: TARGET, "{message}");
 
@@ -755,14 +832,17 @@ pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
 
     let mut accepted = Vec::new();
     let mut first_error = None;
+    let mut failed_transaction_count = 0;
 
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(signed_submission)) => accepted.push(signed_submission),
             Ok(Err(error)) => {
+                failed_transaction_count += 1;
                 first_error.get_or_insert(error);
             }
             Err(error) => {
+                failed_transaction_count += 1;
                 first_error.get_or_insert_with(|| StepError::LogicalError {
                     message: format!("Concurrent transaction submission task failed: {error}"),
                 });
@@ -773,6 +853,7 @@ pub(crate) async fn submit_signed_user_wallet_submissions_to_nodes(
     Ok(SignedUserWalletSubmissionNetworkResult {
         accepted,
         first_error,
+        failed_transaction_count,
         fanout_node_names,
         node_selection_duration,
         preflight_duration,
@@ -809,13 +890,53 @@ pub(crate) fn record_accepted_signed_user_wallet_submissions(
     accepted: &[SignedUserWalletSubmission],
 ) -> Result<Vec<(String, TxHash)>, StepError> {
     let mut tx_hashes = Vec::with_capacity(accepted.len());
+    let mut submissions_by_wallet = BTreeMap::<String, Vec<&SignedUserWalletSubmission>>::new();
     for signed_submission in accepted {
-        tx_hashes.push((
-            signed_submission.wallet.wallet_name.clone(),
-            signed_submission.tx_hash(),
-        ));
-        record_signed_user_wallet_submission(world, signed_submission)?;
+        let wallet_name = signed_submission.wallet.wallet_name.clone();
+        tx_hashes.push((wallet_name.clone(), signed_submission.tx_hash()));
+        submissions_by_wallet
+            .entry(wallet_name)
+            .or_default()
+            .push(signed_submission);
     }
+
+    for (wallet_name, wallet_submissions) in submissions_by_wallet {
+        let Some(representative) = wallet_submissions.first() else {
+            continue;
+        };
+        let group_key = world
+            .fork_groups
+            .mapping()
+            .get(&representative.wallet.node_name)
+            .cloned()
+            .unwrap_or_default();
+        let fee_sponsor_inputs = world
+            .with_wallets_mut(|wallets| {
+                wallets.record_wallet_reservations(
+                    wallet_name.clone(),
+                    wallet_submissions.iter().map(|submission| {
+                        (
+                            submission.tx_hash(),
+                            submission.reserved_inputs(),
+                            submission.submission.spent_fee(),
+                        )
+                    }),
+                )
+            })
+            .map_err(|error| StepError::StepFail {
+                message: format!(
+                    "Post-submission wallet bookkeeping failed after accepted transactions for \
+                    wallet '{wallet_name}': {error}"
+                ),
+            })?;
+
+        world.wallet_registry.fee_state.reserve_for_wallet(
+            wallet_name,
+            group_key,
+            fee_sponsor_inputs,
+        );
+    }
+
     Ok(tx_hashes)
 }
 
@@ -824,18 +945,18 @@ async fn validate_submission_fee_horizon(
     client: &NodeHttpClient,
     fee_policy: Option<&TransactionFeePolicy>,
 ) -> Result<(), StepError> {
+    let Some(policy) = fee_policy else {
+        return Ok(());
+    };
     let consensus = client
         .consensus_info()
         .await
         .map_err(|source| StepError::StepFail {
             message: format!("submission fee-horizon consensus query failed: {source}"),
         })?;
-    if let Some(policy) = fee_policy {
-        let current_epoch =
-            consensus.cryptarchia_info.slot.into_inner() / world.chain.slots_per_epoch.get();
-        validate_submission_epoch(current_epoch, Some(policy))?;
-    }
-    Ok(())
+    let current_epoch =
+        consensus.cryptarchia_info.slot.into_inner() / world.chain.slots_per_epoch.get();
+    validate_submission_epoch(current_epoch, Some(policy))
 }
 
 /// Check whether a prepared wallet batch can still be submitted under the
@@ -1542,40 +1663,147 @@ mod cache_removal_tests {
         }));
     }
 
-    #[test]
-    fn fanout_accepts_when_all_nodes_succeed() {
-        let accepted = summarize_fanout_attempts([
-            ("NODE_A".to_owned(), Ok(())),
-            ("NODE_B".to_owned(), Ok(())),
-            ("NODE_C".to_owned(), Ok(())),
-        ])
-        .expect("all successful fan-out attempts should be accepted");
+    #[tokio::test]
+    async fn fanout_accepts_when_all_nodes_succeed() {
+        let attempts = ["NODE_A", "NODE_B", "NODE_C"]
+            .into_iter()
+            .map(|node| {
+                let node = node.to_owned();
+                tokio::spawn(async move { (node, Ok(())) })
+            })
+            .collect();
 
-        assert_eq!(accepted, ["NODE_A", "NODE_B", "NODE_C"]);
+        let accepted = wait_for_first_fanout_success(attempts)
+            .await
+            .expect("all successful fan-out attempts should accept the transaction");
+        assert!(["NODE_A", "NODE_B", "NODE_C"].contains(&accepted.as_str()));
     }
 
-    #[test]
-    fn fanout_accepts_when_any_node_succeeds() {
-        let accepted = summarize_fanout_attempts([
-            ("NODE_A".to_owned(), Err("connection refused".to_owned())),
-            ("NODE_B".to_owned(), Ok(())),
-            ("NODE_C".to_owned(), Err("timeout".to_owned())),
-        ])
-        .expect("one successful fan-out attempt should be accepted");
+    #[tokio::test]
+    async fn fanout_accepts_with_one_success_and_two_failures() {
+        let attempts = vec![
+            tokio::spawn(async { ("NODE_A".to_owned(), Err("connection refused".to_owned())) }),
+            tokio::spawn(async { ("NODE_B".to_owned(), Ok(())) }),
+            tokio::spawn(async { ("NODE_C".to_owned(), Err("timeout".to_owned())) }),
+        ];
 
-        assert_eq!(accepted, ["NODE_B"]);
+        assert!(wait_for_first_fanout_success(attempts).await.is_ok());
     }
 
-    #[test]
-    fn fanout_rejects_when_all_nodes_fail() {
-        let error = summarize_fanout_attempts([
-            ("NODE_A".to_owned(), Err("connection refused".to_owned())),
-            ("NODE_B".to_owned(), Err("timeout".to_owned())),
-            ("NODE_C".to_owned(), Err("rejected".to_owned())),
-        ])
-        .expect_err("all failed fan-out attempts should fail");
+    #[tokio::test]
+    async fn fanout_accepts_with_two_successes_and_one_failure() {
+        let attempts = vec![
+            tokio::spawn(async { ("NODE_A".to_owned(), Ok(())) }),
+            tokio::spawn(async { ("NODE_B".to_owned(), Ok(())) }),
+            tokio::spawn(async { ("NODE_C".to_owned(), Err("connection refused".to_owned())) }),
+        ];
 
-        assert_eq!(error, "connection refused; timeout; rejected");
+        assert!(wait_for_first_fanout_success(attempts).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fanout_all_failures_are_reported() {
+        let attempts = vec![
+            tokio::spawn(async { ("NODE_A".to_owned(), Err("connection refused".to_owned())) }),
+            tokio::spawn(async { ("NODE_B".to_owned(), Err("timeout".to_owned())) }),
+            tokio::spawn(async { ("NODE_C".to_owned(), Err("rejected".to_owned())) }),
+        ];
+
+        let error = wait_for_first_fanout_success(attempts)
+            .await
+            .expect_err("all failed fan-out attempts should fail");
+        assert!(error.contains("connection refused"));
+        assert!(error.contains("timeout"));
+        assert!(error.contains("rejected"));
+    }
+
+    #[tokio::test]
+    async fn fanout_returns_on_first_success_and_detaches_remaining_attempts() {
+        let (slow_success_release, slow_success_wait) = tokio::sync::oneshot::channel();
+        let (slow_success_done, slow_success_done_wait) = tokio::sync::oneshot::channel();
+        let (slow_failure_release, slow_failure_wait) = tokio::sync::oneshot::channel();
+        let (slow_failure_done, slow_failure_done_wait) = tokio::sync::oneshot::channel();
+
+        let attempts = vec![
+            tokio::spawn(async { ("NODE_FAST".to_owned(), Ok(())) }),
+            tokio::spawn(async move {
+                let _ = slow_success_wait.await;
+                let _ = slow_success_done.send(());
+                ("NODE_SLOW_SUCCESS".to_owned(), Ok(()))
+            }),
+            tokio::spawn(async move {
+                let _ = slow_failure_wait.await;
+                let _ = slow_failure_done.send(());
+                ("NODE_SLOW_FAILURE".to_owned(), Err("late error".to_owned()))
+            }),
+        ];
+
+        assert_eq!(
+            wait_for_first_fanout_success(attempts)
+                .await
+                .expect("fast node should accept"),
+            "NODE_FAST"
+        );
+
+        slow_success_release
+            .send(())
+            .expect("slow request detached");
+        slow_failure_release
+            .send(())
+            .expect("slow request detached");
+        timeout(Duration::from_secs(1), slow_success_done_wait)
+            .await
+            .expect("slow successful request should complete")
+            .expect("slow successful request should send completion");
+        timeout(Duration::from_secs(1), slow_failure_done_wait)
+            .await
+            .expect("slow failing request should complete")
+            .expect("slow failing request should send completion");
+    }
+
+    #[tokio::test]
+    async fn fanout_fast_failure_then_success_does_not_wait_for_slow_timeout() {
+        let (medium_release, medium_wait) = tokio::sync::oneshot::channel();
+        let (slow_release, slow_wait) = tokio::sync::oneshot::channel();
+        let (slow_done, slow_done_wait) = tokio::sync::oneshot::channel();
+
+        let fast =
+            tokio::spawn(async { ("NODE_FAST_FAILURE".to_owned(), Err("rejected".to_owned())) });
+        let (failure_seen_tx, failure_seen_rx) = tokio::sync::oneshot::channel();
+        let fast = tokio::spawn(async move {
+            let result = fast.await.expect("fast failure task should run");
+            let _ = failure_seen_tx.send(());
+            result
+        });
+        let medium = tokio::spawn(async move {
+            let _ = medium_wait.await;
+            ("NODE_MEDIUM_SUCCESS".to_owned(), Ok(()))
+        });
+        let slow = tokio::spawn(async move {
+            let _ = slow_wait.await;
+            let _ = slow_done.send(());
+            ("NODE_SLOW_TIMEOUT".to_owned(), Err("timeout".to_owned()))
+        });
+
+        // Releasing the medium response after the fast failure future has had
+        // a scheduling turn makes the expected acceptance order deterministic.
+        tokio::spawn(async move {
+            let _ = failure_seen_rx.await;
+            let _ = medium_release.send(());
+        });
+        let attempts = vec![fast, medium, slow];
+
+        assert_eq!(
+            wait_for_first_fanout_success(attempts)
+                .await
+                .expect("medium node should accept after fast failure"),
+            "NODE_MEDIUM_SUCCESS"
+        );
+        slow_release.send(()).expect("slow task should be detached");
+        timeout(Duration::from_secs(1), slow_done_wait)
+            .await
+            .expect("slow fan-out task should be allowed to complete")
+            .expect("slow task should signal completion");
     }
 
     fn fee_policy_through_epoch(valid_through_epoch: u32) -> TransactionFeePolicy {
@@ -1718,6 +1946,140 @@ mod cache_removal_tests {
     }
 
     #[test]
+    fn workload_selection_prefers_one_sufficient_large_primary() {
+        let pool = WorkloadUtxoPool::new(&[
+            workload_utxo(20_000, 0),
+            workload_utxo(8_000, 1),
+            workload_utxo(8_000, 2),
+            workload_utxo(1, 3),
+            workload_utxo(1, 4),
+        ]);
+        let primary_candidates = pool.primary_candidates();
+        let selected_primary_count = (1..=primary_candidates.len())
+            .find(|count| {
+                prepare_all_provided(
+                    &primary_candidates[..*count],
+                    8_000,
+                    GasPrices::default(),
+                    0,
+                )
+                .is_ok()
+            })
+            .expect("large primary should fund the transaction");
+        let base_fee = 0;
+        let candidates = pool.candidates_for_primary(
+            &primary_candidates[..selected_primary_count],
+            8_000,
+            base_fee,
+        );
+
+        assert_eq!(selected_primary_count, 1);
+        assert_eq!(candidates.primary_inputs[0].note.value, 20_000);
+        assert!(!candidates.dust.iter().any(|utxo| utxo.note.value == 8_000));
+    }
+
+    #[test]
+    fn workload_selection_uses_two_or_three_primary_inputs_only_when_needed() {
+        let two_input_utxos = [workload_utxo(8_000, 0), workload_utxo(8_000, 1)];
+        let two_input_pool = WorkloadUtxoPool::new(&two_input_utxos);
+        let two_input_candidates = two_input_pool.primary_candidates();
+        let two_input_count = (1..=two_input_candidates.len())
+            .find(|count| {
+                prepare_all_provided(
+                    &two_input_candidates[..*count],
+                    13_000,
+                    GasPrices::default(),
+                    0,
+                )
+                .is_ok()
+            })
+            .expect("two 8,000 inputs should fund the transfer");
+        assert_eq!(two_input_count, 2);
+
+        let three_input_utxos = [
+            workload_utxo(8_000, 10),
+            workload_utxo(8_000, 11),
+            workload_utxo(8_000, 12),
+        ];
+        let three_input_pool = WorkloadUtxoPool::new(&three_input_utxos);
+        let three_input_candidates = three_input_pool.primary_candidates();
+        let two_input_max_output = {
+            let mut low = 0u64;
+            let mut high = 16_000u64;
+            while low < high {
+                let output_value = low + (high - low).div_ceil(2);
+                if prepare_all_provided(
+                    &three_input_candidates[..2],
+                    output_value,
+                    GasPrices::default(),
+                    0,
+                )
+                .is_ok()
+                {
+                    low = output_value;
+                } else {
+                    high = output_value - 1;
+                }
+            }
+            low
+        };
+        let output_value = two_input_max_output + 1;
+        assert!(
+            prepare_all_provided(
+                &three_input_candidates[..2],
+                output_value,
+                GasPrices::default(),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_all_provided(
+                &three_input_candidates[..3],
+                output_value,
+                GasPrices::default(),
+                0,
+            )
+            .is_ok()
+        );
+        let three_input_count = (1..=three_input_candidates.len())
+            .find(|count| {
+                prepare_all_provided(
+                    &three_input_candidates[..*count],
+                    output_value,
+                    GasPrices::default(),
+                    0,
+                )
+                .is_ok()
+            })
+            .expect("three 8,000 inputs should fund the transfer");
+        assert_eq!(three_input_count, 3);
+    }
+
+    #[test]
+    fn workload_primary_inputs_remain_eligible_below_the_dust_threshold() {
+        let utxos = [
+            workload_utxo(8_000, 0),
+            workload_utxo(8_000, 1),
+            workload_utxo(8_000, 2),
+            workload_utxo(1, 3),
+        ];
+        let pool = WorkloadUtxoPool::new(&utxos);
+        let primary_candidates = pool.primary_candidates();
+        let candidates = pool.candidates_for_primary(&primary_candidates[..3], 21_000, 9_000);
+
+        assert_eq!(candidates.dust_threshold, 9_000);
+        assert_eq!(candidates.primary_inputs.len(), 3);
+        assert!(
+            candidates
+                .primary_inputs
+                .iter()
+                .all(|utxo| utxo.note.value == 8_000)
+        );
+        assert!(candidates.dust.iter().all(|utxo| utxo.note.value == 1));
+    }
+
+    #[test]
     fn workload_fee_diagnostic_exposes_insufficient_headroom_for_11000_primary() {
         let primary = workload_utxo(11_000, 0);
         let intent = WalletTransactionIntent::transfer(&[(ZkPublicKey::zero(), 8_000)])
@@ -1770,6 +2132,21 @@ mod cache_removal_tests {
     }
 
     #[test]
+    fn workload_primary_prefix_is_bounded_by_transaction_input_limit() {
+        let utxos = (0..300)
+            .map(|index| workload_utxo(1, index))
+            .collect::<Vec<_>>();
+        let pool = WorkloadUtxoPool::new(&utxos);
+        let primary_candidates = pool.primary_candidates();
+
+        assert_eq!(primary_candidates.len(), MAX_TRANSACTION_INPUTS);
+        assert_eq!(pool.len(), 300);
+        assert!(
+            prepare_all_provided(&primary_candidates, 1_000, GasPrices::default(), 0,).is_err()
+        );
+    }
+
+    #[test]
     fn workload_selection_measures_dust_against_transfer_value() {
         let mut utxos = vec![
             workload_utxo(1_200_000, 0),
@@ -1783,7 +2160,7 @@ mod cache_removal_tests {
         let pool = WorkloadUtxoPool::new(&utxos);
         let candidates = pool.candidates(8_000, 0).expect("primary should exist");
 
-        assert_eq!(candidates.primary.note.value, 1_200_000);
+        assert_eq!(candidates.primary_inputs[0].note.value, 1_200_000);
         assert_eq!(
             candidates.dust_threshold,
             8_000 / CONTINUOUS_WORKLOAD_DUST_RATIO
@@ -1925,8 +2302,9 @@ mod cache_removal_tests {
         let mut reserved_ids = HashSet::new();
 
         for expected_primary in [400_000, 400_000] {
+            let primary_candidates = pools.primary_candidates("sender");
             let candidates = pools
-                .candidates("sender", 8_000, 0)
+                .candidates("sender", &primary_candidates[..1], 8_000, 0)
                 .expect("primary should exist");
             let inputs = candidates.inputs(candidates.dust.len());
             assert_eq!(inputs[0].note.value, expected_primary);
@@ -1947,11 +2325,48 @@ mod cache_removal_tests {
         }
 
         assert_eq!(pools.candidate_count("sender"), cache["sender"].len());
+        let next_primary_candidates = pools.primary_candidates("sender");
         let next_candidates = pools
-            .candidates("sender", 8_000, 0)
+            .candidates("sender", &next_primary_candidates[..1], 8_000, 0)
             .expect("next primary remains");
-        assert_eq!(next_candidates.primary.note.value, 400_000);
+        assert_eq!(next_candidates.primary_inputs[0].note.value, 400_000);
         assert_eq!(next_candidates.dust.len(), 0);
+    }
+
+    #[test]
+    fn shared_workload_pools_keep_indexes_valid_across_wallet_batches() {
+        let mut cache = HashMap::from([
+            (
+                WalletId::from("sender_a"),
+                vec![workload_utxo(10_000, 0), workload_utxo(100, 1)],
+            ),
+            (
+                WalletId::from("sender_b"),
+                vec![workload_utxo(20_000, 2), workload_utxo(200, 3)],
+            ),
+        ]);
+        let mut pools = WorkloadUtxoPools::from_cache(&cache);
+        let sender_a_primary = pools.primary_candidates("sender_a")[0];
+        pools
+            .remove_reserved_inputs(
+                &mut cache,
+                WalletReservedInputs::new(vec![sender_a_primary], Vec::new()),
+            )
+            .expect("sender A input should be removed through the shared index");
+
+        let sender_b_primary_candidates = pools.primary_candidates("sender_b");
+        assert_eq!(sender_b_primary_candidates[0].note.value, 20_000);
+        assert_eq!(pools.candidate_count("sender_a"), cache["sender_a"].len());
+        assert_eq!(pools.candidate_count("sender_b"), cache["sender_b"].len());
+
+        pools
+            .remove_reserved_inputs(
+                &mut cache,
+                WalletReservedInputs::new(vec![sender_b_primary_candidates[0]], Vec::new()),
+            )
+            .expect("sender B input should be removed through the same shared index");
+        assert_eq!(pools.candidate_count("sender_b"), cache["sender_b"].len());
+        assert_eq!(pools.primary_candidates("sender_b")[0].note.value, 200);
     }
 
     #[test]
@@ -1966,9 +2381,8 @@ mod cache_removal_tests {
             .with_gas_prices(GasPrices::default());
         let (_, base_tx_fee) = estimate_workload_fee_requirements(&intent, &[primary], 0)
             .expect("base transaction fee should be estimable");
-        let candidates = pool
-            .candidates(1, base_tx_fee)
-            .expect("primary should exist");
+        let primary_candidates = pool.primary_candidates();
+        let candidates = pool.candidates_for_primary(&primary_candidates[..1], 1, base_tx_fee);
         let inputs = candidates.inputs(candidates.dust.len());
 
         assert_eq!(inputs[0].note.value, 430_000);

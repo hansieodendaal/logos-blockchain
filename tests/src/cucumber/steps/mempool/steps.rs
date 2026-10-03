@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use cucumber::{gherkin::Step, then, when};
+use futures::future::join_all;
 use tokio::time::{sleep, timeout};
 use tracing::info;
 
@@ -280,59 +281,70 @@ async fn observe_mempool_drain_for_epochs(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keep concurrent node sampling and its explicit coverage handling together"
+)]
 pub(crate) async fn record_mempool_pending_counts(
     world: &CucumberWorld,
     workload_mode: &str,
     observation_phase: &str,
 ) -> StepResult {
     let mut node_names = world.all_node_names();
+    node_names.retain(|node_name| !world.lifecycle.node_stopped_at.contains_key(node_name));
     node_names.sort();
 
-    let mut nodes = Vec::with_capacity(node_names.len());
-    let mut pending_counts = Vec::with_capacity(node_names.len());
-    for node_name in node_names {
-        let snapshot = match world.resolve_node_http_client(&node_name) {
+    let expected_node_count = node_names.len();
+    let observations = join_all(node_names.into_iter().map(async |node_name| {
+        match world.resolve_node_http_client(&node_name) {
             Ok(client) => {
-                let (pending, consensus) =
-                    tokio::join!(client.test_mempool_view(), client.consensus_info());
-                let (pending_count, pending_view_error) = match pending {
-                    Ok(items) => {
-                        let count = items.len();
-                        pending_counts.push(count);
-                        (Some(count), None)
-                    }
-                    Err(error) => (None, Some(error.to_string())),
-                };
-                let (height, consensus_info_error) = match consensus {
-                    Ok(info) => (Some(info.cryptarchia_info.height), None),
-                    Err(error) => (None, Some(error.to_string())),
-                };
-
-                serde_json::json!({
-                    "node_name": node_name,
-                    "height": height,
-                    "pending_count": pending_count,
-                    "pending_view_error": pending_view_error,
-                    "consensus_info_error": consensus_info_error,
-                })
+                let (metrics, consensus) =
+                    tokio::join!(client.mantle_metrics(), client.consensus_info());
+                PendingNodeObservation {
+                    node_name,
+                    pending_count: metrics.as_ref().ok().map(|metrics| metrics.pending_items),
+                    height: consensus
+                        .as_ref()
+                        .ok()
+                        .map(|info| info.cryptarchia_info.height),
+                    metrics_error: metrics.err().map(|error| error.to_string()),
+                    consensus_info_error: consensus.err().map(|error| error.to_string()),
+                }
             }
-            Err(error) => serde_json::json!({
-                "node_name": node_name,
-                "pending_count": serde_json::Value::Null,
-                "pending_view_error": error.to_string(),
-                "consensus_info_error": serde_json::Value::Null,
-            }),
-        };
-        nodes.push(snapshot);
-    }
+            Err(error) => PendingNodeObservation {
+                node_name,
+                pending_count: None,
+                height: None,
+                metrics_error: Some(error.to_string()),
+                consensus_info_error: Some(error.to_string()),
+            },
+        }
+    }))
+    .await;
+    let summary = summarize_pending_observations(expected_node_count, &observations);
+    let nodes = observations
+        .iter()
+        .map(|observation| {
+            serde_json::json!({
+                "node_name": observation.node_name,
+                "height": observation.height,
+                "pending_count": observation.pending_count,
+                "metrics_error": observation.metrics_error,
+                "consensus_info_error": observation.consensus_info_error,
+            })
+        })
+        .collect::<Vec<_>>();
 
-    let total_pending_count = pending_counts.iter().sum::<usize>();
-    let max_node_pending_count = pending_counts.iter().copied().max();
     info!(
         workload_mode,
         observation_phase,
-        total_pending_count,
-        max_node_pending_count,
+        expected_node_count = summary.expected_node_count,
+        successful_node_count = summary.successful_node_count,
+        failed_node_count = summary.failed_node_count,
+        complete_snapshot = summary.complete_snapshot,
+        pending_count_coverage_complete = summary.pending_count_coverage_complete,
+        total_pending_count = summary.total_pending_count,
+        max_node_pending_count = ?summary.max_node_pending_count,
         "Mempool pending-count diagnostic snapshot"
     );
 
@@ -341,14 +353,98 @@ pub(crate) async fn record_mempool_pending_counts(
         &serde_json::json!({
             "workload_mode": workload_mode,
             "observation_phase": observation_phase,
-            "node_count": nodes.len(),
-            "total_pending_count": total_pending_count,
-            "max_node_pending_count": max_node_pending_count,
+            "expected_node_count": summary.expected_node_count,
+            "successful_node_count": summary.successful_node_count,
+            "failed_node_count": summary.failed_node_count,
+            "complete_snapshot": summary.complete_snapshot,
+            "successful_metrics_node_count": summary.successful_metrics_node_count,
+            "pending_count_coverage_complete": summary.pending_count_coverage_complete,
+            "total_pending_count": summary.total_pending_count,
+            "max_node_pending_count": summary.max_node_pending_count,
             "nodes": nodes,
         }),
     );
 
+    if observation_phase.starts_with("burst_")
+        && observation_phase.ends_with("_submitted")
+        && !summary.pending_count_coverage_complete
+    {
+        let failures = observations
+            .iter()
+            .filter(|observation| observation.pending_count.is_none())
+            .map(|observation| {
+                format!(
+                    "{}: {}",
+                    observation.node_name,
+                    observation
+                        .metrics_error
+                        .as_deref()
+                        .unwrap_or("pending metrics unavailable")
+                )
+            })
+            .collect::<Vec<_>>();
+        return Err(StepError::StepFail {
+            message: format!(
+                "Immediate post-network mempool snapshot was incomplete: metrics succeeded on \
+                {}/{} running nodes; failures: {}",
+                summary.successful_metrics_node_count,
+                summary.expected_node_count,
+                failures.join("; ")
+            ),
+        });
+    }
+
     Ok(())
+}
+
+struct PendingNodeObservation {
+    node_name: String,
+    pending_count: Option<usize>,
+    height: Option<u64>,
+    metrics_error: Option<String>,
+    consensus_info_error: Option<String>,
+}
+
+struct PendingObservationSummary {
+    expected_node_count: usize,
+    successful_node_count: usize,
+    failed_node_count: usize,
+    successful_metrics_node_count: usize,
+    complete_snapshot: bool,
+    pending_count_coverage_complete: bool,
+    total_pending_count: usize,
+    max_node_pending_count: Option<usize>,
+}
+
+fn summarize_pending_observations(
+    expected_node_count: usize,
+    observations: &[PendingNodeObservation],
+) -> PendingObservationSummary {
+    let successful_metrics_node_count = observations
+        .iter()
+        .filter(|observation| observation.pending_count.is_some())
+        .count();
+    let successful_node_count = observations
+        .iter()
+        .filter(|observation| observation.pending_count.is_some() && observation.height.is_some())
+        .count();
+    let pending_counts = observations
+        .iter()
+        .filter_map(|observation| observation.pending_count)
+        .collect::<Vec<_>>();
+    let pending_count_coverage_complete =
+        expected_node_count > 0 && successful_metrics_node_count == expected_node_count;
+
+    PendingObservationSummary {
+        expected_node_count,
+        successful_node_count,
+        failed_node_count: expected_node_count.saturating_sub(successful_node_count),
+        successful_metrics_node_count,
+        complete_snapshot: expected_node_count > 0 && successful_node_count == expected_node_count,
+        pending_count_coverage_complete,
+        total_pending_count: pending_counts.iter().sum(),
+        max_node_pending_count: pending_counts.into_iter().max(),
+    }
 }
 
 #[when(
@@ -506,4 +602,77 @@ fn parse_node_names_table(step: &Step) -> Result<Vec<String>, StepError> {
             Ok(row[0].trim().to_owned())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod pending_metrics_tests {
+    use super::*;
+
+    fn observation(
+        node_name: &str,
+        pending_count: Option<usize>,
+        height: Option<u64>,
+    ) -> PendingNodeObservation {
+        PendingNodeObservation {
+            node_name: node_name.to_owned(),
+            pending_count,
+            height,
+            metrics_error: pending_count
+                .is_none()
+                .then(|| "metrics unavailable".to_owned()),
+            consensus_info_error: height.is_none().then(|| "consensus unavailable".to_owned()),
+        }
+    }
+
+    #[test]
+    fn all_node_metrics_produce_complete_pending_coverage() {
+        let observations = [
+            observation("NODE_A", Some(10), Some(1)),
+            observation("NODE_B", Some(20), Some(2)),
+            observation("NODE_C", Some(30), Some(3)),
+        ];
+
+        let summary = summarize_pending_observations(3, &observations);
+        assert_eq!(summary.expected_node_count, 3);
+        assert_eq!(summary.successful_node_count, 3);
+        assert_eq!(summary.failed_node_count, 0);
+        assert_eq!(summary.successful_metrics_node_count, 3);
+        assert!(summary.complete_snapshot);
+        assert!(summary.pending_count_coverage_complete);
+        assert_eq!(summary.total_pending_count, 60);
+        assert_eq!(summary.max_node_pending_count, Some(30));
+    }
+
+    #[test]
+    fn failed_node_metrics_mark_the_aggregate_as_partial() {
+        let observations = [
+            observation("NODE_A", Some(10), Some(1)),
+            observation("NODE_B", None, Some(2)),
+            observation("NODE_C", Some(30), Some(3)),
+        ];
+
+        let summary = summarize_pending_observations(3, &observations);
+        assert_eq!(summary.successful_node_count, 2);
+        assert_eq!(summary.failed_node_count, 1);
+        assert_eq!(summary.successful_metrics_node_count, 2);
+        assert!(!summary.complete_snapshot);
+        assert!(!summary.pending_count_coverage_complete);
+        assert_eq!(summary.total_pending_count, 40);
+        assert_eq!(summary.max_node_pending_count, Some(30));
+    }
+
+    #[test]
+    fn consensus_failure_marks_snapshot_incomplete_without_hiding_metric_coverage() {
+        let observations = [
+            observation("NODE_A", Some(10), Some(1)),
+            observation("NODE_B", Some(20), None),
+        ];
+
+        let summary = summarize_pending_observations(2, &observations);
+        assert_eq!(summary.successful_node_count, 1);
+        assert_eq!(summary.failed_node_count, 1);
+        assert!(!summary.complete_snapshot);
+        assert!(summary.pending_count_coverage_complete);
+        assert_eq!(summary.total_pending_count, 30);
+    }
 }

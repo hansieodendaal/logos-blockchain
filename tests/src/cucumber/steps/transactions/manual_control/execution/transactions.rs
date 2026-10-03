@@ -434,6 +434,7 @@ pub(super) async fn prepare_ring_send_round_send_with_utxo_cache(
     from: &str,
     to: &str,
     available_utxos: &mut WalletUtxos,
+    workload_pools: &mut utils::WorkloadUtxoPools,
     gas_prices: Option<GasPrices>,
     priority_fee_percent: u64,
     dependent_state: Option<&DependentTransactionLoadState>,
@@ -443,7 +444,6 @@ pub(super) async fn prepare_ring_send_round_send_with_utxo_cache(
     let receiver = world.resolve_recipient(to)?;
     let receiver_pk = receiver.public_key;
     let mut reserved_submissions = Vec::with_capacity(transactions);
-    let mut workload_pools = utils::WorkloadUtxoPools::from_cache(available_utxos);
     let reservation_started = Instant::now();
 
     for _ in 0..transactions {
@@ -466,7 +466,7 @@ pub(super) async fn prepare_ring_send_round_send_with_utxo_cache(
             transaction_intent,
             value,
             available_utxos,
-            &mut workload_pools,
+            workload_pools,
             gas_prices.clone(),
             priority_fee_percent,
         )

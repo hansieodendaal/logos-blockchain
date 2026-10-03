@@ -627,13 +627,11 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
     let mut signed_submissions = Vec::with_capacity(wallet_names.len() * transactions_per_wallet);
     let mut prepared_counts = BTreeMap::new();
 
-    for i in 0..wallet_names.len() {
+    for from in wallet_names {
         info!(
             target: TARGET,
             "{mode} round {displayed_round} A: Await funds",
         );
-        let from = &wallet_names[i];
-        let to = &wallet_names[(i + 1) % wallet_names.len()];
 
         let required_available = transactions_per_wallet as u64 * value;
         sync::wait_wallet_send_ready(
@@ -650,6 +648,15 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
             used_input_note_ids,
         )
         .await?;
+    }
+
+    let pool_build_started = Instant::now();
+    let mut workload_pools = utils::WorkloadUtxoPools::from_cache(available_utxos);
+    let workload_pool_build_duration = pool_build_started.elapsed();
+
+    for i in 0..wallet_names.len() {
+        let from = &wallet_names[i];
+        let to = &wallet_names[(i + 1) % wallet_names.len()];
 
         info!(
             target: TARGET,
@@ -664,6 +671,7 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
             from,
             to,
             available_utxos,
+            &mut workload_pools,
             Some(policy.horizon.ceiling_prices.clone()),
             policy.priority_fee_percent,
             dependent_state,
@@ -674,6 +682,14 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
         validate_fee_horizon_after_wallet_batch(world, &policy, from, prepared.len()).await?;
         signed_submissions.append(&mut prepared);
     }
+
+    info!(
+        target: TARGET,
+        workload_mode = if dependent_state.is_some() { "dependent" } else { "independent" },
+        round = round_number,
+        workload_pool_build_ms = workload_pool_build_duration.as_millis(),
+        "Built next-wallet workload UTXO indexes once for the round"
+    );
 
     let mut cycle_used_input_note_ids: HashSet<NoteId> = HashSet::new();
     for submission in &signed_submissions {
@@ -751,6 +767,7 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
     let SignedUserWalletSubmissionNetworkResult {
         accepted,
         first_error,
+        failed_transaction_count,
         fanout_node_names,
         node_selection_duration,
         preflight_duration,
@@ -761,26 +778,30 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
         workload_mode,
         burst = round_number,
         accepted = accepted.len(),
-        failed = first_error.is_some(),
+        failed = failed_transaction_count,
         fanout_nodes = ?fanout_node_names,
         network_submission_ms = network_submission_duration.as_millis(),
-        "Burst network submission completed"
+        "Burst network acceptance completed"
     );
     let mut submitted_counts = BTreeMap::new();
-    if mempool_diagnostics && first_error.is_none() {
+    let pending_snapshot_result = if mempool_diagnostics {
         info!(
             target: TARGET,
             workload_mode,
             burst = round_number,
-            "Capturing post-network mempool pending snapshot before wallet bookkeeping"
+            "Capturing post-network acceptance mempool snapshot before wallet bookkeeping"
         );
-        record_mempool_pending_counts(
-            world,
-            workload_mode,
-            &format!("burst_{round_number}_submitted"),
+        Some(
+            record_mempool_pending_counts(
+                world,
+                workload_mode,
+                &format!("burst_{round_number}_submitted"),
+            )
+            .await,
         )
-        .await?;
-    }
+    } else {
+        None
+    };
 
     info!(
         target: TARGET,
@@ -811,6 +832,19 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
         &submitted_counts,
     );
 
+    if let Some(Err(snapshot_error)) = pending_snapshot_result {
+        if let Some(network_error) = first_error {
+            return Err(StepError::StepFail {
+                message: format!(
+                    "Post-network diagnostic snapshot failed ({snapshot_error}) after \
+                    {failed_transaction_count} transaction(s) failed all fan-out nodes; first \
+                    submission error: {network_error}"
+                ),
+            });
+        }
+        return Err(snapshot_error);
+    }
+
     if let Some(error) = first_error {
         return Err(error);
     }
@@ -830,8 +864,8 @@ async fn execute_ring_send_round_with_utxo_cache<S: BuildHasher + Sync>(
                 "fanout_nodes": fanout_node_names,
                 "preflight_ms": preflight_duration.as_millis(),
                 "network_submission_ms": network_submission_duration.as_millis(),
-                "submission_ms": network_submission_duration.as_millis(),
                 "wallet_bookkeeping_ms": bookkeeping_duration.as_millis(),
+                "failed_transaction_count": failed_transaction_count,
                 "total_submit_and_record_ms": node_selection_duration
                     .saturating_add(preflight_duration)
                     .saturating_add(network_submission_duration)
