@@ -1028,6 +1028,7 @@ mod tests {
                 lib_slot: Slot::from(1),
                 channel_notes: Vec::new(),
                 finalized_config: MsgId::root(),
+                funding: Vec::new(),
             },
             channel_update,
             deposits: Vec::new(),
