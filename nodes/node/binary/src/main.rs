@@ -121,6 +121,6 @@ async fn main() -> Result<()> {
         "Running chain {chain_id} on fork {fork_digest}."
     );
 
-    app.wait_finished().await;
-    Ok(())
+    // An error here means Overwatch shut down because a service panicked.
+    app.wait_finished().await.map_err(|panic| eyre!("{panic}"))
 }
