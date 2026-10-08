@@ -167,16 +167,13 @@ async fn step_coin_split_transactions_for_each_user_wallet(
     Ok(())
 }
 
-#[when(
-    expr = "I split available funds in each user wallet into {int} approximately equal outputs with {int} epochs fee headroom"
-)]
+#[when(expr = "I split available funds in each user wallet into {int} approximately equal outputs")]
 async fn step_mempool_diagnostic_split_available_funds(
     world: &mut CucumberWorld,
     step: &Step,
     outputs_per_wallet: usize,
-    epochs_headroom: u32,
 ) -> StepResult {
-    execute_mempool_diagnostic_coin_splits(world, &step.value, outputs_per_wallet, epochs_headroom)
+    execute_mempool_diagnostic_coin_splits(world, &step.value, outputs_per_wallet)
         .await
         .inspect_err(|error| {
             warn!(target: TARGET, "Step `{}` error: {error}", step.value);
