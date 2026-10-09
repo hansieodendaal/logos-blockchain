@@ -49,22 +49,25 @@ where
         + lb_blend_service::ServiceComponents,
     <BlendService as ServiceData>::Message: Send,
 {
-    pub async fn publish_proposal(&self, proposal: Proposal) {
+    /// Returns whether the local Blend relay accepted this proposal.
+    /// Acceptance does not establish network transmission or peer reception.
+    pub async fn publish_proposal(&self, proposal: Proposal) -> bool {
         let Ok(payload) = DataPayload::try_from_proposal(&proposal) else {
             error!(
                 target: LOG_TARGET,
                 "Refusing to publish an oversized block proposal"
             );
-            return;
+            return false;
         };
         let payload_clone = payload.clone();
 
         if let Err(error) = self.relay.send(ServiceMessage::Blend(payload).into()).await {
             error!(target: LOG_TARGET, "Failed to relay proposal to blend service: {error}");
-            return;
+            return false;
         }
 
         log_proposal_submitted(&proposal, &payload_clone);
+        true
     }
 }
 
