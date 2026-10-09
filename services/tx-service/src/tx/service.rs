@@ -560,14 +560,6 @@ where
         }
         Self::notify_about_accepted_item(accepted_items_channel_sender, accepted_item);
 
-        tracing::trace!(
-            target: LOG_TARGET,
-            {
-                counter.tx_mempool_pending_items = pool.pending_item_count(),
-            },
-            "mempool pending items updated"
-        );
-
         state_updater.update(Some(<Pool as RecoverableMempool>::save(pool).into()));
     }
 

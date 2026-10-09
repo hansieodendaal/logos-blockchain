@@ -1191,6 +1191,10 @@ fn log_diagnostic_identities_step(world: &mut CucumberWorld) -> StepResult {
     log_diagnostic_identities(world)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Effective deployment evidence and node identity mapping are emitted together"
+)]
 fn log_diagnostic_identities(world: &CucumberWorld) -> StepResult {
     let mut node_names: Vec<_> = world.nodes_info.keys().cloned().collect();
     node_names.sort();
@@ -1202,6 +1206,39 @@ fn log_diagnostic_identities(world: &CucumberWorld) -> StepResult {
         .first()
         .ok_or_else(|| diagnostic_error("No running nodes are available for identity mapping"))?;
     let deployment = deployment_settings(world, reference_node)?;
+    let parameters = deployment.genesis_era_parameters();
+    let epoch_config = parameters.cryptarchia.epoch_config;
+    let geometry = DiagnosticGeometry::from_settings(&deployment);
+    append_timeline_record(
+        world,
+        &serde_json::json!({
+            "event": "blend_diagnostic_effective_configuration",
+            "timestamp": OffsetDateTime::now_utc().to_string(),
+            "node": reference_node,
+            "source": "runtime_deployment",
+            "security_parameter": parameters.cryptarchia.security_param.get(),
+            "slot_duration_secs": parameters.time.slot_duration.as_secs(),
+            "slot_duration_ms": parameters.time.slot_duration.as_millis(),
+            "slot_activation_coeff_numerator": parameters
+                .cryptarchia
+                .slot_activation_coeff
+                .numerator,
+            "slot_activation_coeff_denominator": parameters
+                .cryptarchia
+                .slot_activation_coeff
+                .denominator
+                .get(),
+            "epoch_stake_distribution_stabilization": epoch_config
+                .epoch_stake_distribution_stabilization
+                .get(),
+            "epoch_period_nonce_buffer": epoch_config.epoch_period_nonce_buffer.get(),
+            "epoch_period_nonce_stabilization": epoch_config
+                .epoch_period_nonce_stabilization
+                .get(),
+            "slots_per_epoch": geometry.slots_per_epoch,
+            "base_period_length": geometry.base_period_length,
+        }),
+    );
     let declared_provider_ids = deployment
         .genesis_block
         .genesis_tx()

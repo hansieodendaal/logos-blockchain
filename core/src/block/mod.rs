@@ -344,6 +344,22 @@ impl<Tx> Block<Tx> {
             signature: self.signature,
         }
     }
+
+    /// Builds the proposal represented by this block without cloning its
+    /// transactions. This is useful for observing the exact proposal bytes
+    /// before the block itself is consumed for publication.
+    #[must_use]
+    pub fn as_proposal(&self) -> Proposal
+    where
+        Tx: Hashable<Hash = TxHash>,
+    {
+        Proposal {
+            header: self.header.clone(),
+            uncle_headers: self.uncle_headers.clone(),
+            references: References::from_block_transactions(&self.transactions),
+            signature: self.signature,
+        }
+    }
 }
 
 /// Validates the header using only the content within the header.
@@ -636,6 +652,21 @@ mod tests {
             proposal.mempool_transactions(),
             expected_prefixes.as_slice()
         );
+    }
+
+    #[test]
+    fn borrowed_proposal_conversion_matches_consuming_conversion() {
+        let block = Block::create(
+            [0u8; 32].into(),
+            Slot::from(42u64),
+            UncleHeaders::empty(),
+            create_proof(),
+            BlockTransactions::<IndexedTestMantleTx>::empty(),
+            &Ed25519Key::from_bytes(&[0; 32]),
+        )
+        .expect("block should be created");
+
+        assert_eq!(block.as_proposal(), block.to_proposal());
     }
 
     #[test]

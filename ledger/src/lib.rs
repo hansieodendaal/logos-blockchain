@@ -498,16 +498,15 @@ impl LedgerState {
             GasCost::calculate(execution_gas, gas_prices.execution_base_gas_price)?;
         let permanent_storage_fees = GasCost::calculate(storage_gas, gas_prices.storage_gas_price)?;
         let total_gas_cost = execution_base_fees.checked_add(permanent_storage_fees)?;
-        tracing::debug!(
-            target: LOG_TARGET,
-            balance,
-            total_gas_cost = total_gas_cost.into_inner(),
-            storage_gas_price = ?gas_prices.storage_gas_price,
-            execution_gas_price = ?gas_prices.execution_base_gas_price,
-            "tx balance check"
-        );
-
         if balance < Balance::from(total_gas_cost.into_inner()) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                balance,
+                total_gas_cost = total_gas_cost.into_inner(),
+                storage_gas_price = ?gas_prices.storage_gas_price,
+                execution_gas_price = ?gas_prices.execution_base_gas_price,
+                "tx balance check failed"
+            );
             return Err(LedgerError::InsufficientBalance);
         }
 

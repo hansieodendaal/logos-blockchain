@@ -12,7 +12,7 @@ use lb_blend_service::message::{DataPayload, ProxyServiceMessage, ServiceMessage
 use lb_core::block::Proposal;
 use lb_log_targets::chain;
 use overwatch::services::{ServiceData, relay::OutboundRelay};
-use tracing::error;
+use tracing::{error, info};
 
 const LOG_TARGET: &str = chain::leader::BLEND;
 
@@ -54,6 +54,16 @@ where
             );
             return;
         };
+
+        info!(
+            target: LOG_TARGET,
+            event = "blend_proposal_submitted",
+            timestamp_unix_ms = lb_blend_service::message::proposal_diagnostic_timestamp_unix_ms(),
+            block_id = %proposal.header().id(),
+            slot = u64::from(proposal.header().slot()),
+            proposal_digest = %lb_blend_service::message::proposal_diagnostic_digest_from_encoded(payload.body()),
+            "Handing local block proposal to Blend"
+        );
 
         if let Err(error) = self.relay.send(ServiceMessage::Blend(payload).into()).await {
             error!(target: LOG_TARGET, "Failed to relay proposal to blend service: {error}");

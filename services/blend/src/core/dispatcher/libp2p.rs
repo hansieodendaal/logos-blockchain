@@ -279,6 +279,13 @@ where
     async fn dispatch(&self, payload: DataPayload) {
         match payload {
             DataPayload::BlockProposal(proposal) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    event = "blend_proposal_exit",
+                    timestamp_unix_ms = crate::message::proposal_diagnostic_timestamp_unix_ms(),
+                    proposal_digest = %crate::message::proposal_diagnostic_digest_from_encoded(&proposal),
+                    "Decapsulated block proposal for ordinary network broadcast"
+                );
                 broadcast_block_proposal(
                     &self.network_relay,
                     self.settings.topic.clone(),
