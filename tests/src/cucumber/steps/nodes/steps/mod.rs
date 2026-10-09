@@ -85,6 +85,8 @@ mod configuration;
 mod genesis;
 mod lifecycle;
 mod network;
+#[cfg(feature = "security-audit")]
+mod security_audit;
 mod snapshots;
 
 #[cfg(test)]

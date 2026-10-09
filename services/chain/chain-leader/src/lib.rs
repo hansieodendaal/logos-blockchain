@@ -5,6 +5,8 @@ mod leadership;
 mod mempool;
 mod metrics;
 mod relays;
+#[cfg(feature = "security-audit")]
+mod security_audit;
 mod tx_selection;
 mod wallet;
 
@@ -58,6 +60,8 @@ use tracing::{Level, error, info, instrument, span, trace};
 use tracing_futures::Instrument as _;
 use tx_selection::{TransactionSelection, select_transactions};
 
+#[cfg(feature = "security-audit")]
+pub use crate::security_audit::SecurityAuditSettings;
 pub use crate::wallet::LeaderWalletConfig;
 use crate::{
     blend::BlendAdapter,
@@ -190,6 +194,9 @@ impl Debug for LeaderMsg {
 pub struct LeaderSettings {
     pub config: lb_ledger::Config,
     pub wallet_config: LeaderWalletConfig,
+    #[cfg(feature = "security-audit")]
+    #[serde(default)]
+    pub security_audit: SecurityAuditSettings,
 }
 
 #[expect(clippy::allow_attributes_without_reason)]
@@ -375,6 +382,8 @@ where
         let LeaderSettings {
             config: ledger_config,
             wallet_config,
+            #[cfg(feature = "security-audit")]
+            security_audit,
         } = self
             .service_resources_handle
             .settings_handle
@@ -449,6 +458,8 @@ where
             loop {
                 tokio::select! {
                     Some(SlotTick { slot, epoch }) = slot_timer.next() => {
+                        #[cfg(feature = "security-audit")]
+                        let audit_timing = security_audit::LeadershipTiming::start();
                         trace!(target: LOG_TARGET, "Received SlotTick for slot {}, ep {}", u64::from(slot), u32::from(epoch));
                         let Some(SlotContext { wallet_tip, epoch_state, eligible_aged, .. }) =
                             fetch_slot_context(&cryptarchia_api, &wallet_api, &ledger_config, slot).await
@@ -498,6 +509,8 @@ where
                         };
 
                         if let Some((proof, signing_key)) = proof {
+                            #[cfg(feature = "security-audit")]
+                            let audit_timing = audit_timing.proposal_started(wallet_tip, slot);
                             // TODO: spawn as a separate task?
                             match Self::propose_block(
                                 wallet_tip,
@@ -512,11 +525,22 @@ where
                             .await
                             {
                                 Ok(block) => {
-                                    Self::apply_and_publish_block_proposal(block, &chain_network_api, &blend_adapter).await;
+                                    let (_ordinary_template, _ordinary_submission) = Self::apply_and_publish_block_proposal(
+                                        block, &chain_network_api, &blend_adapter,
+                                        #[cfg(feature = "security-audit")]
+                                        security_audit,
+                                    ).await;
+                                    #[cfg(feature = "security-audit")]
+                                    security_audit::produce_siblings(
+                                        _ordinary_template.as_ref(), &signing_key, &wallet_api, &blend_adapter,
+                                        security_audit, audit_timing, _ordinary_submission,
+                                    ).await;
                                 }
                                 Err(e) => {
                                     metrics::consensus_proposals_create_failed("propose_block");
                                     error!(target: LOG_TARGET, "{e}");
+                                    #[cfg(feature = "security-audit")]
+                                    audit_timing.proposal_failed(security_audit);
                                 }
                             }
                         }
@@ -700,28 +724,41 @@ where
 
     /// Apply our own proposed block to the chain and publish it to the blend
     /// network.
+    /// Returns an optional audit template and the local relay enqueue outcome.
+    /// A missing outcome means local application failed.
     async fn apply_and_publish_block_proposal(
         block: Block<Mempool::Item>,
         chain_network_api: &ChainNetworkServiceApi<ChainNetwork>,
         blend_adapter: &BlendAdapter<BlendService>,
-    ) {
+        #[cfg(feature = "security-audit")] security_audit: SecurityAuditSettings,
+    ) -> (Option<Block<Mempool::Item>>, Option<bool>) {
         if let Err(e) = chain_network_api
             .apply_block_and_reconcile_mempool(block.clone())
             .await
         {
             error!(target: LOG_TARGET, "Failed to apply our own proposed block {:?}: {e:?}", block.header().id());
-            return;
+            return (None, None);
         }
 
         #[cfg(not(feature = "testing-disable-proposal-publish"))]
-        blend_adapter.publish_proposal(block.to_proposal()).await;
+        let (template, relay_enqueued) = {
+            #[cfg(feature = "security-audit")]
+            let (proposal, template) = security_audit::ordinary_proposal(block, security_audit);
+            #[cfg(not(feature = "security-audit"))]
+            let (proposal, template) = (block.to_proposal(), None);
+            (template, blend_adapter.publish_proposal(proposal).await)
+        };
         #[cfg(feature = "testing-disable-proposal-publish")]
-        let _ = {
+        let (template, relay_enqueued) = {
             tracing::warn!(target: LOG_TARGET, "proposal publishing is disabled by the `testing-disable-proposal-publish` feature");
-            blend_adapter
+            let _ = blend_adapter;
+            #[cfg(feature = "security-audit")]
+            let _ = security_audit;
+            (None, false)
         };
 
         metrics::consensus_proposals_created_local();
+        (template, Some(relay_enqueued))
     }
 
     #[expect(

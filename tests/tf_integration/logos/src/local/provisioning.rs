@@ -834,6 +834,8 @@ fn build_cryptarchia_user_config(
                 max_tx_fee: mantle::Value::MAX.into(),
                 funding_pk: consensus.funding_pk,
             },
+            #[cfg(feature = "security-audit")]
+            security_audit: leader::SecurityAuditSettings::default(),
         },
     }
 }
