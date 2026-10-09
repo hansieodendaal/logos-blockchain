@@ -6,7 +6,11 @@ use core::{
 
 use futures::{Stream, StreamExt as _, stream, stream::BoxStream};
 use lb_binary_codec::bincode::DeserializeOp;
+#[cfg(feature = "security-audit")]
+use lb_binary_codec::canonical::BinaryDecodeExt as _;
 use lb_chain_network_service::Message as ChainNetworkMsg;
+#[cfg(feature = "security-audit")]
+use lb_core::block::Proposal;
 use lb_core::{
     header::HeaderId,
     mantle::{traits::Hashable, transactions::hash::PrefixedKey},
@@ -277,6 +281,19 @@ where
     async fn dispatch(&self, payload: DataPayload) {
         match payload {
             DataPayload::BlockProposal(proposal) => {
+                #[cfg(feature = "security-audit")]
+                if let Ok(decoded) = Proposal::decode_all(&proposal) {
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        diagnostic = "blend_reachability",
+                        event = "security_audit_blend_payload_decapsulated",
+                        block_id = %decoded.header().id(),
+                        parent_block_id = %decoded.header().parent(),
+                        slot = u64::from(decoded.header().slot()),
+                        "Blend decapsulated a block proposal for the local node"
+                    );
+                }
+
                 broadcast_block_proposal(
                     &self.network_relay,
                     self.settings.topic.clone(),
