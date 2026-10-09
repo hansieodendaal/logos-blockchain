@@ -3,6 +3,7 @@ use std::{
     env, fs, io,
     net::{Ipv4Addr, UdpSocket},
     num::NonZeroU64,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -70,6 +71,49 @@ pub const USER_CONFIG_FILE: &str = "node.yaml";
 /// The default filename for the deployment config.
 pub const DEPLOYMENT_CONFIG_FILE: &str = "deployment.yaml";
 
+#[derive(Clone)]
+pub struct LocalNodeConfig {
+    run_config: RunConfig,
+    binary_override: Option<PathBuf>,
+}
+
+impl LocalNodeConfig {
+    pub(crate) const fn new(run_config: RunConfig, binary_override: Option<PathBuf>) -> Self {
+        Self {
+            run_config,
+            binary_override,
+        }
+    }
+
+    #[must_use]
+    pub const fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
+    #[must_use]
+    pub const fn run_config_mut(&mut self) -> &mut RunConfig {
+        &mut self.run_config
+    }
+
+    pub fn replace_run_config(&mut self, run_config: RunConfig) {
+        self.run_config = run_config;
+    }
+}
+
+impl Deref for LocalNodeConfig {
+    type Target = RunConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run_config
+    }
+}
+
+impl DerefMut for LocalNodeConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.run_config
+    }
+}
+
 struct PlannedLocalNodeConfig {
     config: Config,
     descriptor_override: Option<RunConfig>,
@@ -119,14 +163,26 @@ impl LocalDeployerEnv for LbcEnv {
                     .map(|name| (name.to_owned(), peer.network_port()))
             })
             .collect();
-        build_dynamic_node_config(
+        let prepared = build_dynamic_node_config(
             context.topology,
             context.index,
             &peer_ports_by_name,
             context.options,
             &peer_ports,
-            context.template_config,
-        )
+            context.template_config.map(|config| &config.run_config),
+        )?;
+        Ok(PreparedNode {
+            name: prepared.name,
+            network_port: prepared.network_port,
+            config: LocalNodeConfig {
+                run_config: prepared.config,
+                binary_override: context
+                    .topology
+                    .config()
+                    .node_binary_override(context.index)
+                    .cloned(),
+            },
+        })
     }
 
     fn build_initial_node_configs(
@@ -137,12 +193,19 @@ impl LocalDeployerEnv for LbcEnv {
             .iter()
             .map(|node| {
                 let label = format!("node-{}", node.index());
-                let config = build_node_run_config(
+                let run_config = build_node_run_config(
                     topology,
                     node,
                     topology.config().node_config_override(node.index()),
                 )
                 .map_err(|source| ProcessSpawnError::Config { source })?;
+                let config = LocalNodeConfig {
+                    run_config,
+                    binary_override: topology
+                        .config()
+                        .node_binary_override(node.index())
+                        .cloned(),
+                };
                 Ok::<_, ProcessSpawnError>(PreparedNode {
                     name: label,
                     network_port: config.user.network.backend.swarm.port,
@@ -165,7 +228,8 @@ impl LocalDeployerEnv for LbcEnv {
         dir: &Path,
         label: &str,
     ) -> Result<LaunchSpec, DynError> {
-        let mut config = config.clone();
+        let binary_override = config.binary_override.clone();
+        let mut config = config.run_config.clone();
 
         record_system_monitor_event(
             "node_runtime_prepared",
@@ -206,7 +270,7 @@ impl LocalDeployerEnv for LbcEnv {
         let deployment_yaml =
             serde_yaml::to_string(&config.deployment).map_err(io::Error::other)?;
 
-        build_node_launch_spec(dir, user_yaml, deployment_yaml).await
+        build_node_launch_spec(dir, user_yaml, deployment_yaml, binary_override.as_deref()).await
     }
 
     fn node_endpoints(
@@ -217,7 +281,7 @@ impl LocalDeployerEnv for LbcEnv {
             ..Default::default()
         };
 
-        add_endpoint_ports(&mut endpoints, config);
+        add_endpoint_ports(&mut endpoints, &config.run_config);
 
         Ok(endpoints)
     }
@@ -255,6 +319,7 @@ async fn build_node_launch_spec(
     dir: &Path,
     user_yaml: String,
     deployment_yaml: String,
+    binary_override: Option<&Path>,
 ) -> Result<LaunchSpec, DynError> {
     let config_path = dir.join(USER_CONFIG_FILE);
     let deployment_path = dir.join(DEPLOYMENT_CONFIG_FILE);
@@ -265,14 +330,19 @@ async fn build_node_launch_spec(
 
     Ok(LaunchSpec {
         binary: {
-            let provider = node_binary_provider(&node_binary_profile)?;
-            let current = if node_binary_profile == NodeBinaryProfile::TokioConsole {
+            let profile_uses_tokio_console =
+                binary_override.is_none() && node_binary_profile == NodeBinaryProfile::TokioConsole;
+            let provider: BinaryProviderRef = match binary_override {
+                Some(path) => Arc::new(PathBinaryProvider::new(path.to_path_buf())),
+                None => node_binary_provider(&node_binary_profile)?,
+            };
+            let current = if profile_uses_tokio_console {
                 replace_default_env("RUSTFLAGS", &rustflags_with_tokio_unstable())
             } else {
                 None
             };
             let resolve_result = provider.resolve().await;
-            if node_binary_profile == NodeBinaryProfile::TokioConsole {
+            if profile_uses_tokio_console {
                 if let Some(val) = current {
                     let _unused = replace_default_env("RUSTFLAGS", &val);
                 } else {
@@ -530,8 +600,15 @@ fn build_dynamic_node_config(
         options.common.peers.as_ref(),
         peer_ports,
     )?;
-    let mut config =
-        finalize_dynamic_run_config(&plan, options.config_override.as_ref(), template_config);
+    let mut config = finalize_dynamic_run_config(
+        &plan,
+        options
+            .config_override
+            .as_ref()
+            .map(|config| &config.run_config),
+        template_config,
+    );
+    apply_sibling_count_override(topology, index, &mut config);
     let mut network_port = config.user.network.backend.swarm.port;
 
     match plan.port_strategy {
@@ -654,17 +731,34 @@ pub fn build_node_run_config(
     node: &NodePlan,
     descriptor_override: Option<&RunConfig>,
 ) -> Result<RunConfig, DynError> {
-    if let Some(override_config) = descriptor_override {
-        return Ok(override_config.clone());
-    }
+    let mut config = if let Some(override_config) = descriptor_override {
+        override_config.clone()
+    } else {
+        let genesis_block = topology
+            .config()
+            .genesis_block
+            .clone()
+            .ok_or_else(|| io::Error::other("missing topology genesis tx"))?;
+        let deployment_settings =
+            deployment_settings_for_topology(&genesis_block, topology.config());
+        build_run_config(node.general.clone(), &deployment_settings)
+    };
+    apply_sibling_count_override(topology, node.index(), &mut config);
+    Ok(config)
+}
 
-    let genesis_block = topology
+fn apply_sibling_count_override(topology: &DeploymentPlan, index: usize, config: &mut RunConfig) {
+    if let Some(additional_siblings) = topology
         .config()
-        .genesis_block
-        .clone()
-        .ok_or_else(|| io::Error::other("missing topology genesis tx"))?;
-    let deployment_settings = deployment_settings_for_topology(&genesis_block, topology.config());
-    Ok(build_run_config(node.general.clone(), &deployment_settings))
+        .sibling_blocks_per_leadership_override(index)
+    {
+        config
+            .user
+            .cryptarchia
+            .leader
+            .security_audit
+            .sibling_blocks_per_leadership = additional_siblings;
+    }
 }
 
 fn finalize_dynamic_run_config(
@@ -834,6 +928,7 @@ fn build_cryptarchia_user_config(
                 max_tx_fee: mantle::Value::MAX.into(),
                 funding_pk: consensus.funding_pk,
             },
+            security_audit: leader::SecurityAuditSettings::default(),
         },
     }
 }

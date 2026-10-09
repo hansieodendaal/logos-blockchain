@@ -13,7 +13,8 @@ use lb_core::{
     header::HeaderId,
     mantle::Utxo,
     proofs::leader_proof::{
-        Error as LeaderProofError, Groth16LeaderProof, LeaderPrivate, LeaderPublic,
+        Error as LeaderProofError, Groth16LeaderProof, LeaderPrivate, LeaderProof as _,
+        LeaderPublic,
     },
     sdp::blend::{PolEpochState, PolEpochStateSource},
 };
@@ -55,14 +56,24 @@ const LOG_TARGET: &str = chain::leader::LEADERSHIP;
     clippy::cognitive_complexity,
     reason = "TODO: address this in a dedicated refactor"
 )]
-pub async fn build_proof_for<Wallet, RuntimeServiceId>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Parent identity and sibling count are needed for audit proof generation"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Ordinary proof generation and best-effort siblings share one winning witness"
+)]
+pub async fn build_proof_batch_for<Wallet, RuntimeServiceId>(
     utxos: &[UtxoWithKeyId],
     latest_tree: &UtxoTree,
     epoch_state: &EpochState,
     slot: Slot,
+    parent_block_id: HeaderId,
+    additional_siblings: usize,
     wallet: &WalletApi<Wallet, RuntimeServiceId>,
     kms: &(impl KmsAdapter<RuntimeServiceId, KeyId = KeyId> + Sync),
-) -> Result<Option<(Groth16LeaderProof, Ed25519Key)>, BuildProofError>
+) -> Result<Option<(Vec<(usize, Groth16LeaderProof)>, Ed25519Key)>, BuildProofError>
 where
     Wallet: WalletServiceData,
     RuntimeServiceId: Debug + Display + Sync + AsServiceId<Wallet>,
@@ -118,7 +129,7 @@ where
                 }
             };
 
-            let voucher_cm = match wallet.generate_new_voucher().await {
+            let ordinary_voucher_cm = match wallet.generate_new_voucher().await {
                 Ok(voucher_cm) => voucher_cm,
                 Err(e) => {
                     metrics::consensus_proposals_create_failed("voucher_generation");
@@ -131,12 +142,13 @@ where
                 }
             };
 
+            let retained_witness = (additional_siblings > 0).then(|| private_inputs.clone());
             let res = spawn_blocking("logos/chain/leader-proof-blocking", move || {
-                Groth16LeaderProof::prove(private_inputs, voucher_cm)
+                Groth16LeaderProof::prove(private_inputs, ordinary_voucher_cm)
             })
             .await;
-            match res {
-                Ok(Ok(proof)) => return Ok(Some((proof, leader_signing_key))),
+            let ordinary_proof = match res {
+                Ok(Ok(proof)) => proof,
                 Ok(Err(e)) => {
                     metrics::consensus_proposals_create_failed("proof_generation");
                     tracing::error!(
@@ -144,6 +156,7 @@ where
                         "Failed to build proof for winning utxo {:?} for {slot:?}: {e:?}",
                         utxo.id(),
                     );
+                    continue;
                 }
                 Err(e) => {
                     metrics::consensus_proposals_create_failed("proof_task");
@@ -152,11 +165,119 @@ where
                         "Failed to wait for proof task for winning utxo {:?} for {slot:?}: {e:?}",
                         utxo.id(),
                     );
+                    continue;
+                }
+            };
+
+            let mut proof_candidates = Vec::with_capacity(additional_siblings.saturating_add(1));
+            let mut voucher_commitments = Vec::with_capacity(proof_candidates.capacity());
+            voucher_commitments.push(*ordinary_proof.voucher_cm());
+            proof_candidates.push((0, ordinary_proof));
+
+            if additional_siblings == 0 {
+                return Ok(Some((proof_candidates, leader_signing_key)));
+            }
+
+            tracing::info!(
+                target: LOG_TARGET,
+                diagnostic = BLEND_REACHABILITY,
+                event = "security_audit_sibling_batch_started",
+                epoch = u32::from(epoch_state.epoch),
+                slot = u64::from(slot),
+                parent_block_id = %parent_block_id,
+                configured_additional_siblings = additional_siblings,
+                total_candidates = additional_siblings.saturating_add(1),
+                "Starting valid sibling proposal batch"
+            );
+
+            for sibling_index in 1..=additional_siblings {
+                let voucher_cm = match wallet.generate_new_voucher().await {
+                    Ok(voucher_cm) => voucher_cm,
+                    Err(error) => {
+                        metrics::consensus_proposals_create_failed("sibling_voucher_generation");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            diagnostic = BLEND_REACHABILITY,
+                            event = "security_audit_sibling_proof_failed",
+                            epoch = u32::from(epoch_state.epoch),
+                            slot = u64::from(slot),
+                            parent_block_id = %parent_block_id,
+                            sibling_index,
+                            configured_additional_siblings = additional_siblings,
+                            proof_generation_result = "voucher_generation_failed",
+                            error = %error,
+                            "Could not generate a sibling voucher"
+                        );
+                        continue;
+                    }
+                };
+
+                if voucher_commitments.contains(&voucher_cm) {
+                    metrics::consensus_proposals_create_failed("sibling_duplicate_voucher");
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        diagnostic = BLEND_REACHABILITY,
+                        event = "security_audit_sibling_proof_failed",
+                        epoch = u32::from(epoch_state.epoch),
+                        slot = u64::from(slot),
+                        parent_block_id = %parent_block_id,
+                        sibling_index,
+                        configured_additional_siblings = additional_siblings,
+                        proof_generation_result = "duplicate_voucher_commitment",
+                        "Wallet returned a duplicate sibling voucher commitment"
+                    );
+                    continue;
+                }
+                voucher_commitments.push(voucher_cm);
+
+                let sibling_witness = retained_witness
+                    .as_ref()
+                    .expect("a winning witness is retained when siblings are configured")
+                    .clone();
+                let proof_result = spawn_blocking("logos/chain/leader-proof-blocking", move || {
+                    Groth16LeaderProof::prove(sibling_witness, voucher_cm)
+                })
+                .await;
+                match proof_result {
+                    Ok(Ok(proof)) => proof_candidates.push((sibling_index, proof)),
+                    Ok(Err(error)) => {
+                        metrics::consensus_proposals_create_failed("sibling_proof_generation");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            diagnostic = BLEND_REACHABILITY,
+                            event = "security_audit_sibling_proof_failed",
+                            epoch = u32::from(epoch_state.epoch),
+                            slot = u64::from(slot),
+                            parent_block_id = %parent_block_id,
+                            sibling_index,
+                            configured_additional_siblings = additional_siblings,
+                            proof_generation_result = "proof_generation_failed",
+                            error = %error,
+                            "Could not prove a valid sibling block"
+                        );
+                    }
+                    Err(error) => {
+                        metrics::consensus_proposals_create_failed("sibling_proof_task");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            diagnostic = BLEND_REACHABILITY,
+                            event = "security_audit_sibling_proof_failed",
+                            epoch = u32::from(epoch_state.epoch),
+                            slot = u64::from(slot),
+                            parent_block_id = %parent_block_id,
+                            sibling_index,
+                            configured_additional_siblings = additional_siblings,
+                            proof_generation_result = "proof_task_failed",
+                            error = %error,
+                            "Could not await sibling proof generation"
+                        );
+                    }
                 }
             }
-        } else {
-            non_winning_utxos += 1;
+
+            return Ok(Some((proof_candidates, leader_signing_key)));
         }
+        non_winning_utxos += 1;
     }
 
     tracing::trace!(
@@ -562,14 +683,27 @@ fn epoch_winning_slots_stream<RuntimeServiceId>(
 #[cfg(test)]
 mod pol_tests {
     use core::fmt;
-    use std::{fmt::Formatter, num::NonZero, slice};
+    use std::{
+        collections::HashSet,
+        fmt::Formatter,
+        num::NonZero,
+        slice,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use lb_core::{
+        block::{Block, BlockTransactions, UncleHeaders},
         mantle::{
-            ledger::{Inputs, Note, Outputs},
-            ops::{leader_claim::VoucherCm, transfer::TransferOp},
+            SignedOps,
+            gas::MainnetGasProfile,
+            ledger::{Inputs, Note, Outputs, verification_mode::StandardMode},
+            ops::{
+                leader_claim::{VoucherCm, VoucherSecret},
+                transfer::TransferOp,
+            },
+            transactions::states::Preverified,
         },
-        proofs::leader_proof::{LeaderProof as _, check_winning},
+        proofs::leader_proof::check_winning,
         sdp::{MinStake, ServiceParameters, ServiceType},
     };
     use lb_cryptarchia_engine::EpochConfig;
@@ -590,8 +724,97 @@ mod pol_tests {
 
     use super::*;
 
-    /// Test that [`Leader::build_proof_for`] generates `PoL` which can be
-    /// verified successfully.
+    /// An ordinary winning-slot proof batch contains only candidate zero.
+    #[tokio::test]
+    async fn test_build_proof_batch_without_siblings() {
+        let (config, parent_state, utxo, key_id) = ledger_test_fixtures();
+        let parent_id = HeaderId::from([0u8; 32]);
+        let (wallet, voucher_count) = DummyWallet::spawn_with_distinct_vouchers();
+        let (proofs, signing_key, slot) = find_winning_slot_and_build_proof_batch(
+            &parent_state,
+            UtxoWithKeyId { utxo, key_id },
+            parent_id,
+            0,
+            &wallet,
+            &DummyKms,
+        )
+        .await;
+
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].0, 0);
+        assert_eq!(voucher_count.load(Ordering::SeqCst), 1);
+        validate_candidates_as_ordinary_node(
+            &config,
+            parent_state,
+            parent_id,
+            slot,
+            &proofs,
+            &signing_key,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_proof_batch_with_one_sibling() {
+        let (config, parent_state, utxo, key_id) = ledger_test_fixtures();
+        let parent_id = HeaderId::from([0u8; 32]);
+        let (wallet, voucher_count) = DummyWallet::spawn_with_distinct_vouchers();
+        let (proofs, signing_key, slot) = find_winning_slot_and_build_proof_batch(
+            &parent_state,
+            UtxoWithKeyId { utxo, key_id },
+            parent_id,
+            1,
+            &wallet,
+            &DummyKms,
+        )
+        .await;
+
+        assert_eq!(proofs.len(), 2);
+        assert_eq!(
+            proofs.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(voucher_count.load(Ordering::SeqCst), 2);
+        validate_candidates_as_ordinary_node(
+            &config,
+            parent_state,
+            parent_id,
+            slot,
+            &proofs,
+            &signing_key,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_proof_batch_with_multiple_siblings() {
+        let (config, parent_state, utxo, key_id) = ledger_test_fixtures();
+        let parent_id = HeaderId::from([0u8; 32]);
+        let (wallet, voucher_count) = DummyWallet::spawn_with_distinct_vouchers();
+        let (proofs, signing_key, slot) = find_winning_slot_and_build_proof_batch(
+            &parent_state,
+            UtxoWithKeyId { utxo, key_id },
+            parent_id,
+            3,
+            &wallet,
+            &DummyKms,
+        )
+        .await;
+
+        assert_eq!(proofs.len(), 4);
+        assert_eq!(
+            proofs.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        assert_eq!(voucher_count.load(Ordering::SeqCst), 4);
+        validate_candidates_as_ordinary_node(
+            &config,
+            parent_state,
+            parent_id,
+            slot,
+            &proofs,
+            &signing_key,
+        );
+    }
+
     #[tokio::test]
     async fn test_build_proof_for() {
         let config = test_config();
@@ -629,7 +852,7 @@ mod pol_tests {
         // Create dummy wallet service
         let wallet = DummyWallet::spawn();
 
-        // Find a winning slot by calling `build_proof_for` until it succeeds
+        // Find a winning slot by calling `build_proof_batch_for` until it succeeds
         let (proof, winning_slot) = find_winning_slot_and_build_proof(
             (0..1000).map(Slot::from),
             UtxoWithKeyId { utxo, key_id },
@@ -657,7 +880,7 @@ mod pol_tests {
         );
     }
 
-    /// Find a winning slot by calling `build_proof_for` until it succeeds
+    /// Find a winning slot by calling `build_proof_batch_for` until it succeeds
     async fn find_winning_slot_and_build_proof(
         slots: impl Iterator<Item = Slot>,
         utxo: UtxoWithKeyId,
@@ -667,21 +890,148 @@ mod pol_tests {
         kms: &(impl KmsAdapter<TestRuntimeServiceId, KeyId = KeyId> + Sync),
     ) -> Option<(Groth16LeaderProof, Slot)> {
         for slot in slots {
-            if let Some((proof, _signing_key)) = build_proof_for(
+            if let Some((proofs, _signing_key)) = build_proof_batch_for(
                 slice::from_ref(&utxo),
                 latest_tree,
                 epoch_state,
                 slot,
+                HeaderId::from([0u8; 32]),
+                0,
                 wallet,
                 kms,
             )
             .await
             .expect("proof build should not fail")
             {
+                let (_, proof) = proofs
+                    .into_iter()
+                    .next()
+                    .expect("ordinary proof candidate should exist");
                 return Some((proof, slot));
             }
         }
         None
+    }
+
+    fn ledger_test_fixtures() -> (lb_ledger::Config, lb_ledger::LedgerState, Utxo, KeyId) {
+        let config = test_config();
+        let key_id = KeyId::from("0");
+        let pk = UnsecuredZkKey::new(Fr::from(0u64)).to_public_key();
+        let transfer = TransferOp::new(Inputs::empty(), Outputs::new([Note::new(1000u64, pk)]));
+        let utxo = transfer.outputs.utxo_by_index(0, &transfer).unwrap();
+        let parent_state = lb_ledger::LedgerState::from_utxos([utxo], &config);
+
+        (config, parent_state, utxo, key_id)
+    }
+
+    async fn find_winning_slot_and_build_proof_batch(
+        parent_state: &lb_ledger::LedgerState,
+        utxo: UtxoWithKeyId,
+        parent_id: HeaderId,
+        additional_siblings: usize,
+        wallet: &WalletApi<DummyWallet, TestRuntimeServiceId>,
+        kms: &(impl KmsAdapter<TestRuntimeServiceId, KeyId = KeyId> + Sync),
+    ) -> (Vec<(usize, Groth16LeaderProof)>, Ed25519Key, Slot) {
+        let latest_tree = parent_state.latest_utxos().clone();
+        let epoch_state = parent_state.epoch_state().clone();
+
+        for slot in (1..10_000).map(Slot::from) {
+            if let Some((proofs, signing_key)) = build_proof_batch_for(
+                slice::from_ref(&utxo),
+                &latest_tree,
+                &epoch_state,
+                slot,
+                parent_id,
+                additional_siblings,
+                wallet,
+                kms,
+            )
+            .await
+            .expect("proof batch generation should not fail")
+            {
+                return (proofs, signing_key, slot);
+            }
+        }
+
+        panic!("test fixture should win a genuine leadership slot");
+    }
+
+    fn validate_candidates_as_ordinary_node(
+        config: &lb_ledger::Config,
+        parent_state: lb_ledger::LedgerState,
+        parent_id: HeaderId,
+        slot: Slot,
+        proof_candidates: &[(usize, Groth16LeaderProof)],
+        signing_key: &Ed25519Key,
+    ) {
+        let public_inputs = public_inputs_for_slot(
+            parent_state.epoch_state(),
+            slot,
+            parent_state.latest_utxos(),
+        );
+        let uncle_headers = UncleHeaders::empty();
+        let uncle_slots = uncle_headers.slots();
+        let ordinary_ledger = lb_ledger::Ledger::new(parent_id, parent_state, config.clone());
+        let mut voucher_commitments = HashSet::new();
+        let mut proof_bytes = HashSet::new();
+        let mut block_ids = HashSet::new();
+        let mut built_blocks: Vec<(usize, Block<SignedOps<Preverified, StandardMode>>)> =
+            Vec::with_capacity(proof_candidates.len());
+
+        for (sibling_index, proof) in proof_candidates {
+            assert!(voucher_commitments.insert(*proof.voucher_cm()));
+            assert!(proof.verify(&public_inputs));
+            assert!(proof_bytes.insert(proof.proof().to_bytes().to_vec()));
+            assert_eq!(
+                proof.leader_key(),
+                signing_key.public_key().as_unverified(),
+                "all candidates must share the winning-slot signing key"
+            );
+
+            let block = Block::<SignedOps<Preverified, StandardMode>>::create(
+                parent_id,
+                slot,
+                uncle_headers.clone(),
+                proof.clone(),
+                BlockTransactions::empty(),
+                signing_key,
+            )
+            .expect("each proof should produce a correctly signed block");
+            let block_id = block.header().id();
+            assert_ne!(block_id, parent_id);
+            assert!(block_ids.insert(block_id));
+            assert_eq!(block.header().parent(), parent_id);
+            assert_eq!(block.header().slot(), slot);
+            assert_eq!(block.uncle_headers(), &uncle_headers);
+
+            let received_block = Block::reconstruct(
+                block.header().clone(),
+                block.uncle_headers().clone(),
+                block.transactions().clone(),
+                *block.signature(),
+            )
+            .expect("ordinary block reconstruction should verify the signature and body root");
+            assert_eq!(received_block.header().id(), block_id);
+
+            ordinary_ledger
+                .prepare_update::<_, Groth16LeaderProof, MainnetGasProfile>(
+                    block_id,
+                    parent_id,
+                    slot,
+                    block.header().leader_proof(),
+                    &uncle_slots,
+                    block.transactions_iter().cloned(),
+                )
+                .expect("ordinary ledger validation should accept every sibling from the parent")
+                .verify_batch_proofs()
+                .expect("ordinary ledger batch validation should succeed");
+
+            if let Some((_, first)) = built_blocks.first() {
+                assert_eq!(block.header().body_root(), first.header().body_root());
+                assert_eq!(block.transactions(), first.transactions());
+            }
+            built_blocks.push((*sibling_index, block));
+        }
     }
 
     /// Build an [`EpochState`] and a winning UTXO for `scan` tests.
@@ -937,6 +1287,30 @@ mod pol_tests {
             });
 
             WalletApi::<Self, TestRuntimeServiceId>::new(OutboundRelay::new(msg_sender))
+        }
+
+        fn spawn_with_distinct_vouchers()
+        -> (WalletApi<Self, TestRuntimeServiceId>, Arc<AtomicUsize>) {
+            let (msg_sender, mut msg_receiver) = mpsc::channel(10);
+            let voucher_count = Arc::new(AtomicUsize::new(0));
+            let voucher_count_for_task = Arc::clone(&voucher_count);
+
+            tokio::spawn(async move {
+                let mut next_secret = 100u64;
+                while let Some(msg) = msg_receiver.recv().await {
+                    if let WalletMsg::GenerateNewVoucherSecret { resp_tx } = msg {
+                        let secret = VoucherSecret(Fr::from(next_secret));
+                        next_secret += 1;
+                        voucher_count_for_task.fetch_add(1, Ordering::SeqCst);
+                        drop(resp_tx.send(Ok(VoucherCm::from_secret(secret))));
+                    }
+                }
+            });
+
+            (
+                WalletApi::<Self, TestRuntimeServiceId>::new(OutboundRelay::new(msg_sender)),
+                voucher_count,
+            )
         }
     }
 

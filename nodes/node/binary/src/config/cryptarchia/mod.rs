@@ -162,6 +162,8 @@ impl ServiceConfig {
                 funding_pk: self.user.leader.wallet.funding_pk,
                 max_tx_fee: self.user.leader.wallet.max_tx_fee,
             },
+            #[cfg(feature = "security-audit")]
+            security_audit: self.user.leader.security_audit,
         };
         (
             chain_service_settings,

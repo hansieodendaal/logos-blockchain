@@ -27,7 +27,7 @@ use lb_node::config::{
     RunConfig, blend::deployment::MinimumNetworkSize, cryptarchia::deployment::EpochConfig,
 };
 use lb_testing_framework::{
-    DeploymentBuilder, NodeHttpClient, TopologyConfig as TfTopologyConfig,
+    DeploymentBuilder, LocalNodeConfig, NodeHttpClient, TopologyConfig as TfTopologyConfig,
     configs::wallet::{WalletAccount, WalletConfig},
 };
 use lb_utils::math::NonNegativeRatio;
@@ -354,16 +354,18 @@ async fn start_sdp_manual_cluster(
                 .with_persist_dir(node0_persist_dir)
                 .create_patch({
                     let slots_per_epoch = Arc::clone(&slots_per_epoch);
-                    move |config| {
-                        let config = patch_sdp_manual_cluster_config(config);
+                    move |mut config: LocalNodeConfig| {
+                        let run_config =
+                            patch_sdp_manual_cluster_config(config.run_config().clone());
                         slots_per_epoch.store(
-                            config
+                            run_config
                                 .deployment
                                 .genesis_era_parameters()
                                 .cryptarchia
                                 .slots_per_epoch(),
                             Ordering::Relaxed,
                         );
+                        config.replace_run_config(run_config);
                         Ok::<_, DynError>(config)
                     }
                 }),

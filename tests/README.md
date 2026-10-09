@@ -71,6 +71,39 @@ CI expects `target/release/logos-blockchain-node` to already exist, or
 `LOGOS_BLOCKCHAIN_NODE_BIN` to point at the prebuilt binary. It does not build
 node binaries inside the test process.
 
+## Security-audit sibling production
+
+The security-audit branch can build an audit-capable node binary separately:
+
+    cargo build --release --target-dir target/security-audit -p logos-blockchain-node --features security-audit
+
+For a local test run, set LOGOS_BLOCKCHAIN_NODE_BIN to that binary. A node
+configuration can enable sibling production with:
+
+    cryptarchia:
+      leader:
+        security_audit:
+          sibling_blocks_per_leadership: 3
+
+Omitting the setting or using 0 leaves the audit hook disabled. Local
+TopologyConfig builders can select a binary per node with
+with_node_binary_override(index, path) and set the sibling count per node
+with with_sibling_blocks_per_leadership(index, count). A zero count is
+omitted from serialized config, so an ordinary node binary can share a
+topology with audit-capable nodes.
+
+Compose and Kubernetes can set the sibling count independently per node and
+use their existing cluster-wide node-image setting to run the audit image.
+Their current runners select one node image for the whole cluster; per-node
+production/audit image mixing is available in local deployments through the
+binary-path override, but needs runner/chart support for Compose and Kubernetes.
+
+For a winning slot, the producer freezes the parent ledger state, uncle set,
+and mempool snapshot while it builds every candidate. It then self-applies and
+reconciles the ordinary candidate as usual. Extra siblings are published
+through Blend as competing proposals and are not inserted into the producer's
+local chain, so they cannot become same-slot parents or change its local tip.
+
 ### 1. Run a specific test
 
 _**MacOS or Linux**_

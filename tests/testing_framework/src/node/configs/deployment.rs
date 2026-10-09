@@ -119,6 +119,8 @@ pub struct TopologyConfig {
     pub active_slot_coeff: NonNegativeRatio,
     pub security_param: NonZeroU32,
     node_config_overrides: HashMap<usize, RunConfig>,
+    node_binary_overrides: HashMap<usize, PathBuf>,
+    sibling_blocks_per_leadership_overrides: HashMap<usize, usize>,
     allow_multiple_genesis_tokens: bool,
     allow_zero_value_genesis_tokens: bool,
     pub test_context: Option<String>,
@@ -201,6 +203,46 @@ impl TopologyConfig {
         self.node_config_overrides.get(&index)
     }
 
+    /// Replace the generated user and deployment config for one node.
+    #[must_use]
+    pub fn with_node_config_override(mut self, index: usize, config: RunConfig) -> Self {
+        self.node_config_overrides.insert(index, config);
+        self
+    }
+
+    /// Select a node executable for one local test node.
+    ///
+    /// This path takes precedence over the scenario-wide binary override.
+    #[must_use]
+    pub fn with_node_binary_override(mut self, index: usize, path: PathBuf) -> Self {
+        self.node_binary_overrides.insert(index, path);
+        self
+    }
+
+    #[must_use]
+    pub fn node_binary_override(&self, index: usize) -> Option<&PathBuf> {
+        self.node_binary_overrides.get(&index)
+    }
+
+    /// Configure the number of additional valid sibling blocks for one node.
+    #[must_use]
+    pub fn with_sibling_blocks_per_leadership(
+        mut self,
+        index: usize,
+        additional_siblings: usize,
+    ) -> Self {
+        self.sibling_blocks_per_leadership_overrides
+            .insert(index, additional_siblings);
+        self
+    }
+
+    #[must_use]
+    pub fn sibling_blocks_per_leadership_override(&self, index: usize) -> Option<usize> {
+        self.sibling_blocks_per_leadership_overrides
+            .get(&index)
+            .copied()
+    }
+
     pub(crate) const fn apply_deployment_overrides(&self, settings: &mut DeploymentSettings) {
         let cryptarchia = &mut settings.genesis_era_parameters_mut().cryptarchia;
         cryptarchia.security_param = self.security_param;
@@ -224,6 +266,8 @@ impl Default for TopologyConfig {
             active_slot_coeff: DEFAULT_ACTIVE_SLOT_COEFF,
             security_param: DEFAULT_SECURITY_PARAM,
             node_config_overrides: HashMap::new(),
+            node_binary_overrides: HashMap::new(),
+            sibling_blocks_per_leadership_overrides: HashMap::new(),
             allow_multiple_genesis_tokens: false,
             allow_zero_value_genesis_tokens: false,
             test_context: None,
@@ -457,5 +501,21 @@ mod tests {
 
         assert_eq!(first.config().genesis_time(), genesis_time);
         assert_eq!(second.config().genesis_time(), genesis_time);
+    }
+
+    #[test]
+    fn security_audit_overrides_are_independent_per_node() {
+        let config = TopologyConfig::empty()
+            .with_node_binary_override(0, PathBuf::from("audit-node"))
+            .with_sibling_blocks_per_leadership(0, 3)
+            .with_sibling_blocks_per_leadership(1, 0);
+
+        assert_eq!(
+            config.node_binary_override(0),
+            Some(&PathBuf::from("audit-node"))
+        );
+        assert_eq!(config.node_binary_override(1), None);
+        assert_eq!(config.sibling_blocks_per_leadership_override(0), Some(3));
+        assert_eq!(config.sibling_blocks_per_leadership_override(1), Some(0));
     }
 }

@@ -5,6 +5,7 @@ use lb_libp2p::{
     identity::{Keypair, ed25519},
 };
 use lb_node::config::RunConfig;
+use lb_testing_framework::LocalNodeConfig;
 use testing_framework_core::scenario::{Application, ClusterHandle, DynError};
 
 use crate::cucumber::{
@@ -58,6 +59,12 @@ impl NodeRuntimeInfoProvider for RunConfig {
             })?,
             wallets: node_wallet_keys_from_config(&config.user)?,
         })
+    }
+}
+
+impl NodeRuntimeInfoProvider for LocalNodeConfig {
+    fn runtime_info(&self) -> Result<NodeRuntimeInfo, DynError> {
+        self.run_config().runtime_info()
     }
 }
 

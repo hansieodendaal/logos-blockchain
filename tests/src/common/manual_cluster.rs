@@ -9,7 +9,7 @@ use lb_core::mantle::Utxo;
 use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_node::config::RunConfig;
 use lb_testing_framework::{
-    DeploymentBuilder, LbcEnv, LbcManualCluster, NodeHttpClient, TopologyConfig,
+    DeploymentBuilder, LbcEnv, LbcManualCluster, LocalNodeConfig, NodeHttpClient, TopologyConfig,
     configs::wallet::WalletConfig, internal::DeploymentPlan, is_truthy_env,
     record_system_monitor_event, register_system_monitor_output_file,
     unregister_system_monitor_output_file,
@@ -228,7 +228,14 @@ where
                     StartNodeOptions::default()
                         .with_peers(peers)
                         .with_persist_dir(scenario_base_dir.join(format!("node-{node_index}")))
-                        .create_patch(config_patch.clone()),
+                        .create_patch({
+                            let config_patch = config_patch.clone();
+                            move |mut config: LocalNodeConfig| {
+                                let run_config = config_patch(config.run_config().clone())?;
+                                config.replace_run_config(run_config);
+                                Ok(config)
+                            }
+                        }),
                 ),
             )
             .await

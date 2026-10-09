@@ -5,6 +5,8 @@ mod leadership;
 mod mempool;
 mod metrics;
 mod relays;
+#[cfg(feature = "security-audit")]
+mod security_audit;
 mod tx_selection;
 mod wallet;
 
@@ -58,11 +60,15 @@ use tracing::{Level, error, info, instrument, span, trace};
 use tracing_futures::Instrument as _;
 use tx_selection::{TransactionSelection, select_transactions};
 
+#[cfg(feature = "security-audit")]
+pub use crate::security_audit::SecurityAuditSettings;
 pub use crate::wallet::LeaderWalletConfig;
 use crate::{
     blend::BlendAdapter,
     kms::PreloadKmsService,
-    leadership::{SlotContext, build_proof_for, fetch_slot_context, search_for_winning_slots},
+    leadership::{
+        SlotContext, build_proof_batch_for, fetch_slot_context, search_for_winning_slots,
+    },
     mempool::{MempoolAdapter as _, adapter::MempoolAdapter},
     relays::CryptarchiaConsensusRelays,
 };
@@ -190,6 +196,8 @@ impl Debug for LeaderMsg {
 pub struct LeaderSettings {
     pub config: lb_ledger::Config,
     pub wallet_config: LeaderWalletConfig,
+    #[cfg(feature = "security-audit")]
+    pub security_audit: SecurityAuditSettings,
 }
 
 #[expect(clippy::allow_attributes_without_reason)]
@@ -375,6 +383,8 @@ where
         let LeaderSettings {
             config: ledger_config,
             wallet_config,
+            #[cfg(feature = "security-audit")]
+            security_audit,
         } = self
             .service_resources_handle
             .settings_handle
@@ -472,11 +482,19 @@ where
                         };
 
                         let latest_tree = tip_state.latest_utxos();
-                        let proof = match build_proof_for(
+                        #[cfg(feature = "security-audit")]
+                        let additional_siblings = security_audit.sibling_blocks_per_leadership;
+                        #[cfg(not(feature = "security-audit"))]
+                        let additional_siblings = 0;
+                        let total_candidates = additional_siblings.saturating_add(1);
+
+                        let proof_batch = match build_proof_batch_for(
                             &eligible_aged,
                             latest_tree,
                             &epoch_state,
                             slot,
+                            wallet_tip,
+                            additional_siblings,
                             &wallet_api,
                             &kms_api,
                         )
@@ -497,27 +515,140 @@ where
                             }
                         };
 
-                        if let Some((proof, signing_key)) = proof {
-                            // TODO: spawn as a separate task?
-                            match Self::propose_block(
+                        if let Some((proof_candidates, signing_key)) = proof_batch {
+                            let mut candidate_blocks = match Self::propose_block_candidates(
                                 wallet_tip,
                                 slot,
-                                proof,
+                                proof_candidates,
                                 &signing_key,
                                 &cryptarchia_api,
                                 &relays,
-                                tip_state,
+                                tip_state.clone(),
                                 &ledger_config,
                             )
                             .await
                             {
-                                Ok(block) => {
-                                    Self::apply_and_publish_block_proposal(block, &chain_network_api, &blend_adapter).await;
-                                }
+                                Ok(blocks) => blocks,
                                 Err(e) => {
                                     metrics::consensus_proposals_create_failed("propose_block");
                                     error!(target: LOG_TARGET, "{e}");
+                                    if additional_siblings > 0 {
+                                        tracing::info!(
+                                            target: LOG_TARGET,
+                                            diagnostic = BLEND_REACHABILITY,
+                                            event = "security_audit_sibling_batch_completed",
+                                            epoch = u32::from(ledger_config.epoch(slot)),
+                                            slot = u64::from(slot),
+                                            parent_block_id = %wallet_tip,
+                                            configured_additional_siblings = additional_siblings,
+                                            total_candidates,
+                                            sibling_candidates_produced = 0,
+                                            sibling_candidates_published = 0,
+                                            ordinary_candidate_result = "construction_failed",
+                                            "Sibling proposal batch completed"
+                                        );
+                                    }
+                                    continue;
                                 }
+                            };
+
+                            let (ordinary_index, ordinary_block) = candidate_blocks.remove(0);
+                            debug_assert_eq!(ordinary_index, 0);
+                            let ordinary_block_id = ordinary_block.header().id();
+                            let produced_siblings = candidate_blocks.len();
+
+                            if additional_siblings > 0 {
+                                for (sibling_index, sibling_block) in &candidate_blocks {
+                                    tracing::info!(
+                                        target: LOG_TARGET,
+                                        diagnostic = BLEND_REACHABILITY,
+                                        event = "security_audit_sibling_produced",
+                                        epoch = u32::from(ledger_config.epoch(slot)),
+                                        slot = u64::from(slot),
+                                        parent_block_id = %wallet_tip,
+                                        ordinary_block_id = %ordinary_block_id,
+                                        sibling_block_id = %sibling_block.header().id(),
+                                        sibling_index,
+                                        configured_additional_siblings = additional_siblings,
+                                        total_candidates,
+                                        proof_generation_result = "success",
+                                        "Produced a valid same-parent sibling proposal"
+                                    );
+                                }
+                            }
+
+                            // Construct the whole batch before this ordinary candidate can
+                            // change the local tip or mempool.
+                            let ordinary_applied = Self::apply_and_publish_block_proposal(
+                                ordinary_block,
+                                &chain_network_api,
+                                &blend_adapter,
+                            )
+                            .await;
+
+                            let mut published_siblings = 0usize;
+                            for (sibling_index, sibling_block) in candidate_blocks {
+                                let sibling_block_id = sibling_block.header().id();
+                                #[cfg(not(feature = "testing-disable-proposal-publish"))]
+                                let (published, publication_result) = {
+                                    let published = blend_adapter
+                                        .publish_proposal(sibling_block.to_proposal())
+                                        .await;
+                                    (
+                                        published,
+                                        if published { "published" } else { "failed" },
+                                    )
+                                };
+                                #[cfg(feature = "testing-disable-proposal-publish")]
+                                let (published, publication_result) = {
+                                    drop(sibling_block);
+                                    tracing::warn!(
+                                        target: LOG_TARGET,
+                                        "proposal publishing is disabled by the testing-disable-proposal-publish feature"
+                                    );
+                                    (false, "disabled")
+                                };
+
+                                if published {
+                                    published_siblings += 1;
+                                }
+                                tracing::info!(
+                                    target: LOG_TARGET,
+                                    diagnostic = BLEND_REACHABILITY,
+                                    event = "security_audit_sibling_published",
+                                    epoch = u32::from(ledger_config.epoch(slot)),
+                                    slot = u64::from(slot),
+                                    parent_block_id = %wallet_tip,
+                                    ordinary_block_id = %ordinary_block_id,
+                                    sibling_block_id = %sibling_block_id,
+                                    sibling_index,
+                                    configured_additional_siblings = additional_siblings,
+                                    total_candidates,
+                                    publication_result,
+                                    "Attempted to publish a valid sibling proposal"
+                                );
+                            }
+
+                            if additional_siblings > 0 {
+                                tracing::info!(
+                                    target: LOG_TARGET,
+                                    diagnostic = BLEND_REACHABILITY,
+                                    event = "security_audit_sibling_batch_completed",
+                                    epoch = u32::from(ledger_config.epoch(slot)),
+                                    slot = u64::from(slot),
+                                    parent_block_id = %wallet_tip,
+                                    ordinary_block_id = %ordinary_block_id,
+                                    configured_additional_siblings = additional_siblings,
+                                    total_candidates,
+                                    sibling_candidates_produced = produced_siblings,
+                                    sibling_candidates_published = published_siblings,
+                                    ordinary_candidate_result = if ordinary_applied {
+                                        "applied_and_publish_attempted"
+                                    } else {
+                                        "local_apply_failed"
+                                    },
+                                    "Sibling proposal batch completed"
+                                );
                             }
                         }
                     }
@@ -614,18 +745,22 @@ where
         level = "debug",
         skip(
             relays,
-            ledger_state,
+            parent_ledger_state,
             ledger_config,
             cryptarchia_api,
-            proof,
+            proof_candidates,
             signing_key
         )
     )]
     #[expect(clippy::too_many_arguments, reason = "Need all args")]
-    async fn propose_block(
+    #[expect(
+        clippy::type_complexity,
+        reason = "Candidate indices stay attached to blocks for audit diagnostics"
+    )]
+    async fn propose_block_candidates(
         parent: HeaderId,
         slot: Slot,
-        proof: Groth16LeaderProof,
+        proof_candidates: Vec<(usize, Groth16LeaderProof)>,
         signing_key: &Ed25519Key,
         cryptarchia_api: &CryptarchiaServiceApi<CryptarchiaService>,
         relays: &CryptarchiaConsensusRelays<
@@ -634,16 +769,15 @@ where
             MempoolNetAdapter,
             RuntimeServiceId,
         >,
-        mut ledger_state: LedgerState,
+        parent_ledger_state: LedgerState,
         ledger_config: &lb_ledger::Config,
-    ) -> Result<Block<Mempool::Item>, Error> {
+    ) -> Result<Vec<(usize, Block<Mempool::Item>)>, Error> {
         let txs_stream = relays
             .mempool_adapter()
             .get_mempool_view([0; 32].into())
             .await
             .map_err(Error::FetchBlockTransactions)?;
-
-        let tx_stream: Pin<Box<_>> = Box::pin(txs_stream);
+        let pending_txs = Box::pin(txs_stream).collect::<Vec<_>>().await;
 
         let uncle_headers = cryptarchia_api
             .select_uncles(parent, slot)
@@ -653,49 +787,85 @@ where
                 // A proposal without uncles is still valid
                 UncleHeaders::empty()
             });
+        let uncle_slots = uncle_headers.slots();
+        let mut blocks = Vec::with_capacity(proof_candidates.len());
 
-        (ledger_state, _) = ledger_state
-            .clone()
-            .try_apply_header::<Groth16LeaderProof, HeaderId>(
-                slot,
-                &proof,
-                &uncle_headers.slots(),
-                ledger_config,
-            )?;
-        // Collect all candidate transactions up front so the ones that fail can
-        // be retried across multiple rounds.
-        let TransactionSelection {
-            ledger_state,
-            selected_txs,
-            invalid_tx_hashes,
-        } = select_transactions(ledger_state, tx_stream.collect().await, ledger_config);
+        for (candidate_index, proof) in proof_candidates {
+            let candidate = async {
+                let (ledger_state, _) = parent_ledger_state
+                    .clone()
+                    .try_apply_header::<Groth16LeaderProof, HeaderId>(
+                        slot,
+                        &proof,
+                        &uncle_slots,
+                        ledger_config,
+                    )?;
+                // Each candidate selects transactions from the same mempool snapshot
+                // and the same parent ledger state.
+                let TransactionSelection {
+                    ledger_state,
+                    selected_txs,
+                    invalid_tx_hashes,
+                } = select_transactions(ledger_state, pending_txs.clone(), ledger_config);
 
-        if !invalid_tx_hashes.is_empty()
-            && let Err(e) = relays
-                .mempool_adapter()
-                .remove_transactions(&invalid_tx_hashes)
-                .await
-        {
-            error!(target: LOG_TARGET, "Failed to remove invalid transactions from mempool: {e:?}");
+                if candidate_index == 0
+                    && !invalid_tx_hashes.is_empty()
+                    && let Err(error) = relays
+                        .mempool_adapter()
+                        .remove_transactions(&invalid_tx_hashes)
+                        .await
+                {
+                    error!(target: LOG_TARGET, "Failed to remove invalid transactions from mempool: {error:?}");
+                }
+
+                let txs = txs_for_block(stream::iter(selected_txs)).await;
+                let block = Block::create(
+                    parent,
+                    slot,
+                    uncle_headers.clone(),
+                    proof,
+                    txs,
+                    signing_key,
+                )?;
+
+                if tracing::enabled!(Level::DEBUG) {
+                    log_sdp_activity_selected_for_proposal(&block, &ledger_state);
+                }
+
+                if candidate_index == 0 {
+                    info!(
+                        target: LOG_TARGET,
+                        "proposed block {:?} with {} transactions ({} removed)",
+                        block.header().id(),
+                        block.transactions_iter().len(),
+                        invalid_tx_hashes.len()
+                    );
+                }
+
+                Ok::<_, Error>(block)
+            }
+            .await;
+
+            match candidate {
+                Ok(block) => blocks.push((candidate_index, block)),
+                Err(error) if candidate_index == 0 => return Err(error),
+                Err(error) => {
+                    metrics::consensus_proposals_create_failed("sibling_propose_block");
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        diagnostic = BLEND_REACHABILITY,
+                        event = "security_audit_sibling_candidate_failed",
+                        slot = u64::from(slot),
+                        parent_block_id = %parent,
+                        sibling_index = candidate_index,
+                        error = %error,
+                        "Could not construct a valid sibling candidate"
+                    );
+                }
+            }
         }
 
-        let valid_tx_stream = stream::iter(selected_txs);
-        let txs = txs_for_block(valid_tx_stream).await;
-
-        let block = Block::create(parent, slot, uncle_headers, proof, txs, signing_key)?;
-        if tracing::enabled!(Level::DEBUG) {
-            log_sdp_activity_selected_for_proposal(&block, &ledger_state);
-        }
-
-        info!(
-            target: LOG_TARGET,
-            "proposed block {:?} with {} transactions ({} removed)",
-            block.header().id(),
-            block.transactions_iter().len(),
-            invalid_tx_hashes.len()
-        );
-
-        Ok(block)
+        Ok(blocks)
     }
 
     /// Apply our own proposed block to the chain and publish it to the blend
@@ -704,13 +874,13 @@ where
         block: Block<Mempool::Item>,
         chain_network_api: &ChainNetworkServiceApi<ChainNetwork>,
         blend_adapter: &BlendAdapter<BlendService>,
-    ) {
+    ) -> bool {
         if let Err(e) = chain_network_api
             .apply_block_and_reconcile_mempool(block.clone())
             .await
         {
             error!(target: LOG_TARGET, "Failed to apply our own proposed block {:?}: {e:?}", block.header().id());
-            return;
+            return false;
         }
 
         #[cfg(not(feature = "testing-disable-proposal-publish"))]
@@ -722,6 +892,7 @@ where
         };
 
         metrics::consensus_proposals_created_local();
+        true
     }
 
     #[expect(

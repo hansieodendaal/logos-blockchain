@@ -24,7 +24,6 @@ pub use block_feed::{
 use common_http_client::BasicAuthCredentials;
 use lb_config::kms::key_id_for_preload_backend;
 use lb_core::block::genesis::GenesisBlock;
-use lb_node::config::RunConfig;
 use reqwest::Url;
 pub use snapshot::NodeStateSnapshotStore;
 pub use testing_framework_app::{
@@ -74,7 +73,7 @@ impl Application for LbcEnv {
 
     type NodeClient = NodeHttpClient;
 
-    type NodeConfig = RunConfig;
+    type NodeConfig = local::LocalNodeConfig;
 
     fn external_node_client(source: &ExternalNodeSource) -> Result<Self::NodeClient, DynError> {
         let endpoint = Url::parse(source.endpoint())?;

@@ -96,6 +96,7 @@ jemalloc  = ["dep:tikv-jemallocator"]
 # Existing broad profiling feature. Keep this as an umbrella feature for
 # backwards compatibility: HTTP pprof + tokio-console support.
 profiling                        = ["lb-http-api-common/profiling", "tokio-console"]
+security-audit                   = ["lb-chain-leader-service/security-audit"]
 testing                          = ["lb-key-management-system-service/unsafe"]
 testing-disable-proposal-publish = ["lb-chain-leader-service/testing-disable-proposal-publish"]
 

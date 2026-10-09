@@ -46,17 +46,19 @@ where
         + lb_blend_service::ServiceComponents,
     <BlendService as ServiceData>::Message: Send,
 {
-    pub async fn publish_proposal(&self, proposal: Proposal) {
+    pub async fn publish_proposal(&self, proposal: Proposal) -> bool {
         let Ok(payload) = DataPayload::try_from_proposal(&proposal) else {
             error!(
                 target: LOG_TARGET,
                 "Refusing to publish an oversized block proposal"
             );
-            return;
+            return false;
         };
 
         if let Err(error) = self.relay.send(ServiceMessage::Blend(payload).into()).await {
             error!(target: LOG_TARGET, "Failed to relay proposal to blend service: {error}");
+            return false;
         }
+        true
     }
 }

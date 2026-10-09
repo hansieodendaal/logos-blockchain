@@ -10,7 +10,10 @@ use testing_framework_core::{
 use thiserror::Error;
 
 use crate::{
-    framework::{LbcEnv, local::build_node_run_config},
+    framework::{
+        LbcEnv,
+        local::{LocalNodeConfig, build_node_run_config},
+    },
     node::DeploymentPlan,
 };
 
@@ -27,21 +30,28 @@ impl StaticNodeConfigProvider for LbcEnv {
     fn build_node_config(
         deployment: &DeploymentPlan,
         node_index: usize,
-    ) -> Result<RunConfig, Self::Error> {
+    ) -> Result<LocalNodeConfig, Self::Error> {
         let node = &deployment.nodes()[node_index];
-        build_node_run_config(
+        let run_config = build_node_run_config(
             deployment,
             node,
             deployment.config().node_config_override(node.index()),
         )
-        .map_err(Into::into)
+        .map_err(NodeCfgsyncError::from)?;
+        Ok(LocalNodeConfig::new(
+            run_config,
+            deployment
+                .config()
+                .node_binary_override(node.index())
+                .cloned(),
+        ))
     }
 
     fn rewrite_for_hostnames(
         deployment: &DeploymentPlan,
         node_index: usize,
         hostnames: &[String],
-        config: &mut RunConfig,
+        config: &mut LocalNodeConfig,
     ) -> Result<(), Self::Error> {
         let rewritten_peers = rewrite_node_peers(deployment, node_index, hostnames)
             .map_err(NodeCfgsyncError::from)?;
@@ -52,8 +62,8 @@ impl StaticNodeConfigProvider for LbcEnv {
         Ok(())
     }
 
-    fn serialize_node_config(config: &RunConfig) -> Result<String, Self::Error> {
-        serde_yaml::to_string(config).map_err(|source| NodeCfgsyncError {
+    fn serialize_node_config(config: &LocalNodeConfig) -> Result<String, Self::Error> {
+        serde_yaml::to_string(config.run_config()).map_err(|source| NodeCfgsyncError {
             source: source.into(),
         })
     }
@@ -89,7 +99,7 @@ impl StaticNodeConfigProvider for LbcEnv {
         }
 
         if let Some(override_config) = options.config_override.clone() {
-            config = override_config;
+            config.replace_run_config(override_config.run_config().clone());
             apply_launch_ready_bind_addresses(&mut config);
         }
 

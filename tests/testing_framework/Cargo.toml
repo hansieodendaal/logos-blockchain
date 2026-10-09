@@ -29,7 +29,7 @@ lb-http-api-common               = { workspace = true }
 lb-key-management-system-service = { workspace = true }
 lb-libp2p                        = { workspace = true }
 lb-network-service               = { workspace = true }
-lb-node                          = { features = ["testing"], workspace = true }
+lb-node                          = { features = ["security-audit", "testing"], workspace = true }
 lb-sdp-service                   = { workspace = true }
 lb-tx-service                    = { workspace = true }
 lb-utils                         = { workspace = true }

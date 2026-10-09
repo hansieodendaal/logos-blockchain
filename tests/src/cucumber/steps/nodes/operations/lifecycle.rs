@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use lb_testing_framework::LocalNodeConfig;
+
 use super::*;
 use crate::cucumber::{
     deployment::{LocalDeployment, runtime_info::NodeRuntimeInfo},
@@ -141,7 +143,6 @@ pub async fn start_node(
                 .map(wallet_account_key_id),
         )
         .collect();
-
     let common_options = NodeLaunchOptions::default()
         .with_peers(startup_settings.peer_selection.clone())
         .with_persist_dir(persist_dir);
@@ -590,9 +591,10 @@ impl StartupSettings {
         }
 
         Ok(Some(StartNodeOptions::default().create_patch(
-            move |mut config: RunConfig| {
+            move |mut config: LocalNodeConfig| {
+                let mut run_config = config.run_config().clone();
                 prepare_config_patch(
-                    &mut config,
+                    &mut run_config,
                     self.join_external_network,
                     self.deployment_settings_override.as_ref(),
                     &self.manual_node_config_overrides,
@@ -605,13 +607,14 @@ impl StartupSettings {
                 )?;
 
                 let declared_blend_address =
-                    config.user.blend.core.backend.listening_address.clone();
+                    run_config.user.blend.core.backend.listening_address.clone();
                 blend_relays.configure_provider(
                     &node_name,
-                    &mut config,
+                    &mut run_config,
                     &declared_blend_address,
                 )?;
 
+                config.replace_run_config(run_config);
                 Ok(config)
             },
         )))
