@@ -187,7 +187,13 @@ where
         wait_until_services_are_ready!(
             &overwatch_handle,
             Some(Duration::from_mins(1)),
-            PreloadKmsService<_>,
+            PreloadKmsService<_>
+        )
+        .await?;
+
+        wait_until_services_are_ready!(
+            &overwatch_handle,
+            None,
             SdpService,
             <EdgeService as EdgeServiceComponents>::ChainService
         )
