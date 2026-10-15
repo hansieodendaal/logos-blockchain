@@ -8,7 +8,8 @@ use std::{
 };
 
 use cucumber::then;
-use lb_core::header::HeaderId;
+use lb_common_http_client::ApiBlock;
+use lb_core::{header::HeaderId, mantle::traits::Hashable as _};
 use lb_testing_framework::USER_CONFIG_FILE;
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -17,7 +18,13 @@ use crate::{
     common::manual_cluster::read_manual_node_logs,
     cucumber::{
         error::{StepError, StepResult},
-        steps::TARGET,
+        steps::{
+            TARGET,
+            mempool::actions::{
+                prepare_transfer_transaction, submit_prepared_transaction_to_nodes,
+            },
+        },
+        utils::tx_hash_to_hex,
         world::CucumberWorld,
     },
 };
@@ -28,6 +35,12 @@ const SIBLING_COUNT: usize = 4;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 const LEADERSHIP_TIMEOUT: Duration = Duration::from_secs(300);
 const RECEIVER_TIMEOUT: Duration = Duration::from_secs(30);
+const NONEMPTY_TRANSACTION_BUDGET: usize = 16;
+const NONEMPTY_TRANSACTION_WINDOW: Duration = Duration::from_secs(180);
+const TRANSACTION_PENDING_TIMEOUT: Duration = Duration::from_secs(6);
+const NONEMPTY_TRANSACTION_AMOUNT: u64 = 10;
+const TRANSACTION_SENDER: &str = "SECURITY_AUDIT_SENDER";
+const TRANSACTION_RECEIVER: &str = "SECURITY_AUDIT_RECEIVER";
 
 #[derive(Clone)]
 struct ProducerOpportunity {
@@ -36,6 +49,15 @@ struct ProducerOpportunity {
     siblings: Vec<(usize, HashMap<String, String>)>,
     timing: HashMap<String, String>,
     timing_line: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct BlockBodyEvidence {
+    block_id: String,
+    parent_block_id: String,
+    slot: u64,
+    body_root: String,
+    transaction_hashes: Vec<String>,
 }
 
 struct AuditFailure {
@@ -63,6 +85,7 @@ struct ReceiverEvent {
     parent_block_id: Option<String>,
     slot: Option<String>,
     timestamp: Option<[u32; 7]>,
+    reason: Option<String>,
     path: PathBuf,
     offset: u64,
 }
@@ -241,12 +264,89 @@ async fn step_verify_sibling_propagation(world: &mut CucumberWorld) -> StepResul
     }
 }
 
+#[then("NODE_1 produces four valid nonempty siblings containing submitted transactions")]
+async fn step_verify_nonempty_sibling_propagation(world: &mut CucumberWorld) -> StepResult {
+    // The lifecycle step starts the shared wallet scanner when the first
+    // honest peers come up, before NODE_1's funded sender wallet is
+    // registered. Stop that scanner now; the observation step starts it again
+    // after Blend readiness, when all four nodes and wallets are registered.
+    world.reset_wallet_scanner_after_current_iteration().await;
+
+    let artifact_dir = world
+        .lifecycle
+        .scenario_base_dir
+        .join("security-audit-nonempty-evidence");
+    fs::create_dir_all(&artifact_dir).map_err(|error| StepError::StepFail {
+        message: format!("cannot create nonempty audit evidence directory: {error}"),
+    })?;
+
+    let result = observe_nonempty_sibling_propagation(world).await;
+    let log_capture = copy_node_logs(world, &artifact_dir);
+    let mut report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            let mut details = error.details;
+            details["status"] = json!("failed");
+            details["failure"] = json!(error.message);
+            details
+        }
+    };
+    report["artifact_dir"] = json!(artifact_dir);
+    match &log_capture {
+        Ok(paths) => report["node_logs"] = json!(paths),
+        Err(error) => report["node_log_capture_error"] = json!(error),
+    }
+    let report_path = artifact_dir.join("nonempty-opportunity.json");
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| StepError::StepFail {
+            message: format!("cannot encode nonempty audit evidence: {error}"),
+        })?,
+    )
+    .map_err(|error| StepError::StepFail {
+        message: format!("cannot write {}: {error}", report_path.display()),
+    })?;
+
+    if let Err(error) = log_capture {
+        return Err(StepError::StepFail {
+            message: format!(
+                "nonempty audit evidence was collected, but node logs could not be preserved: {error}; evidence: {}",
+                report_path.display()
+            ),
+        });
+    }
+
+    if report["nonempty_honest_peer_validation"].as_bool() == Some(true) {
+        tracing::info!(
+            target: TARGET,
+            event = "security_audit_nonempty_scenario_evidence",
+            evidence_path = %report_path.display(),
+            "An honest node reconstructed and applied a same-slot sibling with the ordinary block transaction body"
+        );
+        Ok(())
+    } else {
+        let failure = report["failure"]
+            .as_str()
+            .unwrap_or("no honest node validated a sibling with the matching nonempty body");
+        Err(StepError::StepFail {
+            message: format!(
+                "nonempty security-audit sibling assertion failed: {failure}; evidence: {}",
+                report_path.display()
+            ),
+        })
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Collects all correlated producer and receiver evidence for one selected opportunity"
 )]
 async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, AuditFailure> {
-    let provenance = verify_runtime_configuration(world).map_err(|message| AuditFailure {
+    let provenance = verify_runtime_configuration(
+        world,
+        "Honest peers validate valid same-slot sibling blocks",
+    )
+    .map_err(|message| AuditFailure {
         message,
         details: json!({}),
     })?;
@@ -269,7 +369,7 @@ async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, Aud
                 }),
             })?;
     let (receiver_stages, no_subscriber_errors) =
-        observe_honest_receivers(&mut tails, &mut logs, &opportunity)
+        observe_honest_receivers(&mut tails, &mut logs, &opportunity, false)
             .await
             .map_err(|message| AuditFailure {
                 message,
@@ -336,6 +436,7 @@ async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, Aud
                 "evidence_events": evidence.ordered_events().iter().map(|event| json!({
                     "stage": event.stage,
                     "timestamp": format_log_timestamp(event.timestamp),
+                    "reason": event.reason,
                     "source_file": event.path,
                     "source_offset": event.offset,
                 })).collect::<Vec<_>>(),
@@ -344,6 +445,7 @@ async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, Aud
                     "parent_block_id": event.parent_block_id,
                     "slot": event.slot,
                     "timestamp": format_log_timestamp(event.timestamp),
+                    "reason": event.reason,
                     "source_file": event.path,
                     "source_offset": event.offset,
                 })).collect::<Vec<_>>(),
@@ -427,6 +529,486 @@ async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, Aud
         "receiver_observability": {
             "blend_topic_subscription_api": "not exposed; matching decapsulated sibling event is direct per-payload reception evidence",
             "canonical_selection": "not asserted; ordinary acceptance may be non-canonical"
+        },
+    }))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Runs the bounded nonempty transaction workload and correlates the selected block bodies"
+)]
+async fn observe_nonempty_sibling_propagation(
+    world: &mut CucumberWorld,
+) -> Result<Value, AuditFailure> {
+    let scenario = "Honest peers validate nonempty same-slot sibling blocks";
+    let provenance =
+        verify_runtime_configuration(world, scenario).map_err(|message| AuditFailure {
+            message,
+            details: json!({}),
+        })?;
+    let (readiness, mut tails) =
+        wait_for_blend_readiness(world)
+            .await
+            .map_err(|message| AuditFailure {
+                message,
+                details: json!({ "provenance": provenance }),
+            })?;
+
+    world
+        .ensure_wallet_scanner_started()
+        .await
+        .map_err(|error| AuditFailure {
+            message: format!("could not start the wallet scanner for the workload: {error}"),
+            details: json!({
+                "provenance": provenance,
+                "blend_readiness": readiness,
+            }),
+        })?;
+
+    // `wait_for_blend_readiness` snapshots all current log offsets before this
+    // function prepares or submits any workload transactions.
+    let mut producer_logs = Vec::new();
+    let mut submitted_hashes = BTreeSet::new();
+    let mut submitted_transactions = Vec::new();
+    let mut transaction_observations = Vec::new();
+    let mut skipped_opportunities = Vec::new();
+    let mut seen_ordinary_ids = BTreeSet::new();
+    let global_deadline = Instant::now() + NONEMPTY_TRANSACTION_WINDOW;
+    let mut selected: Option<(ProducerOpportunity, ApiBlock)> = None;
+    let mut last_mempool_status = "not_observed".to_owned();
+
+    'transactions: for transaction_index in 1..=NONEMPTY_TRANSACTION_BUDGET {
+        if Instant::now() >= global_deadline {
+            break;
+        }
+        let alias = format!("SECURITY_AUDIT_NONEMPTY_{transaction_index}");
+        prepare_transfer_transaction(
+            world,
+            "security audit nonempty sibling workload",
+            alias.clone(),
+            NONEMPTY_TRANSACTION_AMOUNT,
+            TRANSACTION_SENDER.to_owned(),
+            TRANSACTION_RECEIVER.to_owned(),
+        )
+        .await
+        .map_err(|error| AuditFailure {
+            message: format!("could not prepare independent workload transaction {alias}: {error}"),
+            details: json!({
+                "provenance": provenance,
+                "blend_readiness": readiness,
+                "transactions_prepared": submitted_transactions,
+            }),
+        })?;
+        let signed = world
+            .resolve_prepared_transaction(&alias)
+            .map_err(|error| AuditFailure {
+                message: format!("prepared workload transaction {alias} disappeared: {error}"),
+                details: json!({ "provenance": provenance }),
+            })?;
+        let transaction_hash = tx_hash_to_hex(&signed.hash());
+        submitted_hashes.insert(transaction_hash.clone());
+        submitted_transactions.push(json!({
+            "alias": alias,
+            "transaction_hash": transaction_hash,
+        }));
+        submit_prepared_transaction_to_nodes(
+            world,
+            "security audit nonempty sibling workload",
+            alias.clone(),
+            [PRODUCER, HONEST_NODES[0], HONEST_NODES[1], HONEST_NODES[2]]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .await
+        .map_err(|error| AuditFailure {
+            message: format!(
+                "could not submit workload transaction {alias} to all four mempools: {error}"
+            ),
+            details: json!({
+                "provenance": provenance,
+                "blend_readiness": readiness,
+                "submitted_transactions": submitted_transactions,
+            }),
+        })?;
+
+        let submitted_hash = signed.hash();
+        let transaction_deadline =
+            (Instant::now() + TRANSACTION_PENDING_TIMEOUT).min(global_deadline);
+        let mut saw_transaction_pending = false;
+        let mut mempool_samples = Vec::new();
+
+        loop {
+            producer_logs.extend(tails.read_new_lines(PRODUCER).map_err(|message| {
+                AuditFailure {
+                    message,
+                    details: json!({
+                        "provenance": provenance,
+                        "blend_readiness": readiness,
+                        "submitted_transactions": submitted_transactions,
+                        "skipped_opportunities": skipped_opportunities,
+                    }),
+                }
+            })?);
+
+            for opportunity in find_producer_opportunities(&producer_logs) {
+                let Some(ordinary_id) = opportunity.ordinary.get("ordinary_block_id").cloned()
+                else {
+                    continue;
+                };
+                if seen_ordinary_ids.contains(&ordinary_id) {
+                    continue;
+                }
+                let Some(node) = world.nodes_info.get(PRODUCER) else {
+                    return Err(AuditFailure {
+                        message: "NODE_1 was not started".to_owned(),
+                        details: json!({ "provenance": provenance }),
+                    });
+                };
+                let header_id = match parse_header_id(&ordinary_id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        skipped_opportunities.push(json!({
+                            "ordinary_block_id": ordinary_id,
+                            "reason": "invalid_ordinary_block_id",
+                            "detail": error,
+                        }));
+                        seen_ordinary_ids.insert(ordinary_id);
+                        continue;
+                    }
+                };
+                let block = match node.client.block(&header_id).await {
+                    Ok(Some(block)) => block,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        last_mempool_status = format!("ordinary block API request failed: {error}");
+                        continue;
+                    }
+                };
+                let body = summarize_api_block(&block);
+                seen_ordinary_ids.insert(ordinary_id.clone());
+                if body.block_id != ordinary_id
+                    || Some(&body.parent_block_id) != opportunity.ordinary.get("parent_block_id")
+                    || Some(&body.slot.to_string()) != opportunity.ordinary.get("slot")
+                {
+                    return Err(AuditFailure {
+                        message:
+                            "NODE_1 block API identity disagrees with the ordinary submission event"
+                                .to_owned(),
+                        details: json!({
+                            "provenance": provenance,
+                            "ordinary_submission": opportunity.ordinary,
+                            "ordinary_block_api": body,
+                            "submitted_transactions": submitted_transactions,
+                        }),
+                    });
+                }
+                if has_nonempty_submitted_body(&body.transaction_hashes, &submitted_hashes) {
+                    transaction_observations.push(json!({
+                        "alias": alias,
+                        "transaction_hash": transaction_hash,
+                        "observed_pending_before_candidate": saw_transaction_pending,
+                        "mempool_observations": mempool_samples,
+                        "last_mempool_status": last_mempool_status,
+                    }));
+                    selected = Some((opportunity, block));
+                    break 'transactions;
+                }
+                skipped_opportunities.push(json!({
+                    "ordinary_block_id": body.block_id,
+                    "parent_block_id": body.parent_block_id,
+                    "slot": body.slot,
+                    "transaction_count": body.transaction_hashes.len(),
+                    "transaction_hashes": body.transaction_hashes,
+                    "body_root": body.body_root,
+                    "reason": if body.transaction_hashes.is_empty() {
+                        "empty_ordinary_body"
+                    } else {
+                        "no_submitted_transaction_in_ordinary_body"
+                    },
+                }));
+            }
+
+            if Instant::now() >= global_deadline || Instant::now() >= transaction_deadline {
+                break;
+            }
+
+            let node_1 = &world.nodes_info[PRODUCER].client;
+            let node_2 = &world.nodes_info[HONEST_NODES[0]].client;
+            let node_3 = &world.nodes_info[HONEST_NODES[1]].client;
+            let node_4 = &world.nodes_info[HONEST_NODES[2]].client;
+            let (view_1, view_2, view_3, view_4) = tokio::join!(
+                node_1.test_mempool_view(),
+                node_2.test_mempool_view(),
+                node_3.test_mempool_view(),
+                node_4.test_mempool_view(),
+            );
+            let views = [
+                (PRODUCER, view_1),
+                (HONEST_NODES[0], view_2),
+                (HONEST_NODES[1], view_3),
+                (HONEST_NODES[2], view_4),
+            ];
+            let all_views_succeeded = views.iter().all(|(_, view)| view.is_ok());
+            let pending_nodes = views
+                .iter()
+                .filter_map(|(name, view)| {
+                    view.as_ref()
+                        .ok()
+                        .filter(|hashes| hashes.contains(&submitted_hash))
+                        .map(|_| *name)
+                })
+                .collect::<Vec<_>>();
+            saw_transaction_pending |= !pending_nodes.is_empty();
+            last_mempool_status = views
+                .iter()
+                .map(|(name, view)| match view {
+                    Ok(hashes) => format!("{name}:pending={}", hashes.contains(&submitted_hash)),
+                    Err(error) => format!("{name}:error={error}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            mempool_samples.push(json!({
+                "observed_at_utc": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0.0, |duration| duration.as_secs_f64()),
+                "pending_nodes": pending_nodes,
+                "all_node_views_succeeded": all_views_succeeded,
+                "observations": last_mempool_status,
+            }));
+            if saw_transaction_pending && all_views_succeeded && pending_nodes.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        transaction_observations.push(json!({
+            "alias": alias,
+            "transaction_hash": transaction_hash,
+            "observed_pending_before_disappearing": saw_transaction_pending,
+            "mempool_observations": mempool_samples,
+            "last_mempool_status": last_mempool_status,
+        }));
+    }
+
+    let Some((opportunity, ordinary_block)) = selected else {
+        return Err(AuditFailure {
+            message: format!(
+                "workload/setup failure: NODE_1 did not produce a four-sibling ordinary block containing one of the submitted transactions after {} bounded submissions",
+                submitted_transactions.len()
+            ),
+            details: json!({
+                "provenance": provenance,
+                "blend_readiness": readiness,
+                "submitted_transactions": submitted_transactions,
+                "transaction_observations": transaction_observations,
+                "producer_opportunities_examined": seen_ordinary_ids.len(),
+                "empty_or_nonmatching_opportunities_skipped": skipped_opportunities.len(),
+                "skipped_opportunities": skipped_opportunities,
+                "last_mempool_status": last_mempool_status,
+                "failure_classification": "workload_or_leadership_setup",
+            }),
+        });
+    };
+
+    let ordinary_body = summarize_api_block(&ordinary_block);
+    let mut producer_log_map = BTreeMap::from([(PRODUCER.to_owned(), producer_logs)]);
+    let (receiver_stages, no_subscriber_errors) = observe_honest_receivers(
+        &mut tails,
+        &mut producer_log_map,
+        &opportunity,
+        true,
+    )
+    .await
+    .map_err(|message| AuditFailure {
+        message,
+        details: json!({
+            "provenance": provenance,
+            "blend_readiness": readiness,
+            "ordinary_block": ordinary_body,
+            "siblings": opportunity.siblings.iter().map(|(_, event)| event).collect::<Vec<_>>(),
+        }),
+    })?;
+    let storage_events = query_accepted_blocks(world, &opportunity, &receiver_stages).await;
+    let ordinary_hashes = &ordinary_body.transaction_hashes;
+    let mut sibling_outcomes = Vec::new();
+    let mut accepted_body_path = false;
+    let mut accepted_bodies_all_match = true;
+    for (_, identity) in &opportunity.siblings {
+        let sibling_id = identity
+            .get("sibling_block_id")
+            .cloned()
+            .unwrap_or_default();
+        let mut receiver_reports = Vec::new();
+        let mut accepted = false;
+        for node in HONEST_NODES {
+            let evidence = receiver_stages
+                .get(&(node.to_owned(), sibling_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let storage = storage_events.iter().find(|event| {
+                event["node"].as_str() == Some(node)
+                    && event["block_id"].as_str() == Some(sibling_id.as_str())
+            });
+            let has_stored_block =
+                storage.and_then(|event| event["stored"].as_bool()) == Some(true);
+            let root_matches = storage
+                .and_then(|event| event["body_root"].as_str())
+                .is_some_and(|root| root == ordinary_body.body_root);
+            let stored_hashes = storage
+                .and_then(|event| event["transaction_hashes"].as_array())
+                .map(|hashes| {
+                    hashes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                });
+            let hashes_match = stored_hashes
+                .as_ref()
+                .is_some_and(|hashes| hashes == ordinary_hashes);
+            let body_matches = storage
+                .and_then(|event| event["body_root"].as_str())
+                .zip(stored_hashes.as_ref())
+                .is_some_and(|(root, hashes)| same_transaction_body(&ordinary_body, root, hashes));
+            let ordered_path = evidence.has_ordered_blend_to_acceptance();
+            accepted |= evidence.has_stage("accepted");
+            if evidence.has_stage("accepted") && (!has_stored_block || !body_matches) {
+                accepted_bodies_all_match = false;
+            }
+            accepted_body_path |= ordered_path && has_stored_block && body_matches;
+            let reasons = evidence
+                .ordered_events()
+                .into_iter()
+                .filter_map(|event| {
+                    event.reason.as_ref().map(|reason| json!({
+                    "stage": event.stage,
+                    "reason": reason,
+                    "transaction_references_unavailable": reason.contains("UnresolvedReference"),
+                }))
+                })
+                .collect::<Vec<_>>();
+            receiver_reports.push(json!({
+                "node": node,
+                "node_identity": world.cluster.node_peer_ids.get(node).map(ToString::to_string),
+                "blend_received": evidence.has_stage("blend_received"),
+                "chain_proposal_received": evidence.has_stage("chain_proposal_received"),
+                "reconstructed": evidence.has_stage("reconstructed"),
+                "reconstruction_failed": evidence.has_stage("reconstruction_failed"),
+                "accepted": evidence.has_stage("accepted"),
+                "rejected": evidence.has_stage("rejected"),
+                "apply_failed": evidence.has_stage("apply_failed"),
+                "not_processed": evidence.has_stage("not_processed"),
+                "ordered_blend_to_acceptance": ordered_path,
+                "explicit_reasons": reasons,
+                "transaction_references_unavailable": reasons.iter().any(|reason| {
+                    reason["transaction_references_unavailable"] == true
+                }),
+                "full_block_available": has_stored_block,
+                "body_root_matches_ordinary": root_matches,
+                "ordered_transaction_hashes_match_ordinary": hashes_match,
+                "body_matches_ordinary": body_matches,
+                "transaction_count": storage.and_then(|event| event["transaction_count"].as_u64()),
+                "body_root": storage.and_then(|event| event["body_root"].as_str()),
+                "transaction_hashes": storage.and_then(|event| event["transaction_hashes"].as_array()),
+                "storage_error": storage.and_then(|event| event["error"].as_str()),
+                "observed_stages": evidence.stage_names(),
+                "evidence_events": evidence.ordered_events().iter().map(|event| json!({
+                    "stage": event.stage,
+                    "timestamp": format_log_timestamp(event.timestamp),
+                    "reason": event.reason,
+                    "source_file": event.path,
+                    "source_offset": event.offset,
+                })).collect::<Vec<_>>(),
+                "mismatched_identity_events": evidence.mismatched_events.iter().map(|event| json!({
+                    "stage": event.stage,
+                    "parent_block_id": event.parent_block_id,
+                    "slot": event.slot,
+                    "timestamp": format_log_timestamp(event.timestamp),
+                    "reason": event.reason,
+                    "source_file": event.path,
+                    "source_offset": event.offset,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        sibling_outcomes.push(json!({
+            "sibling_index": identity.get("sibling_index"),
+            "ordinary_block_id": identity.get("ordinary_block_id"),
+            "sibling_block_id": sibling_id,
+            "parent_block_id": identity.get("parent_block_id"),
+            "slot": identity.get("slot"),
+            "relay_enqueued": identity_bool(identity, "relay_enqueued"),
+            "accepted_by_any_honest_node": accepted,
+            "receivers": receiver_reports,
+        }));
+    }
+
+    let submitted_hashes_in_body = ordinary_body
+        .transaction_hashes
+        .iter()
+        .filter(|hash| submitted_hashes.contains(*hash))
+        .cloned()
+        .collect::<Vec<_>>();
+    let integrity = sibling_body_integrity(&ordinary_body, &opportunity);
+    let passed = accepted_body_path
+        && accepted_bodies_all_match
+        && !submitted_hashes_in_body.is_empty()
+        && integrity;
+    let timing = &opportunity.timing;
+    Ok(json!({
+        "status": if passed { "passed" } else { "failed" },
+        "failure": if passed { Value::Null } else {
+            json!("no ordered honest-peer acceptance was paired with an available sibling block whose body root and ordered transaction hashes exactly match the nonempty ordinary block")
+        },
+        "failure_classification": if passed { Value::Null } else { json!("sibling_validation_or_body_integrity") },
+        "nonempty_honest_peer_validation": passed,
+        "honest_peer_validation": accepted_body_path,
+        "cluster_nodes": 4,
+        "blend_provider_count": 4,
+        "producer": PRODUCER,
+        "producer_runtime_name": world.nodes_info.get(PRODUCER).map(|node| node.runtime_name.as_str()),
+        "blend_readiness": readiness,
+        "provenance": provenance,
+        "transaction_budget": NONEMPTY_TRANSACTION_BUDGET,
+        "transactions_submitted": submitted_transactions.len(),
+        "submitted_transactions": submitted_transactions,
+        "transaction_observations": transaction_observations,
+        "producer_opportunities_examined": seen_ordinary_ids.len(),
+        "empty_or_nonmatching_opportunities_skipped": skipped_opportunities.len(),
+        "skipped_opportunities": skipped_opportunities,
+        "selected_ordinary_block": {
+            "block_id": ordinary_body.block_id,
+            "parent_block_id": ordinary_body.parent_block_id,
+            "slot": ordinary_body.slot,
+            "body_root": ordinary_body.body_root,
+            "transaction_count": ordinary_body.transaction_hashes.len(),
+            "transaction_hashes": ordinary_body.transaction_hashes,
+            "submitted_transaction_hashes_in_body": submitted_hashes_in_body,
+        },
+        "ordinary_submission_preceded_sibling_construction": opportunity.ordinary_line
+            < opportunity.siblings.first().map_or(usize::MAX, |(line, _)| *line),
+        "timing": {
+            "configured_siblings": parse_usize(timing, "configured_siblings"),
+            "constructed_siblings": parse_usize(timing, "constructed_siblings"),
+            "failed_siblings": parse_usize(timing, "failed_siblings"),
+            "relay_enqueued_siblings": parse_usize(timing, "relay_enqueued_siblings"),
+            "ordinary_self_applied": identity_bool(timing, "ordinary_self_applied"),
+            "ordinary_relay_enqueued": identity_bool(timing, "ordinary_relay_enqueued"),
+            "slot_to_ordinary_submission_ms": timing.get("slot_to_ordinary_submission_ms"),
+            "ordinary_proposal_ms": timing.get("ordinary_proposal_ms"),
+            "sibling_construction_ms": timing.get("sibling_construction_ms"),
+            "sibling_blend_enqueue_ms": timing.get("sibling_blend_enqueue_ms"),
+            "additional_processing_ms": timing.get("additional_processing_ms"),
+            "total_leadership_processing_ms": timing.get("total_leadership_processing_ms"),
+        },
+        "producer_no_peers_subscribed_to_topic_errors_after_readiness": no_subscriber_errors,
+        "sibling_body_integrity": integrity,
+        "accepted_bodies_all_match_ordinary": accepted_bodies_all_match,
+        "siblings": sibling_outcomes,
+        "storage_observations": storage_events,
+        "receiver_observability": {
+            "blend_topic_subscription_api": "not exposed; matching decapsulated sibling event is direct per-payload reception evidence",
+            "canonical_selection": "not asserted; accepted sibling may be non-canonical",
+            "producer_enqueue_is_not_peer_delivery": true,
         },
     }))
 }
@@ -526,11 +1108,16 @@ async fn wait_for_producer_opportunity(
 }
 
 fn find_producer_opportunity(lines: &[ObservedLogLine]) -> Option<ProducerOpportunity> {
+    find_producer_opportunities(lines).into_iter().next()
+}
+
+fn find_producer_opportunities(lines: &[ObservedLogLine]) -> Vec<ProducerOpportunity> {
     let parsed = lines
         .iter()
         .enumerate()
         .map(|(line, raw)| (line, raw, parse_log_fields(&raw.text)))
         .collect::<Vec<_>>();
+    let mut opportunities = Vec::new();
     for (ordinary_line, ordinary_record, ordinary) in &parsed {
         if ordinary
             .get("event")
@@ -602,7 +1189,7 @@ fn find_producer_opportunity(lines: &[ObservedLogLine]) -> Option<ProducerOpport
         {
             continue;
         }
-        return Some(ProducerOpportunity {
+        opportunities.push(ProducerOpportunity {
             ordinary: ordinary.clone(),
             ordinary_line: *ordinary_line,
             siblings: siblings
@@ -613,7 +1200,7 @@ fn find_producer_opportunity(lines: &[ObservedLogLine]) -> Option<ProducerOpport
             timing_line: *timing_line,
         });
     }
-    None
+    opportunities
 }
 
 fn log_line_precedes(first: &ObservedLogLine, second: &ObservedLogLine) -> bool {
@@ -630,10 +1217,70 @@ fn log_line_precedes(first: &ObservedLogLine, second: &ObservedLogLine) -> bool 
     }
 }
 
+fn summarize_api_block(block: &ApiBlock) -> BlockBodyEvidence {
+    BlockBodyEvidence {
+        block_id: block.header.id.to_string(),
+        parent_block_id: block.header.parent_block.to_string(),
+        slot: u64::from(block.header.slot),
+        body_root: block.header.body_root.to_string(),
+        transaction_hashes: block
+            .transactions
+            .iter()
+            .map(|transaction| tx_hash_to_hex(&transaction.hash()))
+            .collect(),
+    }
+}
+
+fn parse_header_id(value: &str) -> Result<HeaderId, String> {
+    let bytes = value
+        .strip_prefix("0x")
+        .map_or_else(|| hex::decode(value), hex::decode)
+        .map_err(|error| format!("invalid block ID {value}: {error}"))?;
+    HeaderId::try_from(bytes.as_slice())
+        .map_err(|error| format!("invalid block ID {value}: {error}"))
+}
+
+fn has_nonempty_submitted_body(
+    transaction_hashes: &[String],
+    submitted_hashes: &BTreeSet<String>,
+) -> bool {
+    !transaction_hashes.is_empty()
+        && transaction_hashes
+            .iter()
+            .any(|transaction_hash| submitted_hashes.contains(transaction_hash))
+}
+
+fn same_transaction_body(
+    ordinary: &BlockBodyEvidence,
+    body_root: &str,
+    transaction_hashes: &[String],
+) -> bool {
+    ordinary.body_root == body_root && ordinary.transaction_hashes == transaction_hashes
+}
+
+fn sibling_body_integrity(ordinary: &BlockBodyEvidence, opportunity: &ProducerOpportunity) -> bool {
+    let sibling_ids = opportunity
+        .siblings
+        .iter()
+        .filter_map(|(_, sibling)| sibling.get("sibling_block_id"))
+        .collect::<BTreeSet<_>>();
+    sibling_ids.len() == SIBLING_COUNT
+        && !sibling_ids.contains(&ordinary.block_id)
+        && opportunity.siblings.len() == SIBLING_COUNT
+        && {
+            let expected_slot = ordinary.slot.to_string();
+            opportunity.siblings.iter().all(|(_, sibling)| {
+                sibling.get("parent_block_id") == Some(&ordinary.parent_block_id)
+                    && sibling.get("slot") == Some(&expected_slot)
+            })
+        }
+}
+
 async fn observe_honest_receivers(
     tails: &mut AuditLogTail,
     logs: &mut BTreeMap<String, Vec<ObservedLogLine>>,
     opportunity: &ProducerOpportunity,
+    require_full_observation_window: bool,
 ) -> Result<(HashMap<(String, String), ReceiverEvidence>, bool), String> {
     let ids = opportunity
         .siblings
@@ -664,9 +1311,8 @@ async fn observe_honest_receivers(
             })
         });
         if (has_valid_acceptance
-            && (all_terminal
-                || first_acceptance_at
-                    .is_some_and(|start| start.elapsed() >= Duration::from_secs(8))))
+            && (first_acceptance_at.is_some_and(|start| start.elapsed() >= Duration::from_secs(8))
+                || (!require_full_observation_window && all_terminal)))
             || Instant::now() >= deadline
         {
             let no_subscriber_errors = logs.get(PRODUCER).is_some_and(|producer| {
@@ -706,6 +1352,7 @@ fn receiver_stages(
                 parent_block_id: fields.get("parent_block_id").cloned(),
                 slot: fields.get("slot").cloned(),
                 timestamp: parse_log_timestamp(&line.text),
+                reason: fields.get("reason").cloned(),
                 path: line.path.clone(),
                 offset: line.offset,
             };
@@ -751,18 +1398,12 @@ async fn query_accepted_blocks(
         let Some(node) = world.nodes_info.get(node_name) else {
             continue;
         };
-        let decoded = block_id
-            .strip_prefix("0x")
-            .map_or_else(|| hex::decode(block_id), hex::decode);
-        let Ok(bytes) = decoded else {
+        let Ok(header_id) = parse_header_id(block_id) else {
             continue;
         };
-        let Ok(header_id) = HeaderId::try_from(bytes.as_slice()) else {
-            continue;
-        };
-        if !matches!(node.client.block(&header_id).await, Ok(Some(_))) {
-            continue;
-        }
+        let block_result = node.client.block(&header_id).await;
+        let block_error = block_result.as_ref().err().map(ToString::to_string);
+        let block = block_result.as_ref().ok().and_then(Option::as_ref);
         let identity = opportunity
             .siblings
             .iter()
@@ -777,14 +1418,22 @@ async fn query_accepted_blocks(
             "block_id": block_id,
             "parent_block_id": identity.and_then(|event| event.get("parent_block_id")),
             "slot": identity.and_then(|event| event.get("slot")),
-            "stored": true,
+            "stored": block.is_some(),
+            "body_root": block.map(|block| block.header.body_root.to_string()),
+            "transaction_count": block.map(|block| block.transactions.len()),
+            "transaction_hashes": block.map(|block| {
+                block.transactions.iter()
+                    .map(|transaction| tx_hash_to_hex(&transaction.hash()))
+                    .collect::<Vec<_>>()
+            }),
+            "error": block_error,
             "evidence_source": "NodeHttpClient::block",
         }));
     }
     observations
 }
 
-fn verify_runtime_configuration(world: &CucumberWorld) -> Result<Value, String> {
+fn verify_runtime_configuration(world: &CucumberWorld, scenario: &str) -> Result<Value, String> {
     let binary = std::env::var_os("LOGOS_BLOCKCHAIN_NODE_BIN").ok_or_else(|| {
         "LOGOS_BLOCKCHAIN_NODE_BIN was not set by the Cucumber environment".to_owned()
     })?;
@@ -856,7 +1505,7 @@ fn verify_runtime_configuration(world: &CucumberWorld) -> Result<Value, String> 
         "binary_path": binary,
         "binary_sha256": binary_sha256,
         "feature_set": "security-audit,testing",
-        "scenario": "Honest peers validate valid same-slot sibling blocks",
+        "scenario": scenario,
         "node_configs": nodes,
     }))
 }
@@ -1034,10 +1683,44 @@ fn copy_node_logs(world: &CucumberWorld, output: &Path) -> Result<Vec<String>, S
 }
 
 fn parse_log_fields(line: &str) -> HashMap<String, String> {
-    line.split_whitespace()
+    let mut fields = line
+        .split_whitespace()
         .filter_map(|field| field.split_once('='))
         .map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()))
-        .collect()
+        .collect::<HashMap<_, _>>();
+    if let Some(reason) = parse_quoted_log_field(line, "reason") {
+        fields.insert("reason".to_owned(), reason);
+    }
+    fields
+}
+
+fn parse_quoted_log_field(line: &str, key: &str) -> Option<String> {
+    let marker = format!("{key}=");
+    let (start, _) = line.match_indices(&marker).find(|(index, _)| {
+        *index == 0
+            || line
+                .get(..*index)
+                .is_some_and(|prefix| prefix.chars().next_back().is_some_and(char::is_whitespace))
+    })?;
+    let mut value = line.get(start + marker.len()..)?.chars();
+    if value.next()? != '"' {
+        return None;
+    }
+    let mut output = String::new();
+    let mut escaped = false;
+    for character in value {
+        if escaped {
+            output.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Some(output);
+        } else {
+            output.push(character);
+        }
+    }
+    None
 }
 
 fn parse_log_timestamp(line: &str) -> Option<[u32; 7]> {
@@ -1325,5 +2008,111 @@ mod tests {
 
         assert!(!matched_evidence(missing_timestamp).has_ordered_blend_to_acceptance());
         assert!(!matched_evidence(tied_cross_file).has_ordered_blend_to_acceptance());
+    }
+
+    fn body_evidence(block_id: &str, transaction_hashes: &[&str]) -> BlockBodyEvidence {
+        BlockBodyEvidence {
+            block_id: block_id.to_owned(),
+            parent_block_id: PARENT_ID.to_owned(),
+            slot: 42,
+            body_root: "0xbody-root".to_owned(),
+            transaction_hashes: transaction_hashes
+                .iter()
+                .map(|hash| (*hash).to_owned())
+                .collect(),
+        }
+    }
+
+    fn opportunity_with_siblings() -> ProducerOpportunity {
+        let siblings = (1..=SIBLING_COUNT)
+            .map(|index| {
+                (
+                    index,
+                    HashMap::from([
+                        ("sibling_block_id".to_owned(), format!("0xsibling-{index}")),
+                        ("parent_block_id".to_owned(), PARENT_ID.to_owned()),
+                        ("slot".to_owned(), "42".to_owned()),
+                    ]),
+                )
+            })
+            .collect();
+        ProducerOpportunity {
+            ordinary: HashMap::from([
+                ("ordinary_block_id".to_owned(), "0xordinary".to_owned()),
+                ("parent_block_id".to_owned(), PARENT_ID.to_owned()),
+                ("slot".to_owned(), "42".to_owned()),
+            ]),
+            ordinary_line: 1,
+            siblings,
+            timing: HashMap::new(),
+            timing_line: 10,
+        }
+    }
+
+    #[test]
+    fn nonempty_body_selection_rejects_empty_and_unrelated_transactions() {
+        let submitted = BTreeSet::from(["0xtest-transaction".to_owned()]);
+
+        assert!(!has_nonempty_submitted_body(&[], &submitted));
+        assert!(!has_nonempty_submitted_body(
+            &["0xother-transaction".to_owned()],
+            &submitted
+        ));
+        assert!(has_nonempty_submitted_body(
+            &[
+                "0xother-transaction".to_owned(),
+                "0xtest-transaction".to_owned()
+            ],
+            &submitted
+        ));
+    }
+
+    #[test]
+    fn sibling_body_requires_identical_commitment_and_ordered_transaction_hashes() {
+        let ordinary = body_evidence("0xordinary", &["0xtx-a", "0xtx-b"]);
+        assert!(same_transaction_body(
+            &ordinary,
+            "0xbody-root",
+            &["0xtx-a".to_owned(), "0xtx-b".to_owned()]
+        ));
+        assert!(!same_transaction_body(
+            &ordinary,
+            "0xdifferent-root",
+            &["0xtx-a".to_owned(), "0xtx-b".to_owned()]
+        ));
+        assert!(!same_transaction_body(
+            &ordinary,
+            "0xbody-root",
+            &["0xtx-b".to_owned(), "0xtx-a".to_owned()]
+        ));
+        assert!(!same_transaction_body(
+            &ordinary,
+            "0xbody-root",
+            &["0xtx-a".to_owned(), "0xtx-c".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn sibling_identity_check_requires_four_distinct_same_parent_same_slot_ids() {
+        let ordinary = body_evidence("0xordinary", &["0xtx-a"]);
+        let mut opportunity = opportunity_with_siblings();
+        assert!(sibling_body_integrity(&ordinary, &opportunity));
+
+        opportunity.siblings[0]
+            .1
+            .insert("parent_block_id".to_owned(), "0xother-parent".to_owned());
+        assert!(!sibling_body_integrity(&ordinary, &opportunity));
+    }
+
+    #[test]
+    fn quoted_receiver_failure_reason_preserves_spaces() {
+        let fields = parse_log_fields(
+            "2026-10-11T10:00:00.000Z INFO event=security_audit_proposal_reconstruction_failed reason=\"UnresolvedReference: transaction hash not in mempool\"",
+        );
+
+        assert_eq!(
+            fields.get("reason").map(String::as_str),
+            Some("UnresolvedReference: transaction hash not in mempool")
+        );
     }
 }

@@ -34,10 +34,18 @@ python3 .security_audit_tools/summarize.py \
 The report contains each leadership opportunity, its timing fields, sibling
 identity events and receiver results grouped by node. `timings.csv` contains
 minimum, median and maximum values with a sample count for each timing metric.
-Anomalies are written to JSON and produce exit status 1 unless
-`--allow-anomalies` is passed. The parser reports missing/incomplete timing and
-identity records, duplicate IDs or indexes, parent/slot mismatches, relay
-enqueue failures, and inconsistent event counts.
+Evidence-integrity `anomalies` produce exit status 1 unless
+`--allow-anomalies` is passed. Nonfatal `incomplete_observations` describe
+missing or ambiguous receiver evidence and do not change the default exit
+status. Confirmed local and receiver outcomes remain in each sibling's
+`outcome` and each node's `receiver_results`; failure reasons are retained
+where the logs provide them.
+
+The summary distinguishes complete Blend-to-acceptance paths, partial receiver
+observations, missing receiver observations, explicit reconstruction failures,
+explicit application failures, and local relay enqueue failures. Incomplete
+evidence is not a rejection. A local relay enqueue failure is a confirmed
+producer-side result, but it is not a receiver or consensus result.
 
 ## Evidence semantics
 
@@ -54,8 +62,8 @@ enqueue failures, and inconsistent event counts.
   timestamps establish order only when the events are in the same file and
   their line positions are increasing. Missing timestamps, ambiguous ties,
   reverse order, and stages split across peers cannot produce a successful
-  path. Partial observations remain `not_observed`; they are not treated as
-  confirmed rejection.
+  path. These are listed under `incomplete_observations`, not evidence-
+  integrity errors. Missing evidence is distinct from a confirmed rejection.
 - The aggregate sibling outcome is derived from complete per-node results.
   Aggregate stage-presence fields remain for compatibility, but must not be
   used alone to claim an accepted Blend delivery. `accepted_after_blend_reception`
@@ -69,6 +77,13 @@ enqueue failures, and inconsistent event counts.
   identity records. Receiver events are correlated by window, sibling ID,
   receiving node, parent ID and slot. An accepted stage on one peer cannot be
   combined with Blend reception on another peer.
+- A receiver's explicit reconstruction failure is reported as
+  `reconstruction_failed`, with its logged reason when present. An
+  `UnresolvedReference` reason records that reconstruction could not resolve a
+  transaction reference from that peer's mempool; it does not by itself prove
+  the sibling was consensus-invalid. Proposal rejection and consensus apply
+  failure are separately reported with their reasons. Missing events remain
+  unobserved rather than being synthesized into failures.
 
 These logs cannot establish that an unobserved peer never received a proposal;
 they establish only which stages were observed in the supplied logs and time

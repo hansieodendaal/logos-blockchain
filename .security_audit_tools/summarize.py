@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import re
 import statistics
 import sys
@@ -110,6 +111,18 @@ def parse_log(log_name: str, path: Path) -> tuple[list[dict[str, Any]], list[dic
         return [], [{"type": "log_read_failed", "node": log_name, "path": str(path), "detail": str(error)}]
 
     for line_number, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("{"):
+            try:
+                json.loads(line.lstrip())
+            except json.JSONDecodeError as error:
+                anomalies.append({
+                    "type": "malformed_json_log_line",
+                    "node": log_name,
+                    "path": str(path),
+                    "line": line_number,
+                    "detail": str(error),
+                })
+                continue
         fields = parse_fields(line)
         event_name = fields.get("event")
         if not isinstance(event_name, str) or not event_name.startswith("security_audit_"):
@@ -129,6 +142,8 @@ def parse_log(log_name: str, path: Path) -> tuple[list[dict[str, Any]], list[dic
             **fields,
         }
         if stamp is None:
+            # A missing timestamp weakens ordering evidence but does not make
+            # the recorded protocol outcome false.
             anomalies.append(
                 {"type": "event_missing_timestamp", "node": log_name, "path": str(path), "line": line_number, "event": event_name}
             )
@@ -250,6 +265,40 @@ def _receiver_status(events: list[dict[str, Any]]) -> dict[str, Any]:
         else "not_observed"
     )
     storage_events = [event for event in events if event.get("stage") == "storage_observed"]
+    reconstruction_failures = [event for event in events if event.get("stage") == "reconstruction_failed"]
+    application_failures = [
+        event for event in events if event.get("stage") in {"rejected", "apply_failed"}
+    ]
+    def failure_reasons(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "stage": event.get("stage"),
+                "reason": next(
+                    (
+                        event.get(field)
+                        for field in ("reason", "error", "failure_reason", "error_reason")
+                        if event.get(field) is not None
+                    ),
+                    None,
+                ),
+            }
+            for event in records
+        ]
+    outcome = (
+        "accepted"
+        if "accepted" in stage_names
+        else "reconstruction_failed"
+        if reconstruction_failures
+        else "proposal_rejected"
+        if "rejected" in stage_names
+        else "application_failed"
+        if "apply_failed" in stage_names
+        else "not_processed"
+        if "not_processed" in stage_names
+        else "receiver_observation_incomplete"
+        if events
+        else "receiver_observation_missing"
+    )
     return {
         "blend_received": "blend_received" in stage_names,
         "blend_status": "received" if "blend_received" in stage_names else "not_observed",
@@ -262,6 +311,9 @@ def _receiver_status(events: list[dict[str, Any]]) -> dict[str, Any]:
         "apply_failed": "apply_failed" in stage_names,
         "not_processed": "not_processed" in stage_names,
         "application_status": application_status,
+        "outcome": outcome,
+        "reconstruction_failure_reasons": failure_reasons(reconstruction_failures),
+        "application_failure_reasons": failure_reasons(application_failures),
         "stored": bool(storage_events),
         "canonical_status": _canonical_status(storage_events),
         "ordered_blend_to_acceptance": _ordered_receiver_path(events),
@@ -276,6 +328,7 @@ def analyze(
     producer_node: str | None = None,
 ) -> dict[str, Any]:
     anomalies: list[dict[str, Any]] = []
+    incomplete_observations: list[dict[str, Any]] = []
     filtered_events: list[tuple[dict[str, Any], str]] = []
     selected_windows: list[dict[str, Any] | None] = windows or [None]
     for window in selected_windows:
@@ -342,6 +395,21 @@ def analyze(
             failed = as_int(row, "failed_siblings", local_anomalies, row)
             relay_count = as_int(row, "relay_enqueued_siblings", local_anomalies, row)
             anomalies.extend(local_anomalies)
+            for field, value in (
+                ("configured_siblings", configured),
+                ("constructed_siblings", constructed),
+                ("failed_siblings", failed),
+                ("relay_enqueued_siblings", relay_count),
+            ):
+                if value is not None and value < 0:
+                    anomalies.append({
+                        "type": "invalid_sibling_count",
+                        "node": producer,
+                        "slot": slot,
+                        "field": field,
+                        "value": value,
+                        "window": window_name,
+                    })
             checks_expected = producer_node is None or producer == producer_node
             if checks_expected and expected_siblings is not None and configured != expected_siblings:
                 anomalies.append({"type": "unexpected_configured_sibling_count", "node": producer, "slot": slot, "expected": expected_siblings, "actual": configured, "window": window_name})
@@ -373,8 +441,6 @@ def analyze(
                 if ordinary_id and identity.get("ordinary_block_id") != ordinary_id:
                     anomalies.append({"type": "sibling_ordinary_id_mismatch", "node": producer, "slot": slot, "sibling_block_id": sibling_id, "window": window_name})
                 relay_enqueued = truthy(identity.get("relay_enqueued"))
-                if not relay_enqueued:
-                    anomalies.append({"type": "local_relay_enqueue_failed", "node": producer, "slot": slot, "sibling_block_id": sibling_id, "window": window_name})
                 candidate_receiver_events = [
                     entry
                     for entry in receiver_events
@@ -382,6 +448,13 @@ def analyze(
                     and str(entry.get("sibling_block_id") or entry.get("block_id") or "") == sibling_id
                     and entry.get("node") != producer
                 ]
+                if not candidate_receiver_events:
+                    incomplete_observations.append({
+                        "type": "receiver_observation_missing",
+                        "window": window_name,
+                        "sibling_block_id": sibling_id,
+                        "relay_enqueued": relay_enqueued,
+                    })
                 receiver_nodes: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
                     lambda: {"matching": [], "mismatched": []}
                 )
@@ -414,8 +487,8 @@ def analyze(
                     ordered_path = _ordered_receiver_path(matching_events)
                     if not ordered_path and matching_events:
                         missing_stages = [stage for stage in REQUIRED_RECEIVER_PATH if stage not in unique_stages]
-                        if missing_stages and ("blend_received" in unique_stages or "accepted" in unique_stages):
-                            anomalies.append({
+                        if missing_stages:
+                            incomplete_observations.append({
                                 "type": "receiver_intermediate_stage_missing",
                                 "node": receiver_node,
                                 "window": window_name,
@@ -423,7 +496,7 @@ def analyze(
                                 "missing_stages": missing_stages,
                             })
                         elif not missing_stages:
-                            anomalies.append({
+                            incomplete_observations.append({
                                 "type": "receiver_event_order_invalid",
                                 "node": receiver_node,
                                 "window": window_name,
@@ -432,7 +505,7 @@ def analyze(
                     for stage in unique_stages:
                         stage_count = stage_names.count(stage)
                         if stage_count > 1:
-                            anomalies.append({
+                            incomplete_observations.append({
                                 "type": "duplicate_receiver_stage_event",
                                 "node": receiver_node,
                                 "window": window_name,
@@ -463,7 +536,7 @@ def analyze(
                 blend_nodes = {item["node"] for item in receiver_results if item["blend_received"]}
                 accepted_nodes = {item["node"] for item in receiver_results if item["accepted"]}
                 if blend_nodes and accepted_nodes and not complete_receiver and blend_nodes.isdisjoint(accepted_nodes):
-                    anomalies.append({
+                    incomplete_observations.append({
                         "type": "reception_and_acceptance_split_across_nodes",
                         "window": window_name,
                         "sibling_block_id": sibling_id,
@@ -471,7 +544,7 @@ def analyze(
                         "acceptance_nodes": sorted(accepted_nodes),
                     })
                 if not complete_receiver and set(REQUIRED_RECEIVER_PATH).issubset(aggregate_stages):
-                    anomalies.append({
+                    incomplete_observations.append({
                         "type": "receiver_stages_split_across_nodes_or_unordered",
                         "window": window_name,
                         "sibling_block_id": sibling_id,
@@ -488,8 +561,14 @@ def analyze(
                         if complete_receiver
                         else "accepted_without_ordered_blend_evidence"
                         if "accepted" in aggregate_stages
-                        else "rejected_or_failed"
-                        if {"rejected", "apply_failed"} & aggregate_stages
+                        else "reconstruction_failed"
+                        if "reconstruction_failed" in aggregate_stages
+                        else "proposal_rejected"
+                        if "rejected" in aggregate_stages
+                        else "application_failed"
+                        if "apply_failed" in aggregate_stages
+                        else "not_processed"
+                        if "not_processed" in aggregate_stages
                         else "receiver_observation_incomplete"
                         if aggregate_stages
                         else "local_enqueue_succeeded_peer_delivery_not_observed"
@@ -531,11 +610,20 @@ def analyze(
                 if constructed > configured or constructed + skipped > configured or (failed is not None and failed > configured):
                     anomalies.append({"type": "configured_sibling_outcome_count_mismatch", "node": producer, "slot": slot, "configured": configured, "constructed": constructed, "failed": failed, "skipped": skipped, "window": window_name})
 
+            incomplete_timing_fields = {
+                field
+                for issue in anomalies
+                if issue.get("type") == "incomplete_timing_event"
+                for field in issue.get("missing_fields", [])
+            }
             for metric in METRICS:
                 try:
-                    metric_values[(window_name, configured or 0, metric)].append(float(row[metric]))
+                    value = float(row[metric])
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("timing metric must be finite and nonnegative")
+                    metric_values[(window_name, configured or 0, metric)].append(value)
                 except (KeyError, TypeError, ValueError):
-                    if metric not in [issue.get("field") for issue in anomalies if issue.get("type") == "incomplete_timing_event"]:
+                    if metric not in incomplete_timing_fields:
                         anomalies.append({"type": "invalid_timing_metric", "node": producer, "slot": slot, "metric": metric, "value": row.get(metric), "window": window_name})
 
             opportunities.append({
@@ -588,10 +676,53 @@ def analyze(
             "observed_reconstructions": sum(sibling["receiver_evidence"]["reconstructed"] for opportunity in opportunities for sibling in opportunity["siblings"]),
             "observed_acceptances": sum(sibling["receiver_evidence"]["accepted"] for opportunity in opportunities for sibling in opportunity["siblings"]),
             "accepted_after_blend_reception": sum(sibling["receiver_evidence"]["ordered_blend_to_acceptance"] for opportunity in opportunities for sibling in opportunity["siblings"]),
+            "complete_blend_to_acceptance_paths": sum(sibling["receiver_evidence"]["ordered_blend_to_acceptance"] for opportunity in opportunities for sibling in opportunity["siblings"]),
+            "accepted_without_ordered_blend_evidence": sum(sibling["outcome"] == "accepted_without_ordered_blend_evidence" for opportunity in opportunities for sibling in opportunity["siblings"]),
+            "partial_receiver_observations": sum(
+                bool(receiver.get("evidence_events")) and not receiver.get("ordered_blend_to_acceptance")
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+                for receiver in sibling["receiver_evidence"]["receiver_results"]
+            ),
+            "siblings_without_receiver_observations": sum(
+                not sibling["receiver_evidence"]["receiver_results"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+            ),
+            "explicit_reconstruction_failures": sum(
+                receiver["reconstruction_failed"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+                for receiver in sibling["receiver_evidence"]["receiver_results"]
+            ),
+            "explicit_application_failures": sum(
+                receiver["rejected"] or receiver["apply_failed"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+                for receiver in sibling["receiver_evidence"]["receiver_results"]
+            ),
+            "explicit_proposal_rejections": sum(
+                receiver["rejected"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+                for receiver in sibling["receiver_evidence"]["receiver_results"]
+            ),
+            "explicit_consensus_application_failures": sum(
+                receiver["apply_failed"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+                for receiver in sibling["receiver_evidence"]["receiver_results"]
+            ),
+            "local_relay_enqueue_failures": sum(
+                not sibling["relay_enqueued"]
+                for opportunity in opportunities
+                for sibling in opportunity["siblings"]
+            ),
         },
         "statistics": stats,
         "opportunities": opportunities,
         "anomalies": anomalies,
+        "incomplete_observations": incomplete_observations,
     }
 
 
@@ -647,13 +778,20 @@ def main(argv: list[str] | None = None) -> int:
 
     events: list[dict[str, Any]] = []
     read_anomalies: list[dict[str, Any]] = []
+    read_incomplete: list[dict[str, Any]] = []
     for node, path in log_specs:
         parsed, issues = parse_log(node, path)
         events.extend(parsed)
-        read_anomalies.extend(issues)
+        read_anomalies.extend(
+            issue for issue in issues if issue.get("type") != "event_missing_timestamp"
+        )
+        read_incomplete.extend(
+            issue for issue in issues if issue.get("type") == "event_missing_timestamp"
+        )
 
     result = analyze(events, windows, args.expected_siblings, args.producer_node)
     result["anomalies"][:0] = read_anomalies
+    result["incomplete_observations"][:0] = read_incomplete
     result["provenance"] = {
         "commit_sha": args.commit_sha,
         "binary_sha256": args.binary_sha256,
@@ -681,7 +819,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_ms": row["max"],
             })
 
-    print(json.dumps({"summary": result["summary"], "anomalies": result["anomalies"], "outputs": [str(args.output_dir / "measurements.json"), str(args.output_dir / "timings.csv")]}, indent=2))
+    print(json.dumps({"summary": result["summary"], "anomalies": result["anomalies"], "incomplete_observations": result["incomplete_observations"], "outputs": [str(args.output_dir / "measurements.json"), str(args.output_dir / "timings.csv")]}, indent=2))
     return 1 if result["anomalies"] and not args.allow_anomalies else 0
 
 

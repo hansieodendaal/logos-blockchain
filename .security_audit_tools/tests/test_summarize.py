@@ -85,6 +85,7 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(three["siblings"][0]["receiver_evidence"]["blend_status"], "not_observed")
         self.assertEqual(three["siblings"][0]["receiver_evidence"]["application_status"], "not_observed")
         self.assertEqual(result["summary"]["accepted_after_blend_reception"], 1)
+        self.assertEqual(result["summary"]["complete_blend_to_acceptance_paths"], 1)
         self.assertTrue(one["siblings"][0]["receiver_evidence"]["ordered_blend_to_acceptance"])
         self.assertEqual(one["siblings"][0]["receiver_evidence"]["receiver_results"][0]["node"], "NODE_2")
 
@@ -151,10 +152,12 @@ class SummarizeTests(unittest.TestCase):
         result = summarize.analyze(events, [], None)
         sibling = result["opportunities"][0]["siblings"][0]
 
-        self.assertIn("local_relay_enqueue_failed", {item["type"] for item in result["anomalies"]})
+        self.assertNotIn("local_relay_enqueue_failed", {item["type"] for item in result["anomalies"]})
         self.assertFalse(sibling["relay_enqueued"])
         self.assertFalse(sibling["receiver_evidence"]["blend_received"])
         self.assertFalse(sibling["receiver_evidence"]["accepted"])
+        self.assertEqual(sibling["outcome"], "local_relay_enqueue_failed")
+        self.assertEqual(result["summary"]["local_relay_enqueue_failures"], 1)
 
     def test_reverse_receiver_event_order_is_not_accepted(self):
         events = self.events_with_receiver_path(
@@ -166,7 +169,11 @@ class SummarizeTests(unittest.TestCase):
 
         self.assertEqual(sibling["outcome"], "accepted_without_ordered_blend_evidence")
         self.assertFalse(sibling["receiver_evidence"]["ordered_blend_to_acceptance"])
-        self.assertIn("receiver_event_order_invalid", {item["type"] for item in result["anomalies"]})
+        self.assertIn(
+            "receiver_event_order_invalid",
+            {item["type"] for item in result["incomplete_observations"]},
+        )
+        self.assertEqual(result["anomalies"], [])
 
     def test_receiver_stages_from_different_nodes_are_not_combined(self):
         events = self.events_with_receiver_path(["blend_received"], node="NODE_2")
@@ -183,7 +190,7 @@ class SummarizeTests(unittest.TestCase):
         self.assertFalse(sibling["receiver_evidence"]["ordered_blend_to_acceptance"])
         self.assertIn(
             "reception_and_acceptance_split_across_nodes",
-            {item["type"] for item in result["anomalies"]},
+            {item["type"] for item in result["incomplete_observations"]},
         )
         self.assertEqual(
             {receiver["node"] for receiver in sibling["receiver_evidence"]["receiver_results"]},
@@ -202,7 +209,64 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(receiver["reconstruction_status"], "not_observed")
         self.assertEqual(receiver["application_status"], "accepted")
         self.assertEqual(sibling["outcome"], "accepted_without_ordered_blend_evidence")
-        self.assertIn("receiver_intermediate_stage_missing", {item["type"] for item in result["anomalies"]})
+        self.assertIn(
+            "receiver_intermediate_stage_missing",
+            {item["type"] for item in result["incomplete_observations"]},
+        )
+        self.assertNotIn("receiver_intermediate_stage_missing", {item["type"] for item in result["anomalies"]})
+
+    def test_partial_receiver_evidence_is_nonfatal_and_not_rejection(self):
+        events = self.events_with_receiver_path(
+            ["chain_proposal_received", "reconstructed", "accepted"]
+        )
+
+        result = summarize.analyze(events, [], None)
+        sibling = result["opportunities"][0]["siblings"][0]
+        receiver = sibling["receiver_evidence"]["receiver_results"][0]
+
+        self.assertEqual(result["anomalies"], [])
+        self.assertEqual(sibling["outcome"], "accepted_without_ordered_blend_evidence")
+        self.assertEqual(receiver["outcome"], "accepted")
+        self.assertFalse(receiver["blend_received"])
+        self.assertFalse(receiver["reconstruction_failed"])
+        self.assertIn(
+            "receiver_intermediate_stage_missing",
+            {item["type"] for item in result["incomplete_observations"]},
+        )
+
+    def test_missing_blend_evidence_is_not_a_rejection(self):
+        events = self.events_with_receiver_path(
+            ["chain_proposal_received", "reconstructed", "accepted"]
+        )
+
+        sibling = summarize.analyze(events, [], None)["opportunities"][0]["siblings"][0]
+
+        self.assertEqual(sibling["outcome"], "accepted_without_ordered_blend_evidence")
+        self.assertFalse(sibling["receiver_evidence"]["rejected"])
+        self.assertFalse(sibling["receiver_evidence"]["reconstruction_failed"])
+
+    def test_reconstruction_failure_preserves_reason_as_confirmed_outcome(self):
+        events = self.events_with_receiver_path(
+            ["blend_received", "chain_proposal_received", "reconstruction_failed"]
+        )
+        failed = next(
+            event
+            for event in events
+            if event.get("event") == "security_audit_proposal_reconstruction_failed"
+        )
+        failed["reason"] = "UnresolvedReference: transaction hash not in mempool"
+
+        result = summarize.analyze(events, [], None)
+        sibling = result["opportunities"][0]["siblings"][0]
+        receiver = sibling["receiver_evidence"]["receiver_results"][0]
+
+        self.assertEqual(sibling["outcome"], "reconstruction_failed")
+        self.assertEqual(receiver["outcome"], "reconstruction_failed")
+        self.assertEqual(result["summary"]["explicit_reconstruction_failures"], 1)
+        self.assertEqual(
+            receiver["reconstruction_failure_reasons"][0]["reason"],
+            "UnresolvedReference: transaction hash not in mempool",
+        )
 
     def test_confirmed_reconstruction_and_application_failures_are_reported(self):
         events = self.events_with_receiver_path(
@@ -214,7 +278,7 @@ class SummarizeTests(unittest.TestCase):
 
         self.assertEqual(receiver["reconstruction_status"], "failed")
         self.assertEqual(receiver["application_status"], "rejected")
-        self.assertEqual(result["opportunities"][0]["siblings"][0]["outcome"], "rejected_or_failed")
+        self.assertEqual(result["opportunities"][0]["siblings"][0]["outcome"], "reconstruction_failed")
 
     def test_storage_observation_is_reported_per_receiving_node(self):
         events = self.events_with_receiver_path(
@@ -266,8 +330,11 @@ class SummarizeTests(unittest.TestCase):
         invalid = summarize.analyze(invalid_events, [], None)
         self.assertFalse(invalid["opportunities"][0]["siblings"][0]["receiver_evidence"]["ordered_blend_to_acceptance"])
         anomaly_types = {item["type"] for item in invalid["anomalies"]}
-        self.assertIn("duplicate_receiver_stage_event", anomaly_types)
-        self.assertIn("receiver_event_order_invalid", anomaly_types)
+        self.assertNotIn("duplicate_receiver_stage_event", anomaly_types)
+        self.assertNotIn("receiver_event_order_invalid", anomaly_types)
+        incomplete_types = {item["type"] for item in invalid["incomplete_observations"]}
+        self.assertIn("duplicate_receiver_stage_event", incomplete_types)
+        self.assertIn("receiver_event_order_invalid", incomplete_types)
 
     def test_receiver_evidence_is_scoped_to_measurement_window(self):
         events = self.events_with_receiver_path(
@@ -294,6 +361,15 @@ class SummarizeTests(unittest.TestCase):
 
         self.assertIn("incomplete_timing_event", anomaly_types)
         self.assertIn("incomplete_sibling_identity", anomaly_types)
+
+    def test_invalid_timing_values_remain_actionable_errors(self):
+        events = copy.deepcopy(self.events)
+        timing = next(event for event in events if event.get("event") == summarize.TIMING_EVENT)
+        timing["additional_processing_ms"] = float("nan")
+
+        result = summarize.analyze(events, [], None)
+
+        self.assertIn("invalid_timing_metric", {item["type"] for item in result["anomalies"]})
 
     def test_window_is_half_open(self):
         window = summarize.parse_window("2026-10-11T10:01:00Z", "2026-10-11T10:02:00Z", 1)
@@ -332,7 +408,6 @@ class SummarizeTests(unittest.TestCase):
                     "--feature", "security-audit,testing",
                     "--scenario", "audit smoke",
                     "--node-identity", "NODE_1=peer-id-1",
-                    "--allow-anomalies",
                 ])
 
             self.assertEqual(exit_code, 0)
@@ -343,6 +418,64 @@ class SummarizeTests(unittest.TestCase):
             csv_text = (output / "timings.csv").read_text()
             self.assertIn("configured_siblings,samples,metric", csv_text)
             self.assertIn("additional_processing_ms", csv_text)
+
+    def test_partial_receiver_evidence_keeps_default_cli_exit_successful(self):
+        events = self.events_with_receiver_path(
+            ["chain_proposal_received", "reconstructed", "accepted"]
+        )
+        events.append({
+            "event": "security_audit_diagnostic",
+            "node": "NODE_2",
+            "path": "NODE_2.log",
+            "line": 999,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "partial.jsonl"
+            log_path.write_text(
+                "\n".join(
+                    json.dumps({key: value for key, value in event.items() if key != "_timestamp"})
+                    for event in events
+                )
+                + "\n"
+            )
+            output = Path(directory) / "summary"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = summarize.main([
+                    "--log", f"NODE_1={log_path}",
+                    "--output-dir", str(output),
+                ])
+
+            report = json.loads((output / "measurements.json").read_text())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["anomalies"], [])
+        self.assertIn(
+            "receiver_intermediate_stage_missing",
+            {item["type"] for item in report["incomplete_observations"]},
+        )
+        self.assertIn(
+            "event_missing_timestamp",
+            {item["type"] for item in report["incomplete_observations"]},
+        )
+
+    def test_allow_anomalies_still_returns_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "malformed.jsonl"
+            log_path.write_text(FIXTURE.read_text() + "{broken json\n")
+            output = Path(directory) / "summary"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = summarize.main([
+                    "--log", f"NODE_1={log_path}",
+                    "--output-dir", str(output),
+                    "--allow-anomalies",
+                ])
+
+            report = json.loads((output / "measurements.json").read_text())
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("malformed_json_log_line", {item["type"] for item in report["anomalies"]})
 
 
 if __name__ == "__main__":
