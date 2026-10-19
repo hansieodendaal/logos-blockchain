@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::{BufRead as _, BufReader, Seek as _, SeekFrom},
     path::{Path, PathBuf},
@@ -8,9 +8,11 @@ use std::{
 };
 
 use cucumber::then;
+use futures_util::future::join_all;
+use hex::ToHex as _;
 use lb_common_http_client::ApiBlock;
 use lb_core::{header::HeaderId, mantle::traits::Hashable as _};
-use lb_testing_framework::USER_CONFIG_FILE;
+use lb_testing_framework::{NodeHttpClient, USER_CONFIG_FILE};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
@@ -41,6 +43,12 @@ const TRANSACTION_PENDING_TIMEOUT: Duration = Duration::from_secs(6);
 const NONEMPTY_TRANSACTION_AMOUNT: u64 = 10;
 const TRANSACTION_SENDER: &str = "SECURITY_AUDIT_SENDER";
 const TRANSACTION_RECEIVER: &str = "SECURITY_AUDIT_RECEIVER";
+const FINALITY_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(600);
+const FINALITY_OBSERVATION_INTERVAL: Duration = Duration::from_secs(2);
+const PRODUCER_PROMPT_STOP_LIMIT: Duration = Duration::from_secs(30);
+const FINALITY_STABILITY_WINDOW: Duration = Duration::from_secs(10);
+const FINALITY_MAX_ANCESTRY_DEPTH: usize = 100_000;
+const FINALITY_MAX_TIP_HEIGHT_SKEW: u64 = 1;
 
 #[derive(Clone)]
 struct ProducerOpportunity {
@@ -88,6 +96,105 @@ struct ReceiverEvent {
     reason: Option<String>,
     path: PathBuf,
     offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderLink {
+    id: HeaderId,
+    parent: HeaderId,
+    slot: u64,
+}
+
+#[derive(Default)]
+struct HeaderCache {
+    links: HashMap<HeaderId, HeaderLink>,
+    failures: BTreeMap<String, String>,
+}
+
+struct AncestryPath {
+    links: Vec<HeaderLink>,
+    target_reached: bool,
+    complete_below_slot: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AttackBranch {
+    Ordinary,
+    Sibling(usize),
+    OtherCompeting(HeaderId),
+    None,
+    Unverified,
+}
+
+#[derive(Clone)]
+struct AttackCandidate {
+    id: HeaderId,
+}
+
+#[derive(Clone)]
+struct AttackEvidence {
+    ordinary_id: HeaderId,
+    ordinary_id_text: String,
+    parent_id: HeaderId,
+    parent_id_text: String,
+    slot: u64,
+    body_root: String,
+    transaction_hashes: Vec<String>,
+    siblings: Vec<(usize, AttackCandidate)>,
+}
+
+#[derive(Clone)]
+struct ConsensusState {
+    tip_id: HeaderId,
+    tip_id_text: String,
+    tip_height: u64,
+    tip_slot: u64,
+    lib_id: HeaderId,
+    lib_id_text: String,
+    lib_slot: u64,
+    tip_descends_from_lib: Option<bool>,
+}
+
+#[derive(Clone)]
+struct CanonicalTipState {
+    id: HeaderId,
+    id_text: String,
+    height: u64,
+    slot: u64,
+    observed_at_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalizedHistoryRelation {
+    Shared,
+    Ancestral,
+    Conflicting,
+    Unverified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TipTransition {
+    Unchanged,
+    Descendant,
+    Reorganization,
+    Unverified,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StableFinalityCompletion {
+    started_elapsed_ms: u128,
+    completed_elapsed_ms: u128,
+}
+
+struct FinalityNodeObservation {
+    snapshot: Value,
+    consensus: Option<ConsensusState>,
+    tip_path_complete: bool,
+    finalized_path_complete: bool,
+    attack_branch: AttackBranch,
+    finalized_attack_branch: AttackBranch,
+    continuity: String,
 }
 
 #[derive(Clone, Default)]
@@ -266,6 +373,22 @@ async fn step_verify_sibling_propagation(world: &mut CucumberWorld) -> StepResul
 
 #[then("NODE_1 produces four valid nonempty siblings containing submitted transactions")]
 async fn step_verify_nonempty_sibling_propagation(world: &mut CucumberWorld) -> StepResult {
+    record_nonempty_sibling_propagation(world, true).await
+}
+
+#[then(
+    "NODE_1 produces four valid nonempty siblings containing submitted transactions for the selected equivocation opportunity"
+)]
+async fn step_verify_selected_nonempty_sibling_propagation(
+    world: &mut CucumberWorld,
+) -> StepResult {
+    record_nonempty_sibling_propagation(world, false).await
+}
+
+async fn record_nonempty_sibling_propagation(
+    world: &mut CucumberWorld,
+    require_full_observation_window: bool,
+) -> StepResult {
     // The lifecycle step starts the shared wallet scanner when the first
     // honest peers come up, before NODE_1's funded sender wallet is
     // registered. Stop that scanner now; the observation step starts it again
@@ -280,7 +403,7 @@ async fn step_verify_nonempty_sibling_propagation(world: &mut CucumberWorld) -> 
         message: format!("cannot create nonempty audit evidence directory: {error}"),
     })?;
 
-    let result = observe_nonempty_sibling_propagation(world).await;
+    let result = observe_nonempty_sibling_propagation(world, require_full_observation_window).await;
     let log_capture = copy_node_logs(world, &artifact_dir);
     let mut report = match result {
         Ok(report) => report,
@@ -292,6 +415,7 @@ async fn step_verify_nonempty_sibling_propagation(world: &mut CucumberWorld) -> 
         }
     };
     report["artifact_dir"] = json!(artifact_dir);
+    report["observation_completed_unix_ms"] = json!(unix_timestamp_ms());
     match &log_capture {
         Ok(paths) => report["node_logs"] = json!(paths),
         Err(error) => report["node_log_capture_error"] = json!(error),
@@ -335,6 +459,1597 @@ async fn step_verify_nonempty_sibling_propagation(world: &mut CucumberWorld) -> 
             ),
         })
     }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+async fn capture_pre_attack_consensus(world: &CucumberWorld) -> Value {
+    let observations = join_all(HONEST_NODES.iter().map(async |node_name| {
+        let Some(node) = world.nodes_info.get(*node_name) else {
+            return json!({
+                "node": node_name,
+                "observed_at_unix_ms": unix_timestamp_ms(),
+                "responsive": false,
+                "error": "node was not started",
+            });
+        };
+
+        let observed_at_unix_ms = unix_timestamp_ms();
+        let consensus = match node.client.consensus_info().await {
+            Ok(consensus) => consensus,
+            Err(error) => {
+                return json!({
+                    "node": node_name,
+                    "observed_at_unix_ms": observed_at_unix_ms,
+                    "responsive": false,
+                    "error": error.to_string(),
+                });
+            }
+        };
+        let info = &consensus.cryptarchia_info;
+        let mut cache = HeaderCache::default();
+        let path = walk_to_target(
+            &node.client,
+            info.tip,
+            info.lib,
+            u64::from(info.lib_slot),
+            &mut cache,
+        )
+        .await;
+        let descends_from_lib = ancestry_presence(&path, info.lib);
+
+        json!({
+            "node": node_name,
+            "observed_at_unix_ms": observed_at_unix_ms,
+            "responsive": true,
+            "phase": format!("{:?}", consensus.phase),
+            "tip_id": info.tip.encode_hex::<String>(),
+            "tip_height": info.height,
+            "tip_slot": u64::from(info.slot),
+            "lib_id": info.lib.encode_hex::<String>(),
+            "lib_slot": u64::from(info.lib_slot),
+            "tip_descends_from_lib": descends_from_lib,
+            "tip_to_lib_ancestry": ancestry_path_json(&path),
+            "header_lookup_failures": header_cache_failures_json(&cache),
+        })
+    }))
+    .await;
+    Value::Array(observations)
+}
+
+async fn walk_to_target(
+    client: &NodeHttpClient,
+    start: HeaderId,
+    target: HeaderId,
+    target_slot: u64,
+    cache: &mut HeaderCache,
+) -> AncestryPath {
+    let mut links = Vec::new();
+    let mut current = start;
+    let mut seen = HashSet::new();
+    for _ in 0..FINALITY_MAX_ANCESTRY_DEPTH {
+        if current == target {
+            return AncestryPath {
+                links,
+                target_reached: true,
+                complete_below_slot: true,
+                error: None,
+            };
+        }
+        if !seen.insert(current) {
+            return AncestryPath {
+                links,
+                target_reached: false,
+                complete_below_slot: false,
+                error: Some(format!(
+                    "ancestry cycle at {}",
+                    current.encode_hex::<String>()
+                )),
+            };
+        }
+        let link = match fetch_header_link(client, current, cache).await {
+            Ok(link) => link,
+            Err(error) => {
+                return AncestryPath {
+                    links,
+                    target_reached: false,
+                    complete_below_slot: false,
+                    error: Some(error),
+                };
+            }
+        };
+        links.push(link);
+        if link.parent == target {
+            return AncestryPath {
+                links,
+                target_reached: true,
+                complete_below_slot: true,
+                error: None,
+            };
+        }
+        if link.slot < target_slot || link.parent == current {
+            return AncestryPath {
+                links,
+                target_reached: false,
+                complete_below_slot: true,
+                error: None,
+            };
+        }
+        current = link.parent;
+    }
+    AncestryPath {
+        links,
+        target_reached: false,
+        complete_below_slot: false,
+        error: Some(format!(
+            "ancestry depth exceeded {FINALITY_MAX_ANCESTRY_DEPTH} blocks"
+        )),
+    }
+}
+
+fn proven_below_target_slot_path(current_slot: u64, target_slot: u64) -> Option<AncestryPath> {
+    (current_slot < target_slot).then_some(AncestryPath {
+        links: Vec::new(),
+        target_reached: false,
+        complete_below_slot: true,
+        error: None,
+    })
+}
+
+async fn fetch_header_link(
+    client: &NodeHttpClient,
+    id: HeaderId,
+    cache: &mut HeaderCache,
+) -> Result<HeaderLink, String> {
+    if let Some(link) = cache.links.get(&id) {
+        return Ok(*link);
+    }
+    let id_text = id.encode_hex::<String>();
+    let block = match client.block(&id).await {
+        Ok(Some(block)) => block,
+        Ok(None) => {
+            let error = format!("block API returned no block for {id_text}");
+            cache.failures.insert(id_text, error.clone());
+            return Err(error);
+        }
+        Err(error) => {
+            let error = format!("block API failed for {id_text}: {error}");
+            cache.failures.insert(id_text, error.clone());
+            return Err(error);
+        }
+    };
+    if block.header.id != id {
+        return Err(format!(
+            "block API returned {} while resolving {id_text}",
+            block.header.id.encode_hex::<String>()
+        ));
+    }
+    let link = HeaderLink {
+        id,
+        parent: block.header.parent_block,
+        slot: u64::from(block.header.slot),
+    };
+    cache.links.insert(id, link);
+    Ok(link)
+}
+
+fn ancestry_presence(path: &AncestryPath, target: HeaderId) -> Option<bool> {
+    if path.target_reached
+        || path
+            .links
+            .iter()
+            .any(|link| link.id == target || link.parent == target)
+    {
+        Some(true)
+    } else if path.complete_below_slot {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn ancestry_path_json(path: &AncestryPath) -> Value {
+    json!({
+        "block_ids": path.links.iter().map(|link| link.id.encode_hex::<String>()).collect::<Vec<_>>(),
+        "header_links": path.links.iter().map(|link| json!({
+            "block_id": link.id.encode_hex::<String>(),
+            "parent_block_id": link.parent.encode_hex::<String>(),
+            "slot": link.slot,
+        })).collect::<Vec<_>>(),
+        "target_reached": path.target_reached,
+        "complete_below_target": path.complete_below_slot,
+        "error": path.error,
+    })
+}
+
+fn header_cache_failures_json(cache: &HeaderCache) -> Value {
+    Value::Object(
+        cache
+            .failures
+            .iter()
+            .map(|(id, error)| (id.clone(), json!(error)))
+            .collect(),
+    )
+}
+
+#[then("the honest nodes converge and finalize beyond the nonempty equivocation")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step functions require the world as the first `&mut` argument"
+)]
+async fn step_verify_finality_after_nonempty_equivocation(world: &mut CucumberWorld) -> StepResult {
+    let artifact_dir = world
+        .lifecycle
+        .scenario_base_dir
+        .join("security-audit-nonempty-evidence");
+    let opportunity_path = artifact_dir.join("nonempty-opportunity.json");
+    let opportunity_bytes = fs::read(&opportunity_path).map_err(|error| StepError::StepFail {
+        message: format!(
+            "cannot read selected nonempty opportunity {}: {error}",
+            opportunity_path.display()
+        ),
+    })?;
+    let opportunity: Value =
+        serde_json::from_slice(&opportunity_bytes).map_err(|error| StepError::StepFail {
+            message: format!(
+                "cannot parse selected nonempty opportunity {}: {error}",
+                opportunity_path.display()
+            ),
+        })?;
+    let evidence = parse_attack_evidence(&opportunity).map_err(|error| StepError::StepFail {
+        message: format!(
+            "selected nonempty opportunity is incomplete: {error}; evidence: {}",
+            opportunity_path.display()
+        ),
+    })?;
+
+    let report = observe_finality_after_equivocation(world, &opportunity, &evidence).await;
+    let node_logs = copy_node_logs(world, &artifact_dir);
+    let node_log_hashes = node_logs.as_ref().ok().map(|paths| {
+        paths
+            .iter()
+            .map(|path| {
+                json!({
+                    "path": path,
+                    "sha256": sha256_file(Path::new(path)).ok(),
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut report = match report {
+        Ok(report) => report,
+        Err(error) => json!({
+            "status": "failed",
+            "failure": error,
+            "failure_classification": "incomplete_finality_observation",
+        }),
+    };
+    report["selected_opportunity_path"] = json!(opportunity_path.display().to_string());
+    report["selected_opportunity_sha256"] = json!(sha256_file(&opportunity_path).ok());
+    report["finality_artifact_path"] = json!(
+        artifact_dir
+            .join("finality-observations.json")
+            .display()
+            .to_string()
+    );
+    match &node_logs {
+        Ok(paths) => {
+            report["node_logs_after_producer_stop"] = json!(paths);
+            report["node_log_sha256"] = json!(node_log_hashes);
+        }
+        Err(error) => report["node_log_capture_error"] = json!(error),
+    }
+    let report_path = artifact_dir.join("finality-observations.json");
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| StepError::StepFail {
+            message: format!("cannot encode finality observations: {error}"),
+        })?,
+    )
+    .map_err(|error| StepError::StepFail {
+        message: format!("cannot write {}: {error}", report_path.display()),
+    })?;
+
+    if let Err(error) = node_logs {
+        return Err(StepError::StepFail {
+            message: format!(
+                "finality observations were collected, but node logs could not be preserved: {error}; evidence: {}",
+                report_path.display()
+            ),
+        });
+    }
+    if report["status"].as_str() == Some("passed") {
+        tracing::info!(
+            target: TARGET,
+            event = "security_audit_finality_evidence",
+            evidence_path = %report_path.display(),
+            "Honest nodes converged and advanced a common LIB beyond the isolated nonempty equivocation"
+        );
+        Ok(())
+    } else {
+        let failure = report["failure"]
+            .as_str()
+            .unwrap_or("honest nodes did not satisfy convergence and finality checks");
+        Err(StepError::StepFail {
+            message: format!(
+                "fork-choice/finality experiment failed: {failure}; evidence: {}",
+                report_path.display()
+            ),
+        })
+    }
+}
+
+fn parse_attack_evidence(report: &Value) -> Result<AttackEvidence, String> {
+    if report["nonempty_honest_peer_validation"].as_bool() != Some(true) {
+        return Err("the nonempty sibling acceptance assertion did not pass".to_owned());
+    }
+    let ordinary = &report["selected_ordinary_block"];
+    let ordinary_id_text = ordinary["block_id"]
+        .as_str()
+        .ok_or_else(|| "ordinary block ID is missing".to_owned())?
+        .to_owned();
+    let ordinary_id = parse_header_id(&ordinary_id_text)?;
+    let parent_id_text = ordinary["parent_block_id"]
+        .as_str()
+        .ok_or_else(|| "original parent block ID is missing".to_owned())?
+        .to_owned();
+    let parent_id = parse_header_id(&parent_id_text)?;
+    let slot = ordinary["slot"]
+        .as_u64()
+        .ok_or_else(|| "attack slot is missing or invalid".to_owned())?;
+    let body_root = ordinary["body_root"]
+        .as_str()
+        .ok_or_else(|| "ordinary block body root is missing".to_owned())?
+        .to_owned();
+    let transaction_hashes = ordinary["transaction_hashes"]
+        .as_array()
+        .ok_or_else(|| "ordered ordinary transaction hashes are missing".to_owned())?
+        .iter()
+        .map(|hash| {
+            hash.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "ordinary transaction hash is not a string".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if transaction_hashes.is_empty() {
+        return Err("the selected ordinary block has an empty transaction body".to_owned());
+    }
+    let siblings = report["siblings"]
+        .as_array()
+        .ok_or_else(|| "sibling evidence is missing".to_owned())?
+        .iter()
+        .map(|sibling| {
+            let index = json_usize(&sibling["sibling_index"])
+                .ok_or_else(|| "sibling index is missing or invalid".to_owned())?;
+            let id_text = sibling["sibling_block_id"]
+                .as_str()
+                .ok_or_else(|| format!("sibling {index} block ID is missing"))?
+                .to_owned();
+            Ok((
+                index,
+                AttackCandidate {
+                    id: parse_header_id(&id_text)?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let sibling_indexes = siblings
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<BTreeSet<_>>();
+    if sibling_indexes != BTreeSet::from([1, 2, 3, 4]) {
+        return Err(format!(
+            "expected sibling indexes 1–4, got {sibling_indexes:?}"
+        ));
+    }
+    Ok(AttackEvidence {
+        ordinary_id,
+        ordinary_id_text,
+        parent_id,
+        parent_id_text,
+        slot,
+        body_root,
+        transaction_hashes,
+        siblings,
+    })
+}
+
+fn json_usize(value: &Value) -> Option<usize> {
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .or_else(|| value.as_str()?.parse().ok())
+}
+
+fn classify_attack_branch(
+    path: &[HeaderLink],
+    complete_below_attack: bool,
+    attack: &AttackEvidence,
+) -> AttackBranch {
+    if let Some(link) = path
+        .iter()
+        .find(|link| (link.slot, link.parent) == (attack.slot, attack.parent_id))
+    {
+        if link.id == attack.ordinary_id {
+            return AttackBranch::Ordinary;
+        }
+        if let Some((index, _)) = attack
+            .siblings
+            .iter()
+            .find(|(_, candidate)| candidate.id == link.id)
+        {
+            return AttackBranch::Sibling(*index);
+        }
+        return AttackBranch::OtherCompeting(link.id);
+    }
+    if complete_below_attack {
+        AttackBranch::None
+    } else {
+        AttackBranch::Unverified
+    }
+}
+
+fn attack_branch_json(branch: &AttackBranch, attack: &AttackEvidence) -> Value {
+    match branch {
+        AttackBranch::Ordinary => json!({
+            "kind": "ordinary",
+            "block_id": attack.ordinary_id_text,
+        }),
+        AttackBranch::Sibling(index) => json!({"kind": "sibling", "sibling_index": index}),
+        AttackBranch::OtherCompeting(id) => json!({
+            "kind": "other_competing_block",
+            "block_id": id.encode_hex::<String>(),
+        }),
+        AttackBranch::None => json!({"kind": "none_of_selected_equivocation_blocks"}),
+        AttackBranch::Unverified => json!({"kind": "unverified"}),
+    }
+}
+
+async fn observe_finality_node(
+    node_name: &str,
+    client: &NodeHttpClient,
+    attack: &AttackEvidence,
+    cache: &mut HeaderCache,
+    previous_lib: Option<(HeaderId, u64)>,
+) -> FinalityNodeObservation {
+    let observed_at_unix_ms = unix_timestamp_ms();
+    let consensus = match client.consensus_info().await {
+        Ok(consensus) => consensus,
+        Err(error) => {
+            return FinalityNodeObservation {
+                snapshot: json!({
+                    "node": node_name,
+                    "observed_at_unix_ms": observed_at_unix_ms,
+                    "responsive": false,
+                    "error": error.to_string(),
+                    "header_lookup_failures": header_cache_failures_json(cache),
+                }),
+                consensus: None,
+                tip_path_complete: false,
+                finalized_path_complete: false,
+                attack_branch: AttackBranch::Unverified,
+                finalized_attack_branch: AttackBranch::Unverified,
+                continuity: "unverified".to_owned(),
+            };
+        }
+    };
+    let info = &consensus.cryptarchia_info;
+    let tip_id = info.tip;
+    let lib_id = info.lib;
+    let tip_slot = u64::from(info.slot);
+    let lib_slot = u64::from(info.lib_slot);
+    let tip_path = walk_to_target(client, tip_id, attack.parent_id, attack.slot, cache).await;
+    let attack_branch =
+        classify_attack_branch(&tip_path.links, tip_path.complete_below_slot, attack);
+    let tip_to_lib = walk_to_target(client, tip_id, lib_id, lib_slot, cache).await;
+    let tip_descends_from_lib = ancestry_presence(&tip_to_lib, lib_id);
+    let finalized_path = match proven_below_target_slot_path(lib_slot, attack.slot) {
+        Some(path) => path,
+        None => walk_to_target(client, lib_id, attack.parent_id, attack.slot, cache).await,
+    };
+    let finalized_attack_branch = classify_attack_branch(
+        &finalized_path.links,
+        finalized_path.complete_below_slot,
+        attack,
+    );
+    let (continuity, continuity_path) = if let Some((previous_id, previous_slot)) = previous_lib {
+        if previous_id == lib_id {
+            ("verified", None)
+        } else {
+            let path = walk_to_target(client, lib_id, previous_id, previous_slot, cache).await;
+            match ancestry_presence(&path, previous_id) {
+                Some(true) => ("verified", Some(path)),
+                Some(false) => ("regression_or_unrelated", Some(path)),
+                None => ("unverified", Some(path)),
+            }
+        }
+    } else {
+        ("missing_previous_lib_baseline", None)
+    };
+    let state = ConsensusState {
+        tip_id,
+        tip_id_text: tip_id.encode_hex::<String>(),
+        tip_height: info.height,
+        tip_slot,
+        lib_id,
+        lib_id_text: lib_id.encode_hex::<String>(),
+        lib_slot,
+        tip_descends_from_lib,
+    };
+    let snapshot = json!({
+        "node": node_name,
+        "observed_at_unix_ms": observed_at_unix_ms,
+        "responsive": true,
+        "phase": format!("{:?}", consensus.phase),
+        "tip_id": state.tip_id_text,
+        "tip_height": state.tip_height,
+        "tip_slot": state.tip_slot,
+        "lib_id": state.lib_id_text,
+        "lib_slot": state.lib_slot,
+        "tip_descends_from_lib": state.tip_descends_from_lib,
+        "tip_to_attack_parent_ancestry": ancestry_path_json(&tip_path),
+        "canonical_attack_branch": attack_branch_json(&attack_branch, attack),
+        "tip_to_lib_ancestry": ancestry_path_json(&tip_to_lib),
+        "lib_to_attack_parent_ancestry": ancestry_path_json(&finalized_path),
+        "finalized_attack_branch": attack_branch_json(&finalized_attack_branch, attack),
+        "lib_continuity_from_previous_observation": continuity,
+        "lib_continuity_ancestry": continuity_path.as_ref().map(ancestry_path_json),
+        "header_lookup_failures": header_cache_failures_json(cache),
+    });
+    FinalityNodeObservation {
+        snapshot,
+        consensus: Some(state),
+        tip_path_complete: tip_path.complete_below_slot,
+        finalized_path_complete: finalized_path.complete_below_slot,
+        attack_branch,
+        finalized_attack_branch,
+        continuity: continuity.to_owned(),
+    }
+}
+
+async fn block_id_at_height(
+    client: &NodeHttpClient,
+    tip: HeaderId,
+    tip_height: u64,
+    target_height: u64,
+    cache: &mut HeaderCache,
+) -> Result<HeaderId, String> {
+    if target_height > tip_height {
+        return Err(format!(
+            "target height {target_height} exceeds tip height {tip_height}"
+        ));
+    }
+    let mut current = tip;
+    let mut height = tip_height;
+    while height > target_height {
+        let link = fetch_header_link(client, current, cache).await?;
+        if link.parent == current {
+            return Err(format!("self-parented block at height {height}"));
+        }
+        current = link.parent;
+        height -= 1;
+    }
+    Ok(current)
+}
+
+fn canonical_tips_aligned(height_skew: u64, block_ids_at_common_height: &[HeaderId]) -> bool {
+    height_skew <= FINALITY_MAX_TIP_HEIGHT_SKEW
+        && block_ids_at_common_height
+            .first()
+            .is_some_and(|first| block_ids_at_common_height.iter().all(|id| id == first))
+}
+
+fn producer_stop_is_prompt(producer_stopped: bool, delay_ms: u64) -> bool {
+    producer_stopped
+        && delay_ms <= u64::try_from(PRODUCER_PROMPT_STOP_LIMIT.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn common_finalized_lib(
+    states: &[(String, ConsensusState)],
+    expected_nodes: usize,
+) -> Option<(HeaderId, u64)> {
+    let (_, first) = states.first()?;
+    (states.len() == expected_nodes
+        && states
+            .iter()
+            .all(|(_, state)| state.lib_id == first.lib_id && state.lib_slot == first.lib_slot))
+    .then_some((first.lib_id, first.lib_slot))
+}
+
+fn classify_finalized_history_relation(
+    first_id: HeaderId,
+    first_slot: u64,
+    second_id: HeaderId,
+    second_slot: u64,
+    first_descends_from_second: Option<bool>,
+    second_descends_from_first: Option<bool>,
+) -> FinalizedHistoryRelation {
+    if first_id == second_id {
+        return if first_slot == second_slot {
+            FinalizedHistoryRelation::Shared
+        } else {
+            FinalizedHistoryRelation::Unverified
+        };
+    }
+    if first_descends_from_second == Some(true) || second_descends_from_first == Some(true) {
+        FinalizedHistoryRelation::Ancestral
+    } else if first_descends_from_second == Some(false) && second_descends_from_first == Some(false)
+    {
+        FinalizedHistoryRelation::Conflicting
+    } else {
+        FinalizedHistoryRelation::Unverified
+    }
+}
+
+fn classify_tip_transition(
+    previous_tip_id: HeaderId,
+    new_tip_id: HeaderId,
+    new_tip_descends_from_previous: Option<bool>,
+) -> TipTransition {
+    if previous_tip_id == new_tip_id {
+        TipTransition::Unchanged
+    } else {
+        match new_tip_descends_from_previous {
+            Some(true) => TipTransition::Descendant,
+            Some(false) => TipTransition::Reorganization,
+            None => TipTransition::Unverified,
+        }
+    }
+}
+
+fn update_stable_finality_window(
+    conditions_hold: bool,
+    elapsed_ms: u128,
+    previous_started_elapsed_ms: Option<u128>,
+    required_window_ms: u128,
+) -> (Option<u128>, Option<StableFinalityCompletion>) {
+    if !conditions_hold {
+        return (None, None);
+    }
+    let started_elapsed_ms = previous_started_elapsed_ms.unwrap_or(elapsed_ms);
+    let completion = (elapsed_ms.saturating_sub(started_elapsed_ms) >= required_window_ms)
+        .then_some(StableFinalityCompletion {
+            started_elapsed_ms,
+            completed_elapsed_ms: elapsed_ms,
+        });
+    (Some(started_elapsed_ms), completion)
+}
+
+fn unix_timestamp_at_elapsed(start_unix_ms: u64, elapsed_ms: u128) -> u64 {
+    start_unix_ms.saturating_add(u64::try_from(elapsed_ms).unwrap_or(u64::MAX))
+}
+
+fn parse_initial_lib_baselines(report: &Value) -> BTreeMap<String, (HeaderId, u64)> {
+    report["pre_attack_consensus_snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|snapshot| snapshot["responsive"].as_bool() == Some(true))
+        .filter_map(|snapshot| {
+            let node = snapshot["node"].as_str()?.to_owned();
+            let id = parse_header_id(snapshot["lib_id"].as_str()?).ok()?;
+            let slot = snapshot["lib_slot"].as_u64()?;
+            Some((node, (id, slot)))
+        })
+        .collect()
+}
+
+fn parse_initial_tip_baselines(report: &Value) -> BTreeMap<String, CanonicalTipState> {
+    report["pre_attack_consensus_snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|snapshot| snapshot["responsive"].as_bool() == Some(true))
+        .filter_map(|snapshot| {
+            let node = snapshot["node"].as_str()?.to_owned();
+            let id_text = snapshot["tip_id"].as_str()?.to_owned();
+            Some((
+                node,
+                CanonicalTipState {
+                    id: parse_header_id(&id_text).ok()?,
+                    id_text,
+                    height: snapshot["tip_height"].as_u64()?,
+                    slot: snapshot["tip_slot"].as_u64()?,
+                    observed_at_unix_ms: snapshot["observed_at_unix_ms"].as_u64()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn producer_equivocation_evidence(log: &str) -> Vec<Value> {
+    let parsed = log
+        .lines()
+        .enumerate()
+        .map(|(line, text)| (line + 1, text, parse_log_fields(text)))
+        .collect::<Vec<_>>();
+    parsed
+        .iter()
+        .filter_map(|(line, _, fields)| {
+            if fields.get("event")? != "security_audit_ordinary_submitted"
+                || parse_usize(fields, "configured_siblings") != Some(SIBLING_COUNT)
+            {
+                return None;
+            }
+            let ordinary_id = fields.get("ordinary_block_id")?;
+            let parent_id = fields.get("parent_block_id")?;
+            let slot = fields.get("slot")?;
+            let sibling_ids = parsed
+                .iter()
+                .filter(|(_, _, sibling)| {
+                    sibling
+                        .get("event")
+                        .is_some_and(|event| event == "security_audit_sibling_submitted")
+                        && sibling.get("ordinary_block_id") == Some(ordinary_id)
+                        && sibling.get("parent_block_id") == Some(parent_id)
+                        && sibling.get("slot") == Some(slot)
+                })
+                .map(|(_, _, sibling)| {
+                    json!({
+                        "sibling_index": parse_usize(sibling, "sibling_index"),
+                        "sibling_block_id": sibling.get("sibling_block_id"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            Some(json!({
+                "ordinary_log_line": line,
+                "ordinary_block_id": ordinary_id,
+                "parent_block_id": parent_id,
+                "slot": slot,
+                "configured_siblings": SIBLING_COUNT,
+                "observed_sibling_events": sibling_ids,
+            }))
+        })
+        .collect()
+}
+
+fn read_runtime_node_logs(runtime_dir: &Path, runtime_node_name: &str) -> Result<String, String> {
+    let log_prefix = format!("__logs-{runtime_node_name}");
+    let entries = fs::read_dir(runtime_dir)
+        .map_err(|error| format!("cannot read {}: {error}", runtime_dir.display()))?;
+    let mut log_paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&log_prefix))
+        })
+        .collect::<Vec<_>>();
+    log_paths.sort();
+    log_paths
+        .into_iter()
+        .map(|path| {
+            fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read producer log {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|logs| logs.join("\n"))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Coordinates one bounded post-equivocation fork-choice and finality experiment"
+)]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Keeps the bounded observation and its failure classifications together"
+)]
+async fn observe_finality_after_equivocation(
+    world: &CucumberWorld,
+    opportunity_report: &Value,
+    attack: &AttackEvidence,
+) -> Result<Value, String> {
+    let producer = world
+        .nodes_info
+        .get(PRODUCER)
+        .ok_or_else(|| "NODE_1 was not started".to_owned())?;
+    let producer_log = read_runtime_node_logs(&producer.runtime_dir, &producer.runtime_name)?;
+    let mut opportunities_by_id = BTreeMap::new();
+    for opportunity in producer_equivocation_evidence(&producer_log) {
+        if let Some(id) = opportunity["ordinary_block_id"].as_str() {
+            opportunities_by_id.insert(id.to_owned(), opportunity);
+        }
+    }
+    let producer_opportunities = opportunities_by_id.into_values().collect::<Vec<_>>();
+    let expected_siblings = attack
+        .siblings
+        .iter()
+        .map(|(index, candidate)| (*index, candidate.id.encode_hex::<String>()))
+        .collect::<BTreeSet<_>>();
+    let selected_is_logged = producer_opportunities.iter().any(|opportunity| {
+        let observed_siblings = opportunity["observed_sibling_events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|sibling| {
+                Some((
+                    usize::try_from(sibling["sibling_index"].as_u64()?).ok()?,
+                    parse_header_id(sibling["sibling_block_id"].as_str()?)
+                        .ok()?
+                        .encode_hex::<String>(),
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        let ordinary_id = opportunity["ordinary_block_id"]
+            .as_str()
+            .and_then(|id| parse_header_id(id).ok());
+        let parent_id = opportunity["parent_block_id"]
+            .as_str()
+            .and_then(|id| parse_header_id(id).ok());
+        ordinary_id == Some(attack.ordinary_id)
+            && parent_id == Some(attack.parent_id)
+            && opportunity["slot"]
+                .as_str()
+                .and_then(|slot| slot.parse::<u64>().ok())
+                == Some(attack.slot)
+            && opportunity["observed_sibling_events"]
+                .as_array()
+                .is_some_and(|siblings| siblings.len() == SIBLING_COUNT)
+            && observed_siblings == expected_siblings
+    });
+    let observation_completed_unix_ms = opportunity_report["observation_completed_unix_ms"]
+        .as_u64()
+        .unwrap_or_default();
+    let stop_observed_unix_ms = unix_timestamp_ms();
+    let stop_upper_bound_delay_ms =
+        stop_observed_unix_ms.saturating_sub(observation_completed_unix_ms);
+    let producer_stop_confirmation = match producer.client.consensus_info().await {
+        Ok(info) => json!({
+            "responsive_after_stop_step": true,
+            "tip_id": info.cryptarchia_info.tip.encode_hex::<String>(),
+            "tip_height": info.cryptarchia_info.height,
+            "note": "NODE_1 still answered consensus_info after the stop step",
+        }),
+        Err(error) => json!({
+            "responsive_after_stop_step": false,
+            "error": error.to_string(),
+            "evidence": "NodeHttpClient::consensus_info failed after I stop node NODE_1",
+        }),
+    };
+    let producer_stopped =
+        producer_stop_confirmation["responsive_after_stop_step"].as_bool() == Some(false);
+    let baselines = parse_initial_lib_baselines(opportunity_report);
+    let mut previous_tips = parse_initial_tip_baselines(opportunity_report);
+    let initial_tips = opportunity_report["pre_attack_consensus_snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|snapshot| snapshot["responsive"].as_bool() == Some(true))
+        .filter_map(|snapshot| {
+            Some((
+                snapshot["node"].as_str()?.to_owned(),
+                snapshot["tip_id"].as_str()?.to_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let start_unix_ms = unix_timestamp_ms();
+    let start = Instant::now();
+    let deadline = start + FINALITY_OBSERVATION_TIMEOUT;
+    let mut header_caches = HONEST_NODES
+        .iter()
+        .map(|node| ((*node).to_owned(), HeaderCache::default()))
+        .collect::<BTreeMap<_, _>>();
+    let mut last_verified_libs = baselines.clone();
+    let mut snapshots = Vec::new();
+    let mut attack_branch_changes = Vec::new();
+    let mut previous_branches = BTreeMap::<String, AttackBranch>::new();
+    let mut tip_transition_observations = Vec::new();
+    let mut tip_level_reorganizations = Vec::new();
+    let mut tip_reorganizations_unverified = Vec::new();
+    let mut continuity_regressions = Vec::new();
+    let mut continuity_unverified = Vec::new();
+    let mut ancestry_gaps = Vec::new();
+    let mut finalized_history_checks = Vec::new();
+    let mut safety_conflict_observed = false;
+    let mut missing_finalized_ancestry = false;
+    let mut earliest_common_finalized_history: Option<(u64, HeaderId, u64)> = None;
+    let mut stable_since_elapsed_ms = None;
+    let mut stable_completion = None;
+    let (final_nodes, final_alignment, final_progress) = loop {
+        let mut observations = Vec::with_capacity(HONEST_NODES.len());
+        for node_name in HONEST_NODES {
+            let node = world
+                .nodes_info
+                .get(node_name)
+                .ok_or_else(|| format!("{node_name} was not started"))?;
+            let previous_lib = last_verified_libs.get(node_name).copied();
+            let cache = header_caches
+                .get_mut(node_name)
+                .ok_or_else(|| format!("no header cache allocated for {node_name}"))?;
+            let observation =
+                observe_finality_node(node_name, &node.client, attack, cache, previous_lib).await;
+            if let Some(consensus) = &observation.consensus {
+                match observation.continuity.as_str() {
+                    "verified" => {
+                        last_verified_libs.insert(
+                            node_name.to_owned(),
+                            (consensus.lib_id, consensus.lib_slot),
+                        );
+                    }
+                    "regression_or_unrelated" => continuity_regressions.push(json!({
+                        "node": node_name,
+                        "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
+                        "current_lib_id": consensus.lib_id_text,
+                        "current_lib_slot": consensus.lib_slot,
+                        "previous_verified_lib_id": previous_lib.map(|(id, _)| id.encode_hex::<String>()),
+                        "ancestry": observation.snapshot["lib_continuity_ancestry"],
+                    })),
+                    "unverified" | "missing_previous_lib_baseline" => {
+                        continuity_unverified.push(json!({
+                            "node": node_name,
+                            "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
+                            "status": observation.continuity,
+                            "current_lib_id": consensus.lib_id_text,
+                            "current_lib_slot": consensus.lib_slot,
+                            "previous_verified_lib_id": previous_lib.map(|(id, _)| id.encode_hex::<String>()),
+                            "ancestry": observation.snapshot["lib_continuity_ancestry"],
+                        }));
+                    }
+                    _ => {}
+                }
+                if !observation.tip_path_complete
+                    || observation
+                        .snapshot
+                        .pointer("/tip_descends_from_lib")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    || !observation.finalized_path_complete
+                {
+                    ancestry_gaps.push(json!({
+                        "node": node_name,
+                        "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
+                        "tip_path_complete_below_attack": observation.tip_path_complete,
+                        "tip_descends_from_reported_lib": observation.snapshot["tip_descends_from_lib"],
+                        "finalized_path_complete_below_attack": observation.finalized_path_complete,
+                        "canonical_attack_branch": observation.snapshot["canonical_attack_branch"],
+                        "finalized_attack_branch": observation.snapshot["finalized_attack_branch"],
+                    }));
+                }
+                if observation.attack_branch != AttackBranch::Unverified {
+                    if let Some(previous) = previous_branches.get(node_name)
+                        && previous != &observation.attack_branch
+                    {
+                        attack_branch_changes.push(json!({
+                            "node": node_name,
+                            "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
+                            "from": attack_branch_json(previous, attack),
+                            "to": attack_branch_json(&observation.attack_branch, attack),
+                            "attack_branch_changed": true,
+                        }));
+                    }
+                    previous_branches
+                        .insert(node_name.to_owned(), observation.attack_branch.clone());
+                }
+
+                let new_tip = CanonicalTipState {
+                    id: consensus.tip_id,
+                    id_text: consensus.tip_id_text.clone(),
+                    height: consensus.tip_height,
+                    slot: consensus.tip_slot,
+                    observed_at_unix_ms: observation.snapshot["observed_at_unix_ms"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                };
+                let previous_tip = previous_tips.get(node_name).cloned();
+                let (transition, ancestry, unverified_reason) =
+                    if let Some(previous_tip) = previous_tip.as_ref() {
+                        if previous_tip.id == new_tip.id {
+                            (TipTransition::Unchanged, None, None)
+                        } else {
+                            let path = walk_to_target(
+                                &node.client,
+                                new_tip.id,
+                                previous_tip.id,
+                                previous_tip.slot,
+                                cache,
+                            )
+                            .await;
+                            let relation = ancestry_presence(&path, previous_tip.id);
+                            (
+                                classify_tip_transition(previous_tip.id, new_tip.id, relation),
+                                Some(path),
+                                None,
+                            )
+                        }
+                    } else {
+                        (
+                            TipTransition::Unverified,
+                            None,
+                            Some("no previous responsive tip baseline"),
+                        )
+                    };
+                let transition_name = match transition {
+                    TipTransition::Unchanged => "unchanged",
+                    TipTransition::Descendant => "descendant_of_previous_tip",
+                    TipTransition::Reorganization => "reorganization",
+                    TipTransition::Unverified => "unverified",
+                };
+                let transition_record = json!({
+                    "node": node_name,
+                    "status": transition_name,
+                    "previous_observed_at_unix_ms": previous_tip.as_ref().map(|tip| tip.observed_at_unix_ms),
+                    "observed_at_unix_ms": new_tip.observed_at_unix_ms,
+                    "previous_tip_id": previous_tip.as_ref().map(|tip| &tip.id_text),
+                    "previous_tip_height": previous_tip.as_ref().map(|tip| tip.height),
+                    "previous_tip_slot": previous_tip.as_ref().map(|tip| tip.slot),
+                    "new_tip_id": new_tip.id_text,
+                    "new_tip_height": new_tip.height,
+                    "new_tip_slot": new_tip.slot,
+                    "new_tip_descends_from_previous_tip": match transition {
+                        TipTransition::Unchanged | TipTransition::Descendant => Some(true),
+                        TipTransition::Reorganization => Some(false),
+                        TipTransition::Unverified => None,
+                    },
+                    "supporting_ancestry": ancestry.as_ref().map(ancestry_path_json),
+                    "unverified_reason": unverified_reason,
+                });
+                match transition {
+                    TipTransition::Reorganization => {
+                        tip_level_reorganizations.push(transition_record.clone());
+                    }
+                    TipTransition::Unverified => {
+                        tip_reorganizations_unverified.push(transition_record.clone());
+                    }
+                    TipTransition::Unchanged | TipTransition::Descendant => {}
+                }
+                tip_transition_observations.push(transition_record);
+                previous_tips.insert(node_name.to_owned(), new_tip);
+            }
+            observations.push(observation);
+        }
+
+        let live_states = HONEST_NODES
+            .iter()
+            .zip(&observations)
+            .filter_map(|(node, observation)| {
+                observation
+                    .consensus
+                    .as_ref()
+                    .map(|state| ((*node).to_owned(), state.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut alignment_ids = Vec::new();
+        let alignment = if live_states.len() == HONEST_NODES.len() {
+            let min_height = live_states
+                .iter()
+                .map(|(_, state)| state.tip_height)
+                .min()
+                .unwrap_or_default();
+            let max_height = live_states
+                .iter()
+                .map(|(_, state)| state.tip_height)
+                .max()
+                .unwrap_or_default();
+            let height_skew = max_height.saturating_sub(min_height);
+            if height_skew > FINALITY_MAX_TIP_HEIGHT_SKEW {
+                json!({
+                    "aligned": false,
+                    "reason": "honest tip heights exceed the existing one-block alignment tolerance",
+                    "common_height": min_height,
+                    "height_skew": height_skew,
+                    "max_allowed_height_skew": FINALITY_MAX_TIP_HEIGHT_SKEW,
+                })
+            } else {
+                let mut errors = Vec::new();
+                for (node_name, state) in &live_states {
+                    let node = &world.nodes_info[node_name];
+                    let cache = header_caches
+                        .get_mut(node_name)
+                        .expect("each honest node has a header cache");
+                    match block_id_at_height(
+                        &node.client,
+                        state.tip_id,
+                        state.tip_height,
+                        min_height,
+                        cache,
+                    )
+                    .await
+                    {
+                        Ok(id) => alignment_ids.push((node_name.clone(), id)),
+                        Err(error) => errors.push(json!({"node": node_name, "error": error})),
+                    }
+                }
+                let common_height_ids = alignment_ids.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+                json!({
+                    "aligned": errors.is_empty()
+                        && canonical_tips_aligned(height_skew, &common_height_ids),
+                    "common_height": min_height,
+                    "height_skew": height_skew,
+                    "max_allowed_height_skew": FINALITY_MAX_TIP_HEIGHT_SKEW,
+                    "block_ids_at_common_height": alignment_ids.iter().map(|(node, id)| json!({
+                        "node": node,
+                        "block_id": id.encode_hex::<String>(),
+                    })).collect::<Vec<_>>(),
+                    "errors": errors,
+                })
+            }
+        } else {
+            json!({
+                "aligned": false,
+                "reason": "one or more honest consensus APIs were unresponsive",
+                "responsive_honest_nodes": live_states.iter().map(|(node, _)| node).collect::<Vec<_>>(),
+            })
+        };
+        let aligned = alignment["aligned"].as_bool() == Some(true);
+        let common_lib = common_finalized_lib(&live_states, HONEST_NODES.len());
+        let common_lib_id = common_lib.map(|(id, _)| id);
+        let common_lib_slot = common_lib.map(|(_, slot)| slot);
+        let common_lib_beyond_attack = common_lib.is_some_and(|(_, slot)| slot > attack.slot);
+        if common_lib_beyond_attack && earliest_common_finalized_history.is_none() {
+            earliest_common_finalized_history = live_states
+                .first()
+                .map(|(_, state)| (unix_timestamp_ms(), state.lib_id, state.lib_slot));
+        }
+
+        let mut progress_nodes = Vec::new();
+        let progress = live_states.len() == HONEST_NODES.len()
+            && HONEST_NODES.iter().all(|node| {
+                let changed = live_states
+                    .iter()
+                    .find(|(name, _)| name == node)
+                    .and_then(|(_, state)| {
+                        initial_tips.get(*node).map(|tip| state.tip_id_text != *tip)
+                    })
+                    .unwrap_or(false);
+                progress_nodes.push(json!({"node": node, "tip_changed_since_pre_attack": changed}));
+                changed
+            });
+
+        let pair_checks = check_finalized_history_agreement(
+            world,
+            &observations,
+            &mut header_caches,
+            attack.slot,
+        )
+        .await;
+        for check in &pair_checks {
+            match check["status"].as_str() {
+                Some("conflicting_finalized_histories") => safety_conflict_observed = true,
+                Some("ancestry_unverified") => missing_finalized_ancestry = true,
+                _ => {}
+            }
+        }
+        finalized_history_checks.push(json!({
+            "observed_at_unix_ms": unix_timestamp_ms(),
+            "pairs": pair_checks.clone(),
+        }));
+
+        let continuity_ok = continuity_regressions.is_empty() && continuity_unverified.is_empty();
+        let ancestry_ok = observations.len() == HONEST_NODES.len()
+            && observations.iter().all(|observation| {
+                observation.tip_path_complete
+                    && observation.finalized_path_complete
+                    && observation.snapshot["tip_descends_from_lib"].as_bool() == Some(true)
+            });
+        let snapshot = json!({
+            "elapsed_ms": start.elapsed().as_millis(),
+            "observed_at_unix_ms": unix_timestamp_ms(),
+            "nodes": observations.iter().map(|observation| &observation.snapshot).collect::<Vec<_>>(),
+            "honest_tips_aligned": alignment.clone(),
+            "progress_since_pre_attack": {
+                "all_three_nodes_progressed": progress,
+                "nodes": progress_nodes,
+            },
+            "common_lib": {
+                "same_lib_id": common_lib_id.map(|id| id.encode_hex::<String>()),
+                "same_lib_slot": common_lib_slot,
+                "beyond_attack_slot": common_lib_beyond_attack,
+                "attack_slot": attack.slot,
+            },
+            "finalized_history_pair_checks": pair_checks,
+            "ancestry_sufficient_for_this_snapshot": ancestry_ok,
+            "lib_continuity_sufficient_for_this_snapshot": continuity_ok,
+        });
+        snapshots.push(snapshot);
+
+        let elapsed_ms = start.elapsed().as_millis();
+        let stable_predicate = producer_stop_is_prompt(producer_stopped, stop_upper_bound_delay_ms)
+            && progress
+            && aligned
+            && common_lib_beyond_attack
+            && ancestry_ok
+            && continuity_ok
+            && !safety_conflict_observed
+            && !missing_finalized_ancestry
+            && elapsed_ms <= FINALITY_OBSERVATION_TIMEOUT.as_millis();
+        let (next_stable_since, completion) = update_stable_finality_window(
+            stable_predicate,
+            elapsed_ms,
+            stable_since_elapsed_ms,
+            FINALITY_STABILITY_WINDOW.as_millis(),
+        );
+        stable_since_elapsed_ms = next_stable_since;
+        if completion.is_some() {
+            stable_completion = completion;
+            break (observations, alignment, progress);
+        }
+        if Instant::now() >= deadline {
+            break (observations, alignment, progress);
+        }
+        sleep(FINALITY_OBSERVATION_INTERVAL).await;
+    };
+
+    let duration_ms = start.elapsed().as_millis();
+    let attack_record_count = producer_opportunities.len();
+    let acceptance_path = opportunity_report["nonempty_honest_peer_validation"].as_bool()
+        == Some(true)
+        && opportunity_report["sibling_body_integrity"].as_bool() == Some(true);
+    let single_isolated_opportunity = attack_record_count == 1 && selected_is_logged;
+    let final_live_states = final_nodes
+        .iter()
+        .filter_map(|observation| {
+            Some((
+                observation.snapshot["node"].as_str()?.to_owned(),
+                observation.consensus.clone()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let final_common_lib = common_finalized_lib(&final_live_states, HONEST_NODES.len());
+    let final_common_lib_beyond_attack =
+        final_common_lib.is_some_and(|(_, slot)| slot > attack.slot);
+    let final_common_lib_evidence = json!({
+        "all_honest_nodes_responsive": final_live_states.len() == HONEST_NODES.len(),
+        "same_lib_id": final_common_lib.map(|(id, _)| id.encode_hex::<String>()),
+        "same_lib_slot": final_common_lib.map(|(_, slot)| slot),
+        "beyond_attack_slot": final_common_lib_beyond_attack,
+        "attack_slot": attack.slot,
+        "node_libs": final_nodes.iter().map(|observation| json!({
+            "node": observation.snapshot["node"],
+            "responsive": observation.snapshot["responsive"],
+            "lib_id": observation.snapshot["lib_id"],
+            "lib_slot": observation.snapshot["lib_slot"],
+        })).collect::<Vec<_>>(),
+    });
+    let stable_completion_verified = stable_completion.is_some();
+    let stable_completion_evidence = stable_completion.map(|completion| {
+        json!({
+            "started_at_unix_ms": unix_timestamp_at_elapsed(
+                start_unix_ms,
+                completion.started_elapsed_ms,
+            ),
+            "completed_at_unix_ms": unix_timestamp_at_elapsed(
+                start_unix_ms,
+                completion.completed_elapsed_ms,
+            ),
+            "started_elapsed_ms": completion.started_elapsed_ms,
+            "completed_elapsed_ms": completion.completed_elapsed_ms,
+            "observed_stability_duration_ms": completion
+                .completed_elapsed_ms
+                .saturating_sub(completion.started_elapsed_ms),
+            "required_stability_duration_ms": FINALITY_STABILITY_WINDOW.as_millis(),
+        })
+    });
+    let prompt_stop_verified = producer_stop_is_prompt(producer_stopped, stop_upper_bound_delay_ms);
+    let ancestry_verified = !ancestry_gaps.iter().any(|gap| {
+        gap["tip_path_complete_below_attack"].as_bool() != Some(true)
+            || gap["tip_descends_from_reported_lib"].as_bool() != Some(true)
+            || gap["finalized_path_complete_below_attack"].as_bool() != Some(true)
+    }) && !missing_finalized_ancestry;
+    let continuity_verified = continuity_regressions.is_empty() && continuity_unverified.is_empty();
+    let status = if acceptance_path
+        && single_isolated_opportunity
+        && prompt_stop_verified
+        && final_progress
+        && final_alignment["aligned"].as_bool() == Some(true)
+        && final_common_lib_beyond_attack
+        && stable_completion_verified
+        && ancestry_verified
+        && continuity_verified
+        && !safety_conflict_observed
+        && !snapshots.is_empty()
+    {
+        "passed"
+    } else {
+        "failed"
+    };
+    let mut failure_classifications = Vec::new();
+    if !acceptance_path {
+        failure_classifications.push("workload_or_leadership_setup");
+    }
+    if attack_record_count > 1 {
+        failure_classifications.push("multiple_equivocations_preventing_isolation");
+    } else if !selected_is_logged {
+        failure_classifications.push("selected_equivocation_not_confirmed_in_stopped_producer_log");
+    }
+    if !prompt_stop_verified {
+        failure_classifications.push("producer_stop_not_confirmed_or_not_prompt");
+    }
+    if !final_progress {
+        failure_classifications.push("node_or_network_liveness_failure");
+    }
+    if final_alignment["aligned"].as_bool() != Some(true) {
+        failure_classifications
+            .push("canonical_chain_divergence_persisted_through_observation_end");
+    }
+    if earliest_common_finalized_history.is_none() {
+        failure_classifications
+            .push("lib_failed_to_advance_past_attack_slot_or_common_lib_not_reached");
+    }
+    if !final_common_lib_beyond_attack {
+        failure_classifications.push("no_current_common_lib_beyond_attack_slot");
+    }
+    if !stable_completion_verified {
+        failure_classifications.push("stable_finality_completion_not_verified_before_timeout");
+    }
+    if safety_conflict_observed {
+        failure_classifications.push("conflicting_finalized_histories");
+    }
+    if !continuity_verified {
+        failure_classifications.push("lib_continuity_unverified_or_regressed");
+    }
+    if !ancestry_verified {
+        failure_classifications.push("missing_ancestry_evidence");
+    }
+    if let Some(branch_change) = attack_branch_changes.first() {
+        tracing::info!(
+            target: TARGET,
+            event = "security_audit_attack_branch_change_observed",
+            observed_at_unix_ms = branch_change["observed_at_unix_ms"].as_u64().unwrap_or_default(),
+            "Canonical attack-slot branch changed during the finality observation"
+        );
+    }
+    let final_canonical_branches = final_nodes
+        .iter()
+        .filter_map(|observation| {
+            Some(json!({
+                "node": observation.snapshot["node"],
+                "tip_id": observation.consensus.as_ref()?.tip_id_text,
+                "tip_height": observation.consensus.as_ref()?.tip_height,
+                "canonical_attack_branch": attack_branch_json(&observation.attack_branch, attack),
+                "finalized_attack_branch": attack_branch_json(&observation.finalized_attack_branch, attack),
+            }))
+        })
+        .collect::<Vec<_>>();
+    let elapsed_to_common_lib_ms = earliest_common_finalized_history
+        .as_ref()
+        .map(|(timestamp, _, _)| timestamp.saturating_sub(start_unix_ms));
+    let tip_reorganization_status = if !tip_level_reorganizations.is_empty() {
+        "reorganization_observed"
+    } else if !tip_reorganizations_unverified.is_empty() {
+        "unverified"
+    } else {
+        "no_reorganization_observed_with_complete_transition_evidence"
+    };
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository_root = manifest_dir.parent().unwrap_or(manifest_dir);
+    let consensus_configuration = json!({
+        "diagnostic_parameter_set": "testnet_representative",
+        "security_parameter_k": 5,
+        "slot_duration_secs": 1,
+        "epoch_stake_distribution_stabilization": 3,
+        "epoch_period_nonce_buffer": 3,
+        "epoch_period_nonce_stabilization": 4,
+        "interpretation": "small-k functional experiment; not a production security threshold",
+    });
+    let attack_evidence = json!({
+        "producer": PRODUCER,
+        "honest_nodes": HONEST_NODES,
+        "ordinary_block_id": attack.ordinary_id_text,
+        "parent_block_id": attack.parent_id_text,
+        "attack_slot": attack.slot,
+        "four_sibling_ids": attack.siblings.iter().map(|(index, sibling)| json!({
+            "sibling_index": index,
+            "block_id": sibling.id.encode_hex::<String>(),
+        })).collect::<Vec<_>>(),
+        "ordered_transaction_hashes": attack.transaction_hashes,
+        "body_root": attack.body_root,
+        "nonempty_acceptance_and_body_integrity_passed": acceptance_path,
+    });
+    let producer_stop_evidence = json!({
+        "selected_opportunity_observation_completed_unix_ms": observation_completed_unix_ms,
+        "stop_step_observed_by_finality_step_unix_ms": stop_observed_unix_ms,
+        "stop_upper_bound_delay_ms": stop_upper_bound_delay_ms,
+        "prompt_stop_limit_ms": PRODUCER_PROMPT_STOP_LIMIT.as_millis(),
+        "prompt_stop_verified": prompt_stop_verified,
+        "producer_unresponsive_after_stop_step": producer_stopped,
+        "producer_consensus_probe": producer_stop_confirmation,
+    });
+    let observation_window = json!({
+        "started_unix_ms": start_unix_ms,
+        "duration_ms": duration_ms,
+        "timeout_ms": FINALITY_OBSERVATION_TIMEOUT.as_millis(),
+        "sample_interval_ms": FINALITY_OBSERVATION_INTERVAL.as_millis(),
+        "stability_window_ms": FINALITY_STABILITY_WINDOW.as_millis(),
+        "sample_count": snapshots.len(),
+        "earliest_common_lib_beyond_attack": earliest_common_finalized_history
+            .as_ref()
+            .map(|(observed_at_unix_ms, lib_id, lib_slot)| json!({
+                "observed_at_unix_ms": observed_at_unix_ms,
+                "lib_id": lib_id.encode_hex::<String>(),
+                "lib_slot": lib_slot,
+            })),
+        "elapsed_to_common_lib_ms": elapsed_to_common_lib_ms,
+    });
+    let complete_observation_provenance = json!({
+        "selected_opportunity_artifact": "security-audit-nonempty-evidence/nonempty-opportunity.json",
+        "producer_log_source": producer.runtime_dir,
+        "node_log_capture_root": world.lifecycle.scenario_base_dir,
+        "finality_artifact": "security-audit-nonempty-evidence/finality-observations.json",
+        "source_files": [
+            {
+                "path": "tests/cucumber_tests/features/security_audit.feature",
+                "sha256": sha256_file(&repository_root.join("tests/cucumber_tests/features/security_audit.feature")).ok(),
+            },
+            {
+                "path": "tests/src/cucumber/steps/nodes/steps/security_audit.rs",
+                "sha256": sha256_file(&repository_root.join("tests/src/cucumber/steps/nodes/steps/security_audit.rs")).ok(),
+            },
+        ],
+        "chain_observation_api": "NodeHttpClient::consensus_info and NodeHttpClient::block",
+        "block_header_cache_entries": header_caches.iter().map(|(node, cache)| json!({
+            "node": node,
+            "cached_header_count": cache.links.len(),
+            "lookup_failures": cache.failures,
+        })).collect::<Vec<_>>(),
+    });
+    let failure = (status != "passed").then(|| {
+        format!(
+            "finality experiment did not satisfy: {}",
+            failure_classifications.join(", ")
+        )
+    });
+    Ok(json!({
+        "status": status,
+        "failure": failure,
+        "failure_classifications": failure_classifications,
+        "scenario": "Honest nodes converge and finalize after nonempty sibling equivocation",
+        "source_commit": opportunity_report["provenance"]["commit_sha"],
+        "provenance": opportunity_report["provenance"],
+        "consensus_configuration": consensus_configuration,
+        "attack": attack_evidence,
+        "producer_stop": producer_stop_evidence,
+        "producer_equivocation_opportunities_until_stop": producer_opportunities,
+        "attack_isolated": single_isolated_opportunity,
+        "observation_window": observation_window,
+        "continued_progress": final_progress,
+        "eventual_honest_tip_alignment": final_alignment,
+        "common_lib_beyond_attack": final_common_lib_beyond_attack,
+        "final_common_lib": final_common_lib_evidence,
+        "eventually_common_lib_beyond_attack": earliest_common_finalized_history.is_some(),
+        "stable_completion_verified": stable_completion_verified,
+        "stable_completion": stable_completion_evidence,
+        "canonical_branch_changes": attack_branch_changes,
+        "observed_attack_branch_change": !attack_branch_changes.is_empty(),
+        "tip_transition_observations": tip_transition_observations,
+        "tip_level_reorganizations": tip_level_reorganizations,
+        "tip_reorganizations_unverified": tip_reorganizations_unverified,
+        "tip_reorganization_status": tip_reorganization_status,
+        "observed_reorganization": !tip_level_reorganizations.is_empty(),
+        "final_canonical_and_finalized_branches": final_canonical_branches,
+        "finalized_history_agreement_checks": finalized_history_checks,
+        "lib_continuity_verified": continuity_verified,
+        "lib_continuity_regressions": continuity_regressions,
+        "lib_continuity_unverified_observations": continuity_unverified,
+        "ancestry_verified": ancestry_verified,
+        "ancestry_gaps": ancestry_gaps,
+        "snapshots": snapshots,
+        "complete_observation_provenance": complete_observation_provenance,
+    }))
+}
+
+async fn check_finalized_history_agreement(
+    world: &CucumberWorld,
+    observations: &[FinalityNodeObservation],
+    caches: &mut BTreeMap<String, HeaderCache>,
+    attack_slot: u64,
+) -> Vec<Value> {
+    let mut checks = Vec::new();
+    for first_index in 0..observations.len() {
+        for second_index in first_index + 1..observations.len() {
+            let (Some(first), Some(second)) = (
+                observations[first_index].consensus.as_ref(),
+                observations[second_index].consensus.as_ref(),
+            ) else {
+                continue;
+            };
+            let first_name = HONEST_NODES[first_index];
+            let second_name = HONEST_NODES[second_index];
+            let (first_to_second, second_to_first) = if first.lib_id == second.lib_id {
+                (None, None)
+            } else {
+                let first_node = &world.nodes_info[first_name];
+                let second_node = &world.nodes_info[second_name];
+                let first_to_second = match caches.get_mut(first_name) {
+                    Some(cache) => {
+                        walk_between_finalized_blocks(
+                            &first_node.client,
+                            first.lib_id,
+                            first.lib_slot,
+                            second.lib_id,
+                            second.lib_slot,
+                            cache,
+                        )
+                        .await
+                    }
+                    None => AncestryPath {
+                        links: Vec::new(),
+                        target_reached: false,
+                        complete_below_slot: false,
+                        error: Some(format!("no ancestry cache allocated for {first_name}")),
+                    },
+                };
+                let second_to_first = match caches.get_mut(second_name) {
+                    Some(cache) => {
+                        walk_between_finalized_blocks(
+                            &second_node.client,
+                            second.lib_id,
+                            second.lib_slot,
+                            first.lib_id,
+                            first.lib_slot,
+                            cache,
+                        )
+                        .await
+                    }
+                    None => AncestryPath {
+                        links: Vec::new(),
+                        target_reached: false,
+                        complete_below_slot: false,
+                        error: Some(format!("no ancestry cache allocated for {second_name}")),
+                    },
+                };
+                (Some(first_to_second), Some(second_to_first))
+            };
+            let first_descends_from_second = first_to_second.as_ref().map_or_else(
+                || (first.lib_id == second.lib_id).then_some(true),
+                |path| ancestry_presence(path, second.lib_id),
+            );
+            let second_descends_from_first = second_to_first.as_ref().map_or_else(
+                || (first.lib_id == second.lib_id).then_some(true),
+                |path| ancestry_presence(path, first.lib_id),
+            );
+            let relation = classify_finalized_history_relation(
+                first.lib_id,
+                first.lib_slot,
+                second.lib_id,
+                second.lib_slot,
+                first_descends_from_second,
+                second_descends_from_first,
+            );
+            let status = match relation {
+                FinalizedHistoryRelation::Shared => "shared_finalized_history",
+                FinalizedHistoryRelation::Ancestral => "ancestral_finalized_histories",
+                FinalizedHistoryRelation::Conflicting => "conflicting_finalized_histories",
+                FinalizedHistoryRelation::Unverified => "ancestry_unverified",
+            };
+            checks.push(json!({
+                "first_node": first_name,
+                "first_lib_id": first.lib_id_text,
+                "first_lib_slot": first.lib_slot,
+                "second_node": second_name,
+                "second_lib_id": second.lib_id_text,
+                "second_lib_slot": second.lib_slot,
+                "first_lib_descends_from_second": first_descends_from_second,
+                "second_lib_descends_from_first": second_descends_from_first,
+                "status": status,
+                "attack_slot": attack_slot,
+                "first_to_second_ancestry": first_to_second.as_ref().map(ancestry_path_json),
+                "second_to_first_ancestry": second_to_first.as_ref().map(ancestry_path_json),
+            }));
+        }
+    }
+    checks
+}
+
+async fn walk_between_finalized_blocks(
+    client: &NodeHttpClient,
+    start: HeaderId,
+    start_slot: u64,
+    target: HeaderId,
+    target_slot: u64,
+    cache: &mut HeaderCache,
+) -> AncestryPath {
+    if let Some(path) = proven_below_target_slot_path(start_slot, target_slot) {
+        return path;
+    }
+    walk_to_target(client, start, target, target_slot, cache).await
 }
 
 #[expect(
@@ -539,6 +2254,7 @@ async fn observe_sibling_propagation(world: &CucumberWorld) -> Result<Value, Aud
 )]
 async fn observe_nonempty_sibling_propagation(
     world: &mut CucumberWorld,
+    require_full_observation_window: bool,
 ) -> Result<Value, AuditFailure> {
     let scenario = "Honest peers validate nonempty same-slot sibling blocks";
     let provenance =
@@ -553,6 +2269,8 @@ async fn observe_nonempty_sibling_propagation(
                 message,
                 details: json!({ "provenance": provenance }),
             })?;
+
+    let pre_attack_consensus = capture_pre_attack_consensus(world).await;
 
     world
         .ensure_wallet_scanner_started()
@@ -628,6 +2346,7 @@ async fn observe_nonempty_sibling_propagation(
             details: json!({
                 "provenance": provenance,
                 "blend_readiness": readiness,
+                "pre_attack_consensus_snapshots": pre_attack_consensus,
                 "submitted_transactions": submitted_transactions,
             }),
         })?;
@@ -816,7 +2535,7 @@ async fn observe_nonempty_sibling_propagation(
         &mut tails,
         &mut producer_log_map,
         &opportunity,
-        true,
+        require_full_observation_window,
     )
     .await
     .map_err(|message| AuditFailure {
@@ -964,6 +2683,7 @@ async fn observe_nonempty_sibling_propagation(
         "honest_peer_validation": accepted_body_path,
         "cluster_nodes": 4,
         "blend_provider_count": 4,
+        "pre_attack_consensus_snapshots": pre_attack_consensus,
         "producer": PRODUCER,
         "producer_runtime_name": world.nodes_info.get(PRODUCER).map(|node| node.runtime_name.as_str()),
         "blend_readiness": readiness,
@@ -1803,6 +3523,10 @@ mod tests {
     const SIBLING_ID: &str = "0xsibling";
     const PARENT_ID: &str = "0xparent";
 
+    fn header_id(byte: u8) -> HeaderId {
+        HeaderId::try_from([byte; 32].as_slice()).expect("32-byte test header ID")
+    }
+
     fn event(
         event_name: &str,
         stage_id: &str,
@@ -2102,6 +3826,426 @@ mod tests {
             .1
             .insert("parent_block_id".to_owned(), "0xother-parent".to_owned());
         assert!(!sibling_body_integrity(&ordinary, &opportunity));
+    }
+
+    fn attack_evidence_for_branch_checks() -> AttackEvidence {
+        AttackEvidence {
+            ordinary_id: header_id(1),
+            ordinary_id_text: header_id(1).encode_hex::<String>(),
+            parent_id: header_id(9),
+            parent_id_text: header_id(9).encode_hex::<String>(),
+            slot: 42,
+            body_root: "test-body-root".to_owned(),
+            transaction_hashes: vec!["test-transaction".to_owned()],
+            siblings: (1..=SIBLING_COUNT)
+                .map(|index| {
+                    (
+                        index,
+                        AttackCandidate {
+                            id: header_id(index as u8 + 1),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn consensus_state_with_lib(tip: u8, lib: u8, lib_slot: u64) -> ConsensusState {
+        ConsensusState {
+            tip_id: header_id(tip),
+            tip_id_text: header_id(tip).encode_hex::<String>(),
+            tip_height: u64::from(tip),
+            tip_slot: u64::from(tip),
+            lib_id: header_id(lib),
+            lib_id_text: header_id(lib).encode_hex::<String>(),
+            lib_slot,
+            tip_descends_from_lib: Some(true),
+        }
+    }
+
+    fn below_target_path(block: u8, parent: u8, slot: u64) -> AncestryPath {
+        AncestryPath {
+            links: vec![HeaderLink {
+                id: header_id(block),
+                parent: header_id(parent),
+                slot,
+            }],
+            target_reached: false,
+            complete_below_slot: true,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn ancestry_presence_distinguishes_proven_absence_from_missing_evidence() {
+        let target = header_id(2);
+        let parent_edge_proof = AncestryPath {
+            links: vec![HeaderLink {
+                id: header_id(1),
+                parent: target,
+                slot: 43,
+            }],
+            target_reached: true,
+            complete_below_slot: true,
+            error: None,
+        };
+        let absent = AncestryPath {
+            links: vec![HeaderLink {
+                id: header_id(1),
+                parent: header_id(9),
+                slot: 43,
+            }],
+            target_reached: false,
+            complete_below_slot: true,
+            error: None,
+        };
+        let incomplete = AncestryPath {
+            links: absent.links.clone(),
+            target_reached: false,
+            complete_below_slot: false,
+            error: Some("block API unavailable".to_owned()),
+        };
+        assert_eq!(ancestry_presence(&parent_edge_proof, target), Some(true));
+        assert_eq!(ancestry_presence(&absent, target), Some(false));
+        assert_eq!(ancestry_presence(&incomplete, target), None);
+    }
+
+    #[test]
+    fn pre_attack_lib_slot_proves_equivocation_is_not_finalized_without_genesis_lookup() {
+        let attack = attack_evidence_for_branch_checks();
+        let path = proven_below_target_slot_path(0, attack.slot)
+            .expect("a LIB below the attack slot proves it cannot contain the attack block");
+
+        assert_eq!(ancestry_presence(&path, attack.parent_id), Some(false));
+        assert_eq!(
+            classify_attack_branch(&path.links, path.complete_below_slot, &attack),
+            AttackBranch::None
+        );
+        assert!(proven_below_target_slot_path(attack.slot, attack.slot).is_none());
+    }
+
+    #[test]
+    fn producer_log_reader_uses_only_the_current_runtime_directory() {
+        let test_root = std::env::temp_dir().join(format!(
+            "security-audit-runtime-logs-{}-{}",
+            std::process::id(),
+            unix_timestamp_ms()
+        ));
+        let current_runtime = test_root.join("NODE_1_current");
+        let stale_runtime = test_root.join("NODE_1_stale");
+        fs::create_dir_all(&current_runtime).expect("create current runtime directory");
+        fs::create_dir_all(&stale_runtime).expect("create stale runtime directory");
+        fs::write(current_runtime.join("__logs-NODE_1"), "current run")
+            .expect("write current producer log");
+        fs::write(stale_runtime.join("__logs-NODE_1"), "stale run")
+            .expect("write stale producer log");
+
+        assert_eq!(
+            read_runtime_node_logs(&current_runtime, PRODUCER).expect("read current producer log"),
+            "current run"
+        );
+
+        fs::remove_dir_all(test_root).expect("remove temporary runtime directories");
+    }
+
+    #[test]
+    fn canonical_branch_resolution_distinguishes_equivocation_candidates() {
+        let attack = attack_evidence_for_branch_checks();
+        let matching = |id| HeaderLink {
+            id,
+            parent: attack.parent_id,
+            slot: attack.slot,
+        };
+
+        assert_eq!(
+            classify_attack_branch(&[matching(attack.ordinary_id)], true, &attack),
+            AttackBranch::Ordinary
+        );
+        assert_eq!(
+            classify_attack_branch(&[matching(attack.siblings[2].1.id)], true, &attack),
+            AttackBranch::Sibling(3)
+        );
+        assert_eq!(
+            classify_attack_branch(&[matching(header_id(8))], true, &attack),
+            AttackBranch::OtherCompeting(header_id(8))
+        );
+        assert_eq!(
+            classify_attack_branch(&[], true, &attack),
+            AttackBranch::None
+        );
+        assert_eq!(
+            classify_attack_branch(&[], false, &attack),
+            AttackBranch::Unverified
+        );
+    }
+
+    #[test]
+    fn equal_tip_heights_do_not_imply_canonical_alignment() {
+        assert!(canonical_tips_aligned(
+            0,
+            &[header_id(1), header_id(1), header_id(1)]
+        ));
+        assert!(canonical_tips_aligned(
+            1,
+            &[header_id(1), header_id(1), header_id(1)]
+        ));
+        assert!(!canonical_tips_aligned(
+            0,
+            &[header_id(1), header_id(2), header_id(1)]
+        ));
+        assert!(!canonical_tips_aligned(
+            2,
+            &[header_id(1), header_id(1), header_id(1)]
+        ));
+        assert!(!canonical_tips_aligned(0, &[]));
+    }
+
+    #[test]
+    fn brief_common_lib_then_different_final_libs_cannot_complete_stability() {
+        let common_id = header_id(50);
+        let briefly_common = vec![
+            ("NODE_2".to_owned(), consensus_state_with_lib(60, 50, 50)),
+            ("NODE_3".to_owned(), consensus_state_with_lib(61, 50, 50)),
+            ("NODE_4".to_owned(), consensus_state_with_lib(62, 50, 50)),
+        ];
+        assert_eq!(
+            common_finalized_lib(&briefly_common, 3),
+            Some((common_id, 50))
+        );
+        let (stable_since, completion) = update_stable_finality_window(true, 0, None, 10_000);
+        assert_eq!(stable_since, Some(0));
+        assert_eq!(completion, None);
+
+        let final_libs_differ = vec![
+            ("NODE_2".to_owned(), consensus_state_with_lib(70, 50, 50)),
+            ("NODE_3".to_owned(), consensus_state_with_lib(71, 51, 51)),
+            ("NODE_4".to_owned(), consensus_state_with_lib(72, 50, 50)),
+        ];
+        assert_eq!(common_finalized_lib(&final_libs_differ, 3), None);
+        let (stable_since, completion) =
+            update_stable_finality_window(false, 5_000, stable_since, 10_000);
+        assert_eq!(stable_since, None);
+        assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn common_lib_first_seen_at_timeout_boundary_cannot_complete_stability() {
+        let timeout_ms = FINALITY_OBSERVATION_TIMEOUT.as_millis();
+        let (stable_since, completion) =
+            update_stable_finality_window(true, timeout_ms, None, 10_000);
+        assert_eq!(stable_since, Some(timeout_ms));
+        assert_eq!(completion, None);
+
+        let (stable_since, completion) =
+            update_stable_finality_window(false, timeout_ms + 1, stable_since, 10_000);
+        assert_eq!(stable_since, None);
+        assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn ten_seconds_of_verified_common_finality_completes_stability() {
+        let (stable_since, completion) = update_stable_finality_window(true, 100, None, 10_000);
+        assert_eq!(stable_since, Some(100));
+        assert_eq!(completion, None);
+
+        let (_, completion) = update_stable_finality_window(true, 10_100, stable_since, 10_000);
+        assert_eq!(
+            completion,
+            Some(StableFinalityCompletion {
+                started_elapsed_ms: 100,
+                completed_elapsed_ms: 10_100,
+            })
+        );
+    }
+
+    #[test]
+    fn producer_prompt_stop_uses_the_same_thirty_second_limit_everywhere() {
+        let limit_ms = u64::try_from(PRODUCER_PROMPT_STOP_LIMIT.as_millis()).unwrap();
+        assert_eq!(limit_ms, 30_000);
+        assert!(producer_stop_is_prompt(true, limit_ms - 1));
+        assert!(producer_stop_is_prompt(true, limit_ms));
+        assert!(!producer_stop_is_prompt(true, limit_ms + 1));
+        assert!(!producer_stop_is_prompt(false, 0));
+    }
+
+    #[test]
+    fn finalized_histories_with_the_same_lib_are_shared() {
+        assert_eq!(
+            classify_finalized_history_relation(
+                header_id(50),
+                50,
+                header_id(50),
+                50,
+                Some(true),
+                Some(true),
+            ),
+            FinalizedHistoryRelation::Shared
+        );
+    }
+
+    #[test]
+    fn different_libs_with_a_proven_ancestor_relationship_are_not_conflicts() {
+        let earlier = header_id(50);
+        let later_path = AncestryPath {
+            links: vec![HeaderLink {
+                id: header_id(60),
+                parent: earlier,
+                slot: 60,
+            }],
+            target_reached: true,
+            complete_below_slot: true,
+            error: None,
+        };
+        assert_eq!(ancestry_presence(&later_path, earlier), Some(true));
+        assert_eq!(
+            classify_finalized_history_relation(
+                earlier,
+                50,
+                header_id(60),
+                60,
+                Some(false),
+                Some(true),
+            ),
+            FinalizedHistoryRelation::Ancestral
+        );
+    }
+
+    #[test]
+    fn different_attack_slot_sibling_libs_are_conflicting() {
+        let first = header_id(2);
+        let second = header_id(3);
+        let parent = header_id(9);
+        let first_to_second = below_target_path(2, 9, 42);
+        let second_to_first = below_target_path(3, 9, 42);
+        assert_eq!(ancestry_presence(&first_to_second, second), Some(false));
+        assert_eq!(ancestry_presence(&second_to_first, first), Some(false));
+        assert_eq!(
+            classify_finalized_history_relation(
+                first,
+                42,
+                second,
+                42,
+                ancestry_presence(&first_to_second, second),
+                ancestry_presence(&second_to_first, first),
+            ),
+            FinalizedHistoryRelation::Conflicting
+        );
+        assert_eq!(first_to_second.links[0].parent, parent);
+    }
+
+    #[test]
+    fn attack_slot_sibling_and_competing_descendant_are_conflicting() {
+        let finalized_sibling = header_id(2);
+        let competing_sibling = header_id(3);
+        let descendant = header_id(4);
+        let earlier_path = proven_below_target_slot_path(42, 50).unwrap();
+        let later_path = AncestryPath {
+            links: vec![HeaderLink {
+                id: descendant,
+                parent: competing_sibling,
+                slot: 50,
+            }],
+            target_reached: false,
+            complete_below_slot: true,
+            error: None,
+        };
+        assert_eq!(ancestry_presence(&earlier_path, descendant), Some(false));
+        assert_eq!(
+            ancestry_presence(&later_path, finalized_sibling),
+            Some(false)
+        );
+        assert_eq!(
+            classify_finalized_history_relation(
+                finalized_sibling,
+                42,
+                descendant,
+                50,
+                ancestry_presence(&earlier_path, descendant),
+                ancestry_presence(&later_path, finalized_sibling),
+            ),
+            FinalizedHistoryRelation::Conflicting
+        );
+    }
+
+    #[test]
+    fn different_later_finalized_histories_are_conflicting() {
+        let first = header_id(5);
+        let second = header_id(6);
+        let first_path = below_target_path(5, 1, 60);
+        let second_path = below_target_path(6, 1, 62);
+        assert_eq!(
+            classify_finalized_history_relation(
+                first,
+                60,
+                second,
+                62,
+                ancestry_presence(&first_path, second),
+                ancestry_presence(&second_path, first),
+            ),
+            FinalizedHistoryRelation::Conflicting
+        );
+    }
+
+    #[test]
+    fn missing_finalized_lib_ancestry_is_unverified() {
+        let first = header_id(5);
+        let second = header_id(6);
+        let absent = below_target_path(5, 1, 60);
+        let missing = AncestryPath {
+            links: vec![HeaderLink {
+                id: header_id(6),
+                parent: header_id(4),
+                slot: 62,
+            }],
+            target_reached: false,
+            complete_below_slot: false,
+            error: Some("block API returned no block".to_owned()),
+        };
+        assert_eq!(
+            classify_finalized_history_relation(
+                first,
+                60,
+                second,
+                62,
+                ancestry_presence(&absent, second),
+                ancestry_presence(&missing, first),
+            ),
+            FinalizedHistoryRelation::Unverified
+        );
+    }
+
+    #[test]
+    fn tip_change_to_descendant_is_not_a_reorganization() {
+        assert_eq!(
+            classify_tip_transition(header_id(1), header_id(2), Some(true)),
+            TipTransition::Descendant
+        );
+    }
+
+    #[test]
+    fn tip_reorganization_above_same_attack_sibling_is_recorded_separately() {
+        let attack_branch_before = AttackBranch::Sibling(1);
+        let attack_branch_after = AttackBranch::Sibling(1);
+        assert_eq!(attack_branch_before, attack_branch_after);
+        assert_eq!(
+            classify_tip_transition(header_id(7), header_id(8), Some(false)),
+            TipTransition::Reorganization
+        );
+    }
+
+    #[test]
+    fn missing_tip_ancestry_is_unverified_not_no_reorganization() {
+        assert_eq!(
+            classify_tip_transition(header_id(7), header_id(8), None),
+            TipTransition::Unverified
+        );
+    }
+
+    #[test]
+    fn sibling_index_parser_accepts_log_strings_and_json_numbers() {
+        assert_eq!(json_usize(&json!(3)), Some(3));
+        assert_eq!(json_usize(&json!("4")), Some(4));
+        assert_eq!(json_usize(&json!("not-an-index")), None);
     }
 
     #[test]

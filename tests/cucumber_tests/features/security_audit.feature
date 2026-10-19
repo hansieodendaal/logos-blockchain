@@ -36,3 +36,30 @@ Feature: Security audit
       | NODE_1    | 1             | SECURITY_AUDIT_SENDER | NODE_2       |
     Then NODE_1 produces four valid nonempty siblings containing submitted transactions
     And I stop all nodes
+
+  @security_audit @siblings @finality
+  Scenario: Honest nodes converge and finalize after nonempty sibling equivocation
+    Given the genesis block has the following wallet resources:
+      | account_index | token_count | token_amount |
+      | 1             | 16          | 1000         |
+      | 2             | 0           | 0            |
+      | 3             | 0           | 0            |
+      | 4             | 0           | 0            |
+    And we have a sponsored genesis fee account with 32 tokens of 20000 value each
+    And I have a cluster with capacity of 4 nodes
+    And the cluster uses diagnostic parameter set "testnet_representative"
+    And the first 4 nodes are declared as blend providers
+    And I have user config override "cryptarchia.leader.security_audit.sibling_blocks_per_leadership" as "0"
+    When I start nodes with wallet resources:
+      | node_name | account_index | wallet_name             | connected_to |
+      | NODE_2    | 2             | SECURITY_AUDIT_RECEIVER |              |
+      | NODE_3    | 3             | SECURITY_AUDIT_PEER_3   | NODE_2       |
+      | NODE_4    | 4             | SECURITY_AUDIT_PEER_4   | NODE_2       |
+    And I have user config override "cryptarchia.leader.security_audit.sibling_blocks_per_leadership" as "4"
+    And I start nodes with wallet resources:
+      | node_name | account_index | wallet_name           | connected_to |
+      | NODE_1    | 1             | SECURITY_AUDIT_SENDER | NODE_2       |
+    Then NODE_1 produces four valid nonempty siblings containing submitted transactions for the selected equivocation opportunity
+    When I stop node "NODE_1"
+    Then the honest nodes converge and finalize beyond the nonempty equivocation
+    And I stop all nodes
