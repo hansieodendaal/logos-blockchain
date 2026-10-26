@@ -290,7 +290,11 @@ pub(crate) fn get_claimable_vouchers_sync(
             })?;
 
         if let Err(wait_error) = status_watcher
-            .wait_for(ServiceStatus::Ready, Some(Duration::from_millis(100)))
+            .wait_with_policy(
+                ServiceStatus::Ready,
+                Some(Duration::from_millis(100)),
+                overwatch::services::status::WaitPolicy::RestartFriendly,
+            )
             .await
         {
             return Err(OperationStatus::error(

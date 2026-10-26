@@ -111,7 +111,10 @@ use crate::{
         self,
         chain::{BlendEpoch, BlendEpochState},
     },
-    message::{DataPayload, DataPayloadType, ProcessedMessage, ServiceMessage},
+    message::{
+        DataPayload, DataPayloadType, ProcessedMessage, ServiceMessage,
+        proposal_diagnostic_digest_from_encoded, proposal_diagnostic_timestamp_unix_ms,
+    },
     mode::{CoreMembership, ModeMembership},
     pending::{
         EncapsulationResult, LocalEncapsulation, MessageKind, NextLocalMessage, PendingProposals,
