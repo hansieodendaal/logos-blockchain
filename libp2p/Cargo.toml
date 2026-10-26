@@ -33,7 +33,6 @@ libp2p = { features = [
   "kad",
   "macros",
   "quic",
-  "secp256k1",
   "serde",
   "tokio",
 ], workspace = true }
