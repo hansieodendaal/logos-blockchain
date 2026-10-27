@@ -3268,48 +3268,47 @@ mod tests {
         }
 
         #[test]
-        fn a_claim_is_judged_under_the_window_of_the_era_of_the_epoch_it_is_for() {
-            // Era 1, from epoch 2, shrinks the acceptance window from 100
-            // slots to 10.
+        fn a_claim_is_judged_under_the_window_of_the_era_of_its_anchor_block() {
+            // Era 1, from epoch 2 (slot 200), shrinks the acceptance window
+            // from 100 slots to 10.
             let era_0 = config();
             let mut era_1 = era_0.clone();
             era_1.pow_config.reward.slot_window = NonZeroU64::new(10).unwrap();
             let eras = schedule(era_0, [(2, era_1)]);
-            // A block at slot 205, in epoch 2, and the claim's block 45 slots
-            // before it, in epoch 1.
+            // A block at slot 215, in epoch 2.
             let (mut state, _) = claim_accepting_state();
-            state.cryptarchia_ledger.slot = Slot::from(205u64);
+            state.cryptarchia_ledger.slot = Slot::from(215u64);
             state.cryptarchia_ledger.epoch_state.epoch = 2.into();
-            state
-                .mantle_ledger
-                .pow
-                .add_seen_block_slots(claim_op().block_hash, Slot::from(160u64));
-
-            // Carrying the nonce of epoch 1, the claim is judged under the
-            // window of era 0.
-            state.cryptarchia_ledger.epoch_state.nonce = Fr::ONE;
-            state.cryptarchia_ledger.previous_epoch_nonce = claim_op().epoch_nonce;
-            assert!(
+            let apply_claim = |state: &LedgerState, anchor_slot: u64, nonces: (Fr, Fr)| {
+                let mut state = state.clone();
                 state
-                    .clone()
-                    .try_apply_tx_operations::<_, HeaderId, MainnetGasProfile>(&eras, claim_tx())
-                    .is_ok()
-            );
+                    .mantle_ledger
+                    .pow
+                    .add_seen_block_slots(claim_op().block_hash, Slot::from(anchor_slot));
+                (
+                    state.cryptarchia_ledger.previous_epoch_nonce,
+                    state.cryptarchia_ledger.epoch_state.nonce,
+                ) = nonces;
+                state.try_apply_tx_operations::<_, HeaderId, MainnetGasProfile>(&eras, claim_tx())
+            };
 
-            // Carrying the nonce of epoch 2, it is judged under the window of
-            // era 1.
-            state.cryptarchia_ledger.epoch_state.nonce = claim_op().epoch_nonce;
-            state.cryptarchia_ledger.previous_epoch_nonce = Fr::ONE;
-            let err = state
-                .try_apply_tx_operations::<_, HeaderId, MainnetGasProfile>(&eras, claim_tx())
-                .err()
-                .expect("claim should fail validation");
-            assert!(matches!(
-                err,
-                LedgerError::VerificationError(VerificationError::ClaimPowRewardError(
-                    ClaimPowRewardError::OutOfWindowSlot { .. }
-                ))
-            ));
+            // Whichever accepted nonce the claim carries.
+            for nonces in [
+                (claim_op().epoch_nonce, Fr::ONE),
+                (Fr::ONE, claim_op().epoch_nonce),
+            ] {
+                // Anchored 55 slots back, in era 0: inside its window.
+                assert!(apply_claim(&state, 160, nonces).is_ok());
+                // Anchored 15 slots back, in era 1: outside its window.
+                assert!(matches!(
+                    apply_claim(&state, 200, nonces).err(),
+                    Some(LedgerError::VerificationError(
+                        VerificationError::ClaimPowRewardError(
+                            ClaimPowRewardError::OutOfWindowSlot { .. }
+                        )
+                    ))
+                ));
+            }
         }
 
         #[test]
