@@ -1160,7 +1160,8 @@ where
 ///
 /// The caller must have validated the header first: this walks the mempool once
 /// per reference, so an unauthenticated proposal has to be discarded before it
-/// gets here.
+/// gets here. The proposal's uncle headers were decoded under the maximum of
+/// the era of its slot, which the rebuilt block keeps.
 async fn reconstruct_block_from_proposal<Item>(
     proposal: Proposal,
     mempool: &impl MempoolAdapterTrait<Item>,
