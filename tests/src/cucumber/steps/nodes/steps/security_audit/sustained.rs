@@ -18,6 +18,130 @@ struct NodeTip {
     observed_at_unix_ms: u64,
 }
 
+#[derive(Default)]
+struct ActiveChainState {
+    header_caches: BTreeMap<String, HeaderCache>,
+    last_verified_libs: BTreeMap<String, (HeaderId, u64)>,
+    last_tips: BTreeMap<String, NodeTip>,
+    continuity_regressions: Vec<Value>,
+    continuity_unverified: Vec<Value>,
+    ancestry_gaps: Vec<Value>,
+    tip_transitions: Vec<Value>,
+    tip_reorganizations: Vec<Value>,
+    tip_reorganizations_unverified: Vec<Value>,
+    last_tip_progress: BTreeMap<String, u64>,
+    last_lib_progress: BTreeMap<String, u64>,
+    tip_stall_intervals: Vec<Value>,
+    lib_stall_intervals: Vec<Value>,
+    per_node_tip_advance_counts: BTreeMap<String, usize>,
+    per_node_lib_advance_counts: BTreeMap<String, usize>,
+    unique_tip_blocks: BTreeSet<String>,
+}
+
+impl ActiveChainState {
+    async fn record_observations(
+        &mut self,
+        world: &CucumberWorld,
+        observations: &[FinalityNodeObservation],
+        observed_at_unix_ms: u64,
+        active_started_at: u64,
+        attack_candidates: &BTreeSet<HeaderId>,
+        safety: &mut FinalizedSafety,
+    ) -> (Vec<Value>, usize) {
+        let mut unresponsive_count = 0;
+        let mut node_snapshot_values = Vec::new();
+        for observation in observations {
+            let node_name = observation.node_name.as_str();
+            if observation.consensus.is_some() {
+                let new_tip = tip_from_observation(observation);
+                let previous_tip = self.last_tips.get(node_name).cloned();
+                if let Some(previous) = previous_tip
+                    && previous.id != new_tip.id
+                    && let Some(node) = world.nodes_info.get(node_name)
+                {
+                    let transition = observe_tip_transition(
+                        node_name,
+                        &node.client,
+                        previous,
+                        new_tip.clone(),
+                        &mut self.header_caches,
+                        attack_candidates,
+                    )
+                    .await;
+                    if transition["status"].as_str() == Some("reorganization") {
+                        if transition["last_common_ancestor"]["status"].as_str() == Some("verified")
+                        {
+                            self.tip_reorganizations.push(transition.clone());
+                        } else {
+                            self.tip_reorganizations_unverified.push(transition.clone());
+                        }
+                    } else if transition["status"].as_str() == Some("unverified") {
+                        self.tip_reorganizations_unverified.push(transition.clone());
+                    }
+                    self.tip_transitions.push(transition);
+                }
+                if self
+                    .last_tips
+                    .get(node_name)
+                    .is_none_or(|old| old.id != new_tip.id)
+                {
+                    let previous_at = self
+                        .last_tip_progress
+                        .insert(node_name.to_owned(), observed_at_unix_ms)
+                        .unwrap_or(active_started_at);
+                    if observed_at_unix_ms.saturating_sub(previous_at) > 0 {
+                        self.tip_stall_intervals.push(json!({
+                            "node": node_name,
+                            "started_at_unix_ms": previous_at,
+                            "ended_at_unix_ms": observed_at_unix_ms,
+                            "duration_ms": observed_at_unix_ms.saturating_sub(previous_at),
+                        }));
+                    }
+                    *self
+                        .per_node_tip_advance_counts
+                        .entry(node_name.to_owned())
+                        .or_default() += 1;
+                    self.unique_tip_blocks.insert(new_tip.id_text.clone());
+                    self.last_tips.insert(node_name.to_owned(), new_tip);
+                }
+                if observation.continuity == LibContinuity::Verified {
+                    let previous_at = self
+                        .last_lib_progress
+                        .insert(node_name.to_owned(), observed_at_unix_ms)
+                        .unwrap_or(active_started_at);
+                    if observed_at_unix_ms.saturating_sub(previous_at) > 0 {
+                        self.lib_stall_intervals.push(json!({
+                            "node": node_name,
+                            "started_at_unix_ms": previous_at,
+                            "ended_at_unix_ms": observed_at_unix_ms,
+                            "duration_ms": observed_at_unix_ms.saturating_sub(previous_at),
+                        }));
+                    }
+                    *self
+                        .per_node_lib_advance_counts
+                        .entry(node_name.to_owned())
+                        .or_default() += 1;
+                }
+            } else {
+                unresponsive_count += 1;
+            }
+            if observation.continuity == LibContinuity::RegressionOrUnrelated {
+                self.continuity_regressions
+                    .push(observation.snapshot.clone());
+            } else if observation.continuity == LibContinuity::Unverified {
+                self.continuity_unverified
+                    .push(observation.snapshot.clone());
+            }
+            if !observation.tip_path_complete || !observation.tip_descends_from_lib() {
+                safety.ancestry_unverified = true;
+                self.ancestry_gaps.push(observation.snapshot.clone());
+            }
+            node_snapshot_values.push(observation.snapshot.clone());
+        }
+        (node_snapshot_values, unresponsive_count)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WorkloadCriteria {
     budget: usize,
@@ -35,6 +159,48 @@ struct ExposureCriteria {
     cooldown_blocks: u64,
     min_duration: Duration,
     timeout: Duration,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExposureObservation {
+    observed_at_unix_ms: u64,
+    complete_genuine_opportunities: usize,
+    nonempty_submitted_opportunities: usize,
+    delivered_opportunities: usize,
+    requirements_met: bool,
+}
+
+const fn exposure_requirements_met(
+    complete: usize,
+    nonempty: usize,
+    delivered: usize,
+    criteria: ExposureCriteria,
+) -> bool {
+    complete >= criteria.min_opportunities
+        && nonempty >= criteria.min_nonempty
+        && delivered >= criteria.min_delivered
+}
+
+#[derive(Clone, Copy)]
+enum ActiveExperiment {
+    SustainedAttack(ExposureCriteria),
+    MatchedControl { timeout: Duration },
+}
+
+impl ActiveExperiment {
+    const fn timeout(self) -> Duration {
+        match self {
+            Self::SustainedAttack(criteria) => criteria.timeout,
+            Self::MatchedControl { timeout } => timeout,
+        }
+    }
+
+    const fn attack_criteria(self) -> Option<ExposureCriteria> {
+        match self {
+            Self::SustainedAttack(criteria) => Some(criteria),
+            Self::MatchedControl { .. } => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -391,7 +557,7 @@ async fn step_observe_sustained_attack(world: &mut CucumberWorld, step: &Step) -
             message: "minimum active duration exceeds timeout".to_owned(),
         });
     }
-    run_active_window(world, Some(exposure), workload, None).await
+    run_active_window(world, ActiveExperiment::SustainedAttack(exposure), workload).await
 }
 
 #[then("the control matches the attack's canonical block count with this workload")]
@@ -417,7 +583,12 @@ async fn step_observe_sustained_control(world: &mut CucumberWorld, step: &Step) 
         ],
     )?;
     let timeout = Duration::from_secs(positive_criterion(&values, "active_timeout_seconds")?);
-    run_active_window(world, None, workload_criteria(&values)?, Some(timeout)).await
+    run_active_window(
+        world,
+        ActiveExperiment::MatchedControl { timeout },
+        workload_criteria(&values)?,
+    )
+    .await
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -748,9 +919,8 @@ async fn prepare_active_environment(
 )]
 async fn run_active_window(
     world: &mut CucumberWorld,
-    exposure: Option<ExposureCriteria>,
+    mode: ActiveExperiment,
     workload: WorkloadCriteria,
-    control_timeout: Option<Duration>,
 ) -> StepResult {
     let declared_workload = audit_workload(world)
         .cloned()
@@ -765,15 +935,8 @@ async fn run_active_window(
         .map(String::as_str)
         .collect::<Vec<_>>();
     let canonical_reference = participants.canonical_reference.as_str();
-    let attack_enabled = exposure.is_some();
-    let exposure_criteria = exposure.unwrap_or(ExposureCriteria {
-        min_opportunities: 0,
-        min_nonempty: 0,
-        min_delivered: 0,
-        cooldown_blocks: 0,
-        min_duration: Duration::ZERO,
-        timeout: Duration::ZERO,
-    });
+    let exposure_criteria = mode.attack_criteria();
+    let attack_enabled = exposure_criteria.is_some();
     let scenario = if attack_enabled {
         "Honest peers recover after sustained nonempty sibling equivocation"
     } else {
@@ -789,10 +952,7 @@ async fn run_active_window(
     } else {
         Some(read_matched_attack_report()?)
     };
-    let window_limit = exposure.map_or_else(
-        || control_timeout.expect("control timeout"),
-        |criteria| criteria.timeout,
-    );
+    let window_limit = mode.timeout();
     let expected_siblings =
         audit_sibling_count(world).map_err(|message| StepError::InvalidArgument { message })?;
     if attack_enabled != (expected_siblings > 0) {
@@ -818,19 +978,20 @@ async fn run_active_window(
         &declared_workload,
     )
     .await?;
-    let mut header_caches = node_names(&participants)
-        .into_iter()
-        .map(|name| (name.to_owned(), HeaderCache::default()))
-        .collect::<BTreeMap<_, _>>();
+    let mut chain = ActiveChainState {
+        header_caches: node_names(&participants)
+            .into_iter()
+            .map(|name| (name.to_owned(), HeaderCache::default()))
+            .collect(),
+        ..ActiveChainState::default()
+    };
     let mut log_observations = ActiveLogObservations::default();
-    let mut last_verified_libs = BTreeMap::new();
-    let mut last_tips = BTreeMap::new();
     let pre_window_observations = sample_all_nodes(
         world,
         &participants,
         None,
-        &mut last_verified_libs,
-        &mut header_caches,
+        &mut chain.last_verified_libs,
+        &mut chain.header_caches,
     )
     .await;
     let pre_window_snapshots = pre_window_observations
@@ -840,33 +1001,28 @@ async fn run_active_window(
     let baseline_history_checks = check_finalized_history_agreement(
         world,
         &honest_observations(&pre_window_observations, &participants),
-        &mut header_caches,
+        &mut chain.header_caches,
         0,
     )
     .await;
-    let baseline_safety_conflict = baseline_history_checks
-        .iter()
-        .any(|check| check["status"].as_str() == Some("conflicting_finalized_histories"));
-    let mut baseline_ancestry_unverified = baseline_history_checks
-        .iter()
-        .any(|check| check["status"].as_str() == Some("ancestry_unverified"));
+    let mut safety = FinalizedSafety::default();
+    safety.record_pair_reports(&baseline_history_checks);
     for observation in &pre_window_observations {
         if observation.consensus.is_some()
-            && (!observation.tip_path_complete
-                || observation
-                    .snapshot
-                    .pointer("/tip_descends_from_lib")
-                    .and_then(Value::as_bool)
-                    != Some(true))
+            && (!observation.tip_path_complete || !observation.tip_descends_from_lib())
         {
-            baseline_ancestry_unverified = true;
+            safety.ancestry_unverified = true;
         }
     }
     for observation in &pre_window_observations {
         if let Some(state) = observation.consensus.as_ref() {
-            let name = observation.snapshot["node"].as_str().unwrap_or_default();
-            last_verified_libs.insert(name.to_owned(), (state.lib_id, state.lib_slot));
-            last_tips.insert(name.to_owned(), tip_from_observation(observation));
+            let name = observation.node_name.as_str();
+            chain
+                .last_verified_libs
+                .insert(name.to_owned(), (state.lib_id, state.lib_slot));
+            chain
+                .last_tips
+                .insert(name.to_owned(), tip_from_observation(observation));
         }
     }
     if let Err(error) = world.ensure_wallet_scanner_started().await {
@@ -920,39 +1076,22 @@ async fn run_active_window(
         "observed_at_unix_ms": unix_now_ms(),
         "pairs": baseline_history_checks,
     })];
-    let mut safety_conflict_observed = baseline_safety_conflict;
-    let mut ancestry_unverified = baseline_ancestry_unverified;
-    let mut continuity_regressions = Vec::new();
-    let mut continuity_unverified = Vec::new();
-    let mut ancestry_gaps = pre_window_observations
+    chain.ancestry_gaps = pre_window_observations
         .iter()
         .filter(|observation| {
             observation.consensus.is_some()
-                && (!observation.tip_path_complete
-                    || observation
-                        .snapshot
-                        .pointer("/tip_descends_from_lib")
-                        .and_then(Value::as_bool)
-                        != Some(true))
+                && (!observation.tip_path_complete || !observation.tip_descends_from_lib())
         })
         .map(|observation| observation.snapshot.clone())
         .collect::<Vec<_>>();
-    let mut tip_transitions = Vec::new();
-    let mut tip_reorganizations = Vec::new();
-    let mut tip_reorganizations_unverified = Vec::new();
     let mut alignment_transitions = Vec::new();
     let mut previous_honest_alignment = None;
     let mut last_sample_at = StdInstant::now();
-    let mut last_tip_progress = node_names(&participants)
+    chain.last_tip_progress = node_names(&participants)
         .into_iter()
         .map(|name| (name.to_owned(), active_started_at))
         .collect::<BTreeMap<_, _>>();
-    let mut last_lib_progress = last_tip_progress.clone();
-    let mut tip_stall_intervals = Vec::new();
-    let mut lib_stall_intervals = Vec::new();
-    let mut per_node_tip_advance_counts = BTreeMap::<String, usize>::new();
-    let mut per_node_lib_advance_counts = BTreeMap::<String, usize>::new();
-    let mut unique_tip_blocks = BTreeSet::new();
+    chain.last_lib_progress = chain.last_tip_progress.clone();
     let mut sample_error_count = 0usize;
     let mut cooldown_start: Option<NodeTip> = None;
     let mut cooldown_verified_blocks = 0u64;
@@ -1004,8 +1143,8 @@ async fn run_active_window(
                 world,
                 &participants,
                 latest_attack.as_ref(),
-                &mut last_verified_libs,
-                &mut header_caches,
+                &mut chain.last_verified_libs,
+                &mut chain.header_caches,
             ),
         )
         .await
@@ -1015,108 +1154,26 @@ async fn run_active_window(
         }
         let observed_at_unix_ms = unix_timestamp_ms();
         let elapsed_at_ms = active_started.elapsed().as_millis();
-        let mut node_snapshot_values = Vec::new();
-        for observation in &observations {
-            let node_name = observation.snapshot["node"].as_str().unwrap_or_default();
-            if observation.consensus.is_some() {
-                let new_tip = tip_from_observation(observation);
-                let previous_tip = last_tips.get(node_name).cloned();
-                if let Some(previous) = previous_tip
-                    && previous.id != new_tip.id
-                    && let Some(node) = world.nodes_info.get(node_name)
-                {
-                    let transition = observe_tip_transition(
-                        node_name,
-                        &node.client,
-                        previous,
-                        new_tip.clone(),
-                        &mut header_caches,
-                        &log_observations.attack_candidates,
-                    )
-                    .await;
-                    if transition["status"].as_str() == Some("reorganization") {
-                        if transition["last_common_ancestor"]["status"].as_str() == Some("verified")
-                        {
-                            tip_reorganizations.push(transition.clone());
-                        } else {
-                            tip_reorganizations_unverified.push(transition.clone());
-                        }
-                    } else if transition["status"].as_str() == Some("unverified") {
-                        tip_reorganizations_unverified.push(transition.clone());
-                    }
-                    tip_transitions.push(transition);
-                }
-                if last_tips
-                    .get(node_name)
-                    .is_none_or(|old| old.id != new_tip.id)
-                {
-                    let previous_at = last_tip_progress
-                        .insert(node_name.to_owned(), observed_at_unix_ms)
-                        .unwrap_or(active_started_at);
-                    if observed_at_unix_ms.saturating_sub(previous_at) > 0 {
-                        tip_stall_intervals.push(json!({
-                            "node": node_name,
-                            "started_at_unix_ms": previous_at,
-                            "ended_at_unix_ms": observed_at_unix_ms,
-                            "duration_ms": observed_at_unix_ms.saturating_sub(previous_at),
-                        }));
-                    }
-                    *per_node_tip_advance_counts
-                        .entry(node_name.to_owned())
-                        .or_default() += 1;
-                    unique_tip_blocks.insert(new_tip.id_text.clone());
-                    last_tips.insert(node_name.to_owned(), new_tip);
-                }
-                if observation.continuity == "verified" {
-                    let previous_at = last_lib_progress
-                        .insert(node_name.to_owned(), observed_at_unix_ms)
-                        .unwrap_or(active_started_at);
-                    if observed_at_unix_ms.saturating_sub(previous_at) > 0 {
-                        lib_stall_intervals.push(json!({
-                            "node": node_name,
-                            "started_at_unix_ms": previous_at,
-                            "ended_at_unix_ms": observed_at_unix_ms,
-                            "duration_ms": observed_at_unix_ms.saturating_sub(previous_at),
-                        }));
-                    }
-                    *per_node_lib_advance_counts
-                        .entry(node_name.to_owned())
-                        .or_default() += 1;
-                }
-            } else {
-                sample_error_count += 1;
-            }
-            if observation.continuity == "regression_or_unrelated" {
-                continuity_regressions.push(observation.snapshot.clone());
-            } else if observation.continuity == "unverified" {
-                continuity_unverified.push(observation.snapshot.clone());
-            }
-            if !observation.tip_path_complete
-                || observation
-                    .snapshot
-                    .pointer("/tip_descends_from_lib")
-                    .and_then(Value::as_bool)
-                    != Some(true)
-            {
-                ancestry_unverified = true;
-                ancestry_gaps.push(observation.snapshot.clone());
-            }
-            node_snapshot_values.push(observation.snapshot.clone());
-        }
+        let (node_snapshot_values, unresponsive_count) = chain
+            .record_observations(
+                world,
+                &observations,
+                observed_at_unix_ms,
+                active_started_at,
+                &log_observations.attack_candidates,
+                &mut safety,
+            )
+            .await;
+        sample_error_count += unresponsive_count;
         let honest_observations = honest_observations(&observations, &participants);
         let history_checks = check_finalized_history_agreement(
             world,
             &honest_observations,
-            &mut header_caches,
+            &mut chain.header_caches,
             latest_attack.as_ref().map_or(0, |attack| attack.slot),
         )
         .await;
-        safety_conflict_observed |= history_checks
-            .iter()
-            .any(|check| check["status"].as_str() == Some("conflicting_finalized_histories"));
-        ancestry_unverified |= history_checks
-            .iter()
-            .any(|check| check["status"].as_str() == Some("ancestry_unverified"));
+        safety.record_pair_reports(&history_checks);
         finalized_history_checks.push(json!({
             "observed_at_unix_ms": observed_at_unix_ms,
             "pairs": history_checks,
@@ -1124,7 +1181,7 @@ async fn run_active_window(
         let alignment = align_observations(
             world,
             &observations,
-            &mut header_caches,
+            &mut chain.header_caches,
             &honest_nodes,
             workload.max_tip_height_skew,
         )
@@ -1142,7 +1199,7 @@ async fn run_active_window(
             .iter()
             .filter_map(|observation| {
                 Some((
-                    observation.snapshot["node"].as_str()?.to_owned(),
+                    observation.node_name.clone(),
                     observation.consensus.clone()?,
                 ))
             })
@@ -1168,9 +1225,10 @@ async fn run_active_window(
         }));
         last_sample_at = StdInstant::now();
 
-        if let Some(observation) = observations.iter().find(|item| {
-            item.snapshot["node"].as_str() == Some(canonical_reference) && item.consensus.is_some()
-        }) {
+        if let Some(observation) = observations
+            .iter()
+            .find(|item| item.node_name == canonical_reference && item.consensus.is_some())
+        {
             let tip = tip_from_observation(observation);
             let start = canonical_start.get_or_insert_with(|| tip.clone());
             canonical_end = Some(tip.clone());
@@ -1179,7 +1237,7 @@ async fn run_active_window(
                 canonical_error = Some("canonical tip is below the start height".to_owned());
             } else if let (Some(node), Some(cache)) = (
                 world.nodes_info.get(canonical_reference),
-                header_caches.get_mut(canonical_reference),
+                chain.header_caches.get_mut(canonical_reference),
             ) {
                 match timeout_at(
                     active_deadline_tokio,
@@ -1215,7 +1273,7 @@ async fn run_active_window(
             break;
         }
 
-        if attack_enabled {
+        if let Some(exposure_criteria) = exposure_criteria {
             if cooldown_start.is_none() && StdInstant::now() >= next_exposure_check {
                 let exposure = timeout_at(
                     active_deadline_tokio,
@@ -1232,8 +1290,7 @@ async fn run_active_window(
                 .await;
                 match exposure {
                     Ok(exposure) => {
-                        exposure_requirements_met =
-                            exposure["requirements_met"].as_bool() == Some(true);
+                        exposure_requirements_met = exposure.requirements_met;
                         exposure_observations.push(exposure);
                     }
                     Err(_) => break,
@@ -1243,16 +1300,16 @@ async fn run_active_window(
             if cooldown_start.is_none()
                 && exposure_requirements_met
                 && active_started.elapsed() >= exposure_criteria.min_duration
-                && let Some(tip) = last_tips.get(canonical_reference).cloned()
+                && let Some(tip) = chain.last_tips.get(canonical_reference).cloned()
             {
                 cooldown_events.push(json!({"event": "cooldown_started", "tip_id": tip.id_text, "height": tip.height, "observed_at_unix_ms": observed_at_unix_ms}));
                 cooldown_start = Some(tip);
             }
             if let (Some(start), Some(tip), Some(node), Some(cache)) = (
                 cooldown_start.as_ref(),
-                last_tips.get(canonical_reference),
+                chain.last_tips.get(canonical_reference),
                 world.nodes_info.get(canonical_reference),
-                header_caches.get_mut(canonical_reference),
+                chain.header_caches.get_mut(canonical_reference),
             ) {
                 if tip.height < start.height {
                     cooldown_events.push(json!({"event": "cooldown_reset", "reason": "tip_height_regressed", "previous_start": start.id_text, "new_start": tip.id_text, "observed_at_unix_ms": observed_at_unix_ms}));
@@ -1322,9 +1379,9 @@ async fn run_active_window(
         node_logs: &node_logs,
         observed_ordinary_bodies: &observed_ordinary_bodies,
         submitted_transactions: &submitted_transactions,
-        last_tips: &last_tips,
-        last_verified_libs: &last_verified_libs,
-        header_caches: &mut header_caches,
+        last_tips: &chain.last_tips,
+        last_verified_libs: &chain.last_verified_libs,
+        header_caches: &mut chain.header_caches,
         attack_branch_candidates: &mut attack_branch_candidates,
     })
     .await;
@@ -1340,10 +1397,10 @@ async fn run_active_window(
         });
     }
     for node in node_names(&participants) {
-        if let Some(started_at) = last_tip_progress.get(node) {
+        if let Some(started_at) = chain.last_tip_progress.get(node) {
             let duration_ms = active_ended_at.saturating_sub(*started_at);
             if duration_ms > 0 {
-                tip_stall_intervals.push(json!({
+                chain.tip_stall_intervals.push(json!({
                     "node": node,
                     "started_at_unix_ms": started_at,
                     "ended_at_unix_ms": active_ended_at,
@@ -1352,10 +1409,10 @@ async fn run_active_window(
                 }));
             }
         }
-        if let Some(started_at) = last_lib_progress.get(node) {
+        if let Some(started_at) = chain.last_lib_progress.get(node) {
             let duration_ms = active_ended_at.saturating_sub(*started_at);
             if duration_ms > 0 {
-                lib_stall_intervals.push(json!({
+                chain.lib_stall_intervals.push(json!({
                     "node": node,
                     "started_at_unix_ms": started_at,
                     "ended_at_unix_ms": active_ended_at,
@@ -1368,21 +1425,22 @@ async fn run_active_window(
     let attacked_opportunity_count = opportunity_records.len();
     let workload_setup_failure =
         submitted_transactions.is_empty() && !failed_preparations.is_empty();
-    let insufficient_exposure = attack_enabled
-        && (attacked_opportunity_count < exposure_criteria.min_opportunities
-            || nonempty_opportunities < exposure_criteria.min_nonempty
-            || nonempty_submitted_body_opportunities < exposure_criteria.min_nonempty
-            || delivered_opportunities.len() < exposure_criteria.min_delivered);
+    let insufficient_exposure = exposure_criteria.is_some_and(|criteria| {
+        attacked_opportunity_count < criteria.min_opportunities
+            || nonempty_opportunities < criteria.min_nonempty
+            || nonempty_submitted_body_opportunities < criteria.min_nonempty
+            || delivered_opportunities.len() < criteria.min_delivered
+    });
     let control_blocks_incomplete = !attack_enabled
         && (canonical_status != "verified"
             || target_blocks.is_none_or(|target| canonical_blocks < target));
-    let cooldown_incomplete =
-        attack_enabled && cooldown_verified_blocks < exposure_criteria.cooldown_blocks;
+    let cooldown_incomplete = exposure_criteria
+        .is_some_and(|criteria| cooldown_verified_blocks < criteria.cooldown_blocks);
     let active_window = json!({
         "started_at_unix_ms": active_started_at,
         "ended_at_unix_ms": active_ended_at,
         "duration_ms": active_duration_ms,
-        "minimum_duration_ms": attack_enabled.then_some(exposure_criteria.min_duration.as_millis()),
+        "minimum_duration_ms": exposure_criteria.map(|criteria| criteria.min_duration.as_millis()),
         "maximum_duration_ms": window_limit.as_millis(),
         "matched_attack_report": matched_attack.as_ref().map(|(path, _, hash, _)| json!({"path": path, "sha256": hash})),
         "canonical_blocks": {
@@ -1396,7 +1454,7 @@ async fn run_active_window(
             "error": canonical_error,
         },
         "exposure_observations": exposure_observations,
-        "cooldown": {"required_blocks": exposure_criteria.cooldown_blocks, "verified_blocks": cooldown_verified_blocks, "verified": attack_enabled.then_some(cooldown_verified_blocks >= exposure_criteria.cooldown_blocks), "events": cooldown_events},
+        "cooldown": {"required_blocks": exposure_criteria.map_or(0, |criteria| criteria.cooldown_blocks), "verified_blocks": cooldown_verified_blocks, "verified": exposure_criteria.map(|criteria| cooldown_verified_blocks >= criteria.cooldown_blocks), "events": cooldown_events},
         "sample_interval_ms": SAMPLE_INTERVAL.as_millis(),
         "sample_count": snapshots.len(),
     });
@@ -1415,54 +1473,55 @@ async fn run_active_window(
     });
     let attack_exposure = json!({
         "complete_genuine_opportunities": attacked_opportunity_count,
-        "required_complete_opportunities": exposure_criteria.min_opportunities,
+        "required_complete_opportunities": exposure_criteria.map_or(0, |criteria| criteria.min_opportunities),
         "nonempty_ordinary_bodies": nonempty_opportunities,
-        "required_nonempty_opportunities": exposure_criteria.min_nonempty,
+        "required_nonempty_opportunities": exposure_criteria.map_or(0, |criteria| criteria.min_nonempty),
         "nonempty_bodies_containing_submitted_transactions": nonempty_submitted_body_opportunities,
-        "required_submitted_transaction_body_opportunities": exposure_criteria.min_nonempty,
+        "required_submitted_transaction_body_opportunities": exposure_criteria.map_or(0, |criteria| criteria.min_nonempty),
         "distinct_opportunities_with_ordered_blend_to_acceptance": delivered_opportunities.len(),
-        "required_delivered_opportunities": exposure_criteria.min_delivered,
+        "required_delivered_opportunities": exposure_criteria.map_or(0, |criteria| criteria.min_delivered),
         "insufficient_exposure": insufficient_exposure,
     });
     let liveness_metrics = json!({
-        "per_node_tip_advance_counts": per_node_tip_advance_counts,
-        "per_node_lib_advance_counts": per_node_lib_advance_counts,
-        "unique_observed_tip_blocks": unique_tip_blocks.len(),
-        "tip_stall_intervals": tip_stall_intervals,
-        "lib_stall_intervals": lib_stall_intervals,
+        "per_node_tip_advance_counts": chain.per_node_tip_advance_counts,
+        "per_node_lib_advance_counts": chain.per_node_lib_advance_counts,
+        "unique_observed_tip_blocks": chain.unique_tip_blocks.len(),
+        "tip_stall_intervals": chain.tip_stall_intervals,
+        "lib_stall_intervals": chain.lib_stall_intervals,
         "tip_alignment_transitions": alignment_transitions,
     });
     let safety_metrics = json!({
-        "safety_conflict_observed": safety_conflict_observed,
-        "ancestry_unverified": ancestry_unverified,
-        "lib_continuity_regressions": continuity_regressions,
-        "lib_continuity_unverified_observations": continuity_unverified,
-        "ancestry_gaps": ancestry_gaps,
+        "safety_conflict_observed": safety.conflict_observed,
+        "ancestry_unverified": safety.ancestry_unverified,
+        "lib_continuity_regressions": chain.continuity_regressions,
+        "lib_continuity_unverified_observations": chain.continuity_unverified,
+        "ancestry_gaps": chain.ancestry_gaps,
         "pre_attack_finalized_history_checks": finalized_history_checks.first(),
         "finalized_history_checks": finalized_history_checks,
     });
     let reorganization_metrics = json!({
-        "tip_transition_observations": tip_transitions,
-        "tip_reorganizations": tip_reorganizations,
-        "tip_reorganizations_unverified": tip_reorganizations_unverified,
+        "tip_transition_observations": chain.tip_transitions,
+        "tip_reorganizations": chain.tip_reorganizations,
+        "tip_reorganizations_unverified": chain.tip_reorganizations_unverified,
         "tip_reorganization_observation_is_lower_bound": true,
     });
     let baseline_and_final = json!({
         "pre_window_consensus_snapshots": pre_window_snapshots,
-        "last_active_tips": last_tips.iter().map(|(node, tip)| json!({
+        "last_active_tips": chain.last_tips.iter().map(|(node, tip)| json!({
             "node": node,
             "tip_id": tip.id_text,
             "tip_height": tip.height,
             "tip_slot": tip.slot,
             "observed_at_unix_ms": tip.observed_at_unix_ms,
         })).collect::<Vec<_>>(),
-        "last_verified_libs": last_verified_libs.iter().map(|(node, (id, slot))| json!({
+        "last_verified_libs": chain.last_verified_libs.iter().map(|(node, (id, slot))| json!({
             "node": node,
             "lib_id": id.encode_hex::<String>(),
             "lib_slot": slot,
         })).collect::<Vec<_>>(),
     });
-    let cache_summary = header_caches
+    let cache_summary = chain
+        .header_caches
         .iter()
         .map(|(node, cache)| {
             json!({
@@ -1839,7 +1898,7 @@ async fn observe_active_exposure(
     submitted: &[Value],
     observed_bodies: &mut BTreeMap<String, Value>,
     criteria: ExposureCriteria,
-) -> Value {
+) -> ExposureObservation {
     let submitted_hashes = submitted
         .iter()
         .filter_map(|transaction| transaction["transaction_hash"].as_str())
@@ -1894,15 +1953,18 @@ async fn observe_active_exposure(
             delivered += 1;
         }
     }
-    json!({
-        "observed_at_unix_ms": unix_now_ms(),
-        "complete_genuine_opportunities": complete,
-        "nonempty_submitted_opportunities": nonempty_submitted,
-        "delivered_opportunities": delivered,
-        "requirements_met": complete >= criteria.min_opportunities
-            && nonempty_submitted >= criteria.min_nonempty
-            && delivered >= criteria.min_delivered,
-    })
+    ExposureObservation {
+        observed_at_unix_ms: unix_now_ms(),
+        complete_genuine_opportunities: complete,
+        nonempty_submitted_opportunities: nonempty_submitted,
+        delivered_opportunities: delivered,
+        requirements_met: exposure_requirements_met(
+            complete,
+            nonempty_submitted,
+            delivered,
+            criteria,
+        ),
+    }
 }
 
 fn write_json(path: &Path, value: &Value) -> StepResult {
@@ -2169,13 +2231,13 @@ async fn sample_all_nodes(
             observe_sustained_node(node_name, &node.client, attack, cache, previous_lib).await;
         if let Some(state) = observation.consensus.as_ref() {
             if previous_lib.is_some_and(|(previous_id, _)| previous_id == state.lib_id) {
-                "unchanged".clone_into(&mut observation.continuity);
+                observation.continuity = LibContinuity::Unchanged;
                 observation.snapshot["lib_continuity"] = json!("unchanged");
             }
-            if observation.continuity == "verified" || previous_lib.is_none() {
+            if observation.continuity == LibContinuity::Verified || previous_lib.is_none() {
                 last_verified_libs.insert(node_name.to_owned(), (state.lib_id, state.lib_slot));
                 if previous_lib.is_none() {
-                    "baseline".clone_into(&mut observation.continuity);
+                    observation.continuity = LibContinuity::Baseline;
                     observation.snapshot["lib_continuity"] = json!("baseline");
                 }
             }
@@ -2186,10 +2248,13 @@ async fn sample_all_nodes(
 }
 
 fn unresponsive_observation(node_name: &str, error: &str) -> FinalityNodeObservation {
+    let observed_at_unix_ms = unix_now_ms();
     FinalityNodeObservation {
+        node_name: node_name.to_owned(),
+        observed_at_unix_ms,
         snapshot: json!({
             "node": node_name,
-            "observed_at_unix_ms": unix_now_ms(),
+            "observed_at_unix_ms": observed_at_unix_ms,
             "responsive": false,
             "error": error,
         }),
@@ -2198,7 +2263,7 @@ fn unresponsive_observation(node_name: &str, error: &str) -> FinalityNodeObserva
         finalized_path_complete: false,
         attack_branch: AttackBranch::Unverified,
         finalized_attack_branch: AttackBranch::Unverified,
-        continuity: "unverified".to_owned(),
+        continuity: LibContinuity::Unverified,
     }
 }
 
@@ -2280,16 +2345,16 @@ async fn observe_sustained_node(
             .await
         };
         if previous_id == lib_id {
-            "unchanged"
+            LibContinuity::Unchanged
         } else {
             match ancestry_presence(&path, previous_id) {
-                Some(true) => "verified",
-                Some(false) => "regression_or_unrelated",
-                None => "unverified",
+                Some(true) => LibContinuity::Verified,
+                Some(false) => LibContinuity::RegressionOrUnrelated,
+                None => LibContinuity::Unverified,
             }
         }
     } else {
-        "baseline"
+        LibContinuity::Baseline
     };
     let consensus_state = ConsensusState {
         tip_id,
@@ -2331,6 +2396,8 @@ async fn observe_sustained_node(
         snapshot["finalized_path_to_attack_parent"] = json!(ancestry_path_json(&finalized_path));
     }
     FinalityNodeObservation {
+        node_name: node_name.to_owned(),
+        observed_at_unix_ms,
         snapshot,
         consensus: Some(consensus_state),
         tip_path_complete: tip_path.complete_below_slot || tip_path.target_reached,
@@ -2338,7 +2405,7 @@ async fn observe_sustained_node(
             || finalized_path.target_reached,
         attack_branch,
         finalized_attack_branch: finalized_branch,
-        continuity: continuity.to_owned(),
+        continuity,
     }
 }
 
@@ -2352,9 +2419,7 @@ fn tip_from_observation(observation: &FinalityNodeObservation) -> NodeTip {
         id_text: state.tip_id_text.clone(),
         height: state.tip_height,
         slot: state.tip_slot,
-        observed_at_unix_ms: observation.snapshot["observed_at_unix_ms"]
-            .as_u64()
-            .unwrap_or_default(),
+        observed_at_unix_ms: observation.observed_at_unix_ms,
     }
 }
 
@@ -2368,16 +2433,18 @@ fn honest_observations(
         .filter_map(|name| {
             observations
                 .iter()
-                .find(|observation| observation.snapshot["node"].as_str() == Some(name.as_str()))
+                .find(|observation| observation.node_name == *name)
         })
         .map(|observation| FinalityNodeObservation {
+            node_name: observation.node_name.clone(),
+            observed_at_unix_ms: observation.observed_at_unix_ms,
             snapshot: observation.snapshot.clone(),
             consensus: observation.consensus.clone(),
             tip_path_complete: observation.tip_path_complete,
             finalized_path_complete: observation.finalized_path_complete,
             attack_branch: observation.attack_branch.clone(),
             finalized_attack_branch: observation.finalized_attack_branch.clone(),
-            continuity: observation.continuity.clone(),
+            continuity: observation.continuity,
         })
         .collect()
 }
@@ -2768,7 +2835,7 @@ async fn align_observations(
         .filter_map(|name| {
             observations
                 .iter()
-                .find(|observation| observation.snapshot["node"].as_str() == Some(*name))
+                .find(|observation| observation.node_name == *name)
                 .and_then(|observation| observation.consensus.as_ref())
                 .map(|state| ((*name).to_owned(), state.clone()))
         })
@@ -3042,41 +3109,41 @@ fn attack_candidate_members(
         .collect()
 }
 
-struct RecoveryNodeContext<'a> {
-    world: &'a CucumberWorld,
-    honest_nodes: &'a [&'a str],
-    attack: Option<&'a AttackEvidence>,
-    header_caches: &'a mut BTreeMap<String, HeaderCache>,
-    last_verified_libs: &'a mut BTreeMap<String, (HeaderId, u64)>,
-    last_tips: &'a mut BTreeMap<String, NodeTip>,
-    attack_candidates: &'a BTreeSet<HeaderId>,
-    initial_tips: &'a BTreeMap<String, NodeTip>,
-    progress_by_node: &'a mut BTreeMap<String, bool>,
-    recovery_tip_advance_counts: &'a mut BTreeMap<String, usize>,
-    recovery_lib_advance_counts: &'a mut BTreeMap<String, usize>,
-    last_tip_progress_at: &'a mut BTreeMap<String, u64>,
-    last_lib_progress_at: &'a mut BTreeMap<String, u64>,
-    tip_stall_intervals: &'a mut Vec<Value>,
-    lib_stall_intervals: &'a mut Vec<Value>,
-    tip_transitions: &'a mut Vec<Value>,
-    tip_reorganizations: &'a mut Vec<Value>,
-    tip_reorganizations_unverified: &'a mut Vec<Value>,
-    responsive_failure_observations: &'a mut Vec<Value>,
-    continuity_regressions: &'a mut Vec<Value>,
-    continuity_unverified: &'a mut Vec<Value>,
-    ancestry_gaps: &'a mut Vec<Value>,
-    any_unverified_ancestry: &'a mut bool,
+#[derive(Default)]
+struct RecoveryNodeState {
+    header_caches: BTreeMap<String, HeaderCache>,
+    last_verified_libs: BTreeMap<String, (HeaderId, u64)>,
+    last_tips: BTreeMap<String, NodeTip>,
+    attack_candidates: BTreeSet<HeaderId>,
+    initial_tips: BTreeMap<String, NodeTip>,
+    progress_by_node: BTreeMap<String, bool>,
+    recovery_tip_advance_counts: BTreeMap<String, usize>,
+    recovery_lib_advance_counts: BTreeMap<String, usize>,
+    last_tip_progress_at: BTreeMap<String, u64>,
+    last_lib_progress_at: BTreeMap<String, u64>,
+    tip_stall_intervals: Vec<Value>,
+    lib_stall_intervals: Vec<Value>,
+    tip_transitions: Vec<Value>,
+    tip_reorganizations: Vec<Value>,
+    tip_reorganizations_unverified: Vec<Value>,
+    responsive_failure_observations: Vec<Value>,
+    continuity_regressions: Vec<Value>,
+    continuity_unverified: Vec<Value>,
+    ancestry_gaps: Vec<Value>,
+    any_unverified_ancestry: bool,
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "Tracks each sampled node's liveness and safety evidence together"
 )]
-async fn observe_recovery_nodes(context: RecoveryNodeContext<'_>) -> Vec<FinalityNodeObservation> {
-    let RecoveryNodeContext {
-        world,
-        honest_nodes,
-        attack,
+async fn observe_recovery_nodes(
+    world: &CucumberWorld,
+    honest_nodes: &[&str],
+    attack: Option<&AttackEvidence>,
+    state: &mut RecoveryNodeState,
+) -> Vec<FinalityNodeObservation> {
+    let RecoveryNodeState {
         header_caches,
         last_verified_libs,
         last_tips,
@@ -3097,7 +3164,7 @@ async fn observe_recovery_nodes(context: RecoveryNodeContext<'_>) -> Vec<Finalit
         continuity_unverified,
         ancestry_gaps,
         any_unverified_ancestry,
-    } = context;
+    } = state;
     let mut observations = Vec::with_capacity(honest_nodes.len());
     for &node_name in honest_nodes {
         let Some(node) = world.nodes_info.get(node_name) else {
@@ -3116,16 +3183,16 @@ async fn observe_recovery_nodes(context: RecoveryNodeContext<'_>) -> Vec<Finalit
             observe_sustained_node(node_name, &node.client, attack, cache, previous_lib).await;
         if let Some(state) = observation.consensus.as_ref() {
             if previous_lib.is_some_and(|(previous_id, _)| previous_id == state.lib_id) {
-                "unchanged".clone_into(&mut observation.continuity);
+                observation.continuity = LibContinuity::Unchanged;
                 observation.snapshot["lib_continuity"] = json!("unchanged");
             }
-            if observation.continuity == "verified" || previous_lib.is_none() {
+            if observation.continuity == LibContinuity::Verified || previous_lib.is_none() {
                 last_verified_libs.insert(node_name.to_owned(), (state.lib_id, state.lib_slot));
                 if previous_lib.is_none() {
-                    "baseline".clone_into(&mut observation.continuity);
+                    observation.continuity = LibContinuity::Baseline;
                 }
             }
-            if observation.continuity == "verified" {
+            if observation.continuity == LibContinuity::Verified {
                 let observed_at = observation.snapshot["observed_at_unix_ms"]
                     .as_u64()
                     .unwrap_or_else(unix_now_ms);
@@ -3192,17 +3259,13 @@ async fn observe_recovery_nodes(context: RecoveryNodeContext<'_>) -> Vec<Finalit
         } else {
             responsive_failure_observations.push(observation.snapshot.clone());
         }
-        if observation.continuity == "regression_or_unrelated" {
+        if observation.continuity == LibContinuity::RegressionOrUnrelated {
             continuity_regressions.push(observation.snapshot.clone());
-        } else if observation.continuity == "unverified" {
+        } else if observation.continuity == LibContinuity::Unverified {
             continuity_unverified.push(observation.snapshot.clone());
         }
         if !observation.tip_path_complete
-            || observation
-                .snapshot
-                .pointer("/tip_descends_from_lib")
-                .and_then(Value::as_bool)
-                != Some(true)
+            || !observation.tip_descends_from_lib()
             || !observation.finalized_path_complete
         {
             ancestry_gaps.push(observation.snapshot.clone());
@@ -3364,10 +3427,10 @@ async fn run_recovery_window(
         boundary_slot = latest_slot.max(boundary_slot);
         last_attacked_slot = Some(latest_slot);
     }
-    let mut last_verified_libs = parse_last_verified_libs(&active);
-    let mut last_tips = parse_last_active_tips(&active);
+    let last_verified_libs = parse_last_verified_libs(&active);
+    let last_tips = parse_last_active_tips(&active);
     let initial_tips = last_tips.clone();
-    let mut header_caches = node_names(participants)
+    let header_caches = node_names(participants)
         .into_iter()
         .map(|name| (name.to_owned(), HeaderCache::default()))
         .collect::<BTreeMap<_, _>>();
@@ -3380,82 +3443,64 @@ async fn run_recovery_window(
     ));
     let mut snapshots = Vec::new();
     let mut finalized_history_checks = Vec::new();
-    let mut continuity_regressions = Vec::new();
-    let mut continuity_unverified = Vec::new();
-    let mut ancestry_gaps = active["safety_metrics"]["ancestry_gaps"]
+    let ancestry_gaps = active["safety_metrics"]["ancestry_gaps"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let mut tip_transitions = Vec::new();
-    let mut tip_reorganizations = Vec::new();
-    let mut tip_reorganizations_unverified = Vec::new();
-    let mut safety_conflict_observed =
-        active["safety_metrics"]["safety_conflict_observed"].as_bool() == Some(true);
-    let mut any_unverified_ancestry =
+    let mut safety = FinalizedSafety {
+        conflict_observed: active["safety_metrics"]["safety_conflict_observed"].as_bool()
+            == Some(true),
+        ancestry_unverified: false,
+    };
+    let any_unverified_ancestry =
         active["safety_metrics"]["ancestry_unverified"].as_bool() != Some(false);
-    let mut progress_by_node = BTreeMap::<String, bool>::new();
-    let mut recovery_tip_advance_counts = honest_nodes
+    let recovery_tip_advance_counts = honest_nodes
         .iter()
         .map(|name| ((*name).to_owned(), 0usize))
         .collect::<BTreeMap<_, _>>();
-    let mut recovery_lib_advance_counts = recovery_tip_advance_counts.clone();
-    let mut last_tip_progress_at = honest_nodes
+    let recovery_lib_advance_counts = recovery_tip_advance_counts.clone();
+    let last_tip_progress_at = honest_nodes
         .iter()
         .map(|name| ((*name).to_owned(), recovery_started_at))
         .collect::<BTreeMap<_, _>>();
-    let mut last_lib_progress_at = last_tip_progress_at.clone();
-    let mut tip_stall_intervals = Vec::new();
-    let mut lib_stall_intervals = Vec::new();
+    let last_lib_progress_at = last_tip_progress_at.clone();
+    let mut node_state = RecoveryNodeState {
+        header_caches,
+        last_verified_libs,
+        last_tips,
+        attack_candidates,
+        initial_tips,
+        recovery_tip_advance_counts,
+        recovery_lib_advance_counts,
+        last_tip_progress_at,
+        last_lib_progress_at,
+        ancestry_gaps,
+        any_unverified_ancestry,
+        ..RecoveryNodeState::default()
+    };
     let mut recovery_alignment_transitions = Vec::new();
     let mut previous_recovery_alignment = None;
-    let mut responsive_failure_observations = Vec::new();
-    let mut stable_since_elapsed_ms = None;
-    let mut stable_completion = None;
+    let mut stability_state = StableFinalityState::default();
     let mut final_alignment = json!({"aligned": false, "reason": "no recovery sample yet"});
+    let mut final_states = Vec::<(String, ConsensusState)>::new();
     while StdInstant::now() < recovery_deadline {
         post_stop_observation.sample(producer_name);
         post_stop_logs_quiet = post_stop_observation.quiet();
-        let observations = observe_recovery_nodes(RecoveryNodeContext {
-            world,
-            honest_nodes: &honest_nodes,
-            attack: attack.as_ref(),
-            header_caches: &mut header_caches,
-            last_verified_libs: &mut last_verified_libs,
-            last_tips: &mut last_tips,
-            attack_candidates: &attack_candidates,
-            initial_tips: &initial_tips,
-            progress_by_node: &mut progress_by_node,
-            recovery_tip_advance_counts: &mut recovery_tip_advance_counts,
-            recovery_lib_advance_counts: &mut recovery_lib_advance_counts,
-            last_tip_progress_at: &mut last_tip_progress_at,
-            last_lib_progress_at: &mut last_lib_progress_at,
-            tip_stall_intervals: &mut tip_stall_intervals,
-            lib_stall_intervals: &mut lib_stall_intervals,
-            tip_transitions: &mut tip_transitions,
-            tip_reorganizations: &mut tip_reorganizations,
-            tip_reorganizations_unverified: &mut tip_reorganizations_unverified,
-            responsive_failure_observations: &mut responsive_failure_observations,
-            continuity_regressions: &mut continuity_regressions,
-            continuity_unverified: &mut continuity_unverified,
-            ancestry_gaps: &mut ancestry_gaps,
-            any_unverified_ancestry: &mut any_unverified_ancestry,
-        })
-        .await;
-        let mut caches_for_pairs = header_caches;
-        let history_checks = check_finalized_history_agreement(
-            world,
-            &observations,
-            &mut caches_for_pairs,
-            boundary_slot,
-        )
-        .await;
-        header_caches = caches_for_pairs;
-        safety_conflict_observed |= history_checks
-            .iter()
-            .any(|check| check["status"].as_str() == Some("conflicting_finalized_histories"));
-        any_unverified_ancestry |= history_checks
-            .iter()
-            .any(|check| check["status"].as_str() == Some("ancestry_unverified"));
+        let observations =
+            observe_recovery_nodes(world, &honest_nodes, attack.as_ref(), &mut node_state).await;
+        let RecoveryNodeState {
+            header_caches,
+            progress_by_node,
+            continuity_regressions,
+            continuity_unverified,
+            any_unverified_ancestry,
+            ..
+        } = &mut node_state;
+        let history_checks =
+            check_finalized_history_agreement(world, &observations, header_caches, boundary_slot)
+                .await;
+        safety.record_pair_reports(&history_checks);
+        *any_unverified_ancestry |= safety.ancestry_unverified;
         finalized_history_checks.push(json!({
             "observed_at_unix_ms": unix_now_ms(),
             "pairs": history_checks,
@@ -3463,7 +3508,7 @@ async fn run_recovery_window(
         final_alignment = align_observations(
             world,
             &observations,
-            &mut header_caches,
+            header_caches,
             &honest_nodes,
             max_tip_height_skew,
         )
@@ -3481,12 +3526,13 @@ async fn run_recovery_window(
             .iter()
             .filter_map(|observation| {
                 Some((
-                    observation.snapshot["node"].as_str()?.to_owned(),
+                    observation.node_name.clone(),
                     observation.consensus.clone()?,
                 ))
             })
             .collect::<Vec<_>>();
         let common_lib = common_finalized_lib(&states, honest_nodes.len());
+        final_states.clone_from(&states);
         let all_responsive = states.len() == honest_nodes.len();
         let all_progressed = honest_nodes
             .iter()
@@ -3495,39 +3541,27 @@ async fn run_recovery_window(
             observation.consensus.is_some()
                 && observation.tip_path_complete
                 && observation.finalized_path_complete
-                && observation
-                    .snapshot
-                    .pointer("/tip_descends_from_lib")
-                    .and_then(Value::as_bool)
-                    == Some(true)
+                && observation.tip_descends_from_lib()
         });
         let continuity_safe = continuity_regressions.is_empty()
             && continuity_unverified.is_empty()
-            && observations.iter().all(|observation| {
-                matches!(
-                    observation.continuity.as_str(),
-                    "verified" | "unchanged" | "baseline"
-                )
-            });
+            && observations
+                .iter()
+                .all(|observation| observation.continuity.is_verified());
         let common_beyond_boundary = common_lib.is_some_and(|(_, slot)| slot > boundary_slot);
-        let stable_predicate = producer_confirmed_stopped
-            && post_stop_logs_quiet
-            && all_responsive
-            && all_progressed
-            && final_alignment["aligned"].as_bool() == Some(true)
-            && common_beyond_boundary
-            && all_ancestry_complete
-            && continuity_safe
-            && !safety_conflict_observed
-            && !any_unverified_ancestry;
         let elapsed_ms = recovery_started.elapsed().as_millis();
-        let (next_stable_since, completion) = update_stable_finality_window(
-            stable_predicate,
-            elapsed_ms,
-            stable_since_elapsed_ms,
-            stability.as_millis(),
-        );
-        stable_since_elapsed_ms = next_stable_since;
+        let stable_predicate = FinalityConditions {
+            producer_ready: producer_confirmed_stopped && post_stop_logs_quiet,
+            all_responsive,
+            all_progressed,
+            aligned: final_alignment["aligned"].as_bool() == Some(true),
+            common_beyond_boundary,
+            ancestry_verified: all_ancestry_complete && !*any_unverified_ancestry,
+            continuity_verified: continuity_safe,
+            no_finalized_conflict: !safety.conflict_observed,
+        }
+        .satisfied(elapsed_ms, timeout.as_millis());
+        let stable = stability_state.observe(stable_predicate, elapsed_ms, stability.as_millis());
         let snapshot = json!({
             "observed_at_unix_ms": unix_now_ms(),
             "elapsed_ms": elapsed_ms,
@@ -3542,8 +3576,7 @@ async fn run_recovery_window(
             "post_stop_logs_quiet": post_stop_logs_quiet,
         });
         snapshots.push(snapshot);
-        if completion.is_some() {
-            stable_completion = completion;
+        if stable {
             break;
         }
         if StdInstant::now() >= recovery_deadline {
@@ -3552,6 +3585,24 @@ async fn run_recovery_window(
         sleep(SAMPLE_INTERVAL).await;
     }
 
+    let RecoveryNodeState {
+        last_tip_progress_at,
+        last_lib_progress_at,
+        mut tip_stall_intervals,
+        mut lib_stall_intervals,
+        tip_transitions,
+        tip_reorganizations,
+        tip_reorganizations_unverified,
+        responsive_failure_observations,
+        continuity_regressions,
+        continuity_unverified,
+        ancestry_gaps,
+        any_unverified_ancestry,
+        progress_by_node,
+        recovery_tip_advance_counts,
+        recovery_lib_advance_counts,
+        ..
+    } = node_state;
     let PostStopLogObservation {
         setup_error: stopped_log_tail_setup_error,
         read_error: post_stop_log_read_error,
@@ -3585,30 +3636,7 @@ async fn run_recovery_window(
             }
         }
     }
-    let stable_completion_verified = stable_completion.is_some();
-    let final_states = snapshots.last().map_or_else(Vec::new, |snapshot| {
-        snapshot["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|node| node["responsive"].as_bool() == Some(true))
-            .filter_map(|node| {
-                Some((
-                    node["node"].as_str()?.to_owned(),
-                    ConsensusState {
-                        tip_id: parse_header_id(node["tip_id"].as_str()?).ok()?,
-                        tip_id_text: node["tip_id"].as_str()?.to_owned(),
-                        tip_height: node["tip_height"].as_u64()?,
-                        tip_slot: node["tip_slot"].as_u64()?,
-                        lib_id: parse_header_id(node["lib_id"].as_str()?).ok()?,
-                        lib_id_text: node["lib_id"].as_str()?.to_owned(),
-                        lib_slot: node["lib_slot"].as_u64()?,
-                        tip_descends_from_lib: node["tip_descends_from_lib"].as_bool(),
-                    },
-                ))
-            })
-            .collect::<Vec<_>>()
-    });
+    let stable_completion_verified = stability_state.completion.is_some();
     let final_common = common_finalized_lib(&final_states, honest_nodes.len());
     let final_common_beyond_boundary = final_common.is_some_and(|(_, slot)| slot > boundary_slot);
     let exposure_verified = exposure_is_verified(&active, attack_enabled, attack.is_some());
@@ -3678,7 +3706,7 @@ async fn run_recovery_window(
         && stable_completion_verified
         && continuity_verified
         && ancestry_verified
-        && !safety_conflict_observed;
+        && !safety.conflict_observed;
     let mut failure_classifications = Vec::new();
     if attack_enabled && !exposure_verified {
         failure_classifications.push("insufficient_exposure");
@@ -3713,7 +3741,7 @@ async fn run_recovery_window(
     if !stable_completion_verified {
         failure_classifications.push("stable_common_finality_not_verified_before_timeout");
     }
-    if safety_conflict_observed {
+    if safety.conflict_observed {
         failure_classifications.push("conflicting_finalized_histories");
     }
     if !continuity_verified {
@@ -3776,7 +3804,7 @@ async fn run_recovery_window(
             "last_attacked_slot": last_attacked_slot,
             "earliest_common_lib_beyond_boundary": first_common_beyond(&snapshots, boundary_slot, &honest_nodes),
             "stable_completion_verified": stable_completion_verified,
-            "stable_completion": stable_completion.map(|completion| json!({
+            "stable_completion": stability_state.completion.map(|completion| json!({
                 "started_elapsed_ms": completion.started_elapsed_ms,
                 "completed_elapsed_ms": completion.completed_elapsed_ms,
                 "started_at_unix_ms": recovery_started_at.saturating_add(u64::try_from(completion.started_elapsed_ms).unwrap_or(u64::MAX)),
@@ -3807,7 +3835,7 @@ async fn run_recovery_window(
         },
         "snapshots": snapshots,
         "finalized_history_checks": finalized_history_checks,
-        "safety_conflict_observed": safety_conflict_observed,
+        "safety_conflict_observed": safety.conflict_observed,
         "lib_continuity_verified": continuity_verified,
         "lib_continuity_regressions": continuity_regressions,
         "lib_continuity_unverified_observations": continuity_unverified,
@@ -3817,7 +3845,7 @@ async fn run_recovery_window(
         "tip_reorganizations": tip_reorganizations,
         "tip_reorganizations_unverified": tip_reorganizations_unverified,
         "tip_reorganization_observation_is_lower_bound": true,
-        "finalized_history_conflict_is_sticky": safety_conflict_observed,
+        "finalized_history_conflict_is_sticky": safety.conflict_observed,
         "final_producer_equivocation_opportunities": final_producer_opportunities,
         "incomplete_producer_opportunity_ids": incomplete_producer_opportunity_ids,
         "final_complete_producer_opportunity_count": final_complete_opportunities.len(),
@@ -4065,6 +4093,22 @@ fn first_common_beyond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposure_requires_all_three_independently_verified_counts() {
+        let criteria = ExposureCriteria {
+            min_opportunities: 6,
+            min_nonempty: 3,
+            min_delivered: 2,
+            cooldown_blocks: 10,
+            min_duration: Duration::from_secs(300),
+            timeout: Duration::from_mins(30),
+        };
+        assert!(exposure_requirements_met(6, 3, 2, criteria));
+        assert!(!exposure_requirements_met(5, 3, 2, criteria));
+        assert!(!exposure_requirements_met(6, 2, 2, criteria));
+        assert!(!exposure_requirements_met(6, 3, 1, criteria));
+    }
 
     #[test]
     fn empty_active_log_tracker_does_not_invent_opportunities() {

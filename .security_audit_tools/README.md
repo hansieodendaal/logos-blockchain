@@ -68,6 +68,12 @@ only retrieved bodies and is null when none are available. The
 `accepted_bodies_all_match_ordinary` field is also null when no accepted body
 was retrieved. `observation_completed_unix_ms` records when the qualifying
 producer opportunity was selected, before any receiver wait or producer stop.
+Selection failures distinguish no observed producer leadership,
+leadership without a qualifying submitted-transaction body, incomplete
+opportunity evidence, and workload preparation or submission failures.
+Timeouts during preparation or submission are unverified because their
+effects may be incomplete. Failure evidence can include producer log lines
+with their source paths and offsets.
 
 ### Analyze logs
 

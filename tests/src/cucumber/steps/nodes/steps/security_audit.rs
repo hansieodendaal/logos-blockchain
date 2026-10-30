@@ -263,6 +263,121 @@ struct NonemptySelection {
     selected_at: Instant,
 }
 
+/// Scheduling another transaction and observing leadership have separate
+/// bounds: running out of transactions must not end the observation window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonemptyWorkloadAction {
+    SubmitNext,
+    Observe,
+    Finished,
+}
+
+#[derive(Default)]
+struct NonemptyOpportunityState {
+    logs: Vec<ObservedLogLine>,
+    examined_ids: BTreeSet<String>,
+    incomplete_body_ids: BTreeSet<String>,
+    skipped: Vec<Value>,
+    last_body_error: Option<String>,
+}
+
+impl NonemptyOpportunityState {
+    async fn select(
+        &mut self,
+        world: &CucumberWorld,
+        producer: &str,
+        configured_siblings: usize,
+        submitted_hashes: &BTreeSet<String>,
+    ) -> Result<Option<(ProducerOpportunity, ApiBlock)>, AuditFailure> {
+        let node = world.nodes_info.get(producer).ok_or_else(|| AuditFailure {
+            message: format!("{producer} was not started"),
+            details: json!({}),
+        })?;
+        for opportunity in find_producer_opportunities(&self.logs) {
+            if parse_usize(&opportunity.ordinary, "configured_siblings")
+                != Some(configured_siblings)
+            {
+                return Err(AuditFailure {
+                    message: "producer opportunity contradicts declared sibling configuration"
+                        .to_owned(),
+                    details: json!({"ordinary_submission": opportunity.ordinary}),
+                });
+            }
+            let Some(ordinary_id) = opportunity.ordinary.get("ordinary_block_id").cloned() else {
+                continue;
+            };
+            if self.examined_ids.contains(&ordinary_id) {
+                continue;
+            }
+            let header_id = match parse_header_id(&ordinary_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    self.incomplete_body_ids.insert(ordinary_id.clone());
+                    self.skipped.push(json!({"ordinary_block_id": ordinary_id, "reason": "invalid_ordinary_block_id", "detail": error}));
+                    self.examined_ids.insert(ordinary_id);
+                    continue;
+                }
+            };
+            self.incomplete_body_ids.insert(ordinary_id.clone());
+            let block = match node.client.block(&header_id).await {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    self.incomplete_body_ids.insert(ordinary_id);
+                    continue;
+                }
+                Err(error) => {
+                    self.incomplete_body_ids.insert(ordinary_id);
+                    self.last_body_error = Some(error.to_string());
+                    continue;
+                }
+            };
+            self.incomplete_body_ids.remove(&ordinary_id);
+            let body = summarize_api_block(&block);
+            self.examined_ids.insert(ordinary_id.clone());
+            if body.block_id != ordinary_id
+                || Some(&body.parent_block_id) != opportunity.ordinary.get("parent_block_id")
+                || Some(&body.slot.to_string()) != opportunity.ordinary.get("slot")
+            {
+                return Err(AuditFailure {
+                    message: format!(
+                        "{producer} block API identity disagrees with the ordinary submission event"
+                    ),
+                    details: json!({"ordinary_submission": opportunity.ordinary, "ordinary_block_api": body}),
+                });
+            }
+            if has_nonempty_submitted_body(&body.transaction_hashes, submitted_hashes) {
+                return Ok(Some((opportunity, block)));
+            }
+            self.skipped.push(json!({
+                "ordinary_block_id": body.block_id, "parent_block_id": body.parent_block_id,
+                "slot": body.slot, "transaction_count": body.transaction_hashes.len(),
+                "transaction_hashes": body.transaction_hashes, "body_root": body.body_root,
+                "reason": if body.transaction_hashes.is_empty() { "empty_ordinary_body" } else { "no_submitted_transaction_in_ordinary_body" },
+            }));
+        }
+        Ok(None)
+    }
+}
+
+fn nonempty_workload_action(
+    now: Instant,
+    deadline: Instant,
+    pending_deadline: Option<Instant>,
+    pending_disappeared: bool,
+    submitted: usize,
+    budget: usize,
+) -> NonemptyWorkloadAction {
+    if now >= deadline {
+        NonemptyWorkloadAction::Finished
+    } else if submitted < budget
+        && (pending_deadline.is_none_or(|end| now >= end) || pending_disappeared)
+    {
+        NonemptyWorkloadAction::SubmitNext
+    } else {
+        NonemptyWorkloadAction::Observe
+    }
+}
+
 #[derive(Clone)]
 struct ObservedLogLine {
     text: String,
@@ -373,13 +488,40 @@ struct StableFinalityCompletion {
 mod sustained;
 
 struct FinalityNodeObservation {
+    node_name: String,
+    observed_at_unix_ms: u64,
     snapshot: Value,
     consensus: Option<ConsensusState>,
     tip_path_complete: bool,
     finalized_path_complete: bool,
     attack_branch: AttackBranch,
     finalized_attack_branch: AttackBranch,
-    continuity: String,
+    continuity: LibContinuity,
+}
+
+impl FinalityNodeObservation {
+    fn tip_descends_from_lib(&self) -> bool {
+        self.consensus
+            .as_ref()
+            .is_some_and(|state| state.tip_descends_from_lib == Some(true))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LibContinuity {
+    Verified,
+    Unchanged,
+    Baseline,
+    RegressionOrUnrelated,
+    Unverified,
+    MissingPreviousLibBaseline,
+}
+
+impl LibContinuity {
+    const fn is_verified(self) -> bool {
+        matches!(self, Self::Verified | Self::Unchanged | Self::Baseline)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1529,6 +1671,8 @@ async fn observe_finality_node(
         Ok(consensus) => consensus,
         Err(error) => {
             return FinalityNodeObservation {
+                node_name: node_name.to_owned(),
+                observed_at_unix_ms,
                 snapshot: json!({
                     "node": node_name,
                     "observed_at_unix_ms": observed_at_unix_ms,
@@ -1541,7 +1685,7 @@ async fn observe_finality_node(
                 finalized_path_complete: false,
                 attack_branch: AttackBranch::Unverified,
                 finalized_attack_branch: AttackBranch::Unverified,
-                continuity: "unverified".to_owned(),
+                continuity: LibContinuity::Unverified,
             };
         }
     };
@@ -1566,17 +1710,17 @@ async fn observe_finality_node(
     );
     let (continuity, continuity_path) = if let Some((previous_id, previous_slot)) = previous_lib {
         if previous_id == lib_id {
-            ("verified", None)
+            (LibContinuity::Verified, None)
         } else {
             let path = walk_to_target(client, lib_id, previous_id, previous_slot, cache).await;
             match ancestry_presence(&path, previous_id) {
-                Some(true) => ("verified", Some(path)),
-                Some(false) => ("regression_or_unrelated", Some(path)),
-                None => ("unverified", Some(path)),
+                Some(true) => (LibContinuity::Verified, Some(path)),
+                Some(false) => (LibContinuity::RegressionOrUnrelated, Some(path)),
+                None => (LibContinuity::Unverified, Some(path)),
             }
         }
     } else {
-        ("missing_previous_lib_baseline", None)
+        (LibContinuity::MissingPreviousLibBaseline, None)
     };
     let state = ConsensusState {
         tip_id,
@@ -1609,13 +1753,15 @@ async fn observe_finality_node(
         "header_lookup_failures": header_cache_failures_json(cache),
     });
     FinalityNodeObservation {
+        node_name: node_name.to_owned(),
+        observed_at_unix_ms,
         snapshot,
         consensus: Some(state),
         tip_path_complete: tip_path.complete_below_slot,
         finalized_path_complete: finalized_path.complete_below_slot,
         attack_branch,
         finalized_attack_branch,
-        continuity: continuity.to_owned(),
+        continuity,
     }
 }
 
@@ -1712,6 +1858,68 @@ fn classify_tip_transition(
     }
 }
 
+/// One sampled finality verdict. Collection and ancestry lookups happen before
+/// this evaluator; absent or unverified evidence must be supplied as false.
+#[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Each independent observation is required for the finality verdict"
+)]
+struct FinalityConditions {
+    producer_ready: bool,
+    all_responsive: bool,
+    all_progressed: bool,
+    aligned: bool,
+    common_beyond_boundary: bool,
+    ancestry_verified: bool,
+    continuity_verified: bool,
+    no_finalized_conflict: bool,
+}
+
+impl FinalityConditions {
+    const fn satisfied(self, elapsed_ms: u128, timeout_ms: u128) -> bool {
+        self.producer_ready
+            && self.all_responsive
+            && self.all_progressed
+            && self.aligned
+            && self.common_beyond_boundary
+            && self.ancestry_verified
+            && self.continuity_verified
+            && self.no_finalized_conflict
+            && elapsed_ms <= timeout_ms
+    }
+}
+
+/// Accumulates safety evidence; later agreement cannot erase an earlier
+/// conflict or an incomplete ancestry lookup.
+#[derive(Default, Debug)]
+struct FinalizedSafety {
+    conflict_observed: bool,
+    ancestry_unverified: bool,
+}
+
+impl FinalizedSafety {
+    const fn record_relation(&mut self, relation: FinalizedHistoryRelation) {
+        match relation {
+            FinalizedHistoryRelation::Conflicting => self.conflict_observed = true,
+            FinalizedHistoryRelation::Unverified => self.ancestry_unverified = true,
+            FinalizedHistoryRelation::Shared | FinalizedHistoryRelation::Ancestral => {}
+        }
+    }
+
+    fn record_pair_reports(&mut self, reports: &[Value]) {
+        for report in reports {
+            let relation = match report["status"].as_str() {
+                Some("shared_finalized_history") => FinalizedHistoryRelation::Shared,
+                Some("ancestral_finalized_histories") => FinalizedHistoryRelation::Ancestral,
+                Some("conflicting_finalized_histories") => FinalizedHistoryRelation::Conflicting,
+                _ => FinalizedHistoryRelation::Unverified,
+            };
+            self.record_relation(relation);
+        }
+    }
+}
+
 fn update_stable_finality_window(
     conditions_hold: bool,
     elapsed_ms: u128,
@@ -1728,6 +1936,31 @@ fn update_stable_finality_window(
             completed_elapsed_ms: elapsed_ms,
         });
     (Some(started_elapsed_ms), completion)
+}
+
+#[derive(Default)]
+struct StableFinalityState {
+    started_elapsed_ms: Option<u128>,
+    completion: Option<StableFinalityCompletion>,
+}
+
+impl StableFinalityState {
+    fn observe(
+        &mut self,
+        conditions_hold: bool,
+        elapsed_ms: u128,
+        required_window_ms: u128,
+    ) -> bool {
+        let (started, completion) = update_stable_finality_window(
+            conditions_hold,
+            elapsed_ms,
+            self.started_elapsed_ms,
+            required_window_ms,
+        );
+        self.started_elapsed_ms = started;
+        self.completion = completion;
+        self.completion.is_some()
+    }
 }
 
 fn unix_timestamp_at_elapsed(start_unix_ms: u64, elapsed_ms: u128) -> u64 {
@@ -1928,21 +2161,19 @@ fn finality_producer_evidence<'a>(
     })
 }
 
-struct BriefFinalityNodeContext<'a> {
-    world: &'a CucumberWorld,
-    honest_nodes: &'a [&'a str],
-    attack: &'a AttackEvidence,
-    header_caches: &'a mut BTreeMap<String, HeaderCache>,
-    last_verified_libs: &'a mut BTreeMap<String, (HeaderId, u64)>,
-    previous_tips: &'a mut BTreeMap<String, CanonicalTipState>,
-    previous_branches: &'a mut BTreeMap<String, AttackBranch>,
-    attack_branch_changes: &'a mut Vec<Value>,
-    tip_transition_observations: &'a mut Vec<Value>,
-    tip_level_reorganizations: &'a mut Vec<Value>,
-    tip_reorganizations_unverified: &'a mut Vec<Value>,
-    continuity_regressions: &'a mut Vec<Value>,
-    continuity_unverified: &'a mut Vec<Value>,
-    ancestry_gaps: &'a mut Vec<Value>,
+#[derive(Default)]
+struct BriefFinalityNodeState {
+    header_caches: BTreeMap<String, HeaderCache>,
+    last_verified_libs: BTreeMap<String, (HeaderId, u64)>,
+    previous_tips: BTreeMap<String, CanonicalTipState>,
+    previous_branches: BTreeMap<String, AttackBranch>,
+    attack_branch_changes: Vec<Value>,
+    tip_transition_observations: Vec<Value>,
+    tip_level_reorganizations: Vec<Value>,
+    tip_reorganizations_unverified: Vec<Value>,
+    continuity_regressions: Vec<Value>,
+    continuity_unverified: Vec<Value>,
+    ancestry_gaps: Vec<Value>,
 }
 
 #[expect(
@@ -1950,12 +2181,12 @@ struct BriefFinalityNodeContext<'a> {
     reason = "Records each node's finality and canonical tip evidence together"
 )]
 async fn observe_brief_finality_nodes(
-    context: BriefFinalityNodeContext<'_>,
+    world: &CucumberWorld,
+    honest_nodes: &[&str],
+    attack: &AttackEvidence,
+    state: &mut BriefFinalityNodeState,
 ) -> Result<Vec<FinalityNodeObservation>, String> {
-    let BriefFinalityNodeContext {
-        world,
-        honest_nodes,
-        attack,
+    let BriefFinalityNodeState {
         header_caches,
         last_verified_libs,
         previous_tips,
@@ -1967,7 +2198,7 @@ async fn observe_brief_finality_nodes(
         continuity_regressions,
         continuity_unverified,
         ancestry_gaps,
-    } = context;
+    } = state;
     let mut observations = Vec::with_capacity(honest_nodes.len());
     for &node_name in honest_nodes {
         let node = world
@@ -1981,14 +2212,14 @@ async fn observe_brief_finality_nodes(
         let observation =
             observe_finality_node(node_name, &node.client, attack, cache, previous_lib).await;
         if let Some(consensus) = &observation.consensus {
-            match observation.continuity.as_str() {
-                "verified" => {
+            match observation.continuity {
+                LibContinuity::Verified => {
                     last_verified_libs.insert(
                         node_name.to_owned(),
                         (consensus.lib_id, consensus.lib_slot),
                     );
                 }
-                "regression_or_unrelated" => continuity_regressions.push(json!({
+                LibContinuity::RegressionOrUnrelated => continuity_regressions.push(json!({
                     "node": node_name,
                     "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
                     "current_lib_id": consensus.lib_id_text,
@@ -1996,7 +2227,7 @@ async fn observe_brief_finality_nodes(
                     "previous_verified_lib_id": previous_lib.map(|(id, _)| id.encode_hex::<String>()),
                     "ancestry": observation.snapshot["lib_continuity_ancestry"],
                 })),
-                "unverified" | "missing_previous_lib_baseline" => {
+                LibContinuity::Unverified | LibContinuity::MissingPreviousLibBaseline => {
                     continuity_unverified.push(json!({
                         "node": node_name,
                         "observed_at_unix_ms": observation.snapshot["observed_at_unix_ms"],
@@ -2010,11 +2241,7 @@ async fn observe_brief_finality_nodes(
                 _ => {}
             }
             if !observation.tip_path_complete
-                || observation
-                    .snapshot
-                    .pointer("/tip_descends_from_lib")
-                    .and_then(Value::as_bool)
-                    != Some(true)
+                || !observation.tip_descends_from_lib()
                 || !observation.finalized_path_complete
             {
                 ancestry_gaps.push(json!({
@@ -2047,9 +2274,7 @@ async fn observe_brief_finality_nodes(
                 id_text: consensus.tip_id_text.clone(),
                 height: consensus.tip_height,
                 slot: consensus.tip_slot,
-                observed_at_unix_ms: observation.snapshot["observed_at_unix_ms"]
-                    .as_u64()
-                    .unwrap_or_default(),
+                observed_at_unix_ms: observation.observed_at_unix_ms,
             };
             let previous_tip = previous_tips.get(node_name).cloned();
             let (transition, ancestry, unverified_reason) =
@@ -2187,7 +2412,7 @@ async fn observe_finality_after_equivocation(
         .contains_key(&participants.producer)
         && producer_stop_confirmation["responsive_after_stop_step"].as_bool() == Some(false);
     let baselines = parse_initial_lib_baselines(opportunity_report);
-    let mut previous_tips = parse_initial_tip_baselines(opportunity_report);
+    let previous_tips = parse_initial_tip_baselines(opportunity_report);
     let initial_tips = opportunity_report["pre_attack_consensus_snapshots"]
         .as_array()
         .into_iter()
@@ -2209,44 +2434,23 @@ async fn observe_finality_after_equivocation(
         .copied()
         .unwrap_or_else(Instant::now);
     let deadline = start + timeout;
-    let mut header_caches = honest_nodes
-        .iter()
-        .map(|node| ((*node).to_owned(), HeaderCache::default()))
-        .collect::<BTreeMap<_, _>>();
-    let mut last_verified_libs = baselines.clone();
+    let mut node_state = BriefFinalityNodeState {
+        header_caches: honest_nodes
+            .iter()
+            .map(|node| ((*node).to_owned(), HeaderCache::default()))
+            .collect(),
+        last_verified_libs: baselines.clone(),
+        previous_tips,
+        ..BriefFinalityNodeState::default()
+    };
     let mut snapshots = Vec::new();
-    let mut attack_branch_changes = Vec::new();
-    let mut previous_branches = BTreeMap::<String, AttackBranch>::new();
-    let mut tip_transition_observations = Vec::new();
-    let mut tip_level_reorganizations = Vec::new();
-    let mut tip_reorganizations_unverified = Vec::new();
-    let mut continuity_regressions = Vec::new();
-    let mut continuity_unverified = Vec::new();
-    let mut ancestry_gaps = Vec::new();
     let mut finalized_history_checks = Vec::new();
-    let mut safety_conflict_observed = false;
-    let mut missing_finalized_ancestry = false;
+    let mut safety = FinalizedSafety::default();
     let mut earliest_common_finalized_history: Option<(u64, HeaderId, u64)> = None;
-    let mut stable_since_elapsed_ms = None;
-    let mut stable_completion = None;
+    let mut stability_state = StableFinalityState::default();
     let (final_nodes, final_alignment, final_progress) = loop {
-        let observations = observe_brief_finality_nodes(BriefFinalityNodeContext {
-            world,
-            honest_nodes: &honest_nodes,
-            attack,
-            header_caches: &mut header_caches,
-            last_verified_libs: &mut last_verified_libs,
-            previous_tips: &mut previous_tips,
-            previous_branches: &mut previous_branches,
-            attack_branch_changes: &mut attack_branch_changes,
-            tip_transition_observations: &mut tip_transition_observations,
-            tip_level_reorganizations: &mut tip_level_reorganizations,
-            tip_reorganizations_unverified: &mut tip_reorganizations_unverified,
-            continuity_regressions: &mut continuity_regressions,
-            continuity_unverified: &mut continuity_unverified,
-            ancestry_gaps: &mut ancestry_gaps,
-        })
-        .await?;
+        let observations =
+            observe_brief_finality_nodes(world, &honest_nodes, attack, &mut node_state).await?;
 
         let live_states = honest_nodes
             .iter()
@@ -2283,7 +2487,8 @@ async fn observe_finality_after_equivocation(
                 let mut errors = Vec::new();
                 for (node_name, state) in &live_states {
                     let node = &world.nodes_info[node_name];
-                    let cache = header_caches
+                    let cache = node_state
+                        .header_caches
                         .get_mut(node_name)
                         .expect("each honest node has a header cache");
                     match block_id_at_height(
@@ -2349,28 +2554,23 @@ async fn observe_finality_after_equivocation(
         let pair_checks = check_finalized_history_agreement(
             world,
             &observations,
-            &mut header_caches,
+            &mut node_state.header_caches,
             finality_boundary_slot,
         )
         .await;
-        for check in &pair_checks {
-            match check["status"].as_str() {
-                Some("conflicting_finalized_histories") => safety_conflict_observed = true,
-                Some("ancestry_unverified") => missing_finalized_ancestry = true,
-                _ => {}
-            }
-        }
+        safety.record_pair_reports(&pair_checks);
         finalized_history_checks.push(json!({
             "observed_at_unix_ms": unix_timestamp_ms(),
             "pairs": pair_checks.clone(),
         }));
 
-        let continuity_ok = continuity_regressions.is_empty() && continuity_unverified.is_empty();
+        let continuity_ok = node_state.continuity_regressions.is_empty()
+            && node_state.continuity_unverified.is_empty();
         let ancestry_ok = observations.len() == honest_nodes.len()
             && observations.iter().all(|observation| {
                 observation.tip_path_complete
                     && observation.finalized_path_complete
-                    && observation.snapshot["tip_descends_from_lib"].as_bool() == Some(true)
+                    && observation.tip_descends_from_lib()
             });
         let snapshot = json!({
             "elapsed_ms": start.elapsed().as_millis(),
@@ -2395,27 +2595,22 @@ async fn observe_finality_after_equivocation(
         snapshots.push(snapshot);
 
         let elapsed_ms = start.elapsed().as_millis();
-        let stable_predicate = producer_stop_is_prompt(
-            producer_stopped,
-            stop_upper_bound_delay_ms,
-            prompt_stop_limit,
-        ) && progress
-            && aligned
-            && common_lib_beyond_attack
-            && ancestry_ok
-            && continuity_ok
-            && !safety_conflict_observed
-            && !missing_finalized_ancestry
-            && elapsed_ms <= timeout.as_millis();
-        let (next_stable_since, completion) = update_stable_finality_window(
-            stable_predicate,
-            elapsed_ms,
-            stable_since_elapsed_ms,
-            stability.as_millis(),
-        );
-        stable_since_elapsed_ms = next_stable_since;
-        if completion.is_some() {
-            stable_completion = completion;
+        let stable_predicate = FinalityConditions {
+            producer_ready: producer_stop_is_prompt(
+                producer_stopped,
+                stop_upper_bound_delay_ms,
+                prompt_stop_limit,
+            ),
+            all_responsive: live_states.len() == honest_nodes.len(),
+            all_progressed: progress,
+            aligned,
+            common_beyond_boundary: common_lib_beyond_attack,
+            ancestry_verified: ancestry_ok && !safety.ancestry_unverified,
+            continuity_verified: continuity_ok,
+            no_finalized_conflict: !safety.conflict_observed,
+        }
+        .satisfied(elapsed_ms, timeout.as_millis());
+        if stability_state.observe(stable_predicate, elapsed_ms, stability.as_millis()) {
             break (observations, alignment, progress);
         }
         if Instant::now() >= deadline {
@@ -2424,6 +2619,17 @@ async fn observe_finality_after_equivocation(
         sleep(FINALITY_OBSERVATION_INTERVAL).await;
     };
 
+    let BriefFinalityNodeState {
+        header_caches,
+        attack_branch_changes,
+        tip_transition_observations,
+        tip_level_reorganizations,
+        tip_reorganizations_unverified,
+        continuity_regressions,
+        continuity_unverified,
+        ancestry_gaps,
+        ..
+    } = node_state;
     let duration_ms = start.elapsed().as_millis();
     let attack_record_count = producer_opportunities.len();
     let acceptance_path = opportunity_report["nonempty_honest_peer_validation"].as_bool()
@@ -2434,7 +2640,7 @@ async fn observe_finality_after_equivocation(
         .iter()
         .filter_map(|observation| {
             Some((
-                observation.snapshot["node"].as_str()?.to_owned(),
+                observation.node_name.clone(),
                 observation.consensus.clone()?,
             ))
         })
@@ -2456,8 +2662,8 @@ async fn observe_finality_after_equivocation(
             "lib_slot": observation.snapshot["lib_slot"],
         })).collect::<Vec<_>>(),
     });
-    let stable_completion_verified = stable_completion.is_some();
-    let stable_completion_evidence = stable_completion.map(|completion| {
+    let stable_completion_verified = stability_state.completion.is_some();
+    let stable_completion_evidence = stability_state.completion.map(|completion| {
         json!({
             "started_at_unix_ms": unix_timestamp_at_elapsed(
                 start_unix_ms,
@@ -2488,7 +2694,7 @@ async fn observe_finality_after_equivocation(
         gap["tip_path_complete_below_attack"].as_bool() != Some(true)
             || gap["tip_descends_from_reported_lib"].as_bool() != Some(true)
             || gap["finalized_path_complete_below_attack"].as_bool() != Some(true)
-    }) && !missing_finalized_ancestry;
+    }) && !safety.ancestry_unverified;
     let continuity_verified = continuity_regressions.is_empty() && continuity_unverified.is_empty();
     let status = if acceptance_path
         && selected_is_logged
@@ -2500,7 +2706,7 @@ async fn observe_finality_after_equivocation(
         && stable_completion_verified
         && ancestry_verified
         && continuity_verified
-        && !safety_conflict_observed
+        && !safety.conflict_observed
         && !snapshots.is_empty()
     {
         "passed"
@@ -2537,7 +2743,7 @@ async fn observe_finality_after_equivocation(
     if !stable_completion_verified {
         failure_classifications.push("stable_finality_completion_not_verified_before_timeout");
     }
-    if safety_conflict_observed {
+    if safety.conflict_observed {
         failure_classifications.push("conflicting_finalized_histories");
     }
     if !continuity_verified {
@@ -2707,16 +2913,8 @@ async fn check_finalized_history_agreement(
             ) else {
                 continue;
             };
-            let (Some(first_name), Some(second_name)) = (
-                observations[first_index].snapshot["node"].as_str(),
-                observations[second_index].snapshot["node"].as_str(),
-            ) else {
-                checks.push(json!({
-                    "status": "ancestry_unverified",
-                    "error": "node identity was missing from a finalized-history observation",
-                }));
-                continue;
-            };
+            let first_name = observations[first_index].node_name.as_str();
+            let second_name = observations[second_index].node_name.as_str();
             let (first_to_second, second_to_first) = if first.lib_id == second.lib_id {
                 (None, None)
             } else {
@@ -3072,51 +3270,50 @@ async fn select_nonempty_sibling_opportunity(
 
     // `wait_for_blend_readiness` snapshots all current log offsets before this
     // function prepares or submits any workload transactions.
-    let mut producer_logs = Vec::new();
+    let mut opportunity_state = NonemptyOpportunityState::default();
     let mut submitted_hashes = BTreeSet::new();
     let mut submitted_transactions = Vec::new();
     let mut transaction_observations = Vec::new();
-    let mut skipped_opportunities = Vec::new();
-    let mut seen_ordinary_ids = BTreeSet::new();
     let global_deadline = Instant::now() + Duration::from_secs(workload.window_seconds);
     let mut selected: Option<(ProducerOpportunity, ApiBlock)> = None;
     let mut last_mempool_status = "not_observed".to_owned();
+    let mut mempool_observation_timed_out = false;
 
     'transactions: for transaction_index in 1..=workload.budget {
         if Instant::now() >= global_deadline {
             break;
         }
         let alias = format!("SECURITY_AUDIT_NONEMPTY_{transaction_index}");
-        prepare_transfer_transaction(
+        tokio::time::timeout_at(tokio::time::Instant::from_std(global_deadline), prepare_transfer_transaction(
             world,
             "security audit nonempty sibling workload",
             alias.clone(),
             transfer.amount,
             transfer.sender.clone(),
             transfer.receiver.clone(),
-        )
+        ))
         .await
+        .map_err(|_| AuditFailure {
+            message: format!("workload transaction preparation exceeded the observation deadline: {alias}"),
+            details: json!({"provenance": provenance, "blend_readiness": readiness, "submitted_transactions": submitted_transactions, "failure_classification": "workload_preparation_timeout_unverified"}),
+        })?
         .map_err(|error| AuditFailure {
             message: format!("could not prepare independent workload transaction {alias}: {error}"),
             details: json!({
                 "provenance": provenance,
                 "blend_readiness": readiness,
                 "transactions_prepared": submitted_transactions,
+                "failure_classification": "workload_preparation_failed",
             }),
         })?;
         let signed = world
             .resolve_prepared_transaction(&alias)
             .map_err(|error| AuditFailure {
                 message: format!("prepared workload transaction {alias} disappeared: {error}"),
-                details: json!({ "provenance": provenance }),
+                details: json!({ "provenance": provenance, "failure_classification": "workload_preparation_failed" }),
             })?;
         let transaction_hash = tx_hash_to_hex(&signed.hash());
-        submitted_hashes.insert(transaction_hash.clone());
-        submitted_transactions.push(json!({
-            "alias": alias,
-            "transaction_hash": transaction_hash,
-        }));
-        submit_prepared_transaction_to_nodes(
+        tokio::time::timeout_at(tokio::time::Instant::from_std(global_deadline), submit_prepared_transaction_to_nodes(
             world,
             "security audit nonempty sibling workload",
             alias.clone(),
@@ -3124,8 +3321,12 @@ async fn select_nonempty_sibling_opportunity(
                 .chain(&participants.honest_nodes)
                 .cloned()
                 .collect(),
-        )
+        ))
         .await
+        .map_err(|_| AuditFailure {
+            message: format!("workload transaction submission exceeded the observation deadline: {alias}"),
+            details: json!({"provenance": provenance, "blend_readiness": readiness, "submitted_transactions": submitted_transactions, "in_flight_transaction_hash": transaction_hash, "failure_classification": "workload_submission_timeout_unverified"}),
+        })?
         .map_err(|error| AuditFailure {
             message: format!(
                 "could not submit workload transaction {alias} to the declared nodes: {error}"
@@ -3135,8 +3336,14 @@ async fn select_nonempty_sibling_opportunity(
                 "blend_readiness": readiness,
                 "pre_attack_consensus_snapshots": pre_attack_consensus,
                 "submitted_transactions": submitted_transactions,
+                "failure_classification": "workload_submission_failed",
             }),
         })?;
+        submitted_hashes.insert(transaction_hash.clone());
+        submitted_transactions.push(json!({
+            "alias": alias,
+            "transaction_hash": transaction_hash,
+        }));
 
         let submitted_hash = signed.hash();
         let transaction_deadline =
@@ -3145,121 +3352,100 @@ async fn select_nonempty_sibling_opportunity(
         let mut mempool_samples = Vec::new();
 
         loop {
-            producer_logs.extend(tails.read_new_lines(&participants.producer).map_err(
-                |message| AuditFailure {
-                    message,
-                    details: json!({
-                        "provenance": provenance,
-                        "blend_readiness": readiness,
-                        "submitted_transactions": submitted_transactions,
-                        "skipped_opportunities": skipped_opportunities,
-                    }),
-                },
-            )?);
+            opportunity_state
+                .logs
+                .extend(
+                    tails
+                        .read_new_lines(&participants.producer)
+                        .map_err(|message| AuditFailure {
+                            message,
+                            details: json!({
+                                "provenance": provenance,
+                                "blend_readiness": readiness,
+                                "submitted_transactions": submitted_transactions,
+                                "skipped_opportunities": opportunity_state.skipped,
+                            }),
+                        })?,
+                );
 
-            for opportunity in find_producer_opportunities(&producer_logs) {
-                if parse_usize(&opportunity.ordinary, "configured_siblings")
-                    != Some(configured_siblings)
-                {
-                    return Err(AuditFailure {
-                        message: "producer opportunity contradicts declared sibling configuration"
-                            .to_owned(),
-                        details: json!({ "ordinary_submission": opportunity.ordinary }),
-                    });
+            let selection = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(global_deadline),
+                opportunity_state.select(
+                    world,
+                    &participants.producer,
+                    configured_siblings,
+                    &submitted_hashes,
+                ),
+            )
+            .await;
+            let selection = match selection {
+                Ok(Ok(selection)) => selection,
+                Ok(Err(mut error)) => {
+                    error.details["provenance"] = provenance.clone();
+                    error.details["blend_readiness"] = readiness.clone();
+                    error.details["submitted_transactions"] = json!(submitted_transactions);
+                    return Err(error);
                 }
-                let Some(ordinary_id) = opportunity.ordinary.get("ordinary_block_id").cloned()
-                else {
-                    continue;
-                };
-                if seen_ordinary_ids.contains(&ordinary_id) {
-                    continue;
-                }
-                let Some(node) = world.nodes_info.get(&participants.producer) else {
-                    return Err(AuditFailure {
-                        message: format!("{} was not started", participants.producer),
-                        details: json!({ "provenance": provenance }),
-                    });
-                };
-                let header_id = match parse_header_id(&ordinary_id) {
-                    Ok(id) => id,
-                    Err(error) => {
-                        skipped_opportunities.push(json!({
-                            "ordinary_block_id": ordinary_id,
-                            "reason": "invalid_ordinary_block_id",
-                            "detail": error,
-                        }));
-                        seen_ordinary_ids.insert(ordinary_id);
-                        continue;
-                    }
-                };
-                let block = match node.client.block(&header_id).await {
-                    Ok(Some(block)) => block,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        last_mempool_status = format!("ordinary block API request failed: {error}");
-                        continue;
-                    }
-                };
-                let body = summarize_api_block(&block);
-                seen_ordinary_ids.insert(ordinary_id.clone());
-                if body.block_id != ordinary_id
-                    || Some(&body.parent_block_id) != opportunity.ordinary.get("parent_block_id")
-                    || Some(&body.slot.to_string()) != opportunity.ordinary.get("slot")
-                {
-                    return Err(AuditFailure {
-                        message: format!(
-                            "{} block API identity disagrees with the ordinary submission event",
-                            participants.producer
-                        ),
-                        details: json!({
-                            "provenance": provenance,
-                            "ordinary_submission": opportunity.ordinary,
-                            "ordinary_block_api": body,
-                            "submitted_transactions": submitted_transactions,
-                        }),
-                    });
-                }
-                if has_nonempty_submitted_body(&body.transaction_hashes, &submitted_hashes) {
-                    transaction_observations.push(json!({
-                        "alias": alias,
-                        "transaction_hash": transaction_hash,
-                        "observed_pending_before_candidate": saw_transaction_pending,
-                        "mempool_observations": mempool_samples,
-                        "last_mempool_status": last_mempool_status,
-                    }));
-                    selected = Some((opportunity, block));
+                Err(_) => {
+                    opportunity_state.last_body_error =
+                        Some("opportunity lookup exceeded observation deadline".to_owned());
+                    transaction_observations.push(json!({"alias": alias, "transaction_hash": transaction_hash, "observed_pending_before_deadline": saw_transaction_pending, "mempool_observations": mempool_samples, "last_mempool_status": last_mempool_status}));
                     break 'transactions;
                 }
-                skipped_opportunities.push(json!({
-                    "ordinary_block_id": body.block_id,
-                    "parent_block_id": body.parent_block_id,
-                    "slot": body.slot,
-                    "transaction_count": body.transaction_hashes.len(),
-                    "transaction_hashes": body.transaction_hashes,
-                    "body_root": body.body_root,
-                    "reason": if body.transaction_hashes.is_empty() {
-                        "empty_ordinary_body"
-                    } else {
-                        "no_submitted_transaction_in_ordinary_body"
-                    },
+            };
+            if let Some(candidate) = selection {
+                transaction_observations.push(json!({
+                    "alias": alias,
+                    "transaction_hash": transaction_hash,
+                    "observed_pending_before_candidate": saw_transaction_pending,
+                    "mempool_observations": mempool_samples,
+                    "last_mempool_status": last_mempool_status,
                 }));
+                selected = Some(candidate);
+                break 'transactions;
             }
 
-            if Instant::now() >= global_deadline || Instant::now() >= transaction_deadline {
+            if nonempty_workload_action(
+                Instant::now(),
+                global_deadline,
+                Some(transaction_deadline),
+                false,
+                submitted_transactions.len(),
+                workload.budget,
+            ) != NonemptyWorkloadAction::Observe
+            {
                 break;
             }
 
-            let views = join_all(
-                std::iter::once(&participants.producer)
-                    .chain(&participants.honest_nodes)
-                    .map(async |name| {
-                        (
-                            name.as_str(),
-                            world.nodes_info[name].client.test_mempool_view().await,
-                        )
-                    }),
+            // The final transaction's bounded mempool observation is complete;
+            // continue polling producer events without growing its sample list.
+            if submitted_transactions.len() >= workload.budget
+                && Instant::now() >= transaction_deadline
+            {
+                sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+
+            let views = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(global_deadline),
+                join_all(
+                    std::iter::once(&participants.producer)
+                        .chain(&participants.honest_nodes)
+                        .map(async |name| {
+                            (
+                                name.as_str(),
+                                world.nodes_info[name].client.test_mempool_view().await,
+                            )
+                        }),
+                ),
             )
             .await;
+            let Ok(views) = views else {
+                mempool_observation_timed_out = true;
+                "mempool observation exceeded the observation deadline"
+                    .clone_into(&mut last_mempool_status);
+                break;
+            };
             let all_views_succeeded = views.iter().all(|(_, view)| view.is_ok());
             let pending_nodes = views
                 .iter()
@@ -3287,7 +3473,15 @@ async fn select_nonempty_sibling_opportunity(
                 "all_node_views_succeeded": all_views_succeeded,
                 "observations": last_mempool_status,
             }));
-            if saw_transaction_pending && all_views_succeeded && pending_nodes.is_empty() {
+            if nonempty_workload_action(
+                Instant::now(),
+                global_deadline,
+                Some(transaction_deadline),
+                saw_transaction_pending && all_views_succeeded && pending_nodes.is_empty(),
+                submitted_transactions.len(),
+                workload.budget,
+            ) != NonemptyWorkloadAction::Observe
+            {
                 break;
             }
             sleep(Duration::from_millis(250)).await;
@@ -3302,9 +3496,39 @@ async fn select_nonempty_sibling_opportunity(
     }
 
     let Some((opportunity, ordinary_block)) = selected else {
+        let ordinary_event_count = opportunity_state
+            .logs
+            .iter()
+            .filter(|line| {
+                parse_log_fields(&line.text)
+                    .get("event")
+                    .map(String::as_str)
+                    == Some("security_audit_ordinary_submitted")
+            })
+            .count();
+        let complete_opportunity_count = find_producer_opportunities(&opportunity_state.logs).len();
+        let leadership_observed = opportunity_state.logs.iter().any(|line| {
+            matches!(
+                parse_log_fields(&line.text)
+                    .get("event")
+                    .map(String::as_str),
+                Some("security_audit_ordinary_submitted" | "security_audit_leadership_timing")
+            )
+        });
+        let failure_classification = if mempool_observation_timed_out
+            || !opportunity_state.incomplete_body_ids.is_empty()
+            || ordinary_event_count > complete_opportunity_count
+            || (leadership_observed && opportunity_state.examined_ids.is_empty())
+        {
+            "opportunity_evidence_unverified"
+        } else if leadership_observed {
+            "leadership_without_qualifying_nonempty_body"
+        } else {
+            "no_producer_leadership_observed"
+        };
         return Err(AuditFailure {
             message: format!(
-                "workload/setup failure: {} did not produce a qualifying sibling opportunity containing one of the submitted transactions after {} bounded submissions",
+                "{} did not produce a verified qualifying sibling opportunity containing one of the submitted transactions after {} bounded submissions ({failure_classification})",
                 participants.producer,
                 submitted_transactions.len()
             ),
@@ -3313,11 +3537,16 @@ async fn select_nonempty_sibling_opportunity(
                 "blend_readiness": readiness,
                 "submitted_transactions": submitted_transactions,
                 "transaction_observations": transaction_observations,
-                "producer_opportunities_examined": seen_ordinary_ids.len(),
-                "empty_or_nonmatching_opportunities_skipped": skipped_opportunities.len(),
-                "skipped_opportunities": skipped_opportunities,
+                "producer_opportunities_examined": opportunity_state.examined_ids.len(),
+                "producer_ordinary_event_count": ordinary_event_count,
+                "producer_complete_opportunity_count": complete_opportunity_count,
+                "empty_or_nonmatching_opportunities_skipped": opportunity_state.skipped.len(),
+                "skipped_opportunities": opportunity_state.skipped,
+                "unavailable_ordinary_body_ids": opportunity_state.incomplete_body_ids,
+                "producer_logs": opportunity_state.logs.iter().map(|line| json!({"line": line.text, "path": line.path, "offset": line.offset})).collect::<Vec<_>>(),
                 "last_mempool_status": last_mempool_status,
-                "failure_classification": "workload_or_leadership_setup",
+                "last_body_error": opportunity_state.last_body_error,
+                "failure_classification": failure_classification,
             }),
         });
     };
@@ -3326,7 +3555,7 @@ async fn select_nonempty_sibling_opportunity(
     let ordinary_body = summarize_api_block(&ordinary_block);
     state
         .logs
-        .insert(participants.producer.clone(), producer_logs);
+        .insert(participants.producer.clone(), opportunity_state.logs);
     state.opportunity = Some(opportunity);
     state.nonempty = Some(NonemptySelection {
         ordinary_body,
@@ -3334,8 +3563,8 @@ async fn select_nonempty_sibling_opportunity(
         submitted_hashes,
         submitted_transactions,
         transaction_observations,
-        skipped_opportunities,
-        examined_count: seen_ordinary_ids.len(),
+        skipped_opportunities: opportunity_state.skipped,
+        examined_count: opportunity_state.examined_ids.len(),
         workload,
         selected_at_unix_ms: unix_timestamp_ms(),
         selected_at: Instant::now(),
@@ -4553,6 +4782,179 @@ fn command_output(command: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_nonempty_workload_keeps_observing_until_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        let pending_end = start + Duration::from_secs(2);
+        assert_eq!(
+            nonempty_workload_action(start, deadline, None, false, 0, 1),
+            NonemptyWorkloadAction::SubmitNext
+        );
+        for seconds in [2, 10, 29] {
+            assert_eq!(
+                nonempty_workload_action(
+                    start + Duration::from_secs(seconds),
+                    deadline,
+                    Some(pending_end),
+                    true,
+                    1,
+                    1,
+                ),
+                NonemptyWorkloadAction::Observe
+            );
+        }
+        assert_eq!(
+            nonempty_workload_action(deadline, deadline, Some(pending_end), true, 1, 1),
+            NonemptyWorkloadAction::Finished
+        );
+
+        // The only qualifying block arrives after the last transaction's
+        // pending window. It remains selectable before the overall deadline.
+        let submitted = BTreeSet::from(["submitted".to_owned()]);
+        let mut found = false;
+        for (seconds, body) in [(2, vec![]), (8, vec!["submitted".to_owned()])] {
+            if nonempty_workload_action(
+                start + Duration::from_secs(seconds),
+                deadline,
+                Some(pending_end),
+                true,
+                1,
+                1,
+            ) == NonemptyWorkloadAction::Observe
+                && has_nonempty_submitted_body(&body, &submitted)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn nonempty_workload_schedules_next_only_within_budget_and_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let pending_end = start + Duration::from_secs(4);
+        assert_eq!(
+            nonempty_workload_action(start, deadline, Some(pending_end), false, 1, 2),
+            NonemptyWorkloadAction::Observe
+        );
+        assert_eq!(
+            nonempty_workload_action(start, deadline, Some(pending_end), true, 1, 2),
+            NonemptyWorkloadAction::SubmitNext
+        );
+        assert_eq!(
+            nonempty_workload_action(pending_end, deadline, Some(pending_end), false, 1, 2),
+            NonemptyWorkloadAction::SubmitNext
+        );
+        assert_eq!(
+            nonempty_workload_action(deadline, deadline, Some(pending_end), true, 1, 2),
+            NonemptyWorkloadAction::Finished
+        );
+    }
+
+    #[test]
+    fn finality_requires_complete_observations_and_respects_deadline() {
+        let complete = FinalityConditions {
+            producer_ready: true,
+            all_responsive: true,
+            all_progressed: true,
+            aligned: true,
+            common_beyond_boundary: true,
+            ancestry_verified: true,
+            continuity_verified: true,
+            no_finalized_conflict: true,
+        };
+        assert!(complete.satisfied(30_000, 30_000));
+        assert!(!complete.satisfied(30_001, 30_000));
+        for incomplete in [
+            FinalityConditions {
+                all_responsive: false,
+                ..complete
+            },
+            FinalityConditions {
+                aligned: false,
+                ..complete
+            },
+            FinalityConditions {
+                ancestry_verified: false,
+                ..complete
+            },
+            FinalityConditions {
+                continuity_verified: false,
+                ..complete
+            },
+            FinalityConditions {
+                no_finalized_conflict: false,
+                ..complete
+            },
+        ] {
+            assert!(!incomplete.satisfied(10_000, 30_000));
+        }
+        let (started, _) =
+            update_stable_finality_window(complete.satisfied(0, 30_000), 0, None, 10_000);
+        let (started, completion) = update_stable_finality_window(false, 5_000, started, 10_000);
+        assert!(started.is_none() && completion.is_none());
+        let (started, _) = update_stable_finality_window(true, 10_000, started, 10_000);
+        let (_, completion) = update_stable_finality_window(
+            complete.satisfied(20_000, 30_000),
+            20_000,
+            started,
+            10_000,
+        );
+        assert!(completion.is_some());
+    }
+
+    #[test]
+    fn finalized_safety_evidence_remains_sticky_after_agreement() {
+        let mut safety = FinalizedSafety::default();
+        safety.record_relation(FinalizedHistoryRelation::Unverified);
+        safety.record_relation(FinalizedHistoryRelation::Conflicting);
+        safety.record_relation(FinalizedHistoryRelation::Shared);
+        safety.record_relation(FinalizedHistoryRelation::Ancestral);
+        assert!(safety.conflict_observed);
+        assert!(safety.ancestry_unverified);
+
+        let mut incomplete = FinalizedSafety::default();
+        incomplete.record_pair_reports(&[json!({"unexpected": "missing status"})]);
+        assert!(incomplete.ancestry_unverified);
+        assert!(!incomplete.conflict_observed);
+    }
+
+    #[test]
+    fn stability_state_restarts_after_an_unverified_sample() {
+        let mut state = StableFinalityState::default();
+        assert!(!state.observe(true, 0, 10_000));
+        assert!(!state.observe(false, 9_000, 10_000));
+        assert!(!state.observe(true, 10_000, 10_000));
+        assert!(!state.observe(true, 19_999, 10_000));
+        assert!(state.observe(true, 20_000, 10_000));
+        assert_eq!(state.completion.unwrap().started_elapsed_ms, 10_000);
+    }
+
+    #[test]
+    fn continuity_classification_preserves_evidence_statuses() {
+        assert!(LibContinuity::Verified.is_verified());
+        assert!(LibContinuity::Unchanged.is_verified());
+        assert!(LibContinuity::Baseline.is_verified());
+        for status in [
+            LibContinuity::Unverified,
+            LibContinuity::MissingPreviousLibBaseline,
+            LibContinuity::RegressionOrUnrelated,
+        ] {
+            assert!(!status.is_verified());
+        }
+        assert_eq!(
+            json!(LibContinuity::RegressionOrUnrelated),
+            json!("regression_or_unrelated")
+        );
+        assert_eq!(
+            json!(LibContinuity::MissingPreviousLibBaseline),
+            json!("missing_previous_lib_baseline")
+        );
+    }
 
     #[test]
     fn binary_provenance_distinguishes_override_and_expected_features() {
