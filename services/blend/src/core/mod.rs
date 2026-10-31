@@ -339,11 +339,10 @@ where
             ..
         } = settings_handle.notifier().get_updated_settings();
 
-        // Bounded mode dependencies; the orchestrator already awaited SDP and chain
-        // readiness.
+        // The orchestrator already awaited SDP and chain readiness.
         wait_until_services_are_ready!(
             &overwatch_handle,
-            Some(Duration::from_mins(1)),
+            None,
             NetworkService<_, _, _>,
             TimeService<_, _>,
             SdpService,

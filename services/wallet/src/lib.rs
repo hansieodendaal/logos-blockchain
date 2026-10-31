@@ -1,7 +1,7 @@
 pub mod api;
 mod states;
 
-use std::{collections::HashMap, num::NonZero, time::Duration};
+use std::{collections::HashMap, num::NonZero};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -454,15 +454,15 @@ where
             ..
         } = self;
 
-        // Bounded storage and KMS dependencies.
+        // Wait for storage and KMS before Chain recovery.
         wait_until_services_are_ready!(
             &service_resources_handle.overwatch_handle,
-            Some(Duration::from_mins(1)),
+            None,
             lb_storage_service::StorageService<_>,
             Kms
         )
         .await?;
-        // Chain recovery can take longer than the infrastructure deadline.
+        // Chain becomes ready after persisted-chain recovery.
         wait_until_services_are_ready!(
             &service_resources_handle.overwatch_handle,
             None,
