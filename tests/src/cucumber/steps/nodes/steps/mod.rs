@@ -15,10 +15,7 @@ use lb_libp2p::{Multiaddr, PeerId};
 use lb_pow_service::{AutoClaimSettings, AutoClaimTick, ClaimTarget};
 use lb_testing_framework::{
     USER_CONFIG_FILE,
-    configs::{
-        deployment::{NodeBinaryProfile, SdpFundingConfig},
-        wallet::WalletAccount,
-    },
+    configs::{deployment::SdpFundingConfig, wallet::WalletAccount},
     ensure_node_binary_built,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};

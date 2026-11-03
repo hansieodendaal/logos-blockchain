@@ -9,7 +9,7 @@ use testing_framework_core::{
 };
 use thiserror::Error;
 
-use crate::{DeploymentPlan, LbcEnv, local::build_node_run_config};
+use crate::{DeploymentPlan, LbcEnv, LbcNodeConfig, local::build_node_run_config};
 
 #[derive(Debug, Error)]
 #[error("{source}")]
@@ -24,33 +24,41 @@ impl StaticNodeConfigProvider for LbcEnv {
     fn build_node_config(
         deployment: &DeploymentPlan,
         node_index: usize,
-    ) -> Result<RunConfig, Self::Error> {
+    ) -> Result<LbcNodeConfig, Self::Error> {
         let node = &deployment.nodes()[node_index];
-        build_node_run_config(
+        let config = build_node_run_config(
             deployment,
             node,
             deployment.config().node_config_override(node.index()),
         )
-        .map_err(Into::into)
+        .map_err(NodeCfgsyncError::from)?;
+        Ok(LbcNodeConfig::new(
+            config,
+            deployment.config().node_binary_profile().clone(),
+        ))
     }
 
     fn rewrite_for_hostnames(
         deployment: &DeploymentPlan,
         node_index: usize,
         hostnames: &[String],
-        config: &mut RunConfig,
+        config: &mut LbcNodeConfig,
     ) -> Result<(), Self::Error> {
         let rewritten_peers = rewrite_node_peers(deployment, node_index, hostnames)
             .map_err(NodeCfgsyncError::from)?;
 
-        apply_launch_ready_bind_addresses(config);
-        apply_runtime_networking(config, &hostnames[node_index], rewritten_peers);
+        apply_launch_ready_bind_addresses(config.run_config_mut());
+        apply_runtime_networking(
+            config.run_config_mut(),
+            &hostnames[node_index],
+            rewritten_peers,
+        );
 
         Ok(())
     }
 
-    fn serialize_node_config(config: &RunConfig) -> Result<String, Self::Error> {
-        serde_yaml::to_string(config).map_err(|source| NodeCfgsyncError {
+    fn serialize_node_config(config: &LbcNodeConfig) -> Result<String, Self::Error> {
+        serde_yaml::to_string(config.run_config()).map_err(|source| NodeCfgsyncError {
             source: source.into(),
         })
     }
@@ -62,7 +70,7 @@ impl StaticNodeConfigProvider for LbcEnv {
         options: &StartNodeOptions<Self>,
     ) -> Result<Option<ArtifactSet>, Self::Error> {
         let mut config = Self::build_node_config(deployment, node_index)?;
-        apply_launch_ready_bind_addresses(&mut config);
+        apply_launch_ready_bind_addresses(config.run_config_mut());
 
         match &options.common.peers {
             None | Some(PeerSelection::DefaultLayout) => {
@@ -71,7 +79,7 @@ impl StaticNodeConfigProvider for LbcEnv {
                 }
                 let peers = rewrite_node_peers(deployment, node_index, hostnames)
                     .map_err(NodeCfgsyncError::from)?;
-                apply_runtime_networking(&mut config, &hostnames[node_index], peers);
+                apply_runtime_networking(config.run_config_mut(), &hostnames[node_index], peers);
             }
             Some(PeerSelection::Named(_) | PeerSelection::None) => {
                 let peers = resolve_selected_peers(
@@ -81,13 +89,13 @@ impl StaticNodeConfigProvider for LbcEnv {
                     options.common.peers.as_ref(),
                 )
                 .map_err(NodeCfgsyncError::from)?;
-                apply_runtime_networking(&mut config, &hostnames[node_index], peers);
+                apply_runtime_networking(config.run_config_mut(), &hostnames[node_index], peers);
             }
         }
 
         if let Some(override_config) = options.config_override.clone() {
             config = override_config;
-            apply_launch_ready_bind_addresses(&mut config);
+            apply_launch_ready_bind_addresses(config.run_config_mut());
         }
 
         if let Some(config_patch) = &options.config_patch {

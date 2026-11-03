@@ -1,6 +1,6 @@
 use super::{
-    CucumberWorld, Duration, GenesisTime, Instant, NodeBinaryProfile, OffsetDateTime, Step,
-    StepError, StepResult, TARGET, TimeDuration, ensure_node_binary_built, given, info,
+    CucumberWorld, Duration, GenesisTime, Instant, OffsetDateTime, Step, StepError, StepResult,
+    TARGET, TimeDuration, ensure_node_binary_built, given, info,
     rebuild_pending_local_manual_cluster, sleep, then, when,
 };
 
@@ -49,12 +49,7 @@ async fn step_chain_starts_from_now(
     step: &Step,
     seconds: i64,
 ) -> StepResult {
-    let node_binary_profile = if world.tokio_console_profile_enabled() {
-        NodeBinaryProfile::TokioConsole
-    } else {
-        NodeBinaryProfile::default()
-    };
-    ensure_node_binary_built(&node_binary_profile)
+    ensure_node_binary_built(&world.node_binary_profile)
         .await
         .map_err(|error| StepError::Preflight {
             message: format!("failed to resolve/build node binary: {error}"),

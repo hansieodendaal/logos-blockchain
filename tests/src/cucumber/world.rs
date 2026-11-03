@@ -32,7 +32,10 @@ use lb_node::config::RunConfig;
 use lb_testing_framework::{
     LbcClusterBackend, LbcEnv, LbcK8sManualCluster, LbcScenario, NodeHttpClient, ScenarioBuilder,
     ScenarioBuilderExt as _,
-    configs::{deployment::SdpFundingConfig, wallet::WalletAccount},
+    configs::{
+        deployment::{EraBoundarySchedule, NodeBinaryProfile, SdpFundingConfig},
+        wallet::WalletAccount,
+    },
     env::set_default_env,
     get_reserved_available_udp_port, workloads,
 };
@@ -273,6 +276,8 @@ pub struct ChainParameters {
     /// Manual: Header id of the locally generated genesis block, when the
     /// cluster deployment carries one.
     pub genesis_block_id: Option<HeaderId>,
+    /// A finalized source-era block whose ancestry must survive the transition.
+    pub era_boundary_finalized_anchor: Option<HeaderId>,
     /// Manual: List of genesis tokens allocated to wallets accounts.
     pub genesis_tokens: Vec<GenesisTokens>,
     /// Effective epoch length, populated from the first launched node's
@@ -496,6 +501,8 @@ pub struct NodeStartupConfig {
     /// Manual: If set, nodes use a `DeploymentSettings` loaded from disk
     /// bypassing generated genesis/test deployment.
     pub deployment_config_override_path: Option<PathBuf>,
+    /// Optional consecutive-era fixture for normal era-boundary Cucumber tests.
+    pub era_boundary_schedule: Option<EraBoundarySchedule>,
     /// Manual: Whether to have dynamically started nodes join the external
     /// network
     pub join_external_network: Option<bool>,
@@ -673,6 +680,8 @@ impl ForkGroups {
 pub struct CucumberWorld {
     /// Scenario identity and lifecycle configuration.
     pub lifecycle: ScenarioLifecycle,
+    /// Binary profile resolved for this scenario before genesis time is set.
+    pub node_binary_profile: NodeBinaryProfile,
     /// Chain and genesis parameters for the deployed cluster.
     pub chain: ChainParameters,
     /// Manual-cluster deployment state.
@@ -797,6 +806,7 @@ impl Debug for CucumberWorld {
             )
             .field("genesis_time", &self.lifecycle.genesis_time)
             .field("scenario_base_dir", &self.lifecycle.scenario_base_dir)
+            .field("node_binary_profile", &self.node_binary_profile)
             .field("spec", &format!("{:?}", self.lifecycle.spec))
             .field("run", &format!("{:?}", self.lifecycle.run))
             .field("membership_check", &self.lifecycle.membership_check)
@@ -1559,12 +1569,16 @@ impl CucumberWorld {
             .ok_or(StepError::MissingRunDuration)?
             .get();
 
-        let mut builder: ScenarioBuilderWith = make_builder(&topology, self.lifecycle.genesis_time)
-            .with_backend(match expected {
-                DeployerKind::Local => LbcClusterBackend::Local,
-                DeployerKind::Compose => LbcClusterBackend::Compose,
-                DeployerKind::K8s => LbcClusterBackend::K8s,
-            });
+        let mut builder: ScenarioBuilderWith = make_builder(
+            &topology,
+            self.lifecycle.genesis_time,
+            self.node_binary_profile.clone(),
+        )
+        .with_backend(match expected {
+            DeployerKind::Local => LbcClusterBackend::Local,
+            DeployerKind::Compose => LbcClusterBackend::Compose,
+            DeployerKind::K8s => LbcClusterBackend::K8s,
+        });
 
         builder = builder.with_run_duration(Duration::from_secs(duration_secs));
         if let Some(wallets) = self.lifecycle.spec.wallets {

@@ -19,7 +19,7 @@ use lb_node::config::{
     DeploymentSettings, RunConfig,
     tracing::serde::console::{Layer as ConsoleLayer, TokioConfig},
 };
-use lb_testing_framework::{LbcEnv, NodeHttpClient, configs::wallet::WalletAccount};
+use lb_testing_framework::{LbcEnv, LbcNodeConfig, NodeHttpClient, configs::wallet::WalletAccount};
 use libp2p::Multiaddr;
 use reqwest::{Client, Url};
 use testing_framework_core::scenario::{

@@ -444,7 +444,7 @@ impl NodeHttpClient {
         timeout(operation_timeout, operation)
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Server(format!(
+                Err(Error::Timeout(format!(
                     "{operation_name} timed out after {operation_timeout:?}"
                 )))
             })

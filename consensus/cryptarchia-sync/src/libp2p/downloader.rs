@@ -4,7 +4,7 @@ use lb_utils::tokio::stream::ReadAhead;
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_stream::Control;
 use tokio::{sync::oneshot, time, time::Duration};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     BlocksRequest, TipResponse,
@@ -55,11 +55,19 @@ impl Downloader {
         protocol_name: StreamProtocol,
         reply_sender: oneshot::Sender<BoxedStream<Result<SerialisedBlock, ChainSyncError>>>,
     ) -> Result<BlocksResponseReader, ChainSyncError> {
-        let mut stream = open_stream(peer_id, &mut control, protocol_name).await?;
+        let mut stream = open_stream(peer_id, &mut control, protocol_name.clone()).await?;
 
         let blocks_request = RequestMessage::Blocks(request);
 
         send_message(peer_id, &mut stream, &blocks_request).await?;
+        // Keep successful request evidence at INFO for test binaries while
+        // avoiding an unconditional production INFO event.
+        #[cfg(feature = "testing")]
+        info!(target: LOG_TARGET, %peer_id, protocol = %protocol_name.as_ref(),
+            "Opened chain-sync block request");
+        #[cfg(not(feature = "testing"))]
+        debug!(target: LOG_TARGET, %peer_id, protocol = %protocol_name.as_ref(),
+            "Opened chain-sync block request");
 
         Ok(BlocksResponseReader::new(peer_id, stream, reply_sender))
     }

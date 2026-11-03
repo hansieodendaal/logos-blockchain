@@ -12,6 +12,9 @@ version     = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+testing = []
+
 [dependencies]
 bytes                 = { features = ["serde"], workspace = true }
 educe                 = { features = ["Debug"], workspace = true }

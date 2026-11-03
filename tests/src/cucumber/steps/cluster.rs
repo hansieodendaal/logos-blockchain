@@ -3,9 +3,7 @@ use std::{collections::HashMap, hash::BuildHasher, time::Duration};
 use lb_libp2p::{Multiaddr, PeerId, Protocol};
 use lb_testing_framework::{
     DeploymentBuilder, LbcEnv, NodeHttpClient, TopologyConfig,
-    configs::{
-        PreparedDeployment, build_plan, deployment::NodeBinaryProfile, wallet::WalletAccount,
-    },
+    configs::{PreparedDeployment, build_plan, wallet::WalletAccount},
     internal::DeploymentPlan,
     resolve_automatic_genesis_time,
 };
@@ -67,12 +65,11 @@ fn prepare_manual_cluster_deployment(
         .with_allow_zero_value_genesis_tokens(true)
         .with_test_context(world.lifecycle.test_context.clone())
         .with_sdp_funding_config(world.cluster.sdp_funding_config)
-        .with_node_binary_profile(if world.tokio_console_profile_enabled() {
-            NodeBinaryProfile::TokioConsole
-        } else {
-            NodeBinaryProfile::Normal
-        });
+        .with_resolved_node_binary_profile(world.node_binary_profile.clone());
     let mut config = apply_blend_core_nodes(world, config, nodes_count)?;
+    if let Some(schedule) = world.startup.era_boundary_schedule {
+        config = config.with_era_boundary_schedule(schedule);
+    }
     config = config.with_genesis_time(genesis_time);
 
     for genesis_token in &world.chain.genesis_tokens {
@@ -167,11 +164,7 @@ fn prepare_devnet_manual_cluster_deployment(
         .with_allow_zero_value_genesis_tokens(true)
         .with_test_context(world.lifecycle.test_context.clone())
         .with_sdp_funding_config(world.cluster.sdp_funding_config)
-        .with_node_binary_profile(if world.tokio_console_profile_enabled() {
-            NodeBinaryProfile::TokioConsole
-        } else {
-            NodeBinaryProfile::Normal
-        });
+        .with_resolved_node_binary_profile(world.node_binary_profile.clone());
     let config = apply_blend_core_nodes(world, config, nodes_count)?;
 
     let config = config.with_genesis_time(genesis_time);

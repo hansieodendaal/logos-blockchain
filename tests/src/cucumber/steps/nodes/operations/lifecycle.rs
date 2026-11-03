@@ -637,9 +637,9 @@ impl StartupSettings {
         }
 
         Ok(Some(StartNodeOptions::default().create_patch(
-            move |mut config: RunConfig| {
+            move |mut config: LbcNodeConfig| {
                 prepare_config_patch(
-                    &mut config,
+                    config.run_config_mut(),
                     self.join_external_network,
                     self.deployment_settings_override.as_ref(),
                     &self.manual_node_config_overrides,

@@ -103,6 +103,10 @@ pub struct ProcessedBlockEvent {
 pub enum Error {
     #[error("Internal server error: {0}")]
     Server(String),
+    #[error("Unexpected HTTP response [{status}]: {body}")]
+    HttpStatus { status: StatusCode, body: String },
+    #[error("HTTP request timed out: {0}")]
+    Timeout(String),
     #[error("Failed to execute request: {0}")]
     Client(String),
     #[error(transparent)]
@@ -205,7 +209,6 @@ impl CommonHttpClient {
         match status {
             StatusCode::OK | StatusCode::CREATED => serde_json::from_str(&body)
                 .map_err(|e| Error::Server(format!("Failed to parse response: {e}"))),
-            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::Server(body)),
             _ => Err(Error::Server(format!(
                 "Unexpected response [{status}]: {body}",
             ))),
@@ -267,10 +270,7 @@ impl CommonHttpClient {
                 .map(Some)
                 .map_err(|e| Error::Server(format!("Failed to parse response: {e}"))),
             StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::INTERNAL_SERVER_ERROR => Err(Error::Server(body)),
-            _ => Err(Error::Server(format!(
-                "Unexpected response [{status}]: {body}",
-            ))),
+            _ => Err(Error::HttpStatus { status, body }),
         }
     }
 

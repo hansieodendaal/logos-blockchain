@@ -13,7 +13,7 @@ use lb_core::{
 use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_libp2p::{PeerId, identity, identity::ed25519};
 use lb_node::UserConfig;
-use lb_testing_framework::ScenarioBuilder;
+use lb_testing_framework::{ScenarioBuilder, configs::deployment::NodeBinaryProfile};
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{info, warn};
 
@@ -29,6 +29,7 @@ type ScenarioBuilderWith = ScenarioBuilder;
 pub fn make_builder(
     topology: &TopologySpec,
     requested_genesis_time: Option<GenesisTime>,
+    node_binary_profile: NodeBinaryProfile,
 ) -> ScenarioBuilderWith {
     ScenarioBuilder::deployment_with(|t| {
         let base = match topology.network {
@@ -37,6 +38,7 @@ pub fn make_builder(
         let base = base
             .nodes(topology.nodes.get())
             .scenario_base_dir(topology.scenario_base_dir.clone());
+        let base = base.with_resolved_node_binary_profile(node_binary_profile);
         if let Some(genesis_time) = requested_genesis_time {
             base.with_genesis_time(genesis_time)
         } else {

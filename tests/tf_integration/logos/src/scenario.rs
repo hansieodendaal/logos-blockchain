@@ -3,6 +3,7 @@
 use std::{
     env,
     num::{NonZeroU64, NonZeroUsize},
+    ops::{Deref, DerefMut},
     time::Duration,
 };
 
@@ -32,7 +33,7 @@ use testing_framework_runner_local::ManualCluster;
 use crate::{
     FailureDiagnosticsExpectation, LbcClusterApp, NodeHttpClient, config,
     config::{
-        deployment::{DeploymentBuilder, TopologyConfig},
+        deployment::{DeploymentBuilder, NodeBinaryProfile, TopologyConfig},
         postprocess,
         wallet::WalletConfig,
     },
@@ -55,13 +56,64 @@ pub type LbcScenario = Scenario<AppHostEnv>;
 #[derive(Clone)]
 pub struct LbcEnv;
 
+/// Local node config paired with the immutable binary profile selected for
+/// its deployment.
+#[derive(Clone)]
+pub struct LbcNodeConfig {
+    run_config: RunConfig,
+    node_binary_profile: NodeBinaryProfile,
+}
+
+impl LbcNodeConfig {
+    #[must_use]
+    pub const fn new(run_config: RunConfig, node_binary_profile: NodeBinaryProfile) -> Self {
+        Self {
+            run_config,
+            node_binary_profile,
+        }
+    }
+
+    #[must_use]
+    pub const fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
+    pub const fn run_config_mut(&mut self) -> &mut RunConfig {
+        &mut self.run_config
+    }
+
+    #[must_use]
+    pub const fn node_binary_profile(&self) -> &NodeBinaryProfile {
+        &self.node_binary_profile
+    }
+
+    #[must_use]
+    pub fn into_run_config(self) -> RunConfig {
+        self.run_config
+    }
+}
+
+impl Deref for LbcNodeConfig {
+    type Target = RunConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run_config
+    }
+}
+
+impl DerefMut for LbcNodeConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.run_config
+    }
+}
+
 #[async_trait]
 impl Application for LbcEnv {
     type Deployment = DeploymentPlan;
 
     type NodeClient = NodeHttpClient;
 
-    type NodeConfig = RunConfig;
+    type NodeConfig = LbcNodeConfig;
 
     fn external_node_client(source: &ExternalNodeSource) -> Result<Self::NodeClient, DynError> {
         let endpoint = Url::parse(source.endpoint())?;

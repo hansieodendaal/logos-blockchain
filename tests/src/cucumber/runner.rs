@@ -10,13 +10,18 @@ use std::{
 };
 
 use cucumber::{
-    StatsWriter as _, World, WriterExt as _, codegen::WorldInventory, event::ScenarioFinished,
-    step::Collection, writer, writer::Verbosity,
+    StatsWriter as _, World, WriterExt as _,
+    codegen::WorldInventory,
+    event::ScenarioFinished,
+    gherkin::{Feature, Rule, Scenario},
+    step::Collection,
+    writer,
+    writer::Verbosity,
 };
 use lb_testing_framework::{
-    hash_str, is_truthy_env, record_system_monitor_event, register_system_monitor_output_file,
-    release_reserved_port_block, resolve_automatic_genesis_time,
-    unregister_system_monitor_output_file,
+    configs::deployment::NodeBinaryProfile, ensure_node_binary_built, hash_str, is_truthy_env,
+    record_system_monitor_event, register_system_monitor_output_file, release_reserved_port_block,
+    resolve_automatic_genesis_time_after, unregister_system_monitor_output_file,
 };
 
 use crate::cucumber::{
@@ -156,10 +161,17 @@ where
         .fail_on_skipped()
         // Sets a hook, executed on each Scenario before running all its Steps, including Background
         // ones.
-        .before(move |feature, _rule, scenario, world| {
+        .before(move |feature, rule, scenario, world| {
             Box::pin({
                 let output_dir_clone = output_dir.clone();
                 let scenario_attempts_clone = ScenarioAttempts::clone(&scenario_attempts);
+                let profile = NodeBinaryProfile::from_env_or(
+                    if scenario_requests_tokio_console(feature, rule, scenario) {
+                        NodeBinaryProfile::TokioConsole
+                    } else {
+                        NodeBinaryProfile::default()
+                    },
+                );
                 async move {
                     println!(
                         "\nStarting - {}: {} ({}: {})\n",
@@ -172,9 +184,11 @@ where
                         deployer,
                         &output_dir_clone,
                         &scenario_attempts_clone,
+                        profile,
                         &feature.name,
                         &scenario.name,
-                    );
+                    )
+                    .await;
                 }
             })
         });
@@ -252,20 +266,43 @@ fn get_feature_path_for_deployer(deployer: DeployerKind) -> PathBuf {
     feature_path
 }
 
-fn prepare_world_for_scenario(
+async fn prepare_world_for_scenario(
     world: &mut CucumberWorld,
     deployer: DeployerKind,
     output_dir: &Path,
     scenario_attempts: &ScenarioAttempts,
+    node_binary_profile: NodeBinaryProfile,
     feature_name: &str,
     scenario_name: &str,
 ) {
     world.set_deployer(deployer);
-    world.set_genesis_time(resolve_automatic_genesis_time());
+    world.node_binary_profile.clone_from(&node_binary_profile);
 
     if let Err(err) = world.preflight(deployer) {
         println!("Preflight failed for scenario '{scenario_name}': {err}");
     }
+
+    if deployer.requires_local_node_binary() && world.cluster.implementation.is_logos() {
+        let node_binary = ensure_node_binary_built(&node_binary_profile)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Failed to resolve/build the node binary before assigning scenario genesis time: {error}"
+                )
+            });
+        tracing::info!(
+            profile = node_binary_profile.to_string(),
+            node_binary = %node_binary.display(),
+            "Resolved node binary before assigning scenario genesis time"
+        );
+    }
+
+    let genesis_time = resolve_automatic_genesis_time_after(10);
+    world.set_genesis_time(genesis_time);
+    tracing::info!(
+        ?genesis_time,
+        "Assigned scenario genesis time after node binary resolution"
+    );
 
     let scenario_dir =
         scenario_output_dir(output_dir, scenario_attempts, feature_name, scenario_name);
@@ -294,6 +331,38 @@ fn prepare_world_for_scenario(
 
     let raw_context = format!("{}::{started_at_ns}", scenario_dir.display());
     world.set_test_context(hash_str(&raw_context));
+}
+
+fn scenario_requests_tokio_console(
+    feature: &Feature,
+    rule: Option<&Rule>,
+    scenario: &Scenario,
+) -> bool {
+    let step_values = feature
+        .background
+        .iter()
+        .flat_map(|background| background.steps.iter())
+        .chain(
+            rule.into_iter()
+                .flat_map(|rule| rule.background.iter())
+                .flat_map(|background| background.steps.iter()),
+        )
+        .chain(scenario.steps.iter())
+        .map(|step| step.value.as_str());
+    scenario_profile_for_step_values(step_values) == NodeBinaryProfile::TokioConsole
+}
+
+fn scenario_profile_for_step_values<'a>(
+    step_values: impl IntoIterator<Item = &'a str>,
+) -> NodeBinaryProfile {
+    if step_values
+        .into_iter()
+        .any(|value| value.starts_with("I will have tokio console profile nodes"))
+    {
+        NodeBinaryProfile::TokioConsole
+    } else {
+        NodeBinaryProfile::default()
+    }
 }
 
 fn scenario_output_dir(
@@ -360,6 +429,23 @@ mod tests {
 
     use super::*;
     use crate::cucumber::error::StepError;
+
+    #[test]
+    fn scenario_profile_step_is_visible_to_the_before_hook() {
+        let values = [
+            "Given a node is configured",
+            "I will have tokio console profile nodes:",
+        ];
+
+        assert_eq!(
+            scenario_profile_for_step_values(values),
+            NodeBinaryProfile::TokioConsole
+        );
+        assert_eq!(
+            scenario_profile_for_step_values(["Given a node is configured"]),
+            NodeBinaryProfile::Normal
+        );
+    }
 
     #[derive(Default)]
     struct CleanupWorld {
