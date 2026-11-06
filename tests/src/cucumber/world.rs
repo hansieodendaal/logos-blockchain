@@ -278,6 +278,10 @@ pub struct ChainParameters {
     pub genesis_block_id: Option<HeaderId>,
     /// A finalized source-era block whose ancestry must survive the transition.
     pub era_boundary_finalized_anchor: Option<HeaderId>,
+    /// Node prepared with an empty local runtime before joining an active era.
+    pub era_boundary_fresh_late_joiner: Option<String>,
+    /// Runtime directories present before a late joiner is launched.
+    pub era_boundary_late_joiner_prior_runtime_dirs: Vec<String>,
     /// Manual: List of genesis tokens allocated to wallets accounts.
     pub genesis_tokens: Vec<GenesisTokens>,
     /// Effective epoch length, populated from the first launched node's

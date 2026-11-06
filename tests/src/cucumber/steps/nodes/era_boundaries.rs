@@ -1,19 +1,17 @@
 //! System-level evidence for ordinary era transitions and late-joining IBD.
-//! The real node's deployment.yaml, HTTP APIs and per-node logs are the
+//! The real node's deployment.yaml, HTTP APIs, and runtime state are the
 //! sources.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write as _,
-    path::PathBuf,
     time::Duration,
 };
 
 use cucumber::{given, then, when};
 use lb_common_http_client::Error as HttpClientError;
 use lb_core::header::HeaderId;
-use lb_libp2p::protocol_name::ProtocolScope;
 use lb_node::config::DeploymentSettings;
 use lb_testing_framework::{NodeHttpClient, configs::deployment::EraBoundarySchedule};
 use reqwest::StatusCode;
@@ -23,7 +21,6 @@ use tracing::info;
 use crate::cucumber::{
     error::{StepError, StepResult},
     steps::TARGET,
-    utils::user_config_from_node_yaml,
     world::CucumberWorld,
 };
 
@@ -135,7 +132,6 @@ struct EraProof {
     target_fork: String,
     previous_ruleset: String,
     target_ruleset: String,
-    target_protocol: String,
 }
 
 fn era_proof(
@@ -196,11 +192,6 @@ fn era_proof(
         .map_err(|error| failure(format!("Cannot encode era {previous_era}: {error}")))?;
     let target_ruleset = serde_yaml::to_string(&target.parameters.ruleset)
         .map_err(|error| failure(format!("Cannot encode era {target_era}: {error}")))?;
-    let target_protocol = ProtocolScope::Fork(target.parameters.fork_digest)
-        .to_stream_protocol_with_name("chainsync")
-        .as_ref()
-        .to_owned();
-
     Ok(EraProof {
         previous_era,
         target_era,
@@ -212,7 +203,6 @@ fn era_proof(
         target_fork: format!("{:?}", target.parameters.fork_digest),
         previous_ruleset,
         target_ruleset,
-        target_protocol,
     })
 }
 
@@ -313,7 +303,6 @@ async fn verify_era_deployment(world: &mut CucumberWorld) -> StepResult {
                 "target_era": proof.target_era,
                 "previous_fork": proof.previous_fork,
                 "target_fork": proof.target_fork,
-                "target_chain_sync_protocol": proof.target_protocol,
                 "current_epoch": time.current_epoch,
                 "current_slot": time.current_slot,
             }),
@@ -450,116 +439,148 @@ async fn wait_all_nodes_enter_era(world: &mut CucumberWorld, seconds: u64) -> St
     }
 }
 
-fn find_node_logs(world: &CucumberWorld, name: &str) -> Result<Vec<String>, StepError> {
-    let node = world
-        .nodes_info
-        .get(name)
-        .ok_or_else(|| failure(format!("No running node `{name}`")))?;
-    // Resolve the log directory and exact prefix from this running node's own
-    // effective user config. Never search unrelated nodes' logs.
-    let user = user_config_from_node_yaml(&node.runtime_dir.join("node.yaml"))?;
-    let file = user
-        .tracing
-        .logger
-        .file
-        .ok_or_else(|| failure(format!("Node `{name}` has no file logger enabled")))?;
-    let dir = if file.directory.is_absolute() {
-        file.directory
-    } else {
-        node.runtime_dir.join(file.directory)
-    };
-    let prefix = file
-        .prefix
-        .unwrap_or_else(|| PathBuf::from("logos-blockchain.log"));
-    let prefix = prefix.to_string_lossy();
-    let entries = fs::read_dir(&dir)
-        .map_err(|error| failure(format!("Cannot list {}: {error}", dir.display())))?;
-    let mut logs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| failure(format!("Cannot inspect log: {error}")))?;
-        let filename = entry.file_name().to_string_lossy().into_owned();
-        let exact_prefix = filename == prefix.as_ref();
-        let suffixed_prefix = filename.starts_with(&format!("{prefix}."));
-        if !(exact_prefix || suffixed_prefix) || !entry.path().is_file() {
-            continue;
-        }
-        let contents = fs::read_to_string(entry.path())
-            .map_err(|error| failure(format!("Cannot read {filename}: {error}")))?;
-        logs.push(contents);
+#[then(expr = "all nodes report the target-era fork digest within {int} seconds")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step arguments require &mut World"
+)]
+async fn verify_target_era_fork_digest(world: &mut CucumberWorld, seconds: u64) -> StepResult {
+    let mut names = world.nodes_info.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    if names.is_empty() {
+        return Err(failure("No running nodes"));
     }
-    if logs.is_empty() {
-        return Err(failure(format!(
-            "No log file with prefix `{prefix}` for node `{name}` in {}",
-            dir.display()
-        )));
-    }
-    Ok(logs)
-}
-
-async fn wait_for_node_log(
-    world: &CucumberWorld,
-    name: &str,
-    message: &str,
-    protocol: &str,
-    seconds: u64,
-) -> StepResult {
     let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut last_observations = HashMap::new();
+    let mut observed_fork_digests = HashMap::new();
     loop {
-        if let Ok(logs) = find_node_logs(world, name)
-            && logs.iter().any(|log| {
-                log.lines()
-                    .any(|line| line.contains(message) && line.contains(protocol))
-            })
-        {
-            record(
-                world,
-                "observed_chain_sync_protocol",
-                &serde_json::json!({
-                    "node": name, "message": message, "protocol": protocol,
-                }),
-            )?;
+        let mut all_target = true;
+        for name in &names {
+            let proof = proof_for_node(world, name)?;
+            match world.resolve_node_http_client(name)?.chain_fork().await {
+                Ok(fork) if format!("{fork:?}") == proof.target_fork => {
+                    last_observations.remove(name);
+                    observed_fork_digests.insert(name.clone(), format!("{fork:?}"));
+                }
+                Ok(fork) => {
+                    all_target = false;
+                    observed_fork_digests.remove(name);
+                    last_observations.insert(
+                        name.clone(),
+                        format!(
+                            "active fork digest {fork:?}, expected {}",
+                            proof.target_fork
+                        ),
+                    );
+                }
+                Err(error) => {
+                    all_target = false;
+                    observed_fork_digests.remove(name);
+                    last_observations
+                        .insert(name.clone(), format!("chain fork request failed: {error}"));
+                }
+            }
+        }
+        if all_target {
+            for name in &names {
+                let proof = proof_for_node(world, name)?;
+                let fork_digest = observed_fork_digests.get(name).ok_or_else(|| {
+                    failure(format!(
+                        "No successful fork digest observation for `{name}`"
+                    ))
+                })?;
+                record(
+                    world,
+                    "target_era_fork_digest_observed",
+                    &serde_json::json!({
+                        "node": name,
+                        "target_era": proof.target_era,
+                        "fork_digest": fork_digest,
+                        "deployment_fork_digest": proof.target_fork,
+                        "source": "node_chain_fork_http_api",
+                    }),
+                )?;
+            }
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(failure(format!(
-                "Node `{name}` did not log `{message}` with protocol `{protocol}` within {seconds}s"
+            return Err(failure(polling_timeout_message(
+                &format!("Not all nodes report the target-era fork digest within {seconds}s"),
+                &names,
+                &last_observations,
             )));
         }
         sleep(Duration::from_secs(1)).await;
     }
 }
 
-#[then(expr = "all nodes rotate chain sync into the target-era protocol within {int} seconds")]
-#[expect(
-    clippy::needless_pass_by_ref_mut,
-    reason = "Cucumber step arguments require &mut World"
-)]
-async fn verify_protocol_rotation(world: &mut CucumberWorld, seconds: u64) -> StepResult {
-    let names = world.nodes_info.keys().cloned().collect::<Vec<_>>();
-    for name in names {
-        let proof = proof_for_node(world, &name)?;
-        let target_era = proof.target_era;
-        let message = format!("Entered era {target_era}: chain sync speaks");
-        wait_for_node_log(world, &name, &message, &proof.target_protocol, seconds).await?;
+#[when(expr = "I prepare node {string} to join with fresh state from node {string}")]
+async fn prepare_fresh_late_joiner(
+    world: &mut CucumberWorld,
+    joiner: String,
+    source: String,
+) -> StepResult {
+    if world.nodes_info.contains_key(&joiner) {
+        return Err(failure(format!("Node `{joiner}` has already started")));
     }
-    Ok(())
-}
+    if world.snapshots.node_snapshot_on_startup.is_some() {
+        return Err(failure(format!(
+            "Node `{joiner}` cannot be proven fresh while a startup snapshot is configured"
+        )));
+    }
+    let anchor = world
+        .chain
+        .era_boundary_finalized_anchor
+        .ok_or_else(|| failure("No pre-boundary finalized anchor captured"))?;
+    let joiner_prefix = format!("{joiner}_");
+    let existing_runtime_dirs = fs::read_dir(&world.lifecycle.scenario_base_dir)
+        .map_err(|error| {
+            failure(format!(
+                "Cannot inspect scenario runtime directory {}: {error}",
+                world.lifecycle.scenario_base_dir.display()
+            ))
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(&joiner_prefix))
+        .collect::<Vec<_>>();
 
-#[then(expr = "node {string} opens a target-era chain-sync block request within {int} seconds")]
-#[expect(
-    clippy::needless_pass_by_ref_mut,
-    reason = "Cucumber step arguments require &mut World"
-)]
-async fn verify_era_download(world: &mut CucumberWorld, name: String, seconds: u64) -> StepResult {
-    let proof = proof_for_node(world, &name)?;
-    wait_for_node_log(
+    let source_proof = proof_for_node(world, &source)?;
+    let source_client = world.resolve_node_http_client(&source)?;
+    let source_block = source_client.block(&anchor).await?.ok_or_else(|| {
+        failure(format!(
+            "Source node `{source}` no longer serves captured finalized block {anchor:?} before `{joiner}` starts"
+        ))
+    })?;
+    let source_slot = source_block.header.slot.into_inner();
+    if source_slot < source_proof.previous_first_slot || source_slot >= source_proof.boundary_slot {
+        return Err(failure(format!(
+            "Captured block {anchor:?} on `{source}` is not in source era {}: slot {source_slot}",
+            source_proof.previous_era
+        )));
+    }
+
+    world.chain.era_boundary_fresh_late_joiner = Some(joiner.clone());
+    world
+        .chain
+        .era_boundary_late_joiner_prior_runtime_dirs
+        .clone_from(&existing_runtime_dirs);
+    record(
         world,
-        &name,
-        "Opened chain-sync block request",
-        &proof.target_protocol,
-        seconds,
+        "late_joiner_fresh_state_before_start",
+        &serde_json::json!({
+            "node": joiner,
+            "source_node": source,
+            "source_block_id": format!("{anchor:?}"),
+            "source_block_slot": source_slot,
+            "source_era": source_proof.previous_era,
+            "startup_snapshot_configured": false,
+            "prior_runtime_directories": existing_runtime_dirs,
+            "source_node_served_block_before_joiner_start": true,
+            "source": "node_block_http_api_and_test_framework_runtime_state",
+        }),
     )
-    .await
 }
 
 #[then(expr = "node {string} started in the target era")]
@@ -568,8 +589,50 @@ async fn verify_era_download(world: &mut CucumberWorld, name: String, seconds: u
     reason = "Cucumber step arguments require &mut World"
 )]
 async fn verify_late_join_era(world: &mut CucumberWorld, name: String) -> StepResult {
+    if world.chain.era_boundary_fresh_late_joiner.as_deref() != Some(name.as_str()) {
+        return Err(failure(format!(
+            "Node `{name}` was not recorded as a fresh late joiner before startup"
+        )));
+    }
     let proof = proof_for_node(world, &name)?;
     let target_era = proof.target_era;
+    let node = world
+        .nodes_info
+        .get(&name)
+        .ok_or_else(|| failure(format!("Node `{name}` has not started")))?;
+    let runtime_dir_name = node
+        .runtime_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            failure(format!(
+                "Node `{name}` runtime directory has no valid final path component: {}",
+                node.runtime_dir.display()
+            ))
+        })?;
+    if node.runtime_dir.parent() != Some(world.lifecycle.scenario_base_dir.as_path())
+        || !runtime_dir_name.starts_with(&format!("{name}_"))
+    {
+        return Err(failure(format!(
+            "Node `{name}` runtime directory {} is outside its fresh scenario runtime location",
+            node.runtime_dir.display()
+        )));
+    }
+    if world
+        .chain
+        .era_boundary_late_joiner_prior_runtime_dirs
+        .iter()
+        .any(|existing| existing == runtime_dir_name)
+    {
+        return Err(failure(format!(
+            "Node `{name}` reused a runtime directory that existed before startup: {runtime_dir_name}"
+        )));
+    }
+    if world.snapshots.node_snapshot_on_startup.is_some() {
+        return Err(failure(format!(
+            "Node `{name}` started with a configured chain-state snapshot"
+        )));
+    }
     let time = world.resolve_node_http_client(&name)?.time_info().await?;
     if time.current_slot < proof.boundary_slot || time.current_epoch < proof.first_epoch {
         return Err(failure(format!(
@@ -584,15 +647,43 @@ async fn verify_late_join_era(world: &mut CucumberWorld, name: String) -> StepRe
             "node": name, "target_era": target_era,
             "current_slot": time.current_slot,
             "current_epoch": time.current_epoch,
+            "fresh_state_verified_before_start": true,
+            "runtime_directory": runtime_dir_name,
+            "runtime_directory_created_after_preparation": true,
+            "prior_runtime_directories": world.chain.era_boundary_late_joiner_prior_runtime_dirs,
+            "startup_snapshot_configured": false,
         }),
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CanonicalHistory {
     previous_era_blocks: usize,
     target_era_blocks: usize,
     includes_anchor: bool,
+    anchor_slot: Option<u64>,
+}
+
+fn validate_source_era_anchor(
+    history: &CanonicalHistory,
+    proof: &EraProof,
+    anchor: HeaderId,
+) -> StepResult {
+    if !history.includes_anchor {
+        return Ok(());
+    }
+    let Some(slot) = history.anchor_slot else {
+        return Err(failure(format!(
+            "Captured block {anchor:?} was found in ancestry without a slot"
+        )));
+    };
+    if slot == 0 || slot < proof.previous_first_slot || slot >= proof.boundary_slot {
+        return Err(failure(format!(
+            "Captured block {anchor:?} has slot {slot}, outside source era {} slots {}..{}",
+            proof.previous_era, proof.previous_first_slot, proof.boundary_slot
+        )));
+    }
+    Ok(())
 }
 
 async fn inspect_history(
@@ -611,10 +702,12 @@ async fn inspect_history(
         previous_era_blocks: 0,
         target_era_blocks: 0,
         includes_anchor: false,
+        anchor_slot: None,
     };
     for _ in 0..MAX_ANCESTOR_WALK {
         if current == genesis {
             result.includes_anchor = anchor == Some(current);
+            result.anchor_slot = result.includes_anchor.then_some(0);
             return Ok(result);
         }
         if !visited.insert(current) {
@@ -653,6 +746,7 @@ async fn inspect_history(
         }
         if anchor == Some(current) {
             result.includes_anchor = true;
+            result.anchor_slot = Some(slot);
             return Ok(result);
         }
         if let Some((minimum_previous, minimum_target)) = stop_after_counts
@@ -770,6 +864,194 @@ async fn wait_for_era_blocks(
             return Err(failure(polling_timeout_message(
                 &format!(
                     "Not all canonical chains contain at least {minimum_target} target-era blocks and {minimum_previous} source-era blocks within {seconds}s"
+                ),
+                &names,
+                &last_observations,
+            )));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[then(
+    expr = "node {string} acquires the captured source-era finalized block in canonical history and all nodes preserve it on their LIB ancestry within {int} seconds"
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step arguments require &mut World"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Keeps late-join canonical acquisition and LIB continuity in one bounded poll"
+)]
+async fn verify_late_joiner_history_and_finality(
+    world: &mut CucumberWorld,
+    late_joiner: String,
+    seconds: u64,
+) -> StepResult {
+    if world.chain.era_boundary_fresh_late_joiner.as_deref() != Some(late_joiner.as_str()) {
+        return Err(failure(format!(
+            "Node `{late_joiner}` was not prepared as a fresh late joiner before startup"
+        )));
+    }
+    let anchor = world
+        .chain
+        .era_boundary_finalized_anchor
+        .ok_or_else(|| failure("No pre-boundary finalized anchor captured"))?;
+    let mut names = world.nodes_info.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    if !names.iter().any(|name| name == &late_joiner) {
+        return Err(failure(format!("No running node `{late_joiner}`")));
+    }
+    let genesis = world
+        .chain
+        .genesis_block_id
+        .ok_or_else(|| failure("Genesis block id not recorded"))?;
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut last_observations = HashMap::new();
+
+    loop {
+        let mut all_preserved = true;
+        let mut canonical_late_history = None;
+        let mut finalized_histories = HashMap::new();
+
+        for name in &names {
+            let proof = proof_for_node(world, name)?;
+            let client = world.resolve_node_http_client(name)?;
+            let mut late_canonical_acquired = name != &late_joiner;
+            let consensus = match client.consensus_info().await {
+                Ok(consensus) => consensus,
+                Err(error) => {
+                    all_preserved = false;
+                    last_observations.insert(
+                        name.clone(),
+                        format!("Consensus info request failed: {error}"),
+                    );
+                    continue;
+                }
+            };
+
+            if name == &late_joiner {
+                match inspect_history(
+                    &client,
+                    consensus.cryptarchia_info.tip,
+                    genesis,
+                    proof.previous_first_slot,
+                    proof.boundary_slot,
+                    Some(anchor),
+                    None,
+                )
+                .await
+                {
+                    Ok(history) => {
+                        validate_source_era_anchor(&history, &proof, anchor)?;
+                        if history.includes_anchor {
+                            canonical_late_history = Some((proof.clone(), history));
+                            late_canonical_acquired = true;
+                        } else {
+                            all_preserved = false;
+                            last_observations.insert(
+                                name.clone(),
+                                format!(
+                                    "canonical tip {:?} has not acquired captured block {anchor:?}; observed {} target-era and {} source-era blocks",
+                                    consensus.cryptarchia_info.tip,
+                                    history.target_era_blocks,
+                                    history.previous_era_blocks,
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        observe_history_error(name, error, &mut last_observations)?;
+                        all_preserved = false;
+                    }
+                }
+            }
+
+            match inspect_history(
+                &client,
+                consensus.cryptarchia_info.lib,
+                genesis,
+                proof.previous_first_slot,
+                proof.boundary_slot,
+                Some(anchor),
+                None,
+            )
+            .await
+            {
+                Ok(history) => {
+                    validate_source_era_anchor(&history, &proof, anchor)?;
+                    if history.includes_anchor {
+                        if late_canonical_acquired {
+                            last_observations.remove(name);
+                        }
+                        finalized_histories.insert(
+                            name.clone(),
+                            (proof, consensus.cryptarchia_info.lib, history),
+                        );
+                    } else {
+                        all_preserved = false;
+                        last_observations.insert(
+                            name.clone(),
+                            format!(
+                                "LIB {:?} ancestry has not reached finalized anchor {anchor:?}; observed {} target-era and {} source-era blocks",
+                                consensus.cryptarchia_info.lib,
+                                history.target_era_blocks,
+                                history.previous_era_blocks,
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    observe_history_error(name, error, &mut last_observations)?;
+                    all_preserved = false;
+                }
+            }
+        }
+
+        if all_preserved && let Some((late_proof, canonical_history)) = canonical_late_history {
+            record(
+                world,
+                "late_joiner_canonical_source_history_acquired",
+                &serde_json::json!({
+                    "node": late_joiner,
+                    "source_era": late_proof.previous_era,
+                    "target_era": late_proof.target_era,
+                    "block_id": format!("{anchor:?}"),
+                    "block_slot": canonical_history.anchor_slot,
+                    "canonical_history_contains_block": canonical_history.includes_anchor,
+                    "canonical_tip_previous_era_blocks": canonical_history.previous_era_blocks,
+                    "canonical_tip_target_era_blocks": canonical_history.target_era_blocks,
+                    "fresh_state_verified_before_start": true,
+                    "source_node_served_block_before_joiner_start": true,
+                    "source": "node_block_and_consensus_http_apis",
+                }),
+            )?;
+            for (name, (proof, lib, history)) in finalized_histories {
+                record(
+                    world,
+                    "finality_continuity",
+                    &serde_json::json!({
+                        "node": name,
+                        "source_era": proof.previous_era,
+                        "target_era": proof.target_era,
+                        "original_lib": format!("{anchor:?}"),
+                        "current_lib": format!("{lib:?}"),
+                        "anchor_slot": history.anchor_slot,
+                        "lib_ancestry_contains_anchor": history.includes_anchor,
+                        "previous_era_blocks": history.previous_era_blocks,
+                        "target_era_blocks": history.target_era_blocks,
+                        "source": "node_block_and_consensus_http_apis",
+                    }),
+                )?;
+            }
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(failure(polling_timeout_message(
+                &format!(
+                    "Node `{late_joiner}` did not acquire block {anchor:?} in canonical history and all nodes did not preserve it on their LIB ancestry within {seconds}s"
                 ),
                 &names,
                 &last_observations,

@@ -50,5 +50,4 @@ lb-utils                      = { workspace = true }
 time                          = { workspace = true }
 
 [features]
-testing          = ["lb-cryptarchia-sync/testing"]
 tokio-task-names = ["lb-utils/tokio-task-names"]

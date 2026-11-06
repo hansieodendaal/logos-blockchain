@@ -39,6 +39,7 @@ reqwest                          = { features = ["json"], workspace = true }
 serde                            = { workspace = true }
 serde_json                       = { workspace = true }
 serde_yaml                       = { workspace = true }
+sha2                             = { workspace = true }
 sysinfo                          = { features = ["disk", "system"], workspace = true }
 tar                              = { workspace = true }
 tempfile                         = { workspace = true }
@@ -50,5 +51,6 @@ testing-framework-runner-local   = { workspace = true }
 thiserror                        = { workspace = true }
 time                             = { workspace = true }
 tokio                            = { features = ["macros", "process", "rt-multi-thread", "time"], workspace = true }
+toml                             = { features = ["parse", "serde"], workspace = true }
 tracing                          = { workspace = true }
 uuid                             = { workspace = true }

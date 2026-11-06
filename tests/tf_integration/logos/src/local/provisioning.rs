@@ -27,6 +27,8 @@ use lb_node::{
     },
 };
 use rand::Rng as _;
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use testing_framework_core::scenario::{Application, DynError, PeerSelection, StartNodeOptions};
 use testing_framework_runner_local::{
     BinaryProviderRef, BuildBinaryProvider, BuildCommand, DownloadBinaryProvider, DownloadChecksum,
@@ -292,74 +294,395 @@ async fn build_node_launch_spec(
     })
 }
 
-fn inherited_rustflags() -> Result<Vec<String>, DynError> {
-    let rustflags = unicode_environment_value("RUSTFLAGS")?;
-    let encoded_rustflags = unicode_environment_value("CARGO_ENCODED_RUSTFLAGS")?;
+const TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER: &str =
+    "LOGOS_BLOCKCHAIN_TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER";
 
-    Ok(effective_rustflags_from(
-        rustflags.as_deref(),
-        encoded_rustflags.as_deref(),
-    ))
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CargoConfigBuild {
+    rustc: Option<String>,
+    #[serde(rename = "rustc-wrapper")]
+    rustc_wrapper: Option<String>,
+    #[serde(rename = "rustc-workspace-wrapper")]
+    rustc_workspace_wrapper: Option<String>,
 }
 
-fn unicode_environment_value(name: &str) -> Result<Option<String>, DynError> {
-    env::var_os(name)
-        .map(|value| {
-            value.into_string().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{name} must contain valid UTF-8 to build the Tokio-console binary"),
-                )
-                .into()
-            })
-        })
-        .transpose()
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CargoConfig {
+    build: Option<CargoConfigBuild>,
 }
 
-fn effective_rustflags_from(
-    rustflags: Option<&str>,
-    encoded_rustflags: Option<&str>,
-) -> Vec<String> {
-    if let Some(encoded) = encoded_rustflags {
-        return if encoded.is_empty() {
-            Vec::new()
-        } else {
-            encoded.split('\u{1f}').map(str::to_owned).collect()
-        };
+type CargoConfigSnapshot = Vec<(PathBuf, Option<Vec<u8>>)>;
+
+fn tokio_console_wrapper_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("tokio_console_rustc_wrapper.sh")
+}
+
+fn cargo_config_directories() -> Vec<PathBuf> {
+    let root = workspace_root();
+    let mut directories = Vec::new();
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        directories.push(PathBuf::from(cargo_home));
+    } else if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        directories.push(PathBuf::from(home).join(".cargo"));
     }
 
-    rustflags
-        .map(|flags| flags.split_whitespace().map(str::to_owned).collect())
-        .unwrap_or_default()
+    let mut ancestors = root.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    ancestors.reverse();
+    directories.extend(ancestors.into_iter().map(|path| path.join(".cargo")));
+    directories
 }
 
-fn rustflags_with_tokio_unstable_from(current: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut flags = Vec::new();
-    let mut found_tokio_unstable = false;
-    let mut iter = current.into_iter().peekable();
-
-    while let Some(flag) = iter.next() {
-        if flag == "--cfg" && iter.peek().is_some_and(|value| value == "tokio_unstable") {
-            let cfg = iter.next().expect("peeked cfg value should exist");
-            if !found_tokio_unstable {
-                flags.extend([flag, cfg]);
-                found_tokio_unstable = true;
-            }
-        } else if flag == "--cfg=tokio_unstable" {
-            if !found_tokio_unstable {
-                flags.push(flag);
-                found_tokio_unstable = true;
-            }
+fn cargo_config_snapshot() -> Result<CargoConfigSnapshot, DynError> {
+    let mut snapshot = Vec::new();
+    for directory in cargo_config_directories() {
+        let config = directory.join("config");
+        let config_toml = directory.join("config.toml");
+        if config.is_file() {
+            snapshot.push((config.clone(), Some(fs::read(&config)?)));
+            snapshot.push((config_toml, None));
+        } else if config_toml.is_file() {
+            snapshot.push((config, None));
+            snapshot.push((config_toml.clone(), Some(fs::read(config_toml)?)));
         } else {
-            flags.push(flag);
+            snapshot.push((config, None));
+            snapshot.push((config_toml, None));
+        }
+    }
+    Ok(snapshot)
+}
+
+fn configured_rustc_wrapper() -> Result<Option<PathBuf>, DynError> {
+    let direct_wrapper = env::var_os("RUSTC_WRAPPER");
+    let cargo_wrapper = env::var_os("CARGO_BUILD_RUSTC_WRAPPER");
+    if let (Some(direct), Some(cargo)) = (&direct_wrapper, &cargo_wrapper)
+        && direct != cargo
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "RUSTC_WRAPPER and CARGO_BUILD_RUSTC_WRAPPER disagree; refusing to choose a different compiler wrapper for the Tokio-console build",
+        )
+        .into());
+    }
+    if let Some(value) = direct_wrapper.or(cargo_wrapper) {
+        return resolve_wrapper_value(&value, None, "rustc wrapper");
+    }
+
+    let mut selected = None;
+    for (path, contents) in cargo_config_snapshot()? {
+        let Some(contents) = contents else {
+            continue;
+        };
+        let parsed: CargoConfig =
+            toml::from_str(std::str::from_utf8(&contents).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cargo config {} is not UTF-8: {error}", path.display()),
+                )
+            })?)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cannot parse Cargo config {}: {error}", path.display()),
+                )
+            })?;
+        if let Some(value) = parsed.build.and_then(|build| build.rustc_wrapper) {
+            let config_root = path.parent().and_then(Path::parent);
+            selected = resolve_wrapper_value(
+                std::ffi::OsStr::new(&value),
+                config_root,
+                "configured rustc wrapper",
+            )?;
+        }
+    }
+    Ok(selected)
+}
+
+fn resolve_wrapper_value(
+    value: &std::ffi::OsStr,
+    config_root: Option<&Path>,
+    description: &str,
+) -> Result<Option<PathBuf>, DynError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return existing_wrapper_path(&path, description).map(Some);
+    }
+    if let Some(config_root) = config_root {
+        let configured = config_root.join(&path);
+        if configured.exists() {
+            return existing_wrapper_path(&configured, description).map(Some);
+        }
+    } else if path.components().count() > 1 {
+        let relative = env::current_dir()?.join(&path);
+        if relative.exists() {
+            return existing_wrapper_path(&relative, description).map(Some);
         }
     }
 
-    if !found_tokio_unstable {
-        flags.extend(["--cfg".to_owned(), "tokio_unstable".to_owned()]);
+    if path.components().count() == 1
+        && let Some(search_path) = env::var_os("PATH")
+    {
+        for directory in env::split_paths(&search_path) {
+            let candidate = directory.join(&path);
+            if candidate.is_file() {
+                return existing_wrapper_path(&candidate, description).map(Some);
+            }
+        }
     }
 
-    flags
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("Cannot resolve {description} `{}`", path.display()),
+    )
+    .into())
+}
+
+fn existing_wrapper_path(path: &Path, description: &str) -> Result<PathBuf, DynError> {
+    if !path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} `{}` is not a file", path.display()),
+        )
+        .into());
+    }
+    Ok(path.canonicalize()?)
+}
+
+fn build_environment_names() -> Vec<std::ffi::OsString> {
+    const FIXED: &[&str] = &[
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC",
+        "CARGO_BUILD_RUSTC",
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_TARGET",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_INCREMENTAL",
+        "CARGO_INCREMENTAL",
+        "CARGO_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC_BOOTSTRAP",
+        "PATH",
+        "CC",
+        "CXX",
+        "AR",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "SDKROOT",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "IPHONEOS_DEPLOYMENT_TARGET",
+    ];
+    let mut names = FIXED
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    names.extend(env::vars_os().filter_map(|(name, _)| {
+        let name = name.to_string_lossy();
+        (name.starts_with("CARGO_TARGET_")
+            || name.starts_with("CARGO_PROFILE_")
+            || name.starts_with("CARGO_BUILD_"))
+        .then(|| std::ffi::OsString::from(name.as_ref()))
+    }));
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn compiler_program_values(
+    config_snapshot: &CargoConfigSnapshot,
+) -> Result<Vec<(std::ffi::OsString, Option<PathBuf>)>, DynError> {
+    const ENVIRONMENT_NAMES: &[&str] = &[
+        "RUSTC",
+        "CARGO_BUILD_RUSTC",
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ];
+    let mut programs = Vec::new();
+    for name in ENVIRONMENT_NAMES {
+        if let Some(value) = env::var_os(name) {
+            let path = resolve_wrapper_value(&value, None, name).ok().flatten();
+            programs.push((value, path));
+        }
+    }
+    for (config_path, contents) in config_snapshot {
+        let Some(contents) = contents else {
+            continue;
+        };
+        let parsed: CargoConfig =
+            toml::from_str(std::str::from_utf8(contents).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cargo config {} is not UTF-8: {error}",
+                        config_path.display()
+                    ),
+                )
+            })?)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Cannot parse Cargo config {}: {error}",
+                        config_path.display()
+                    ),
+                )
+            })?;
+        let Some(build) = parsed.build else {
+            continue;
+        };
+        let config_root = config_path.parent().and_then(Path::parent);
+        for value in [
+            build.rustc,
+            build.rustc_wrapper,
+            build.rustc_workspace_wrapper,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let path = resolve_wrapper_value(
+                std::ffi::OsStr::new(&value),
+                config_root,
+                "Cargo compiler program",
+            )
+            .ok()
+            .flatten();
+            programs.push((value.into(), path));
+        }
+    }
+    Ok(programs)
+}
+
+fn managed_build_target_dir(
+    profile: &NodeBinaryProfile,
+    build_args: &[String],
+    tokio_console: bool,
+) -> Result<PathBuf, DynError> {
+    let environment = build_environment_names()
+        .into_iter()
+        .map(|name| {
+            let value = env::var_os(&name);
+            (name, value)
+        })
+        .collect::<Vec<_>>();
+    let config_snapshot = cargo_config_snapshot()?;
+    let compiler_programs = compiler_program_values(&config_snapshot)?;
+    let toolchain_files = [
+        workspace_root().join("rust-toolchain.toml"),
+        workspace_root().join("rust-toolchain"),
+    ]
+    .into_iter()
+    .map(|path| {
+        let contents = path.is_file().then(|| fs::read(&path)).transpose()?;
+        Ok((path, contents))
+    })
+    .collect::<Result<Vec<_>, io::Error>>()?;
+    let mut extra_files = Vec::new();
+    if tokio_console {
+        let wrapper = tokio_console_wrapper_path();
+        extra_files.push((wrapper.clone(), fs::read(wrapper)?));
+        if let Some(original) = configured_rustc_wrapper()? {
+            extra_files.push((original.clone(), fs::read(original)?));
+        }
+    }
+
+    build_target_dir_for_configuration(
+        &workspace_root(),
+        profile,
+        build_args,
+        &environment,
+        &config_snapshot,
+        &compiler_programs,
+        &toolchain_files,
+        &extra_files,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The identity hashes each distinct compiler and Cargo input explicitly"
+)]
+fn build_target_dir_for_configuration(
+    target_root: &Path,
+    profile: &NodeBinaryProfile,
+    build_args: &[String],
+    environment: &[(std::ffi::OsString, Option<std::ffi::OsString>)],
+    config_snapshot: &CargoConfigSnapshot,
+    compiler_programs: &[(std::ffi::OsString, Option<PathBuf>)],
+    toolchain_files: &[(PathBuf, Option<Vec<u8>>)],
+    extra_files: &[(PathBuf, Vec<u8>)],
+) -> Result<PathBuf, DynError> {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, b"logos-managed-node-build-v2");
+    hash_field(&mut hasher, profile.to_string().as_bytes());
+    for argument in build_args {
+        hash_field(&mut hasher, argument.as_bytes());
+    }
+    for (name, value) in environment {
+        hash_field(&mut hasher, name.as_encoded_bytes());
+        match value {
+            Some(value) => hash_field(&mut hasher, value.as_encoded_bytes()),
+            None => hash_field(&mut hasher, b"<unset>"),
+        }
+    }
+    for (path, contents) in config_snapshot {
+        hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+        if let Some(contents) = contents {
+            hash_field(&mut hasher, contents);
+        } else {
+            hash_field(&mut hasher, b"<missing-or-shadowed>");
+        }
+    }
+    for (program, path) in compiler_programs {
+        hash_field(&mut hasher, program.as_encoded_bytes());
+        if let Some(path) = path {
+            hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+            hash_field(&mut hasher, &fs::read(path)?);
+        } else {
+            hash_field(&mut hasher, b"<unresolved-program>");
+        }
+    }
+    for (file, contents) in toolchain_files {
+        hash_field(&mut hasher, file.as_os_str().as_encoded_bytes());
+        if let Some(contents) = contents {
+            hash_field(&mut hasher, contents);
+        } else {
+            hash_field(&mut hasher, b"<missing>");
+        }
+    }
+    for (path, contents) in extra_files {
+        hash_field(&mut hasher, path.as_os_str().as_encoded_bytes());
+        hash_field(&mut hasher, contents);
+    }
+    let digest = hasher.finalize();
+    let identity = hex::encode(digest);
+    Ok(target_root
+        .join("target")
+        .join(".tf-binaries")
+        .join("builds")
+        .join(identity))
 }
 
 fn launch_file(relative_path: &str, contents: Vec<u8>) -> LaunchFile {
@@ -406,7 +729,7 @@ fn node_binary_provider(
     }
 
     providers.push(match node_binary_profile {
-        NodeBinaryProfile::Normal => default_node_binary_provider(),
+        NodeBinaryProfile::Normal => default_node_binary_provider()?,
         NodeBinaryProfile::TokioConsole => tokio_console_node_binary_provider()?,
     });
 
@@ -465,24 +788,33 @@ fn extract_release_binary(artifact: &Path, output: &Path) -> Result<(), DynError
     .into())
 }
 
-fn default_node_binary_provider() -> BinaryProviderRef {
+fn default_node_binary_provider() -> Result<BinaryProviderRef, DynError> {
     if running_in_ci() {
-        Arc::new(PathBinaryProvider::new(release_node_binary_path()))
+        Ok(Arc::new(
+            PathBinaryProvider::new(release_node_binary_path()),
+        ))
     } else {
-        Arc::new(BuildBinaryProvider {
-            command: BuildCommand::new("cargo").with_args([
-                "build",
-                "--locked",
-                "--release",
-                "-p",
-                "logos-blockchain-node",
-                "--features",
-                "testing",
-            ]),
-            output_path: release_node_binary_path(),
+        let build_args = [
+            "build".to_owned(),
+            "--locked".to_owned(),
+            "--release".to_owned(),
+            "-p".to_owned(),
+            "logos-blockchain-node".to_owned(),
+            "--features".to_owned(),
+            "testing".to_owned(),
+        ];
+        let target_dir = managed_build_target_dir(&NodeBinaryProfile::Normal, &build_args, false)?;
+        let command = BuildCommand::new("cargo").with_args(
+            build_args
+                .into_iter()
+                .chain(["--target-dir".to_owned(), target_dir.display().to_string()]),
+        );
+        Ok(Arc::new(BuildBinaryProvider {
+            command,
+            output_path: target_dir.join("release").join("logos-blockchain-node"),
             working_dir: Some(workspace_root()),
             lock_dir: Some(workspace_root().join("target").join(".tf-binaries")),
-        })
+        }))
     }
 }
 
@@ -499,18 +831,7 @@ fn tokio_console_node_binary_provider() -> Result<BinaryProviderRef, DynError> {
             PathBinaryProvider::new(release_node_binary_path()),
         ))
     } else {
-        Ok(Arc::new(BuildBinaryProvider {
-            command: tokio_console_build_command(inherited_rustflags()?),
-            output_path: release_profiling_node_binary_path(),
-            working_dir: Some(workspace_root()),
-            lock_dir: Some(workspace_root().join("target").join(".tf-binaries")),
-        }))
-    }
-}
-
-fn tokio_console_build_command(rustflags: Vec<String>) -> BuildCommand {
-    cargo_command_with_tokio_console_flags(
-        [
+        let build_args = [
             "build".to_owned(),
             "--locked".to_owned(),
             "--profile".to_owned(),
@@ -519,33 +840,44 @@ fn tokio_console_build_command(rustflags: Vec<String>) -> BuildCommand {
             "logos-blockchain-node".to_owned(),
             "--features".to_owned(),
             "testing,tokio-console".to_owned(),
-        ],
-        rustflags,
-    )
+        ];
+        let target_dir =
+            managed_build_target_dir(&NodeBinaryProfile::TokioConsole, &build_args, true)?;
+        let command = tokio_console_build_command(
+            build_args
+                .into_iter()
+                .chain(["--target-dir".to_owned(), target_dir.display().to_string()]),
+        )?;
+        Ok(Arc::new(BuildBinaryProvider {
+            command,
+            output_path: target_dir
+                .join("release-profiling")
+                .join("logos-blockchain-node"),
+            working_dir: Some(workspace_root()),
+            lock_dir: Some(workspace_root().join("target").join(".tf-binaries")),
+        }))
+    }
 }
 
-fn cargo_command_with_tokio_console_flags(
+fn tokio_console_build_command(
     build_args: impl IntoIterator<Item = String>,
-    rustflags: Vec<String>,
-) -> BuildCommand {
-    let rustflags = rustflags_with_tokio_unstable_from(rustflags);
-    let encoded_rustflags = rustflags.join("\u{1f}");
-
-    BuildCommand::new("env").with_args(
-        [
-            format!("CARGO_ENCODED_RUSTFLAGS={encoded_rustflags}"),
-            "cargo".to_owned(),
-        ]
-        .into_iter()
-        .chain(build_args),
-    )
-}
-
-fn release_profiling_node_binary_path() -> PathBuf {
-    workspace_root()
-        .join("target")
-        .join("release-profiling")
-        .join("logos-blockchain-node")
+) -> Result<BuildCommand, DynError> {
+    let wrapper = tokio_console_wrapper_path();
+    let mut env_args = vec![
+        "-u".to_owned(),
+        TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER.to_owned(),
+        format!("RUSTC_WRAPPER={}", wrapper.display()),
+        format!("CARGO_BUILD_RUSTC_WRAPPER={}", wrapper.display()),
+    ];
+    if let Some(original_wrapper) = configured_rustc_wrapper()? {
+        env_args.push(format!(
+            "{TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER}={}",
+            original_wrapper.display()
+        ));
+    }
+    env_args.push("cargo".to_owned());
+    env_args.extend(build_args);
+    Ok(BuildCommand::new("env").with_args(env_args))
 }
 
 fn workspace_root() -> PathBuf {
@@ -1025,147 +1357,362 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tokio_console_build_flags_preserve_existing_flags_and_enable_unstable_apis() {
-        assert_eq!(
-            rustflags_with_tokio_unstable_from(Vec::new()),
-            ["--cfg", "tokio_unstable"]
-        );
-        assert_eq!(
-            rustflags_with_tokio_unstable_from(["-C".to_owned(), "opt-level=1".to_owned(),]),
-            ["-C", "opt-level=1", "--cfg", "tokio_unstable"]
-        );
-        assert_eq!(
-            rustflags_with_tokio_unstable_from([
-                "--cfg".to_owned(),
-                "tokio_unstable".to_owned(),
-                "-C".to_owned(),
-                "opt-level=1".to_owned(),
-                "--cfg".to_owned(),
-                "tokio_unstable".to_owned(),
-            ]),
-            ["--cfg", "tokio_unstable", "-C", "opt-level=1"]
-        );
-        assert_eq!(
-            rustflags_with_tokio_unstable_from([
-                "--cfg=tokio_unstable".to_owned(),
-                "--cfg".to_owned(),
-                "tokio_unstable".to_owned(),
-            ]),
-            ["--cfg=tokio_unstable"]
-        );
-        assert_eq!(
-            cfg_flag_count(
-                &rustflags_with_tokio_unstable_from([
-                    "--cfg".to_owned(),
-                    "tokio_unstable".to_owned(),
-                    "--cfg=tokio_unstable".to_owned(),
-                ]),
-                "tokio_unstable"
-            ),
-            1
-        );
-        assert_eq!(
-            effective_rustflags_from(Some("--cfg plain_user"), Some("--cfg\u{1f}encoded_user")),
-            ["--cfg", "encoded_user"],
-            "Cargo gives CARGO_ENCODED_RUSTFLAGS precedence over RUSTFLAGS"
-        );
-    }
-
-    #[test]
-    fn tokio_console_build_cache_identity_includes_effective_flags() {
-        let first = BuildBinaryProvider {
-            command: cargo_command_with_tokio_console_flags(
-                ["build".to_owned()],
-                vec!["--cfg".to_owned(), "first_profile_flag".to_owned()],
-            ),
-            output_path: PathBuf::from("target/release-profiling/logos-blockchain-node"),
-            working_dir: Some(PathBuf::from("/workspace")),
-            lock_dir: None,
-        };
-        let second = BuildBinaryProvider {
-            command: cargo_command_with_tokio_console_flags(
-                ["build".to_owned()],
-                vec!["--cfg".to_owned(), "second_profile_flag".to_owned()],
-            ),
-            output_path: first.output_path.clone(),
-            working_dir: first.working_dir.clone(),
-            lock_dir: None,
-        };
-
-        assert_ne!(
-            first.cache_key(),
-            second.cache_key(),
-            "effective Rust flags must distinguish cached build providers"
-        );
-    }
-
+    #[cfg(unix)]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        reason = "Exercises Cargo's distinct rustflags sources through real fixture builds"
+    )]
     #[tokio::test]
-    async fn tokio_console_cargo_build_preserves_flag_precedence_and_encoded_boundaries() {
-        let parent_profile = env::var_os(NODE_BINARY_PROFILE);
-        let parent_rustflags = env::var_os("RUSTFLAGS");
-        let parent_encoded_rustflags = env::var_os("CARGO_ENCODED_RUSTFLAGS");
+    async fn tokio_console_compiler_wrapper_preserves_cargo_flag_sources() {
+        let parent_environment = [
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ]
+        .map(|name| (name, env::var_os(name)));
         let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-        let fixture_dir = temp_dir.path().join("fixture");
-        write_profile_build_fixture(&fixture_dir);
         let lock_dir = temp_dir.path().join("locks");
-        let cases = [
+        let cases: [(&str, &[(&str, &str)], Option<&str>, &str); 7] = [
             (
-                "rustflags-only",
-                Some("-C opt-level=1 --cfg profile_user_flag"),
+                "none",
+                &[],
                 None,
-                "true:true:false:false:false",
+                "true:false:false:false:false:false:false:false:false",
             ),
             (
-                "encoded-only",
+                "rustflags",
+                &[("RUSTFLAGS", "-C opt-level=1 --cfg fixture_rustflags")],
                 None,
-                Some("--cfg\u{1f}encoded_user\u{1f}--cfg=encoded_space=\"two words\""),
-                "true:false:true:false:true",
+                "true:true:false:false:false:false:false:false:false",
             ),
             (
-                "both-variables",
-                Some("--cfg plain_user --cfg profile_user_flag"),
-                Some("--cfg\u{1f}encoded_user"),
-                "true:false:true:false:false",
+                "encoded",
+                &[(
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "--cfg\u{1f}fixture_encoded\u{1f}--cfg\u{1f}encoded_space=\"two words\"",
+                )],
+                None,
+                "true:false:true:false:true:false:false:false:false",
             ),
             (
-                "duplicate-tokio-cfg",
+                "both",
+                &[
+                    ("RUSTFLAGS", "--cfg fixture_plain"),
+                    ("CARGO_ENCODED_RUSTFLAGS", "--cfg\u{1f}fixture_encoded"),
+                ],
                 None,
-                Some(
-                    "--cfg\u{1f}tokio_unstable\u{1f}--cfg=tokio_unstable\u{1f}--cfg\u{1f}encoded_user",
-                ),
-                "true:false:true:false:false",
+                "true:false:true:false:false:false:false:false:false",
+            ),
+            (
+                "target-config",
+                &[],
+                Some("[target.'cfg(unix)']\nrustflags = ['--cfg', 'fixture_target']\n"),
+                "true:false:false:false:false:true:false:false:false",
+            ),
+            (
+                "build-config",
+                &[],
+                Some("[build]\nrustflags = ['--cfg', 'fixture_build']\n"),
+                "true:false:false:false:false:false:true:false:false",
+            ),
+            (
+                "existing-tokio-flag",
+                &[("RUSTFLAGS", "--cfg tokio_unstable --cfg fixture_rustflags")],
+                None,
+                "true:true:false:false:false:false:false:false:false",
             ),
         ];
 
-        for (name, rustflags, encoded_rustflags, expected) in cases {
-            let target_dir = temp_dir.path().join(format!("target-{name}"));
+        for (name, environment, cargo_config, expected) in cases {
+            let fixture_dir = temp_dir.path().join(name);
+            write_profile_build_fixture(&fixture_dir);
+            if let Some(config) = cargo_config {
+                write_fixture_cargo_config(&fixture_dir, config);
+            }
+            let target_dir = fixture_dir.join("target");
             let output_path = fixture_binary_path(&target_dir);
-            let build_args = fixture_build_args(&fixture_dir, &target_dir);
             let provider = BuildBinaryProvider {
-                command: fixture_build_command(build_args, rustflags, encoded_rustflags, true),
+                command: fixture_build_command(
+                    fixture_build_args(&fixture_dir, &target_dir),
+                    true,
+                    environment,
+                    None,
+                ),
                 output_path,
                 working_dir: Some(fixture_dir.clone()),
                 lock_dir: Some(lock_dir.clone()),
             };
-
             let binary = resolve_node_binary_with_provider(Arc::new(provider))
                 .await
                 .unwrap_or_else(|error| panic!("{name} Cargo build should succeed: {error}"));
-
-            assert_eq!(
-                run_fixture_binary(&binary),
-                expected,
-                "Cargo should compile the effective flags for {name}"
-            );
+            assert_eq!(run_fixture_binary(&binary), expected, "case {name}");
         }
 
-        assert_eq!(env::var_os(NODE_BINARY_PROFILE), parent_profile);
-        assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
+        let assignment_dir = temp_dir.path().join("existing-tokio-assignment");
+        write_profile_build_fixture(&assignment_dir);
+        let existing_rustc_wrapper = temp_dir.path().join("existing-rustc-wrapper.sh");
+        let existing_rustc_log = temp_dir.path().join("existing-rustc-wrapper.log");
+        let existing_workspace_wrapper = temp_dir.path().join("existing-workspace-wrapper.sh");
+        let workspace_log = temp_dir.path().join("workspace-wrapper.log");
+        write_logging_wrapper(&existing_rustc_wrapper, "TOKIO_EXISTING_RUSTC_WRAPPER_LOG");
+        write_logging_wrapper(&existing_workspace_wrapper, "TOKIO_WORKSPACE_WRAPPER_LOG");
+        let build_environment = [
+            (
+                "CARGO_ENCODED_RUSTFLAGS",
+                "--cfg=tokio_unstable\u{1f}--cfg\u{1f}encoded_space=\"two words\"",
+            ),
+            (
+                "RUSTC_WORKSPACE_WRAPPER",
+                existing_workspace_wrapper.to_str().unwrap(),
+            ),
+            (
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                existing_workspace_wrapper.to_str().unwrap(),
+            ),
+            (
+                "TOKIO_WORKSPACE_WRAPPER_LOG",
+                workspace_log.to_str().unwrap(),
+            ),
+            (
+                "TOKIO_EXISTING_RUSTC_WRAPPER_LOG",
+                existing_rustc_log.to_str().unwrap(),
+            ),
+        ];
+        let target_dir = assignment_dir.join("target");
+        let output_path = fixture_binary_path(&target_dir);
+        let provider = BuildBinaryProvider {
+            command: fixture_build_command(
+                fixture_build_args(&assignment_dir, &target_dir),
+                true,
+                &build_environment,
+                Some(&existing_rustc_wrapper),
+            ),
+            output_path,
+            working_dir: Some(assignment_dir),
+            lock_dir: Some(lock_dir),
+        };
+        let binary = resolve_node_binary_with_provider(Arc::new(provider))
+            .await
+            .expect("existing Cargo wrappers should remain in the invocation chain");
         assert_eq!(
-            env::var_os("CARGO_ENCODED_RUSTFLAGS"),
-            parent_encoded_rustflags
+            run_fixture_binary(&binary),
+            "true:false:false:false:true:false:false:false:false"
         );
+        assert!(fs::metadata(&workspace_log).unwrap().len() > 0);
+        assert!(fs::metadata(&existing_rustc_log).unwrap().len() > 0);
+        assert!(
+            fs::read(&workspace_log)
+                .unwrap()
+                .windows(b"encoded_space=\"two words\"\0".len())
+                .any(|window| window == b"encoded_space=\"two words\"\0"),
+            "Cargo must preserve encoded flag boundaries through both wrappers"
+        );
+        assert!(
+            logged_tokio_cfgs(&workspace_log)
+                .iter()
+                .all(|count| *count <= 1),
+            "the wrapper must not append a second tokio_unstable cfg"
+        );
+
+        for (name, expected) in parent_environment {
+            assert_eq!(env::var_os(name), expected, "parent {name} changed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Covers A-B-A artifact isolation, reuse, and overlapping fixture builds"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_binary_artifacts_are_isolated_for_a_b_a_and_concurrent_builds() {
+        let parent_rustflags = env::var_os("RUSTFLAGS");
+        let parent_encoded = env::var_os("CARGO_ENCODED_RUSTFLAGS");
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
+        let fixture_dir = temp_dir.path().join("fixture");
+        write_profile_build_fixture(&fixture_dir);
+        let build_count = temp_dir.path().join("build-count");
+        write_counting_build_script(&fixture_dir);
+        let logical_args = vec![
+            "build".to_owned(),
+            "--quiet".to_owned(),
+            "--manifest-path".to_owned(),
+            fixture_dir.join("Cargo.toml").display().to_string(),
+        ];
+        let config_snapshot = fixture_config_snapshot(&fixture_dir);
+        let wrapper_path = tokio_console_wrapper_path();
+        let wrapper_file = (wrapper_path.clone(), fs::read(&wrapper_path).unwrap());
+        let env_a = fixture_environment_snapshot("--cfg fixture_a");
+        let env_b = fixture_environment_snapshot("--cfg fixture_b");
+        let extra_files = [wrapper_file];
+        let target_a = build_target_dir_for_configuration(
+            &fixture_dir,
+            &NodeBinaryProfile::TokioConsole,
+            &logical_args,
+            &env_a,
+            &config_snapshot,
+            &[],
+            &[],
+            &extra_files,
+        )
+        .expect("configuration A should have a stable target directory");
+        let target_b = build_target_dir_for_configuration(
+            &fixture_dir,
+            &NodeBinaryProfile::TokioConsole,
+            &logical_args,
+            &env_b,
+            &config_snapshot,
+            &[],
+            &[],
+            &extra_files,
+        )
+        .expect("configuration B should have a stable target directory");
+        assert_ne!(
+            target_a, target_b,
+            "different flags need separate artifacts"
+        );
+
+        let env_a_command = [
+            ("RUSTFLAGS", "--cfg fixture_a"),
+            ("FIXTURE_BUILD_COUNT_FILE", build_count.to_str().unwrap()),
+        ];
+        let env_b_command = [
+            ("RUSTFLAGS", "--cfg fixture_b"),
+            ("FIXTURE_BUILD_COUNT_FILE", build_count.to_str().unwrap()),
+        ];
+        let lock_dir = temp_dir.path().join("locks");
+        let provider_a: BinaryProviderRef = Arc::new(BuildBinaryProvider {
+            command: fixture_build_command(
+                fixture_build_args(&fixture_dir, &target_a),
+                true,
+                &env_a_command,
+                None,
+            ),
+            output_path: fixture_binary_path(&target_a),
+            working_dir: Some(fixture_dir.clone()),
+            lock_dir: Some(lock_dir.clone()),
+        });
+        let provider_b: BinaryProviderRef = Arc::new(BuildBinaryProvider {
+            command: fixture_build_command(
+                fixture_build_args(&fixture_dir, &target_b),
+                true,
+                &env_b_command,
+                None,
+            ),
+            output_path: fixture_binary_path(&target_b),
+            working_dir: Some(fixture_dir.clone()),
+            lock_dir: Some(lock_dir),
+        });
+
+        let binary_a = resolve_node_binary_with_provider(Arc::clone(&provider_a))
+            .await
+            .expect("configuration A should build");
+        assert_eq!(
+            run_fixture_binary(&binary_a),
+            "true:false:false:false:false:false:false:true:false"
+        );
+        assert_eq!(fs::read_to_string(&build_count).unwrap().trim(), "1");
+
+        let binary_b = resolve_node_binary_with_provider(Arc::clone(&provider_b))
+            .await
+            .expect("configuration B should build");
+        assert_ne!(binary_a, binary_b);
+        assert_eq!(
+            run_fixture_binary(&binary_b),
+            "true:false:false:false:false:false:false:false:true"
+        );
+        assert_eq!(
+            run_fixture_binary(&binary_a),
+            "true:false:false:false:false:false:false:true:false"
+        );
+
+        let binary_a_again = resolve_node_binary_with_provider(provider_a)
+            .await
+            .expect("configuration A should resolve after B");
+        assert_eq!(binary_a_again, binary_a);
+        assert_eq!(
+            run_fixture_binary(&binary_a_again),
+            "true:false:false:false:false:false:false:true:false"
+        );
+        assert_eq!(fs::read_to_string(&build_count).unwrap().trim(), "2");
+
+        let concurrent_dir = temp_dir.path().join("concurrent");
+        write_profile_build_fixture(&concurrent_dir);
+        let concurrent_args = vec![
+            "build".to_owned(),
+            "--quiet".to_owned(),
+            "--manifest-path".to_owned(),
+            concurrent_dir.join("Cargo.toml").display().to_string(),
+        ];
+        let concurrent_config = fixture_config_snapshot(&concurrent_dir);
+        let target_normal = build_target_dir_for_configuration(
+            &concurrent_dir,
+            &NodeBinaryProfile::Normal,
+            &concurrent_args,
+            &env_a,
+            &concurrent_config,
+            &[],
+            &[],
+            &[],
+        )
+        .expect("normal profile should have an isolated target directory");
+        let target_tokio = build_target_dir_for_configuration(
+            &concurrent_dir,
+            &NodeBinaryProfile::TokioConsole,
+            &concurrent_args,
+            &env_b,
+            &concurrent_config,
+            &[],
+            &[],
+            &extra_files,
+        )
+        .expect("Tokio-console profile should have an isolated target directory");
+        assert_ne!(target_normal, target_tokio);
+        let normal_environment = [("RUSTFLAGS", "--cfg fixture_a")];
+        let tokio_environment = [("RUSTFLAGS", "--cfg fixture_b")];
+        let normal_provider = Arc::new(BuildBinaryProvider {
+            command: fixture_build_command(
+                fixture_build_args(&concurrent_dir, &target_normal),
+                false,
+                &normal_environment,
+                None,
+            ),
+            output_path: fixture_binary_path(&target_normal),
+            working_dir: Some(concurrent_dir.clone()),
+            lock_dir: Some(temp_dir.path().join("locks")),
+        });
+        let tokio_provider = Arc::new(BuildBinaryProvider {
+            command: fixture_build_command(
+                fixture_build_args(&concurrent_dir, &target_tokio),
+                true,
+                &tokio_environment,
+                None,
+            ),
+            output_path: fixture_binary_path(&target_tokio),
+            working_dir: Some(concurrent_dir),
+            lock_dir: Some(temp_dir.path().join("locks")),
+        });
+        let (normal, tokio_console) = tokio::join!(
+            resolve_node_binary_with_provider(normal_provider),
+            resolve_node_binary_with_provider(tokio_provider),
+        );
+        let normal = normal.expect("normal concurrent build should succeed");
+        let tokio_console = tokio_console.expect("Tokio-console concurrent build should succeed");
+        assert_ne!(normal, tokio_console);
+        assert_eq!(
+            run_fixture_binary(&normal),
+            "false:false:false:false:false:false:false:true:false"
+        );
+        assert_eq!(
+            run_fixture_binary(&tokio_console),
+            "true:false:false:false:false:false:false:false:true"
+        );
+        assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
+        assert_eq!(env::var_os("CARGO_ENCODED_RUSTFLAGS"), parent_encoded);
     }
 
     #[tokio::test]
@@ -1216,74 +1763,6 @@ mod tests {
         assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_normal_and_tokio_console_builds_are_isolated() {
-        let parent_profile = env::var_os(NODE_BINARY_PROFILE);
-        let parent_rustflags = env::var_os("RUSTFLAGS");
-        let parent_encoded_rustflags = env::var_os("CARGO_ENCODED_RUSTFLAGS");
-        let temp_dir = tempfile::tempdir().expect("temporary directory should be created");
-        let normal_dir = temp_dir.path().join("normal");
-        let tokio_dir = temp_dir.path().join("tokio-console");
-        write_profile_build_fixture(&normal_dir);
-        write_profile_build_fixture(&tokio_dir);
-        let lock_dir = temp_dir.path().join("locks");
-        let normal_target = normal_dir.join("target");
-        let tokio_target = tokio_dir.join("target");
-        let normal_output = fixture_binary_path(&normal_target);
-        let tokio_output = fixture_binary_path(&tokio_target);
-        let normal_provider = BuildBinaryProvider {
-            command: fixture_build_command(
-                fixture_build_args(&normal_dir, &normal_target),
-                Some("-C opt-level=1 --cfg profile_user_flag"),
-                None,
-                false,
-            ),
-            output_path: normal_output.clone(),
-            working_dir: Some(normal_dir.clone()),
-            lock_dir: Some(lock_dir.clone()),
-        };
-        let tokio_provider = BuildBinaryProvider {
-            command: fixture_build_command(
-                fixture_build_args(&tokio_dir, &tokio_target),
-                Some("-C opt-level=1 --cfg profile_user_flag"),
-                None,
-                true,
-            ),
-            output_path: tokio_output.clone(),
-            working_dir: Some(tokio_dir),
-            lock_dir: Some(lock_dir),
-        };
-
-        let normal_provider: BinaryProviderRef = Arc::new(normal_provider);
-        let tokio_provider: BinaryProviderRef = Arc::new(tokio_provider);
-        let (normal_result, tokio_result) = tokio::join!(
-            resolve_node_binary_with_provider(normal_provider),
-            resolve_node_binary_with_provider(tokio_provider),
-        );
-        let normal_binary = normal_result.expect("normal build should succeed");
-        let tokio_binary = tokio_result.expect("Tokio-console build should succeed");
-
-        assert_ne!(
-            normal_binary, tokio_binary,
-            "profiles must not share a cached binary"
-        );
-        assert_eq!(normal_binary, normal_output);
-        assert_eq!(tokio_binary, tokio_output);
-        let normal_cfg = run_fixture_binary(&normal_binary);
-        let tokio_cfg = run_fixture_binary(&tokio_binary);
-        assert_eq!(
-            normal_cfg, "false:true:false:false:false",
-            "normal Cargo must not inherit the Tokio-console cfg"
-        );
-        assert_eq!(tokio_cfg, "true:true:false:false:false");
-        assert_eq!(env::var_os(NODE_BINARY_PROFILE), parent_profile);
-        assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
-        assert_eq!(
-            env::var_os("CARGO_ENCODED_RUSTFLAGS"),
-            parent_encoded_rustflags
-        );
-    }
-
     #[tokio::test]
     async fn failed_or_cancelled_resolution_does_not_mutate_parent_environment() {
         let parent_profile = env::var_os(NODE_BINARY_PROFILE);
@@ -1308,6 +1787,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_cargo_build_is_not_cached_and_can_be_retried() {
         let parent_rustflags = env::var_os("RUSTFLAGS");
@@ -1326,9 +1806,9 @@ mod tests {
         let provider: BinaryProviderRef = Arc::new(BuildBinaryProvider {
             command: fixture_build_command(
                 fixture_build_args(&fixture_dir, &target_dir),
+                true,
+                &[],
                 None,
-                None,
-                false,
             ),
             output_path: output_path.clone(),
             working_dir: Some(fixture_dir.clone()),
@@ -1350,7 +1830,10 @@ mod tests {
             .await
             .expect("the same provider should retry after its failed build");
         assert_eq!(binary, output_path);
-        assert_eq!(run_fixture_binary(&binary), "false:false:false:false:false");
+        assert_eq!(
+            run_fixture_binary(&binary),
+            "true:false:false:false:false:false:false:false:false"
+        );
         assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
         assert_eq!(
             env::var_os("CARGO_ENCODED_RUSTFLAGS"),
@@ -1358,6 +1841,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_cargo_resolution_leaves_no_cached_binary_and_can_be_retried() {
         let parent_rustflags = env::var_os("RUSTFLAGS");
@@ -1386,9 +1870,9 @@ mod tests {
         let provider: BinaryProviderRef = Arc::new(BuildBinaryProvider {
             command: fixture_build_command(
                 fixture_build_args(&fixture_dir, &target_dir),
+                true,
+                &[],
                 None,
-                None,
-                false,
             ),
             output_path: output_path.clone(),
             working_dir: Some(fixture_dir.clone()),
@@ -1421,7 +1905,10 @@ mod tests {
             .await
             .expect("the same provider should build successfully after cancellation");
         assert_eq!(binary, output_path);
-        assert_eq!(run_fixture_binary(&binary), "false:false:false:false:false");
+        assert_eq!(
+            run_fixture_binary(&binary),
+            "true:false:false:false:false:false:false:false:false"
+        );
         assert_eq!(env::var_os("RUSTFLAGS"), parent_rustflags);
         assert_eq!(
             env::var_os("CARGO_ENCODED_RUSTFLAGS"),
@@ -1508,9 +1995,65 @@ mod tests {
         .expect("fixture manifest should be written");
         fs::write(
             dir.join("src/main.rs"),
-            "#![allow(unexpected_cfgs)]\nfn main() { println!(\"{}:{}:{}:{}:{}\", cfg!(tokio_unstable), cfg!(profile_user_flag), cfg!(encoded_user), cfg!(plain_user), cfg!(encoded_space = \"two words\")); }\n",
+            "#![allow(unexpected_cfgs)]\nfn main() { println!(\"{}:{}:{}:{}:{}:{}:{}:{}:{}\", cfg!(tokio_unstable), cfg!(fixture_rustflags), cfg!(fixture_encoded), cfg!(fixture_plain), cfg!(encoded_space = \"two words\"), cfg!(fixture_target), cfg!(fixture_build), cfg!(fixture_a), cfg!(fixture_b)); }\n",
         )
         .expect("fixture source should be written");
+    }
+
+    fn write_fixture_cargo_config(dir: &Path, contents: &str) {
+        fs::create_dir_all(dir.join(".cargo"))
+            .expect("fixture cargo config directory should exist");
+        fs::write(dir.join(".cargo/config.toml"), contents)
+            .expect("fixture cargo config should be written");
+    }
+
+    fn fixture_config_snapshot(dir: &Path) -> CargoConfigSnapshot {
+        let config_dir = dir.join(".cargo");
+        let config = config_dir.join("config");
+        let config_toml = config_dir.join("config.toml");
+        vec![
+            (config, None),
+            (
+                config_toml.clone(),
+                config_toml.exists().then(|| fs::read(config_toml).unwrap()),
+            ),
+        ]
+    }
+
+    fn fixture_environment_snapshot(
+        rustflags: &str,
+    ) -> Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> {
+        [
+            ("RUSTFLAGS", Some(rustflags)),
+            ("CARGO_ENCODED_RUSTFLAGS", None),
+            ("RUSTC_WRAPPER", None),
+            ("CARGO_BUILD_RUSTC_WRAPPER", None),
+            ("RUSTC_WORKSPACE_WRAPPER", None),
+            ("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", None),
+            ("CARGO_BUILD_TARGET", None),
+            ("RUSTUP_TOOLCHAIN", None),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.map(std::ffi::OsString::from)))
+        .collect()
+    }
+
+    fn write_counting_build_script(dir: &Path) {
+        let manifest_path = dir.join("Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("fixture manifest should exist");
+        fs::write(
+            manifest_path,
+            manifest.replace(
+                "edition = \"2024\"\n",
+                "edition = \"2024\"\nbuild = \"build.rs\"\n",
+            ),
+        )
+        .expect("fixture manifest should enable build script");
+        fs::write(
+            dir.join("build.rs"),
+            "fn main() { println!(\"cargo:rerun-if-env-changed=FIXTURE_BUILD_COUNT_FILE\"); let path = std::path::PathBuf::from(std::env::var_os(\"FIXTURE_BUILD_COUNT_FILE\").unwrap()); let count = std::fs::read_to_string(&path).ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or_default(); std::fs::write(path, (count + 1).to_string()).unwrap(); }\n",
+        )
+        .expect("fixture build script should be written");
     }
 
     fn fixture_build_args(fixture_dir: &Path, target_dir: &Path) -> Vec<String> {
@@ -1524,49 +2067,92 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
     fn fixture_build_command(
         build_args: impl IntoIterator<Item = String>,
-        rustflags: Option<&str>,
-        encoded_rustflags: Option<&str>,
         tokio_console: bool,
+        child_environment: &[(&str, &str)],
+        existing_workspace_wrapper: Option<&Path>,
     ) -> BuildCommand {
+        let build_args = build_args.into_iter().collect::<Vec<_>>();
+        let fixture_dir = build_args
+            .windows(2)
+            .find(|pair| pair[0] == "--manifest-path")
+            .map(|pair| PathBuf::from(&pair[1]).parent().unwrap().to_owned())
+            .expect("fixture build arguments should include a manifest path");
         let mut environment_args = vec![
             "-u".to_owned(),
             "RUSTFLAGS".to_owned(),
             "-u".to_owned(),
             "CARGO_ENCODED_RUSTFLAGS".to_owned(),
+            "-u".to_owned(),
+            "RUSTC_WRAPPER".to_owned(),
+            "-u".to_owned(),
+            "CARGO_BUILD_RUSTC_WRAPPER".to_owned(),
+            "-u".to_owned(),
+            "RUSTC_WORKSPACE_WRAPPER".to_owned(),
+            "-u".to_owned(),
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER".to_owned(),
+            "-u".to_owned(),
+            TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER.to_owned(),
+            format!("CARGO_HOME={}", fixture_dir.join("cargo-home").display()),
         ];
-        if let Some(rustflags) = rustflags {
-            environment_args.push(format!("RUSTFLAGS={rustflags}"));
-        }
-
+        environment_args.extend(
+            child_environment
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
         if tokio_console {
-            let command = cargo_command_with_tokio_console_flags(
-                build_args,
-                effective_rustflags_from(rustflags, encoded_rustflags),
-            );
-            environment_args.extend(command.args);
-        } else {
-            if let Some(encoded_rustflags) = encoded_rustflags {
-                environment_args.push(format!("CARGO_ENCODED_RUSTFLAGS={encoded_rustflags}"));
+            if let Some(original) = existing_workspace_wrapper {
+                environment_args.push(format!(
+                    "{TOKIO_CONSOLE_ORIGINAL_RUSTC_WRAPPER}={}",
+                    original.display()
+                ));
             }
-            environment_args.push("cargo".to_owned());
-            environment_args.extend(build_args);
+            let wrapper = tokio_console_wrapper_path();
+            environment_args.push(format!("RUSTC_WRAPPER={}", wrapper.display()));
+            environment_args.push(format!("CARGO_BUILD_RUSTC_WRAPPER={}", wrapper.display()));
         }
+        environment_args.push("cargo".to_owned());
+        environment_args.extend(build_args);
 
         BuildCommand::new("env").with_args(environment_args)
     }
 
-    fn cfg_flag_count(flags: &[String], cfg: &str) -> usize {
-        let pair_form_count = flags
-            .windows(2)
-            .filter(|pair| pair[0] == "--cfg" && pair[1] == cfg)
-            .count();
-        let assignment_form_count = flags
-            .iter()
-            .filter(|flag| flag.as_str() == format!("--cfg={cfg}"))
-            .count();
-        pair_form_count + assignment_form_count
+    #[cfg(unix)]
+    fn write_logging_wrapper(path: &Path, log_environment_variable: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf 'CALL\\000' >> \"${log_environment_variable}\"\nfor argument do printf '%s\\000' \"$argument\" >> \"${log_environment_variable}\"; done\nprintf '\\n' >> \"${log_environment_variable}\"\nexec \"$@\"\n"
+        );
+        fs::write(path, script).expect("compiler wrapper script should be written");
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("compiler wrapper should be executable");
+    }
+
+    #[cfg(unix)]
+    fn logged_tokio_cfgs(log_path: &Path) -> Vec<usize> {
+        let bytes = fs::read(log_path).expect("compiler wrapper should produce a log");
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter_map(|call| {
+                let args = call
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .collect::<Vec<_>>();
+                let pair_count = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == b"--cfg" && pair[1] == b"tokio_unstable")
+                    .count();
+                let assignment_count = args
+                    .iter()
+                    .filter(|argument| **argument == b"--cfg=tokio_unstable")
+                    .count();
+                (pair_count + assignment_count > 0).then_some(pair_count + assignment_count)
+            })
+            .collect()
     }
 
     fn fixture_binary_path(target_dir: &Path) -> PathBuf {
