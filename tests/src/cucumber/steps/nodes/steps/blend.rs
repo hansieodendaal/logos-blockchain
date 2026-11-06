@@ -401,6 +401,15 @@ async fn step_all_nodes_reached_min_height_and_converged(
     max_diff_height: u64,
     time_out_seconds: u64,
 ) -> StepResult {
+    if world.startup.era_boundary_schedule.is_some() {
+        return crate::cucumber::steps::nodes::era_boundaries::wait_for_convergence(
+            world,
+            min_height,
+            max_diff_height,
+            time_out_seconds,
+        )
+        .await;
+    }
     nodes_converged(
         world,
         &step.value,

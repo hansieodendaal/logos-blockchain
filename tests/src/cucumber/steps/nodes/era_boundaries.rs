@@ -26,6 +26,162 @@ use crate::cucumber::{
 
 const EVIDENCE_FILE: &str = "era_boundaries_evidence.ndjson";
 const MAX_ANCESTOR_WALK: usize = 1_000_000;
+
+async fn ancestor_at_height<F, Fut>(
+    tip: HeaderId,
+    genesis: HeaderId,
+    distance: u64,
+    mut fetch: F,
+) -> Result<HeaderId, HistoryInspectionError>
+where
+    F: FnMut(HeaderId) -> Fut,
+    Fut: Future<Output = Result<(HeaderId, u64), HistoryInspectionError>>,
+{
+    if distance > MAX_ANCESTOR_WALK as u64 {
+        return Err(HistoryInspectionError::immediate(
+            "Convergence ancestry walk exceeded its internal safety limit",
+        ));
+    }
+    let mut current = tip;
+    let mut child_slot = None;
+    let mut visited = HashSet::new();
+    for _ in 0..distance {
+        if current == genesis || !visited.insert(current) {
+            return Err(HistoryInspectionError::immediate(format!(
+                "Invalid convergence ancestry at block {current:?}"
+            )));
+        }
+        let (parent, slot) = fetch(current).await?;
+        if child_slot.is_some_and(|child| slot > child) {
+            return Err(HistoryInspectionError::immediate(format!(
+                "Convergence ancestor {current:?} has invalid slot {slot}"
+            )));
+        }
+        current = parent;
+        child_slot = Some(slot);
+    }
+    if visited.contains(&current) {
+        return Err(HistoryInspectionError::immediate(format!(
+            "Convergence ancestry contains a cycle at block {current:?}"
+        )));
+    }
+    Ok(current)
+}
+
+/// Compare fresh tips against their actual ancestry at the lowest observed
+/// height. Cached tips from earlier polls can describe a different fork.
+#[expect(
+    clippy::too_many_lines,
+    reason = "The poll keeps fresh snapshots, ancestry validation, and timeout diagnostics together"
+)]
+pub async fn wait_for_convergence(
+    world: &CucumberWorld,
+    minimum_height: u64,
+    maximum_difference: u64,
+    seconds: u64,
+) -> StepResult {
+    let names = world.nodes_info.keys().cloned().collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(failure("No running nodes"));
+    }
+    let genesis = world
+        .chain
+        .genesis_block_id
+        .ok_or_else(|| failure("Genesis block id not recorded"))?;
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut last_observations = HashMap::new();
+    loop {
+        let mut snapshots = Vec::new();
+        for name in &names {
+            let client = world.resolve_node_http_client(name)?;
+            match client.consensus_info().await {
+                Ok(info) => snapshots.push((name, client, info.cryptarchia_info)),
+                Err(error) => {
+                    last_observations.insert(
+                        name.clone(),
+                        format!("Consensus info request failed: {error}"),
+                    );
+                }
+            }
+        }
+        if snapshots.len() == names.len() {
+            let lowest = snapshots
+                .iter()
+                .map(|(_, _, info)| info.height)
+                .min()
+                .unwrap();
+            let highest = snapshots
+                .iter()
+                .map(|(_, _, info)| info.height)
+                .max()
+                .unwrap();
+            if lowest >= minimum_height && highest - lowest <= maximum_difference {
+                let mut ancestors = Vec::new();
+                for (name, client, info) in &snapshots {
+                    let ancestor =
+                        ancestor_at_height(info.tip, genesis, info.height - lowest, async |id| {
+                            match client.block(&id).await {
+                                Ok(Some(block)) => {
+                                    Ok((block.header.parent_block, block.header.slot.into_inner()))
+                                }
+                                Ok(None) => Err(HistoryInspectionError::retryable(format!(
+                                    "Canonical ancestor {id:?} is unavailable (HTTP 404)"
+                                ))),
+                                Err(error) => {
+                                    let message = format!(
+                                        "Failed to retrieve canonical ancestor {id:?}: {error}"
+                                    );
+                                    Err(if transient_block_fetch_error(&error) {
+                                        HistoryInspectionError::retryable(message)
+                                    } else {
+                                        HistoryInspectionError::immediate(message)
+                                    })
+                                }
+                            }
+                        })
+                        .await;
+                    match ancestor {
+                        Ok(id) => ancestors.push((*name, id)),
+                        Err(error) => observe_history_error(name, error, &mut last_observations)?,
+                    }
+                }
+                if ancestors.len() == names.len()
+                    && ancestors.iter().all(|(_, id)| *id == ancestors[0].1)
+                {
+                    record(
+                        world,
+                        "canonical_convergence",
+                        &serde_json::json!({
+                            "height": lowest,
+                            "maximum_height": highest,
+                            "common_block": format!("{:?}", ancestors[0].1),
+                            "nodes": snapshots.iter().map(|(name, _, info)| serde_json::json!({"node": name, "height": info.height, "tip": format!("{:?}", info.tip)})).collect::<Vec<_>>(),
+                            "source": "fresh_node_consensus_and_block_http_apis"
+                        }),
+                    )?;
+                    return Ok(());
+                }
+                for (name, id) in ancestors {
+                    last_observations
+                        .insert(name.clone(), format!("ancestor at height {lowest}: {id:?}"));
+                }
+            } else {
+                for (name, _, info) in &snapshots {
+                    last_observations.insert((*name).clone(), format!("height {}, tip {:?}; required minimum {minimum_height} and maximum difference {maximum_difference}", info.height, info.tip));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(failure(polling_timeout_message(
+                &format!("Nodes did not converge within {seconds}s"),
+                &names,
+                &last_observations,
+            )));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn failure(message: impl Into<String>) -> StepError {
     StepError::StepFail {
         message: message.into(),
@@ -1161,6 +1317,61 @@ async fn preserve_finality(world: &mut CucumberWorld, seconds: u64) -> StepResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn convergence_uses_the_current_tip_ancestry() {
+        let genesis = HeaderId::from([0; 32]);
+        let common = HeaderId::from([1; 32]);
+        let old_tip = HeaderId::from([2; 32]);
+        let new_tip = HeaderId::from([3; 32]);
+        let fork = HeaderId::from([4; 32]);
+        let parents = HashMap::from([
+            (old_tip, (common, 2)),
+            (new_tip, (fork, 3)),
+            (fork, (common, 2)),
+        ]);
+        let fetch = |id| {
+            let parents = &parents;
+            async move { Ok(parents[&id]) }
+        };
+        assert_eq!(
+            ancestor_at_height(old_tip, genesis, 1, fetch)
+                .await
+                .unwrap(),
+            common
+        );
+        assert_eq!(
+            ancestor_at_height(new_tip, genesis, 1, fetch)
+                .await
+                .unwrap(),
+            fork
+        );
+        assert_eq!(
+            ancestor_at_height(new_tip, genesis, 2, fetch)
+                .await
+                .unwrap(),
+            common
+        );
+    }
+
+    #[tokio::test]
+    async fn convergence_rejects_cycles_and_invalid_slot_order() {
+        let genesis = HeaderId::from([0; 32]);
+        let tip = HeaderId::from([1; 32]);
+        let parent = HeaderId::from([2; 32]);
+        let cycle = ancestor_at_height(tip, genesis, 2, async |id| {
+            Ok((if id == tip { parent } else { tip }, 1))
+        })
+        .await
+        .expect_err("cycle must fail");
+        assert!(!cycle.retryable);
+        let invalid = ancestor_at_height(tip, genesis, 2, async |id| {
+            Ok(if id == tip { (parent, 1) } else { (genesis, 2) })
+        })
+        .await
+        .expect_err("parent slot must not follow child slot");
+        assert!(!invalid.retryable);
+    }
 
     #[test]
     fn transient_block_fetch_statuses_are_retryable_only_for_transient_responses() {
