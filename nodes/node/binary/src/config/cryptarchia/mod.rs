@@ -128,6 +128,11 @@ impl ServiceConfig {
         };
         let chain_leader_settings = lb_chain_leader_service::LeaderSettings {
             era_schedule,
+            #[cfg(feature = "testing-era-boundaries")]
+            proposal_publication:
+                lb_chain_leader_service::proposal_control::ProposalPublicationControl::new(
+                    user.leader.testing_proposal_publication_enabled,
+                ),
             consensus_excluded_keys: genesis_block
                 .genesis_tx()
                 .genesis_parameters()

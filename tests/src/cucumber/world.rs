@@ -1,3 +1,5 @@
+#[cfg(feature = "testing-era-boundaries")]
+use std::collections::BTreeMap;
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     env,
@@ -198,6 +200,99 @@ pub struct ConfigOverride {
     pub path: String,
     /// YAML value parsed from the step input.
     pub value: serde_yaml::Value,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A participant's declared role; interaction tables define the traffic path.
+pub enum EraTransitionParticipantRole {
+    Provider,
+    Requester,
+    UnselectedRequester,
+    Observer,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// One named node in the experiment topology, independent of request pairing.
+pub struct EraTransitionParticipant {
+    /// Scenario key that must match the registered node name.
+    pub node_name: String,
+    pub role: EraTransitionParticipantRole,
+    /// Exactly one declaration is the reference for canonical-history checks.
+    pub canonical_reference: bool,
+    /// Position in the table and in the corresponding generated node plan.
+    pub startup_index: usize,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// A declared provider/requester relationship and its fault-control selection.
+pub struct EraTransitionInteraction {
+    pub name: String,
+    /// Participant names, resolved to runtime peer identities after startup.
+    pub provider: String,
+    pub requester: String,
+    /// Exactly one declared interaction is selected for the configured fault.
+    pub selected: bool,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Runtime identity captured from the Cucumber node registry for attribution.
+pub struct EraTransitionRuntimeBinding {
+    /// Stable participant key used to join declarations, nodes, and journals.
+    pub node_name: String,
+    pub runtime_name: String,
+    pub runtime_dir: PathBuf,
+    /// This node's local libp2p identity; request observations name remote
+    /// peers.
+    pub peer_id: String,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Debug, Default)]
+/// Scenario-local declarations, controls, runtime bindings, and evidence state.
+///
+/// Request-selector fields configure the provider hold; they are not global
+/// request identities. Journals remain keyed by participant node.
+pub struct EraTransitionScenarioState {
+    pub participants: BTreeMap<String, EraTransitionParticipant>,
+    pub interactions: BTreeMap<String, EraTransitionInteraction>,
+    pub runtime_bindings: BTreeMap<String, EraTransitionRuntimeBinding>,
+    pub provider_hold_after_blocks: Option<usize>,
+    pub provider_hold_peer_id: Option<String>,
+    pub provider_hold_provider_peer_id: Option<String>,
+    pub provider_hold_protocol: Option<String>,
+    pub provider_hold_target: Option<String>,
+    pub provider_hold_requester_tip: Option<String>,
+    pub provider_hold_latest_immutable: Option<String>,
+    pub provider_hold_additional_blocks: Option<Vec<String>>,
+    pub orphan_recovery: bool,
+    pub provider_hold_excludes_genesis_tip: bool,
+    pub proposal_publishing_suppression_required: bool,
+    pub initial_proposal_publication: BTreeMap<String, bool>,
+    pub accepted_f1_request: Option<EraTransitionAcceptedRequest>,
+    pub observation_journals: Mutex<BTreeMap<String, EraTransitionJournal>>,
+    pub evidence_sequence: AtomicUsize,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Debug)]
+/// Incremental reader and records for exactly one participant's journal.
+pub struct EraTransitionJournal {
+    pub path: PathBuf,
+    pub reader: lb_cryptarchia_sync::observation::ObservationReader,
+    pub records: Vec<lb_cryptarchia_sync::observation::ObservationRecord>,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Request observations accepted on each side; local IDs are never compared
+/// across the requester and provider.
+pub struct EraTransitionAcceptedRequest {
+    pub requester: lb_cryptarchia_sync::observation::RequestObservation,
+    pub provider: lb_cryptarchia_sync::observation::RequestObservation,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -689,6 +784,9 @@ impl ForkGroups {
 pub struct CucumberWorld {
     /// Scenario identity and lifecycle configuration.
     pub lifecycle: ScenarioLifecycle,
+    /// Participant declarations and controls owned by an RFC 439 experiment.
+    #[cfg(feature = "testing-era-boundaries")]
+    pub era_transition: Option<EraTransitionScenarioState>,
     /// Chain and genesis parameters for the deployed cluster.
     pub chain: ChainParameters,
     /// Manual-cluster deployment state.
@@ -805,7 +903,8 @@ impl Debug for CucumberWorld {
             .as_ref()
             .map_or(0, |diagnostics| diagnostics.header_height_node_count);
 
-        f.debug_struct("CucumberWorld")
+        let mut debug = f.debug_struct("CucumberWorld");
+        debug
             .field("deployer", &format!("{:?}", self.lifecycle.deployer))
             .field(
                 "test_context",
@@ -1012,8 +1111,10 @@ impl Debug for CucumberWorld {
                 &node_snapshot_on_startup_display(self.snapshots.node_snapshot_on_startup.as_ref()),
             )
             .field("tokio_console_profile", &self.tokio_console_profile)
-            .field("recorded_gas_prices_len", &self.recorded_gas_prices.len())
-            .finish()
+            .field("recorded_gas_prices_len", &self.recorded_gas_prices.len());
+        #[cfg(feature = "testing-era-boundaries")]
+        debug.field("era_transition", &self.era_transition);
+        debug.finish()
     }
 }
 

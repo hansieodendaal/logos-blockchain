@@ -12,6 +12,9 @@ version     = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+testing-era-boundaries = ["lb-cryptarchia-sync/testing-era-boundaries"]
+
 [dependencies]
 async-trait = { workspace = true }
 backon = { features = ["tokio-sleep"], workspace = true }

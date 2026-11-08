@@ -64,6 +64,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "testing-era-boundaries")]
+    lb_chain_network_service::era_observation::initialize_node_journal()?;
+
     let chain_id = run_config.deployment.chain_id();
     // The fork of the era in force when the node starts.
     let fork_digest = run_config.deployment.fork_digest_in_force();

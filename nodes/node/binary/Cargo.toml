@@ -98,9 +98,13 @@ dhat-heap = ["dep:dhat"]
 jemalloc  = ["dep:tikv-jemallocator"]
 # Existing broad profiling feature. Keep this as an umbrella feature for
 # backwards compatibility: HTTP pprof + tokio-console support.
-profiling                        = ["lb-http-api-common/profiling", "tokio-console"]
-testing                          = ["lb-key-management-system-service/unsafe"]
-testing-disable-proposal-publish = ["lb-chain-leader-service/testing-disable-proposal-publish"]
+profiling = ["lb-http-api-common/profiling", "tokio-console"]
+testing = ["lb-key-management-system-service/unsafe"]
+testing-era-boundaries = [
+  "lb-chain-leader-service/testing-era-boundaries",
+  "lb-chain-network-service/testing-era-boundaries",
+  "lb-network-service/testing-era-boundaries",
+]
 
 # Tokio task/resource profiling via tokio-console.
 #

@@ -4,6 +4,8 @@ pub mod dial_error_ext;
 pub mod protocol_name;
 mod swarm;
 
+#[cfg(feature = "testing-era-boundaries")]
+pub use config::EraBoundaryTestingConfig;
 pub use config::{
     AutonatClientSettings, ChainSyncSettings, GatewaySettings, IdentifySettings, KademliaSettings,
     NatMappingSettings, NatSettings, SwarmConfig, TraversalSettings, secret_key_serde,

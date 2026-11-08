@@ -1,5 +1,7 @@
 pub mod config;
 mod libp2p;
+#[cfg(feature = "testing-era-boundaries")]
+pub mod observation;
 pub use libp2p::messages::{BlocksRequest, max_blocks_response_bincode_size};
 mod messages;
 pub use messages::{SerialisedBlock, TipResponse, TipResponseFailureReason};

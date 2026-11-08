@@ -309,6 +309,7 @@ fn record(world: &CucumberWorld, event: &str, evidence: &serde_json::Value) -> S
     append_evidence(&path, &entry)
 }
 
+#[cfg(any(feature = "testing-era-boundaries", test))]
 pub(crate) fn initialize_evidence_file(scenario_dir: &Path) -> StepResult {
     let path = scenario_dir.join(EVIDENCE_FILE);
     let display = path.display().to_string();
@@ -450,7 +451,10 @@ fn verify_era_transition_properties(world: &mut CucumberWorld) -> StepResult {
 }
 
 #[when(expr = "I capture a non-genesis finalized block before the era boundary on node {string}")]
-async fn capture_pre_boundary_lib(world: &mut CucumberWorld, name: String) -> StepResult {
+pub(crate) async fn capture_pre_boundary_lib(
+    world: &mut CucumberWorld,
+    name: String,
+) -> StepResult {
     let proof = proof_for_node(world, &name)?;
     let source_era = proof.previous_era;
     let target_era = proof.target_era;
@@ -867,6 +871,37 @@ async fn inspect_history(
         },
     )
     .await
+}
+
+/// Reuses the era-boundary canonical ancestry walker to prove that `anchor`
+/// lies on a participant's actual chain from the supplied tip.
+#[cfg(feature = "testing-era-boundaries")]
+pub(crate) async fn canonical_history_contains_block(
+    world: &CucumberWorld,
+    node_name: &str,
+    tip: HeaderId,
+    anchor: HeaderId,
+    timeout: Duration,
+) -> Result<bool, StepError> {
+    let proof = proof_for_node(world, node_name)?;
+    let genesis = world
+        .chain
+        .genesis_block_id
+        .ok_or_else(|| failure("Genesis block id not recorded"))?;
+    let client = world.resolve_node_http_client(node_name)?;
+    let history = inspect_history(
+        &client,
+        tip,
+        genesis,
+        proof.previous_first_slot,
+        proof.boundary_slot,
+        Some(anchor),
+        None,
+        Instant::now() + timeout,
+    )
+    .await
+    .map_err(|error| failure(error.message))?;
+    Ok(history.includes_anchor)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1324,6 +1359,7 @@ async fn preserve_finality(world: &mut CucumberWorld, seconds: u64) -> StepResul
                             "previous_era_blocks": history.previous_era_blocks,
                             "node": name, "original_lib": format!("{anchor:?}"),
                             "current_lib": format!("{:?}", consensus.cryptarchia_info.lib),
+                        "lib_ancestry_contains_anchor": true,
                         }),
                     )?;
                 }

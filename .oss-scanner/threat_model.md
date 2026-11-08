@@ -87,7 +87,7 @@ If an attack needs a large share of the stake or of the Blend nodes, say so and 
 
 ## Anything to leave alone
 
-- Code compiled only for tests or instrumentation: `#[cfg(test)]`, `tests/`, benches, and the features `testing`, `testing-disable-proposal-publish`, `test-utils`, `unsafe-test-functions`, `dhat-heap`, `profiling`, `tokio-console` and `tokio-task-names`. The `unsafe` feature of the KMS crates is the exception: node builds enable it, so the code behind it is in scope.
+- Code compiled only for tests or instrumentation: `#[cfg(test)]`, `tests/`, benches, and the features `testing`, `testing-era-boundaries`, `test-utils`, `unsafe-test-functions`, `dhat-heap`, `profiling`, `tokio-console` and `tokio-task-names`. The `unsafe` feature of the KMS crates is the exception: node builds enable it, so the code behind it is in scope.
 - Keys and secrets in committed configs (`nodes/node/*.yaml`, `deployment/`, `tests/`): they are test and devnet data.
 - The circuits and rapidsnark, which come from other repositories (how this repository calls them and checks their results is in scope), and bugs in third-party crates, unless this repository uses them wrongly.
 - Panics or errors on invalid local configuration or CLI arguments.

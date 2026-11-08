@@ -1,6 +1,8 @@
 pub use identify::Settings as IdentifySettings;
 pub use kademlia::{CachingSettings, KBucketInserts, Settings as KademliaSettings};
 pub use lb_cryptarchia_sync::Config as ChainSyncSettings;
+#[cfg(feature = "testing-era-boundaries")]
+pub use lb_cryptarchia_sync::config::EraBoundaryTestingConfig;
 use libp2p::identity::ed25519;
 pub use nat::{
     Settings as NatSettings, TraversalSettings, autonat_client::Settings as AutonatClientSettings,
@@ -95,6 +97,8 @@ mod tests {
                     peer_response_timeout: Duration::from_secs(5),
                     max_inbound_requests: 10.try_into().unwrap(),
                     inbound_download_stream_timeout: Duration::from_secs(120),
+                    #[cfg(feature = "testing-era-boundaries")]
+                    testing_era_boundaries: None,
                 },
                 nat_config: nat::Settings::default(),
             }

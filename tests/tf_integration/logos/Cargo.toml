@@ -11,6 +11,9 @@ version.workspace    = true
 [lints]
 workspace = true
 
+[features]
+testing-era-boundaries = ["lb-node/testing-era-boundaries"]
+
 [dependencies]
 anyhow                           = { workspace = true }
 async-trait                      = { workspace = true }

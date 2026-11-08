@@ -6,6 +6,10 @@ use libp2p_stream::Control;
 use tokio::{sync::oneshot, time, time::Duration};
 use tracing::{debug, warn};
 
+#[cfg(feature = "testing-era-boundaries")]
+use crate::libp2p::testing::{RequestEvidence, timestamp_unix_ms, timestamp_unix_ns};
+#[cfg(feature = "testing-era-boundaries")]
+use crate::observation::{self, Observation};
 use crate::{
     BlocksRequest, TipResponse,
     libp2p::{
@@ -54,14 +58,44 @@ impl Downloader {
         request: BlocksRequest,
         protocol_name: StreamProtocol,
         reply_sender: oneshot::Sender<BoxedStream<Result<SerialisedBlock, ChainSyncError>>>,
+        #[cfg(feature = "testing-era-boundaries")] evidence: Option<RequestEvidence>,
     ) -> Result<BlocksResponseReader, ChainSyncError> {
         let mut stream = open_stream(peer_id, &mut control, protocol_name).await?;
 
         let blocks_request = RequestMessage::Blocks(request);
 
+        #[cfg(feature = "testing-era-boundaries")]
+        if let Some(evidence) = &evidence {
+            if observation::node_journal_is_active() {
+                observation::emit(Observation::RequesterRequestStarted {
+                    request: evidence.observation(),
+                });
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                era_transition_event = "requester_request_started",
+                timestamp_unix_ms = timestamp_unix_ms(),
+                    timestamp_unix_ns = timestamp_unix_ns(),
+                request_id = evidence.request_id,
+                request_key = %evidence.request_key,
+                peer_id = %evidence.peer_id,
+                protocol = %evidence.protocol,
+                target_block = ?evidence.target_block,
+                requester_tip = ?evidence.requester_tip,
+                latest_immutable_block = ?evidence.latest_immutable_block,
+                "era-boundary experiment observed an outbound block request"
+            );
+        }
+
         send_message(peer_id, &mut stream, &blocks_request).await?;
 
-        Ok(BlocksResponseReader::new(peer_id, stream, reply_sender))
+        Ok(BlocksResponseReader::new(
+            peer_id,
+            stream,
+            reply_sender,
+            #[cfg(feature = "testing-era-boundaries")]
+            evidence,
+        ))
     }
 
     pub async fn receive_tip_response(
@@ -103,6 +137,10 @@ impl Downloader {
     /// caller of `request_blocks` as a stream of blocks, each in a response of
     /// at most `max_response_size` bytes. The response frames are read lazily
     /// as the caller polls the stream.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep ordered response evidence beside its protocol error handling"
+    )]
     pub fn receive_blocks_response(
         blocks_response_reader: BlocksResponseReader,
         timeout: Duration,
@@ -111,42 +149,174 @@ impl Downloader {
         let libp2p_stream = blocks_response_reader.stream;
         let peer_id = blocks_response_reader.peer_id;
         let reply_channel = blocks_response_reader.reply_channel;
+        #[cfg(feature = "testing-era-boundaries")]
+        let evidence = blocks_response_reader.evidence;
 
-        #[expect(
-            closure_returning_async_block,
-            reason = "Signature expected by `try_unfold`"
-        )]
-        let stream = stream::try_unfold(libp2p_stream, move |mut stream| async move {
-            let response = time::timeout(
-                timeout,
-                unpack_from_reader_up_to(&mut stream, max_response_size),
+        #[cfg_attr(
+            not(feature = "testing-era-boundaries"),
+            expect(
+                closure_returning_async_block,
+                reason = "The try_unfold closure needs an async block to capture per-response evidence"
             )
-            .await;
+        )]
+        let stream = stream::try_unfold(
+            (libp2p_stream, 0usize),
+            move |(mut stream, response_count)| {
+                #[cfg(feature = "testing-era-boundaries")]
+                let evidence = evidence.clone();
+                async move {
+                    let response = time::timeout(
+                        timeout,
+                        unpack_from_reader_up_to(&mut stream, max_response_size),
+                    )
+                    .await;
 
-            match response {
-                Ok(Ok(BlocksResponse::Block(block))) => Ok(Some((block, stream))),
-                Ok(Ok(BlocksResponse::NoMoreBlocks)) => {
-                    utils::close_stream(peer_id, stream).await?;
-                    Ok(None)
-                }
-                Ok(Ok(BlocksResponse::Failure(reason))) => {
-                    utils::close_stream(peer_id, stream).await?;
+                    match response {
+                        Ok(Ok(BlocksResponse::Block(block))) => {
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if let Some(evidence) = &evidence {
+                                if observation::node_journal_is_active() {
+                                    observation::emit(
+                                        Observation::RequesterBlockResponseReceived {
+                                            request: evidence.observation(),
+                                            response_index: u64::try_from(response_count + 1)
+                                                .expect("response index fits u64"),
+                                        },
+                                    );
+                                }
+                                tracing::info!(
+                                                target: LOG_TARGET,
+                                                era_transition_event = "requester_block_response_received",
+                                                timestamp_unix_ms = timestamp_unix_ms(),
+                                timestamp_unix_ns = timestamp_unix_ns(),
+                                                request_id = evidence.request_id,
+                                                request_key = %evidence.request_key,
+                                                peer_id = %evidence.peer_id,
+                                                protocol = %evidence.protocol,
+                                                target_block = ?evidence.target_block,
+                                                response_index = response_count + 1,
+                                                block_bytes = block.len(),
+                                                "era-boundary experiment observed a decoded block response"
+                                            );
+                            }
+                            Ok(Some((block, (stream, response_count + 1))))
+                        }
+                        Ok(Ok(BlocksResponse::NoMoreBlocks)) => {
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if let Some(evidence) = &evidence {
+                                if observation::node_journal_is_active() {
+                                    observation::emit(Observation::RequesterRequestCompleted {
+                                        request: evidence.observation(),
+                                        response_count: u64::try_from(response_count)
+                                            .expect("response count fits u64"),
+                                    });
+                                }
+                                tracing::info!(
+                                                target: LOG_TARGET,
+                                                era_transition_event = "requester_request_completed",
+                                                timestamp_unix_ms = timestamp_unix_ms(),
+                                timestamp_unix_ns = timestamp_unix_ns(),
+                                                request_id = evidence.request_id,
+                                                request_key = %evidence.request_key,
+                                                peer_id = %evidence.peer_id,
+                                                protocol = %evidence.protocol,
+                                                target_block = ?evidence.target_block,
+                                                response_count,
+                                                "era-boundary experiment observed normal response completion"
+                                            );
+                            }
+                            utils::close_stream(peer_id, stream).await?;
+                            Ok(None)
+                        }
+                        Ok(Ok(BlocksResponse::Failure(reason))) => {
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if let Some(evidence) = &evidence {
+                                tracing::info!(
+                                                target: LOG_TARGET,
+                                                era_transition_event = "requester_request_rejected",
+                                                timestamp_unix_ms = timestamp_unix_ms(),
+                                timestamp_unix_ns = timestamp_unix_ns(),
+                                                request_id = evidence.request_id,
+                                                request_key = %evidence.request_key,
+                                                peer_id = %evidence.peer_id,
+                                                protocol = %evidence.protocol,
+                                                target_block = ?evidence.target_block,
+                                                response_count,
+                                                failure_reason = %reason,
+                                                "era-boundary experiment observed an explicit provider failure"
+                                            );
+                            }
+                            utils::close_stream(peer_id, stream).await?;
 
-                    Err(ChainSyncError {
-                        peer: peer_id,
-                        kind: ChainSyncErrorKind::BlockProviderUnavailable(reason),
-                    })
+                            Err(ChainSyncError {
+                                peer: peer_id,
+                                kind: ChainSyncErrorKind::BlockProviderUnavailable(reason),
+                            })
+                        }
+                        Ok(Err(e)) => {
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if let Some(evidence) = &evidence {
+                                if observation::node_journal_is_active() {
+                                    observation::emit(Observation::RequesterInterruptionDetected {
+                                        request: evidence.observation(),
+                                        response_count: u64::try_from(response_count)
+                                            .expect("response count fits u64"),
+                                        kind: observation::InterruptionKind::StreamError,
+                                    });
+                                }
+                                tracing::info!(
+                                                target: LOG_TARGET,
+                                                era_transition_event = "requester_interruption_detected",
+                                                timestamp_unix_ms = timestamp_unix_ms(),
+                                timestamp_unix_ns = timestamp_unix_ns(),
+                                                request_id = evidence.request_id,
+                                                request_key = %evidence.request_key,
+                                                peer_id = %evidence.peer_id,
+                                                protocol = %evidence.protocol,
+                                                target_block = ?evidence.target_block,
+                                                response_count,
+                                                interruption_kind = "stream_error",
+                                                interruption = %e,
+                                                "era-boundary experiment observed response-stream termination"
+                                            );
+                            }
+                            drop(utils::close_stream(peer_id, stream).await);
+                            Err(ChainSyncError::from((peer_id, e)))
+                        }
+                        Err(e) => {
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if let Some(evidence) = &evidence {
+                                if observation::node_journal_is_active() {
+                                    observation::emit(Observation::RequesterInterruptionDetected {
+                                        request: evidence.observation(),
+                                        response_count: u64::try_from(response_count)
+                                            .expect("response count fits u64"),
+                                        kind: observation::InterruptionKind::ResponseTimeout,
+                                    });
+                                }
+                                tracing::info!(
+                                                target: LOG_TARGET,
+                                                era_transition_event = "requester_interruption_detected",
+                                                timestamp_unix_ms = timestamp_unix_ms(),
+                                timestamp_unix_ns = timestamp_unix_ns(),
+                                                request_id = evidence.request_id,
+                                                request_key = %evidence.request_key,
+                                                peer_id = %evidence.peer_id,
+                                                protocol = %evidence.protocol,
+                                                target_block = ?evidence.target_block,
+                                                response_count,
+                                                interruption_kind = "response_timeout",
+                                                interruption = %e,
+                                                "era-boundary experiment observed a response timeout"
+                                            );
+                            }
+                            drop(utils::close_stream(peer_id, stream).await);
+                            Err(ChainSyncError::from((peer_id, e)))
+                        }
+                    }
                 }
-                Ok(Err(e)) => {
-                    drop(utils::close_stream(peer_id, stream).await);
-                    Err(ChainSyncError::from((peer_id, e)))
-                }
-                Err(e) => {
-                    drop(utils::close_stream(peer_id, stream).await);
-                    Err(ChainSyncError::from((peer_id, e)))
-                }
-            }
-        });
+            },
+        );
 
         let boxed_stream: BoxedStream<_> =
             Box::new(

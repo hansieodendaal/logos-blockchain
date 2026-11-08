@@ -178,6 +178,33 @@ where
 
         match Self::check_first_block_response_ready(stream.next().await)? {
             Some(first_item) => {
+                #[cfg(feature = "testing-era-boundaries")]
+                if let Ok((block_id, _)) = &first_item {
+                    if lb_cryptarchia_sync::observation::node_journal_is_active() {
+                        lb_cryptarchia_sync::observation::emit(lb_cryptarchia_sync::observation::Observation::RequesterFirstBlockDecoded {
+                            remote_peer: peer.into(), target: target_block, requester_tip: local_tip,
+                            latest_immutable: latest_immutable_block, block_id: *block_id,
+                        });
+                    }
+                    let event_timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        era_transition_event = "requester_first_block_decoded",
+                        timestamp_unix_ms = event_timestamp.as_millis(),
+                        timestamp_unix_ns = event_timestamp.as_nanos(),
+                        request_key = %format!(
+                            "{target_block:?}:{local_tip:?}:{latest_immutable_block:?}"
+                        ),
+                        peer_id = %peer,
+                        target_block = ?target_block,
+                        requester_tip = ?local_tip,
+                        latest_immutable_block = ?latest_immutable_block,
+                        block_id = ?block_id,
+                        "era-boundary experiment observed the requester's first decoded block"
+                    );
+                }
                 let rebuilt = tokio_stream::iter([first_item]).chain(stream);
                 Ok(Box::new(rebuilt))
             }

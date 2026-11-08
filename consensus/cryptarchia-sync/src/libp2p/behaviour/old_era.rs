@@ -1,5 +1,8 @@
 use std::task::{Context, Poll};
 
+#[cfg(feature = "testing-era-boundaries")]
+use libp2p::StreamProtocol;
+
 use super::{OngoingRequests, SyncProtocolState, ToSwarmEvent};
 
 /// The chain sync over the protocol of the era before the one in force, until
@@ -22,5 +25,15 @@ impl OldEra {
 
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarmEvent> {
         self.ongoing_requests.poll(cx)
+    }
+
+    #[cfg(feature = "testing-era-boundaries")]
+    pub(super) const fn protocol_name(&self) -> &StreamProtocol {
+        &self.ongoing_requests.protocol_name
+    }
+
+    #[cfg(feature = "testing-era-boundaries")]
+    pub(super) fn pending_provider_responses(&self) -> usize {
+        self.ongoing_requests.sending_blocks_responses.len()
     }
 }

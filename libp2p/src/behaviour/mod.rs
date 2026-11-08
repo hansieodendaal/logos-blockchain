@@ -119,6 +119,8 @@ impl<Rng: rand_010::Rng + SeedableRng + Send + 'static> Behaviour<Rng> {
         let nat = nat::Behaviour::new(rng, &nat_config);
 
         let chain_sync = lb_cryptarchia_sync::Behaviour::new(
+            #[cfg(feature = "testing-era-boundaries")]
+            peer_id,
             chain_sync_protocol_name,
             chain_sync_config,
             chain_sync_max_block_size,
@@ -178,6 +180,8 @@ mod tests {
                     peer_response_timeout: Duration::from_secs(1),
                     max_inbound_requests: NonZeroUsize::new(1).unwrap(),
                     inbound_download_stream_timeout: Duration::from_secs(120),
+                    #[cfg(feature = "testing-era-boundaries")]
+                    testing_era_boundaries: None,
                 },
                 chain_sync_max_block_size: 1_024,
                 max_data_size_by_topic: HashMap::new(),
