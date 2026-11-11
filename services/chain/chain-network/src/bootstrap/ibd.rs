@@ -19,6 +19,8 @@ use lb_core::{
     },
 };
 use lb_cryptarchia_sync::TipResponse;
+#[cfg(feature = "testing-era-boundaries")]
+use lb_cryptarchia_sync::observation::{self, Observation};
 use lb_log_targets::chain;
 use lb_tx_service::backend::RecoverableMempool;
 use overwatch::DynError;
@@ -61,13 +63,35 @@ where
     }
 
     async fn process_block(&mut self, block: Block<Cryptarchia::Tx>) -> Result<(), Error> {
+        #[cfg(feature = "testing-era-boundaries")]
+        let block_id = block.header().id();
         crate::apply_block_and_reconcile_mempool::<_, Mempool>(
             block,
             &self.cryptarchia,
             &self.mempool_adapter,
         )
         .await
-        .map_err(Error::from)
+        .map_err(Error::from)?;
+        #[cfg(feature = "testing-era-boundaries")]
+        if observation::node_journal_is_active() {
+            observation::emit(Observation::IbdBlockApplied { block_id });
+        }
+        #[cfg(feature = "testing-era-boundaries")]
+        info!(
+            target: LOG_TARGET,
+            era_transition_event = "ibd_block_applied",
+            timestamp_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            timestamp_unix_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            block_id = ?block_id,
+            "era-boundary experiment observed successful IBD block application"
+        );
+        Ok(())
     }
 
     async fn has_processed_block(&self, block_id: HeaderId) -> Result<bool, Error> {
@@ -174,6 +198,24 @@ where
         loop {
             let unsynced_tips = self.collect_unsynced_tips(&config).await?;
             if unsynced_tips.is_empty() {
+                #[cfg(feature = "testing-era-boundaries")]
+                if observation::node_journal_is_active() {
+                    observation::emit(Observation::IbdCompleted);
+                }
+                #[cfg(feature = "testing-era-boundaries")]
+                info!(
+                    target: LOG_TARGET,
+                    era_transition_event = "ibd_completed",
+                    timestamp_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    timestamp_unix_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos(),
+                    "era-boundary experiment observed successful IBD completion"
+                );
                 info!(target: LOG_TARGET, "IBD complete: all configured peer tips are present in the local tree");
                 return Ok(());
             }

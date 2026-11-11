@@ -52,7 +52,45 @@ pub struct NodeHttpClient {
     timeout: Duration,
 }
 
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Deserialize)]
+struct ProposalPublicationState {
+    enabled: bool,
+}
+
 impl NodeHttpClient {
+    #[cfg(feature = "testing-era-boundaries")]
+    pub async fn proposal_publication_enabled(&self) -> Result<bool, reqwest::Error> {
+        let url = self
+            .base_url
+            .join("/testing/proposal-publication")
+            .expect("valid testing URL");
+        let state: ProposalPublicationState = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state.enabled)
+    }
+
+    #[cfg(feature = "testing-era-boundaries")]
+    pub async fn set_proposal_publication(&self, enabled: bool) -> Result<bool, reqwest::Error> {
+        let url = self
+            .base_url
+            .join("/testing/proposal-publication")
+            .expect("valid testing URL");
+        let state: ProposalPublicationState = reqwest::Client::new()
+            .put(url)
+            .json(&serde_json::json!({"enabled": enabled}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(state.enabled)
+    }
     #[must_use]
     pub fn new(base_addr: SocketAddr) -> Self {
         let base_url = Url::parse(&format!("http://{base_addr}"))

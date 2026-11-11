@@ -23,6 +23,8 @@ impl Config {
     pub fn with_required_values(RequiredValues { funding_pk }: RequiredValues) -> Self {
         Self {
             leader: leader::Config {
+                #[cfg(feature = "testing-era-boundaries")]
+                testing_proposal_publication_enabled: true,
                 wallet: leader::WalletConfig {
                     funding_pk,
                     max_tx_fee: leader::default_max_tx_fee(),

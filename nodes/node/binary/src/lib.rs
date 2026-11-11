@@ -222,6 +222,13 @@ pub fn run_node_from_config(
     };
 
     let http_config = api_config.backend_settings();
+    #[cfg(feature = "testing-era-boundaries")]
+    let http_config = lb_api_service::ApiServiceSettings {
+        backend_settings: api::backend::NodeApiSettings {
+            base: http_config.backend_settings,
+            proposal_publication: chain_leader_config.proposal_publication.clone(),
+        },
+    };
 
     let app = OverwatchRunner::<LogosBlockchain>::run(
         LogosBlockchainServiceSettings {

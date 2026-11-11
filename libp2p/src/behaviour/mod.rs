@@ -163,6 +163,8 @@ mod tests {
                     peer_response_timeout: Duration::from_secs(1),
                     max_inbound_requests: NonZeroUsize::new(1).unwrap(),
                     inbound_download_stream_timeout: Duration::from_secs(120),
+                    #[cfg(feature = "testing-era-boundaries")]
+                    testing_era_boundaries: None,
                 },
                 chain_sync_max_block_size: 1_024,
                 max_data_size_by_topic: HashMap::new(),

@@ -1,4 +1,6 @@
 use core::future::ready;
+#[cfg(feature = "testing-era-boundaries")]
+use std::sync::{Arc, atomic::AtomicBool};
 use std::{
     collections::HashSet,
     mem,
@@ -22,6 +24,12 @@ use libp2p_stream::{Behaviour as StreamBehaviour, Control, IncomingStreams};
 use tokio::sync::{mpsc, mpsc::Sender, oneshot};
 use tracing::{debug, error, warn};
 
+#[cfg(feature = "testing-era-boundaries")]
+use crate::libp2p::provider::EraBoundaryResponseHold;
+#[cfg(feature = "testing-era-boundaries")]
+use crate::libp2p::testing::{RequestEvidence, timestamp_unix_ms, timestamp_unix_ns};
+#[cfg(feature = "testing-era-boundaries")]
+use crate::observation::{self, Observation};
 use crate::{
     BlocksProviderResponse, BlocksRequest, TipProviderResponse,
     config::Config,
@@ -65,6 +73,8 @@ pub struct BlocksResponseReader {
     pub peer_id: PeerId,
     pub stream: Libp2pStream,
     pub reply_channel: oneshot::Sender<BoxedStream<Result<SerialisedBlock, ChainSyncError>>>,
+    #[cfg(feature = "testing-era-boundaries")]
+    pub evidence: Option<RequestEvidence>,
 }
 
 impl BlocksResponseReader {
@@ -72,11 +82,14 @@ impl BlocksResponseReader {
         peer_id: PeerId,
         stream: Stream,
         reply_channel: oneshot::Sender<BoxedStream<Result<SerialisedBlock, ChainSyncError>>>,
+        #[cfg(feature = "testing-era-boundaries")] evidence: Option<RequestEvidence>,
     ) -> Self {
         Self {
             peer_id,
             stream,
             reply_channel,
+            #[cfg(feature = "testing-era-boundaries")]
+            evidence,
         }
     }
 }
@@ -136,6 +149,12 @@ pub struct Behaviour {
     old_era: Option<OldEra>,
     /// Configuration for the behaviour.
     config: Config,
+    /// The protocol active when the optional one-shot hold was configured.
+    #[cfg(feature = "testing-era-boundaries")]
+    testing_hold_protocol: Option<StreamProtocol>,
+    /// Shared across era states so the hold can only claim one request.
+    #[cfg(feature = "testing-era-boundaries")]
+    testing_hold_claimed: Arc<AtomicBool>,
     /// The largest response that carries a block: one that carries the largest
     /// block of any era. Chain-sync is fork digest-bound, but it serves blocks
     /// of all eras, so the maximum needs to take that into account.
@@ -189,6 +208,13 @@ struct OngoingRequests {
     config: Config,
     /// The largest response that carries a block.
     max_blocks_response_size: usize,
+    /// Protocol name for accepted inbound and outbound requests.
+    #[cfg(feature = "testing-era-boundaries")]
+    protocol_name: StreamProtocol,
+    #[cfg(feature = "testing-era-boundaries")]
+    testing_hold_protocol: Option<StreamProtocol>,
+    #[cfg(feature = "testing-era-boundaries")]
+    testing_hold_claimed: Arc<AtomicBool>,
 }
 
 impl Behaviour {
@@ -208,17 +234,33 @@ impl Behaviour {
             "A response carrying a block of {max_block_size} bytes is larger than the largest network message."
         );
         let stream_behaviour = StreamBehaviour::new();
+        #[cfg(feature = "testing-era-boundaries")]
+        let testing_hold_protocol = config
+            .testing_era_boundaries
+            .as_ref()
+            .and_then(|settings| settings.hold_provider_after_blocks)
+            .map(|_| protocol_name.clone());
+        #[cfg(feature = "testing-era-boundaries")]
+        let testing_hold_claimed = Arc::new(AtomicBool::new(false));
         let sync_protocol_state = SyncProtocolState::new(
             stream_behaviour.new_control(),
             protocol_name,
             config.clone(),
             max_blocks_response_size,
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_hold_protocol.clone(),
+            #[cfg(feature = "testing-era-boundaries")]
+            Arc::clone(&testing_hold_claimed),
         );
         Self {
             stream_behaviour,
             sync_protocol_state,
             old_era: None,
             config,
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_hold_protocol,
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_hold_claimed,
             max_blocks_response_size,
         }
     }
@@ -242,6 +284,36 @@ impl Behaviour {
             );
         }
         self.finish_era_transition();
+        #[cfg(feature = "testing-era-boundaries")]
+        if self.config.testing_era_boundaries.is_some() {
+            if observation::node_journal_is_active() {
+                observation::emit(Observation::EraRotationStarted {
+                    previous_protocol: self.sync_protocol_state.protocol_name.to_string(),
+                    new_protocol: new_era_protocol_name.to_string(),
+                    pending_provider_responses: u64::try_from(
+                        self.sync_protocol_state
+                            .ongoing_requests
+                            .sending_blocks_responses
+                            .len(),
+                    )
+                    .expect("request count fits u64"),
+                });
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                era_transition_event = "era_rotation_started",
+                timestamp_unix_ms = timestamp_unix_ms(),
+                    timestamp_unix_ns = timestamp_unix_ns(),
+                previous_protocol = %self.sync_protocol_state.protocol_name,
+                new_protocol = %new_era_protocol_name,
+                pending_provider_responses = self
+                    .sync_protocol_state
+                    .ongoing_requests
+                    .sending_blocks_responses
+                    .len(),
+                "era-boundary experiment observed a chain-sync era rotation"
+            );
+        }
         let previous_sync_state = mem::replace(
             &mut self.sync_protocol_state,
             SyncProtocolState::new(
@@ -249,6 +321,10 @@ impl Behaviour {
                 new_era_protocol_name,
                 self.config.clone(),
                 self.max_blocks_response_size,
+                #[cfg(feature = "testing-era-boundaries")]
+                self.testing_hold_protocol.clone(),
+                #[cfg(feature = "testing-era-boundaries")]
+                Arc::clone(&self.testing_hold_claimed),
             ),
         );
         // Switch to the new sync protocol right away by notifying the waker to poll the
@@ -262,6 +338,27 @@ impl Behaviour {
     /// since the new era's chain sync and the other protocols run over them
     /// too.
     pub fn finish_era_transition(&mut self) {
+        #[cfg(feature = "testing-era-boundaries")]
+        if let Some(old_era) = &self.old_era
+            && self.config.testing_era_boundaries.is_some()
+        {
+            if observation::node_journal_is_active() {
+                observation::emit(Observation::EraTransitionExpired {
+                    old_protocol: old_era.protocol_name().to_string(),
+                    pending_provider_responses: u64::try_from(old_era.pending_provider_responses())
+                        .expect("request count fits u64"),
+                });
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                era_transition_event = "era_transition_expired",
+                timestamp_unix_ms = timestamp_unix_ms(),
+                    timestamp_unix_ns = timestamp_unix_ns(),
+                old_protocol = %old_era.protocol_name(),
+                pending_provider_responses = old_era.pending_provider_responses(),
+                "era-boundary experiment observed old-era request expiry"
+            );
+        }
         self.old_era = None;
     }
 
@@ -301,6 +398,8 @@ impl SyncProtocolState {
         protocol_name: StreamProtocol,
         config: Config,
         max_blocks_response_size: usize,
+        #[cfg(feature = "testing-era-boundaries")] testing_hold_protocol: Option<StreamProtocol>,
+        #[cfg(feature = "testing-era-boundaries")] testing_hold_claimed: Arc<AtomicBool>,
     ) -> Self {
         let incoming_streams = control
             .accept(protocol_name.clone())
@@ -308,7 +407,16 @@ impl SyncProtocolState {
         Self {
             control,
             incoming_streams,
-            ongoing_requests: OngoingRequests::new(config, max_blocks_response_size),
+            ongoing_requests: OngoingRequests::new(
+                config,
+                max_blocks_response_size,
+                #[cfg(feature = "testing-era-boundaries")]
+                protocol_name.clone(),
+                #[cfg(feature = "testing-era-boundaries")]
+                testing_hold_protocol,
+                #[cfg(feature = "testing-era-boundaries")]
+                testing_hold_claimed,
+            ),
             protocol_name,
         }
     }
@@ -349,10 +457,33 @@ impl SyncProtocolState {
             additional_blocks,
         );
         let protocol_name = self.protocol_name.clone();
+        #[cfg(feature = "testing-era-boundaries")]
+        let evidence = self
+            .ongoing_requests
+            .config
+            .testing_era_boundaries
+            .as_ref()
+            .map(|_| {
+                RequestEvidence::new(
+                    peer_id,
+                    &protocol_name,
+                    request.target_block,
+                    request.known_blocks.local_tip,
+                    request.known_blocks.latest_immutable_block,
+                )
+            });
 
         self.ongoing_requests.sending_blocks_requests.push(
-            Downloader::send_blocks_request(peer_id, control, request, protocol_name, reply_sender)
-                .boxed(),
+            Downloader::send_blocks_request(
+                peer_id,
+                control,
+                request,
+                protocol_name,
+                reply_sender,
+                #[cfg(feature = "testing-era-boundaries")]
+                evidence,
+            )
+            .boxed(),
         );
 
         self.ongoing_requests.try_notify_waker();
@@ -375,7 +506,13 @@ impl SyncProtocolState {
 }
 
 impl OngoingRequests {
-    fn new(config: Config, max_blocks_response_size: usize) -> Self {
+    fn new(
+        config: Config,
+        max_blocks_response_size: usize,
+        #[cfg(feature = "testing-era-boundaries")] protocol_name: StreamProtocol,
+        #[cfg(feature = "testing-era-boundaries")] testing_hold_protocol: Option<StreamProtocol>,
+        #[cfg(feature = "testing-era-boundaries")] testing_hold_claimed: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             receiving_blocks_responses: FuturesUnordered::new(),
             sending_blocks_responses: FuturesUnordered::new(),
@@ -388,6 +525,12 @@ impl OngoingRequests {
             waker: None,
             config,
             max_blocks_response_size,
+            #[cfg(feature = "testing-era-boundaries")]
+            protocol_name,
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_hold_protocol,
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_hold_claimed,
         }
     }
 
@@ -409,6 +552,52 @@ impl OngoingRequests {
     ) -> Poll<ToSwarmEvent> {
         let (reply_sender, reply_receiver) = mpsc::channel(1);
         let max_response_size = self.max_blocks_response_size;
+        #[cfg(feature = "testing-era-boundaries")]
+        let evidence = self.config.testing_era_boundaries.as_ref().map(|_| {
+            RequestEvidence::new(
+                peer_id,
+                &self.protocol_name,
+                request.target_block,
+                request.known_blocks.local_tip,
+                request.known_blocks.latest_immutable_block,
+            )
+        });
+        #[cfg(feature = "testing-era-boundaries")]
+        if let Some(evidence) = &evidence {
+            if observation::node_journal_is_active() {
+                observation::emit(Observation::ProviderRequestAccepted {
+                    request: evidence.observation(),
+                });
+            }
+            tracing::info!(
+                target: LOG_TARGET,
+                era_transition_event = "provider_request_accepted",
+                timestamp_unix_ms = timestamp_unix_ms(),
+                    timestamp_unix_ns = timestamp_unix_ns(),
+                request_id = evidence.request_id,
+                request_key = %evidence.request_key,
+                peer_id = %evidence.peer_id,
+                protocol = %evidence.protocol,
+                target_block = ?evidence.target_block,
+                requester_tip = ?evidence.requester_tip,
+                latest_immutable_block = ?evidence.latest_immutable_block,
+                "era-boundary experiment observed an accepted block request"
+            );
+        }
+        #[cfg(feature = "testing-era-boundaries")]
+        let hold_after_blocks = self
+            .config
+            .testing_era_boundaries
+            .as_ref()
+            .and_then(|settings| settings.hold_provider_after_blocks)
+            .filter(|_| self.testing_hold_protocol.as_ref() == Some(&self.protocol_name))
+            .map(std::num::NonZeroUsize::get);
+        #[cfg(feature = "testing-era-boundaries")]
+        let response_hold = EraBoundaryResponseHold {
+            evidence,
+            after_blocks: hold_after_blocks,
+            claimed: Arc::clone(&self.testing_hold_claimed),
+        };
 
         self.sending_blocks_responses.push(
             Provider::provide_blocks(
@@ -418,6 +607,8 @@ impl OngoingRequests {
                 max_response_size,
                 self.config.peer_response_timeout,
                 self.config.inbound_download_stream_timeout,
+                #[cfg(feature = "testing-era-boundaries")]
+                response_hold,
             )
             .boxed(),
         );
@@ -752,6 +943,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(200, config).await;
@@ -780,6 +973,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(1, config.clone()).await;
@@ -808,6 +1003,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(1, config).await;
@@ -836,6 +1033,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_and_downloader(0, config).await;
@@ -859,6 +1058,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(5),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (provider_swarm, provider_peer_id, provider_addr) =
             setup_provider_swarm(config.clone());
@@ -942,6 +1143,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let mut provider_swarm = new_swarm_with_quic(config.clone());
         let provider_swarm_peer_id = *provider_swarm.local_peer_id();
@@ -989,6 +1192,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) = start_rejecting_provider(config).await;
 
@@ -1007,6 +1212,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) = start_rejecting_provider(config).await;
 
@@ -1034,6 +1241,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut downloader_swarm, provider_peer_id) =
             start_provider_with_stream_error(config).await;
@@ -1062,6 +1271,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1110,6 +1321,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1159,6 +1372,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 4.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (mut provider_swarm, provider_peer_id, mut downloader_swarm) =
             connect_provider_and_downloader(config).await;
@@ -1200,6 +1415,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 1.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let blocks_count = 400;
         let (provider_swarm, provider_peer_id, provider_addr) =
@@ -1253,6 +1470,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 1.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let blocks_count = 400;
         let (provider_swarm, provider_peer_id, provider_addr) =
@@ -1319,6 +1538,8 @@ mod tests {
             peer_response_timeout: Duration::from_secs(1),
             max_inbound_requests: 1.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(2),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         };
         let (provider_swarm, provider_peer_id, provider_addr) =
             setup_provider_swarm(config.clone());

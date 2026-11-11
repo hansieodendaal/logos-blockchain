@@ -22,4 +22,19 @@ pub struct Config {
     /// download slot indefinitely.
     #[serde_as(as = "DurationMilliSeconds<u64>")]
     pub inbound_download_stream_timeout: Duration,
+    /// Experimental controls for system-level era-transition regressions.
+    /// Absent by default, including in builds with the feature enabled.
+    #[cfg(feature = "testing-era-boundaries")]
+    #[serde(default)]
+    pub testing_era_boundaries: Option<EraBoundaryTestingConfig>,
+}
+
+/// Per-node controls for the experimental era-transition tests.
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EraBoundaryTestingConfig {
+    /// Hold the provider after this many successfully sent blocks, but only if
+    /// another valid block response is ready to send.
+    pub hold_provider_after_blocks: Option<NonZeroUsize>,
 }

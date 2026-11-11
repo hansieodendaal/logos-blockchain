@@ -5,6 +5,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub wallet: WalletConfig,
+    /// Explicit test-only initial state, installed before the leader starts.
+    #[cfg(feature = "testing-era-boundaries")]
+    #[serde(default = "publication_enabled_by_default")]
+    pub testing_proposal_publication_enabled: bool,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+const fn publication_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

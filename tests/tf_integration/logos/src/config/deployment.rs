@@ -262,6 +262,8 @@ pub enum NodeBinaryProfile {
     #[default]
     Normal,
     TokioConsole,
+    #[cfg(feature = "testing-era-boundaries")]
+    EraBoundaryRecovery,
 }
 
 /// Environment variable name for the node binary profile.
@@ -270,10 +272,16 @@ pub const NODE_BINARY_PROFILE: &str = "NODE_BINARY_PROFILE";
 const NODE_BINARY_PROFILE_NORMAL: &str = "normal";
 /// Environment variable value for the tokio-console node binary profile.
 const NODE_BINARY_PROFILE_TOKIO_CONSOLE: &str = "tokio-console";
+#[cfg(feature = "testing-era-boundaries")]
+const NODE_BINARY_PROFILE_ERA_BOUNDARY_RECOVERY: &str = "era-boundary-recovery";
 
 impl NodeBinaryProfile {
     #[must_use]
     pub fn from_env_or(profile: Self) -> Self {
+        #[cfg(feature = "testing-era-boundaries")]
+        if profile == Self::EraBoundaryRecovery {
+            return profile;
+        }
         Self::resolve(std::env::var(NODE_BINARY_PROFILE).ok().as_deref(), profile)
     }
 
@@ -285,6 +293,8 @@ impl NodeBinaryProfile {
     pub fn from_string(s: &str) -> Self {
         match s {
             NODE_BINARY_PROFILE_TOKIO_CONSOLE => Self::TokioConsole,
+            #[cfg(feature = "testing-era-boundaries")]
+            NODE_BINARY_PROFILE_ERA_BOUNDARY_RECOVERY => Self::EraBoundaryRecovery,
             _ => Self::Normal,
         }
     }
@@ -294,6 +304,8 @@ impl NodeBinaryProfile {
         match self {
             Self::Normal => NODE_BINARY_PROFILE_NORMAL,
             Self::TokioConsole => NODE_BINARY_PROFILE_TOKIO_CONSOLE,
+            #[cfg(feature = "testing-era-boundaries")]
+            Self::EraBoundaryRecovery => NODE_BINARY_PROFILE_ERA_BOUNDARY_RECOVERY,
         }
     }
 }

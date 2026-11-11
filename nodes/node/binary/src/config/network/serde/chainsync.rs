@@ -25,6 +25,9 @@ pub struct Config {
     /// download slot indefinitely.
     #[serde_as(as = "MinimalBoundedDuration<1, MILLI>")]
     pub inbound_download_stream_timeout: Duration,
+    /// Experimental era-boundary instrumentation and optional provider hold.
+    #[cfg(feature = "testing-era-boundaries")]
+    pub testing_era_boundaries: Option<lb_libp2p::EraBoundaryTestingConfig>,
 }
 
 impl Default for Config {
@@ -33,6 +36,8 @@ impl Default for Config {
             peer_response_timeout: Duration::from_secs(5),
             max_inbound_requests: 10.try_into().unwrap(),
             inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
         }
     }
 }

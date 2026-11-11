@@ -9,6 +9,8 @@ use std::{
 use futures::{Stream, StreamExt as _};
 use lb_core::header::HeaderId;
 use lb_cryptarchia_engine::Era;
+#[cfg(feature = "testing-era-boundaries")]
+use lb_cryptarchia_sync::observation::{self, Observation};
 use overwatch::DynError;
 use tracing::{debug, error, warn};
 
@@ -275,6 +277,14 @@ where
         // `request_blocks_from_peers` fans out to multiple peers in parallel.
         // So, we don't do retry. A single try with multiple peers is enough.
         // It's better to drain the orphan queue quicker.
+        #[cfg(feature = "testing-era-boundaries")]
+        if observation::node_journal_is_active() {
+            observation::emit(Observation::IbdRequestStarted {
+                target: orphan_info.orphan_id,
+                requester_tip: orphan_info.tip,
+                latest_immutable: orphan_info.lib,
+            });
+        }
         match network
             .request_blocks_from_peers(
                 orphan_info.orphan_id,
@@ -384,6 +394,27 @@ where
             }
             DownloaderState::Requesting(request) => match request.as_mut().poll(cx) {
                 Poll::Ready(Ok(download)) => {
+                    #[cfg(feature = "testing-era-boundaries")]
+                    if observation::node_journal_is_active() {
+                        observation::emit(Observation::IbdDownloaderDownloading {
+                            target: download.orphan_info.orphan_id,
+                        });
+                    }
+                    #[cfg(feature = "testing-era-boundaries")]
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        era_transition_event = "ibd_downloader_downloading",
+                        timestamp_unix_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis(),
+                        timestamp_unix_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos(),
+                        target_block = ?download.orphan_info.orphan_id,
+                        "era-boundary experiment observed entry into the downloading state"
+                    );
                     self.state = DownloaderState::Downloading(download);
 
                     cx.waker().wake_by_ref();
@@ -434,6 +465,31 @@ where
                     }
                     Poll::Ready(Some(Err(e))) => {
                         error!(target: LOG_TARGET, "Error while fetching blocks: {e}");
+                        #[cfg(feature = "testing-era-boundaries")]
+                        if observation::node_journal_is_active() {
+                            observation::emit(Observation::IbdDownloadStreamError {
+                                target: download.orphan_info.orphan_id,
+                                blocks_received: u64::try_from(download.total_blocks_received)
+                                    .expect("block count fits u64"),
+                            });
+                        }
+                        #[cfg(feature = "testing-era-boundaries")]
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            era_transition_event = "ibd_download_stream_error",
+                            timestamp_unix_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis(),
+                            timestamp_unix_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos(),
+                            target_block = ?download.orphan_info.orphan_id,
+                            blocks_received = download.total_blocks_received,
+                            failure = %e,
+                            "era-boundary experiment observed the IBD downloader handling a stream error"
+                        );
 
                         self.state = DownloaderState::Idle;
                         metrics::orphan_blocks_fetch_failed_total();

@@ -10,6 +10,8 @@ use http::StatusCode;
 use lb_api_service::{Backend, http::consensus::Cryptarchia};
 use lb_chain_broadcast_service::BlockBroadcastService;
 use lb_chain_leader_service::api::ChainLeaderServiceData;
+#[cfg(feature = "testing-era-boundaries")]
+use lb_chain_leader_service::proposal_control::ProposalPublicationControl;
 use lb_chain_service::CryptarchiaConsensus;
 use lb_core::{header::HeaderId, mantle::traits::Hashable};
 use lb_http_api_common::metrics::http_metrics_middleware;
@@ -70,6 +72,24 @@ macro_rules! build_router {
 
 type BlockStorageService<RuntimeServiceId> = StorageService<RuntimeServiceId>;
 
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug)]
+pub struct NodeApiSettings {
+    pub base: AxumBackendSettings,
+    pub proposal_publication: ProposalPublicationControl,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+impl std::ops::Deref for NodeApiSettings {
+    type Target = AxumBackendSettings;
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+#[cfg(not(feature = "testing-era-boundaries"))]
+pub type NodeApiSettings = AxumBackendSettings;
+
 pub struct AxumBackend<
     TimeBackend,
     MempoolStorageAdapter,
@@ -78,7 +98,7 @@ pub struct AxumBackend<
     SdpStateStorage,
     ChainLeader,
 > {
-    settings: AxumBackendSettings,
+    settings: NodeApiSettings,
     _phantom: PhantomData<(
         TimeBackend,
         MempoolStorageAdapter,
@@ -171,7 +191,7 @@ where
         + AsServiceId<TracingService>,
 {
     type Error = std::io::Error;
-    type Settings = AxumBackendSettings;
+    type Settings = NodeApiSettings;
 
     async fn new(settings: Self::Settings) -> Result<Self, Self::Error>
     where
@@ -186,6 +206,15 @@ where
     async fn serve(self, handle: OverwatchHandle<RuntimeServiceId>) -> Result<(), Self::Error> {
         let app = api_routes!(build_router)
             .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+
+        #[cfg(feature = "testing-era-boundaries")]
+        let app = app
+            .route(
+                "/testing/proposal-publication",
+                routing::get(crate::api::proposal_control::get)
+                    .put(crate::api::proposal_control::set),
+            )
+            .layer(axum::Extension(self.settings.proposal_publication.clone()));
 
         let app = app
             .with_state(handle.clone())
@@ -224,8 +253,11 @@ where
             app.merge(pprof_routes)
         };
 
-        let app =
-            restrict_browser_access(app, self.settings.cors_origins, self.settings.allowed_hosts);
+        let app = restrict_browser_access(
+            app,
+            self.settings.cors_origins.clone(),
+            self.settings.allowed_hosts.clone(),
+        );
 
         let listener = TcpListener::bind(&self.settings.address)
             .await

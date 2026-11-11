@@ -3,6 +3,8 @@ pub mod scenario;
 pub mod workloads;
 
 pub mod cluster;
+#[cfg(feature = "testing-era-boundaries")]
+pub mod era_transitions;
 pub mod fees;
 pub mod k8s;
 pub mod mempool;

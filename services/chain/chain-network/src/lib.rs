@@ -36,6 +36,8 @@ use lb_core::{
 };
 use lb_cryptarchia_engine::EraSchedule;
 pub use lb_cryptarchia_engine::{Epoch, Slot};
+#[cfg(feature = "testing-era-boundaries")]
+pub use lb_cryptarchia_sync::observation as era_observation;
 pub use lb_ledger::EpochState;
 use lb_log_targets::chain;
 use lb_network_service::NetworkService;

@@ -12,6 +12,9 @@ version     = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+testing-era-boundaries = ["dep:serde_json"]
+
 [dependencies]
 bytes                 = { features = ["serde"], workspace = true }
 educe                 = { features = ["Debug"], workspace = true }
@@ -25,6 +28,7 @@ libp2p                = { workspace = true }
 libp2p-stream         = { workspace = true }
 rand                  = { workspace = true }
 serde                 = { workspace = true }
+serde_json            = { features = ["std"], optional = true, workspace = true }
 serde_with            = { features = ["macros"], workspace = true }
 thiserror             = { workspace = true }
 tokio                 = { features = ["sync", "time"], workspace = true }
@@ -33,3 +37,4 @@ tracing               = { workspace = true }
 [dev-dependencies]
 libp2p            = { features = ["dns", "quic", "tokio"], workspace = true }
 libp2p-swarm-test = { workspace = true }
+tempfile          = { workspace = true }

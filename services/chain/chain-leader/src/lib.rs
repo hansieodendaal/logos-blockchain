@@ -4,6 +4,8 @@ mod kms;
 mod leadership;
 mod mempool;
 mod metrics;
+#[cfg(feature = "testing-era-boundaries")]
+pub mod proposal_control;
 mod relays;
 mod tx_selection;
 mod wallet;
@@ -194,6 +196,8 @@ pub struct LeaderSettings {
     pub era_schedule: Arc<EraScheduledConfig>,
     pub consensus_excluded_keys: ConsensusExcludedKeys,
     pub wallet_config: LeaderWalletConfig,
+    #[cfg(feature = "testing-era-boundaries")]
+    pub proposal_publication: proposal_control::ProposalPublicationControl,
 }
 
 #[expect(clippy::allow_attributes_without_reason)]
@@ -418,6 +422,8 @@ where
             era_schedule,
             consensus_excluded_keys,
             wallet_config,
+            #[cfg(feature = "testing-era-boundaries")]
+            proposal_publication,
         } = self
             .service_resources_handle
             .settings_handle
@@ -531,7 +537,13 @@ where
                             .await
                             {
                                 Ok(block) => {
-                                    Self::apply_and_publish_block_proposal(block, &chain_network_api, &blend_adapter).await;
+                                    Self::apply_and_publish_block_proposal(
+                                        block,
+                                        &chain_network_api,
+                                        &blend_adapter,
+                                        #[cfg(feature = "testing-era-boundaries")]
+                                        &proposal_publication,
+                                    ).await;
                                 }
                                 Err(e) => {
                                     metrics::consensus_proposals_create_failed("propose_block");
@@ -749,6 +761,8 @@ where
         block: Block<Mempool::Item>,
         chain_network_api: &ChainNetworkServiceApi<ChainNetwork>,
         blend_adapter: &BlendAdapter<BlendService>,
+        #[cfg(feature = "testing-era-boundaries")]
+        proposal_publication: &proposal_control::ProposalPublicationControl,
     ) {
         if let Err(e) = chain_network_api
             .apply_block_and_reconcile_mempool(block.clone())
@@ -758,13 +772,12 @@ where
             return;
         }
 
-        #[cfg(not(feature = "testing-disable-proposal-publish"))]
+        #[cfg(not(feature = "testing-era-boundaries"))]
         blend_adapter.publish_proposal(block.to_proposal()).await;
-        #[cfg(feature = "testing-disable-proposal-publish")]
-        let _ = {
-            tracing::warn!(target: LOG_TARGET, "proposal publishing is disabled by the `testing-disable-proposal-publish` feature");
-            blend_adapter
-        };
+        #[cfg(feature = "testing-era-boundaries")]
+        proposal_publication
+            .publish_if_enabled(blend_adapter.publish_proposal(block.to_proposal()))
+            .await;
 
         metrics::consensus_proposals_created_local();
     }

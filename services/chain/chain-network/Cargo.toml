@@ -50,4 +50,5 @@ lb-utils                      = { workspace = true }
 time                          = { workspace = true }
 
 [features]
-tokio-task-names = ["lb-utils/tokio-task-names"]
+testing-era-boundaries = ["lb-cryptarchia-sync/testing-era-boundaries"]
+tokio-task-names       = ["lb-utils/tokio-task-names"]

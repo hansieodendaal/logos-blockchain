@@ -27,6 +27,7 @@ use lb_node::{
     },
 };
 use rand::Rng as _;
+#[cfg(feature = "testing-era-boundaries")]
 use testing_framework_core::scenario::{Application, DynError, PeerSelection, StartNodeOptions};
 use testing_framework_runner_local::{
     BinaryProviderRef, BuildBinaryProvider, BuildCommand, DownloadBinaryProvider, DownloadChecksum,
@@ -275,23 +276,39 @@ async fn build_node_launch_spec_with(
 ) -> Result<LaunchSpec, DynError> {
     let config_path = dir.join(USER_CONFIG_FILE);
     let deployment_path = dir.join(DEPLOYMENT_CONFIG_FILE);
+    let binary = resolve_node_binary_with(node_binary_profile, provider_for_profile).await?;
     let time_backend =
         env::var("LOGOS_BLOCKCHAIN_TIME_BACKEND").unwrap_or_else(|_| "monotonic".to_owned());
+    let files = vec![
+        launch_file(USER_CONFIG_FILE, user_yaml.into_bytes()),
+        launch_file(DEPLOYMENT_CONFIG_FILE, deployment_yaml.into_bytes()),
+    ];
+    #[cfg_attr(
+        not(feature = "testing-era-boundaries"),
+        expect(unused_mut, reason = "the journal environment is feature-gated")
+    )]
+    let mut environment = vec![LaunchEnvVar::new(
+        "LOGOS_BLOCKCHAIN_TIME_BACKEND",
+        time_backend,
+    )];
+    #[cfg(feature = "testing-era-boundaries")]
+    if *node_binary_profile == NodeBinaryProfile::EraBoundaryRecovery {
+        environment.push(LaunchEnvVar::new(
+            "LOGOS_BLOCKCHAIN_ERA_OBSERVATION_JOURNAL",
+            dir.join("era_observations.ndjson")
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
     Ok(LaunchSpec {
-        binary: resolve_node_binary_with(node_binary_profile, provider_for_profile).await?,
-        files: vec![
-            launch_file(USER_CONFIG_FILE, user_yaml.into_bytes()),
-            launch_file(DEPLOYMENT_CONFIG_FILE, deployment_yaml.into_bytes()),
-        ],
+        binary,
+        files,
         args: vec![
             config_path.to_string_lossy().to_string(),
             "--deployment".to_owned(),
             deployment_path.to_string_lossy().to_string(),
         ],
-        env: vec![LaunchEnvVar::new(
-            "LOGOS_BLOCKCHAIN_TIME_BACKEND",
-            time_backend,
-        )],
+        env: environment,
     })
 }
 
@@ -325,7 +342,11 @@ fn node_binary_provider(
 ) -> Result<BinaryProviderRef, DynError> {
     let release_download_requested =
         env::var_os(LOGOS_BLOCKCHAIN_NODE_DOWNLOAD_URL).is_some_and(|url| !url.is_empty());
-    validate_node_binary_selection(node_binary_profile, release_download_requested)?;
+    validate_node_binary_selection(
+        node_binary_profile,
+        release_download_requested,
+        env::var_os("LOGOS_BLOCKCHAIN_NODE_BIN").is_some(),
+    )?;
 
     let mut providers: Vec<BinaryProviderRef> = vec![Arc::new(EnvBinaryProvider::new(
         "LOGOS_BLOCKCHAIN_NODE_BIN",
@@ -338,6 +359,8 @@ fn node_binary_provider(
     providers.push(match node_binary_profile {
         NodeBinaryProfile::Normal => default_node_binary_provider(),
         NodeBinaryProfile::TokioConsole => tokio_console_node_binary_provider(),
+        #[cfg(feature = "testing-era-boundaries")]
+        NodeBinaryProfile::EraBoundaryRecovery => era_boundary_recovery_node_binary_provider(),
     });
 
     Ok(Arc::new(FallbackBinaryProvider::new(providers)))
@@ -346,12 +369,36 @@ fn node_binary_provider(
 fn validate_node_binary_selection(
     node_binary_profile: &NodeBinaryProfile,
     release_download_requested: bool,
+    binary_override_configured: bool,
 ) -> Result<(), DynError> {
-    if release_download_requested && *node_binary_profile == NodeBinaryProfile::TokioConsole {
+    #[cfg(not(feature = "testing-era-boundaries"))]
+    let _ = binary_override_configured;
+    #[cfg(feature = "testing-era-boundaries")]
+    if *node_binary_profile == NodeBinaryProfile::EraBoundaryRecovery && binary_override_configured
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LOGOS_BLOCKCHAIN_NODE_BIN cannot override the era-boundary recovery binary profile; unset it to use the instrumented build",
+        )
+        .into());
+    }
+
+    if release_download_requested
+        && (*node_binary_profile == NodeBinaryProfile::TokioConsole || {
+            #[cfg(feature = "testing-era-boundaries")]
+            {
+                *node_binary_profile == NodeBinaryProfile::EraBoundaryRecovery
+            }
+            #[cfg(not(feature = "testing-era-boundaries"))]
+            {
+                false
+            }
+        })
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{LOGOS_BLOCKCHAIN_NODE_DOWNLOAD_URL} cannot be used with the tokio-console node binary profile"
+                "{LOGOS_BLOCKCHAIN_NODE_DOWNLOAD_URL} cannot be used with the selected instrumented node binary profile"
             ),
         )
         .into());
@@ -396,24 +443,62 @@ fn extract_release_binary(artifact: &Path, output: &Path) -> Result<(), DynError
 }
 
 fn default_node_binary_provider() -> BinaryProviderRef {
-    if running_in_ci() {
+    if running_in_ci() && !cfg!(feature = "testing-era-boundaries") {
         Arc::new(PathBinaryProvider::new(release_node_binary_path()))
     } else {
         Arc::new(BuildBinaryProvider {
             command: BuildCommand::new("cargo").with_args([
-                "build",
-                "--locked",
-                "--release",
-                "-p",
-                "logos-blockchain-node",
-                "--features",
-                "testing",
+                "build".to_owned(),
+                "--locked".to_owned(),
+                "--release".to_owned(),
+                "-p".to_owned(),
+                "logos-blockchain-node".to_owned(),
+                "--features".to_owned(),
+                node_binary_build_features(&NodeBinaryProfile::Normal),
             ]),
             output_path: release_node_binary_path(),
             working_dir: Some(workspace_root()),
             lock_dir: Some(workspace_root().join("target").join(".tf-binaries")),
         })
     }
+}
+
+fn node_binary_build_features(profile: &NodeBinaryProfile) -> String {
+    let mut features = vec!["testing"];
+    if cfg!(feature = "testing-era-boundaries") {
+        features.push("testing-era-boundaries");
+    }
+    if *profile == NodeBinaryProfile::TokioConsole {
+        features.push("tokio-console");
+    }
+    features.join(",")
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+fn era_boundary_recovery_node_binary_provider() -> BinaryProviderRef {
+    Arc::new(BuildBinaryProvider {
+        command: BuildCommand::new("cargo").with_args([
+            "build".to_owned(),
+            "--locked".to_owned(),
+            "--profile".to_owned(),
+            "release-era-boundary-recovery".to_owned(),
+            "-p".to_owned(),
+            "logos-blockchain-node".to_owned(),
+            "--features".to_owned(),
+            node_binary_build_features(&NodeBinaryProfile::EraBoundaryRecovery),
+        ]),
+        output_path: era_boundary_recovery_node_binary_path(),
+        working_dir: Some(workspace_root()),
+        lock_dir: Some(workspace_root().join("target").join(".tf-binaries")),
+    })
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+fn era_boundary_recovery_node_binary_path() -> PathBuf {
+    workspace_root()
+        .join("target")
+        .join("release-era-boundary-recovery")
+        .join("logos-blockchain-node")
 }
 
 fn release_node_binary_path() -> PathBuf {
@@ -433,7 +518,7 @@ fn tokio_console_node_binary_provider() -> BinaryProviderRef {
             "-p".to_owned(),
             "logos-blockchain-node".to_owned(),
             "--features".to_owned(),
-            "testing,tokio-console".to_owned(),
+            node_binary_build_features(&NodeBinaryProfile::TokioConsole),
         ]),
         output_path: release_profiling_node_binary_path(),
         working_dir: Some(workspace_root()),
@@ -853,6 +938,8 @@ fn build_cryptarchia_user_config(
             },
         },
         leader: LeaderConfig {
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_proposal_publication_enabled: true,
             wallet: leader::WalletConfig {
                 max_tx_fee: mantle::Value::MAX.into(),
                 funding_pk: consensus.funding_pk,
@@ -935,12 +1022,34 @@ mod tests {
             NodeBinaryProfile::resolve(Some("tokio-console"), Normal),
             TokioConsole
         );
+        #[cfg(feature = "testing-era-boundaries")]
+        assert_eq!(
+            NodeBinaryProfile::from_env_or(NodeBinaryProfile::EraBoundaryRecovery),
+            NodeBinaryProfile::EraBoundaryRecovery,
+        );
+    }
+
+    #[cfg(feature = "testing-era-boundaries")]
+    #[test]
+    fn proposal_publishing_is_disabled_only_for_the_recovery_binary_profile() {
+        let normal_features = node_binary_build_features(&NodeBinaryProfile::Normal);
+        let recovery_features = node_binary_build_features(&NodeBinaryProfile::EraBoundaryRecovery);
+
+        assert!(normal_features.contains("testing-era-boundaries"));
+        assert!(recovery_features.contains("testing-era-boundaries"));
+        assert_ne!(
+            release_node_binary_path(),
+            era_boundary_recovery_node_binary_path()
+        );
     }
 
     #[test]
     fn deployment_profile_reaches_initial_local_node_configuration() {
         let original_profile = env::var_os("NODE_BINARY_PROFILE");
-        for profile in [NodeBinaryProfile::Normal, NodeBinaryProfile::TokioConsole] {
+        let mut profiles = vec![NodeBinaryProfile::Normal, NodeBinaryProfile::TokioConsole];
+        #[cfg(feature = "testing-era-boundaries")]
+        profiles.push(NodeBinaryProfile::EraBoundaryRecovery);
+        for profile in profiles {
             let topology = DeploymentBuilder::new(
                 TopologyConfig::with_node_numbers(1)
                     .with_resolved_node_binary_profile(profile.clone()),
@@ -1080,6 +1189,8 @@ mod tests {
                 Ok(match profile {
                     NodeBinaryProfile::Normal => Arc::clone(&normal),
                     NodeBinaryProfile::TokioConsole => Arc::clone(&tokio),
+                    #[cfg(feature = "testing-era-boundaries")]
+                    NodeBinaryProfile::EraBoundaryRecovery => Arc::clone(&normal),
                 })
             };
             let sequence = if tokio_first {
@@ -1192,7 +1303,7 @@ mod tests {
 
     #[test]
     fn release_download_rejects_tokio_console_profile() {
-        let error = validate_node_binary_selection(&NodeBinaryProfile::TokioConsole, true)
+        let error = validate_node_binary_selection(&NodeBinaryProfile::TokioConsole, true, false)
             .expect_err("downloaded releases do not include tokio-console support");
 
         assert_eq!(
@@ -1204,6 +1315,20 @@ mod tests {
                 .to_string()
                 .contains(LOGOS_BLOCKCHAIN_NODE_DOWNLOAD_URL)
         );
+    }
+
+    #[cfg(feature = "testing-era-boundaries")]
+    #[test]
+    fn recovery_profile_rejects_unverified_executable_override() {
+        let error =
+            validate_node_binary_selection(&NodeBinaryProfile::EraBoundaryRecovery, false, true)
+                .expect_err("the recovery profile requires its instrumented binary");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert!(error.to_string().contains("LOGOS_BLOCKCHAIN_NODE_BIN"));
     }
 
     #[test]

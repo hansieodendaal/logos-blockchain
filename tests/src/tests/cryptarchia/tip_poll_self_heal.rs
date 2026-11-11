@@ -2,13 +2,12 @@
 //! forks when publishing proposals to the blend network doesn't work
 //! for some reason.
 //!
-//! The four nodes are spawned from a node binary built with
-//! `--features testing-disable-proposal-publish`, which disables publishing
-//! block proposals to the blend network while keep self-applying them to the
-//! local chain.
+//! The four nodes explicitly start with proposal publication disabled using a
+//! node built with `--features testing-era-boundaries`. They continue to apply
+//! their own proposals locally and restore publication after convergence.
 //!
-//! With that feature on, each node grow their local chain with blocks proposed
-//! by themselves, until the watchdog triggers catch-up downloads.
+//! With publication disabled, each node grows its local chain with blocks
+//! proposed by themselves, until the watchdog triggers catch-up downloads.
 //! This test confirms that all nodes eventually converge on a common tip
 //! through the watchdog's tip-polling and catch-up downloads.
 //!
@@ -16,7 +15,7 @@
 //!
 //! ```text
 //! cargo build -p logos-blockchain-node --release \
-//!   --features testing-disable-proposal-publish
+//!   --features testing-era-boundaries
 //! LOGOS_BLOCKCHAIN_NODE_BIN=$(pwd)/target/release/logos-blockchain-node \
 //!   cargo test -p logos-blockchain-tests --features tip_poll_self_heal \
 //!   --test test_cryptarchia_tip_poll_self_heal -- --nocapture
@@ -41,7 +40,30 @@ use testing_framework_core::scenario::{DynError, StartedNode};
 #[serial]
 async fn silent_cluster_converges_via_tip_poll() {
     let (_base, nodes) = start_silent_cluster("silent_cluster_converges_via_tip_poll").await;
+    for node in &nodes {
+        assert!(
+            !node
+                .client
+                .proposal_publication_enabled()
+                .await
+                .expect("query initial publication state")
+        );
+    }
     wait_for_tip_convergence(&nodes, Duration::from_mins(10)).await;
+    for node in &nodes {
+        assert!(
+            node.client
+                .set_proposal_publication(true)
+                .await
+                .expect("enable publication")
+        );
+        assert!(
+            node.client
+                .proposal_publication_enabled()
+                .await
+                .expect("query restored publication state")
+        );
+    }
 }
 
 const NODE_COUNT: usize = 4;
@@ -65,6 +87,11 @@ async fn start_silent_cluster(
 }
 
 fn config(mut config: RunConfig) -> RunConfig {
+    config
+        .user
+        .cryptarchia
+        .leader
+        .testing_proposal_publication_enabled = false;
     config
         .deployment
         .update_genesis_era_parameters(|parameters| {

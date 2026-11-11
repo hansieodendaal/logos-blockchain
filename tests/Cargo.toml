@@ -38,6 +38,7 @@ lb-chain-service                 = { workspace = true }
 lb-common-http-client            = { workspace = true }
 lb-config                        = { workspace = true }
 lb-core                          = { workspace = true }
+lb-cryptarchia-sync              = { optional = true, workspace = true }
 lb-faucet                        = { workspace = true }
 lb-groth16                       = { workspace = true }
 lb-http-api-common               = { workspace = true }
@@ -63,6 +64,7 @@ serde                            = { features = ["derive"], workspace = true }
 serde_json                       = { workspace = true }
 serde_yaml                       = { workspace = true }
 serial_test                      = { workspace = true }
+sha2                             = { workspace = true }
 strum                            = { features = ["derive", "std"], workspace = true }
 strum_macros                     = { workspace = true }
 tempfile                         = { workspace = true }
@@ -76,11 +78,17 @@ tracing                          = { workspace = true }
 tracing-subscriber               = { features = ["env-filter", "fmt"], workspace = true }
 
 [features]
-cucumber             = []
+cucumber = []
 cucumber_stand_alone = []
-mantle_sdp           = []
-testing_framework    = []
-tip_poll_self_heal   = []
+mantle_sdp = []
+testing-era-boundaries = [
+  "dep:lb-cryptarchia-sync",
+  "lb-cryptarchia-sync/testing-era-boundaries",
+  "lb-node/testing-era-boundaries",
+  "lb-testing-framework/testing-era-boundaries",
+]
+testing_framework = []
+tip_poll_self_heal = ["testing-era-boundaries"]
 
 [[test]]
 name = "test_cli_restart"

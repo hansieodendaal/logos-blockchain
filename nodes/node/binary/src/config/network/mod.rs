@@ -93,6 +93,12 @@ impl ServiceConfig {
                             .swarm
                             .chain_sync
                             .inbound_download_stream_timeout,
+                        #[cfg(feature = "testing-era-boundaries")]
+                        testing_era_boundaries: user
+                            .backend
+                            .swarm
+                            .chain_sync
+                            .testing_era_boundaries,
                     },
                     nat_config: user.backend.swarm.nat.into(),
                 },

@@ -101,6 +101,10 @@ pub async fn run(implementation: LocalImplementation) -> ExitCode {
     clippy::future_not_send,
     reason = "Cucumber uses non-Send futures; entry points await the runner directly"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The runner wires scenario setup, retry policy, filtering, diagnostics, and cleanup hooks"
+)]
 pub async fn run_suite<W>(
     implementation: LocalImplementation,
     feature_path: PathBuf,
@@ -168,6 +172,9 @@ where
                 let profile = NodeBinaryProfile::from_env_or(scenario_binary_profile(
                     feature, rule, scenario,
                 ));
+                #[cfg(feature = "testing-era-boundaries")]
+                let era_transition_scenario =
+                    crate::cucumber::steps::era_transitions::has_recovery_tag(&scenario.tags);
                 async move {
                     println!(
                         "\nStarting - {}: {} ({}: {})\n",
@@ -183,6 +190,8 @@ where
                         profile,
                         &feature.name,
                         &scenario.name,
+                        #[cfg(feature = "testing-era-boundaries")]
+                        era_transition_scenario,
                     )
                     .await;
                 }
@@ -197,28 +206,34 @@ where
         world = world.retries(retries);
     }
 
-    let failed = world
-        .after(move |feature, _rule, scenario, scenario_finished, world| {
-            Box::pin(async move {
-                // Runs after the scenario has completed; useful for capturing final state/logs.
-                println!(
-                    "\nFinished - {}: {} ({}: {})\n",
-                    scenario.keyword, scenario.name, feature.keyword, feature.name,
-                );
+    let world = world.after(move |feature, _rule, scenario, scenario_finished, world| {
+        Box::pin(async move {
+            // Runs after the scenario has completed; useful for capturing final state/logs.
+            println!(
+                "\nFinished - {}: {} ({}: {})\n",
+                scenario.keyword, scenario.name, feature.keyword, feature.name,
+            );
 
-                if let Some(world) = world {
-                    finish_scenario(
-                        world,
-                        matches!(scenario_finished, ScenarioFinished::StepPassed),
-                        debug_info,
-                    )
-                    .await;
-                }
-            })
+            if let Some(world) = world {
+                finish_scenario(
+                    world,
+                    matches!(scenario_finished, ScenarioFinished::StepPassed),
+                    debug_info,
+                )
+                .await;
+            }
         })
-        // Runs Cucumber. Features sourced from a Parser are fed to a Runner, which
-        // produces events handled by a Writer.
-        .run(feature_path)
+    });
+    #[cfg(feature = "testing-era-boundaries")]
+    let failed = world.run(feature_path).await;
+    #[cfg(not(feature = "testing-era-boundaries"))]
+    let failed = world
+        .filter_run(feature_path, |_, _, scenario| {
+            !scenario
+                .tags
+                .iter()
+                .any(|tag| tag == "era_boundary_recovery")
+        })
         .await;
 
     // Release this process's reserved port block before exiting.
@@ -262,6 +277,13 @@ fn get_feature_path_for_deployer(deployer: DeployerKind) -> PathBuf {
     feature_path
 }
 
+#[cfg_attr(
+    feature = "testing-era-boundaries",
+    expect(
+        clippy::too_many_arguments,
+        reason = "runner setup receives the scenario's established lifecycle values plus a feature-gated experiment tag"
+    )
+)]
 async fn prepare_world_for_scenario(
     world: &mut CucumberWorld,
     deployer: DeployerKind,
@@ -270,6 +292,7 @@ async fn prepare_world_for_scenario(
     profile: NodeBinaryProfile,
     feature_name: &str,
     scenario_name: &str,
+    #[cfg(feature = "testing-era-boundaries")] era_transition_scenario: bool,
 ) {
     world.set_deployer(deployer);
     world.lifecycle.node_binary_profile = Some(profile.clone());
@@ -304,10 +327,18 @@ async fn prepare_world_for_scenario(
     );
 
     world.set_scenario_base_dir(&scenario_dir, &deployer);
+    #[cfg(feature = "testing-era-boundaries")]
     if feature_name == "Happy-path era boundaries" {
         crate::cucumber::steps::nodes::era_boundaries::initialize_evidence_file(&scenario_dir)
             .unwrap_or_else(|error| {
                 panic!("Failed to initialize era-boundary evidence for scenario `{scenario_name}`: {error}")
+            });
+    }
+    #[cfg(feature = "testing-era-boundaries")]
+    if era_transition_scenario {
+        crate::cucumber::steps::era_transitions::prepare_recovery_scenario(world, &scenario_dir)
+            .unwrap_or_else(|error| {
+                panic!("Failed to initialize era-transition scenario `{scenario_name}`: {error}")
             });
     }
     world.set_scenario_name(scenario_name);
@@ -346,6 +377,11 @@ fn scenario_binary_profile(
     rule: Option<&Rule>,
     scenario: &Scenario,
 ) -> NodeBinaryProfile {
+    #[cfg(feature = "testing-era-boundaries")]
+    if crate::cucumber::steps::era_transitions::has_recovery_tag(&scenario.tags) {
+        return NodeBinaryProfile::EraBoundaryRecovery;
+    }
+
     let mut steps = feature
         .background
         .iter()
@@ -399,7 +435,23 @@ async fn finish_scenario<W: AsMut<CucumberWorld> + ScenarioCleanup>(
     }
     let _unused = std::fs::write(&path, debug_info);
 
-    if successful && cleanup.is_ok() && is_truthy_env(CUCUMBER_REMOVE_ARTEFACTS_IF_SUCCESSFUL) {
+    #[cfg(feature = "testing-era-boundaries")]
+    let mut era_transition_evidence_failures = Vec::new();
+    #[cfg(feature = "testing-era-boundaries")]
+    era_transition_evidence_failures
+        .extend(crate::cucumber::steps::era_transitions::finish_recovery_scenario(world).await);
+
+    #[cfg(feature = "testing-era-boundaries")]
+    let preserve_era_transition_artifacts =
+        crate::cucumber::steps::era_transitions::preserves_scenario_artifacts(world);
+    #[cfg(not(feature = "testing-era-boundaries"))]
+    let preserve_era_transition_artifacts = false;
+
+    if successful
+        && cleanup.is_ok()
+        && !preserve_era_transition_artifacts
+        && is_truthy_env(CUCUMBER_REMOVE_ARTEFACTS_IF_SUCCESSFUL)
+    {
         println!(
             "Env var '{CUCUMBER_REMOVE_ARTEFACTS_IF_SUCCESSFUL}' set, removing all \
             artefacts\n"
@@ -419,6 +471,16 @@ async fn finish_scenario<W: AsMut<CucumberWorld> + ScenarioCleanup>(
     // Cucumber reports an after-hook panic as a scenario failure. Keep the
     // diagnostics and artifacts above even when cleanup fails.
     cleanup.expect("scenario cleanup failed");
+    #[cfg(feature = "testing-era-boundaries")]
+    if successful {
+        assert!(
+            era_transition_evidence_failures.is_empty(),
+            "era-transition evidence capture failed: {}",
+            era_transition_evidence_failures.join("; ")
+        );
+    } else if !era_transition_evidence_failures.is_empty() {
+        tracing::error!(failures = ?era_transition_evidence_failures, "secondary era-transition evidence failures after scenario failure");
+    }
 }
 
 #[cfg(test)]

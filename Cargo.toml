@@ -26,6 +26,9 @@ debug    = true      # Include debug symbols for profiling
 inherits = "release"
 strip    = "none"    # Don't strip symbols to allow for better profiling results
 
+[profile.release-era-boundary-recovery]
+inherits = "release"
+
 [workspace]
 # Make sure any excluded crates are still clipped in our CI. Also, make sure they use the same Clippy and rustc lints we specify in this file down below.
 members = [
@@ -297,6 +300,7 @@ serde_urlencoded      = { default-features = false, version = "0.7.1" }
 serde_with            = { default-features = false, version = "3.14.0" }
 serde_yaml            = { default-features = false, version = "0.9.33" }
 serial_test           = { default-features = false, version = "3.1.1" }
+sha2                  = { default-features = false, version = "0.10.9" }
 sntpc                 = { default-features = false, version = "0.5" }
 strum                 = { default-features = false, version = "0.27" }
 strum_macros          = { default-features = false, version = "0.27.2" }
