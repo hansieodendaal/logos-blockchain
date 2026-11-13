@@ -48,6 +48,8 @@ pub struct ReceivedRequest {
 pub struct EraBoundaryResponseHold {
     pub(super) evidence: Option<RequestEvidence>,
     pub(super) after_blocks: Option<usize>,
+    pub(super) selected_peer_id: Option<String>,
+    pub(super) selected_protocol: Option<String>,
     pub(super) claimed: Arc<AtomicBool>,
 }
 
@@ -329,7 +331,16 @@ async fn send_blocks_normally(
 #[cfg(feature = "testing-era-boundaries")]
 fn provider_hold_is_armed(response_hold: &EraBoundaryResponseHold) -> bool {
     response_hold.after_blocks.is_some()
-        && response_hold.evidence.is_some()
+        && response_hold.evidence.as_ref().is_some_and(|evidence| {
+            response_hold
+                .selected_peer_id
+                .as_ref()
+                .is_none_or(|peer_id| peer_id == &evidence.peer_id.to_string())
+                && response_hold
+                    .selected_protocol
+                    .as_ref()
+                    .is_none_or(|protocol| protocol == &evidence.protocol)
+        })
         && !response_hold.claimed.load(Ordering::Acquire)
 }
 
@@ -663,6 +674,8 @@ mod era_boundary_tests {
         let absent = EraBoundaryResponseHold {
             evidence: None,
             after_blocks: None,
+            selected_peer_id: None,
+            selected_protocol: None,
             claimed: std::sync::Arc::clone(&claimed),
         };
         assert!(!provider_hold_is_armed(&absent));
@@ -677,11 +690,46 @@ mod era_boundary_tests {
         let configured = EraBoundaryResponseHold {
             evidence: Some(evidence),
             after_blocks: Some(1),
+            selected_peer_id: None,
+            selected_protocol: Some("/test/era-boundary".into()),
             claimed: std::sync::Arc::clone(&claimed),
         };
         assert!(provider_hold_is_armed(&configured));
         claimed.store(true, std::sync::atomic::Ordering::Release);
         assert!(!provider_hold_is_armed(&configured));
+    }
+
+    #[test]
+    fn provider_hold_selector_matches_peer_and_protocol() {
+        let claimed = std::sync::Arc::new(AtomicBool::new(false));
+        let requester = PeerId::random();
+        let evidence = RequestEvidence::new(
+            requester,
+            &StreamProtocol::new("/test/era-boundary"),
+            HeaderId::from([1; 32]),
+            HeaderId::from([2; 32]),
+            HeaderId::from([3; 32]),
+        );
+        let selected = EraBoundaryResponseHold {
+            evidence: Some(evidence),
+            after_blocks: Some(1),
+            selected_peer_id: Some(requester.to_string()),
+            selected_protocol: Some("/test/era-boundary".into()),
+            claimed: std::sync::Arc::clone(&claimed),
+        };
+        assert!(provider_hold_is_armed(&selected));
+
+        let wrong_peer = EraBoundaryResponseHold {
+            selected_peer_id: Some(PeerId::random().to_string()),
+            ..selected.clone()
+        };
+        assert!(!provider_hold_is_armed(&wrong_peer));
+
+        let wrong_protocol = EraBoundaryResponseHold {
+            selected_protocol: Some("/test/another-era".into()),
+            ..selected
+        };
+        assert!(!provider_hold_is_armed(&wrong_protocol));
     }
 
     #[tokio::test]

@@ -8,7 +8,10 @@ use serde_json::Value;
 use super::{
     events::{RuntimeObservation, collect_observations, node_peer_id},
     lifecycle,
-    scenario::{participants, provider_name, requester_name, validate_participant_topology},
+    scenario::{
+        participants, provider_name, requester_name, runtime_binding, unselected_requester_name,
+        validate_participant_topology,
+    },
 };
 use crate::cucumber::{
     error::{StepError, StepResult},
@@ -162,7 +165,9 @@ fn verify_scenario_evidence(
         participants(world).map_err(|error| vec![format!("participants: {error:?}")])?;
     let provider = provider_name(world).map_err(|error| vec![format!("provider: {error:?}")])?;
     let requester = requester_name(world).map_err(|error| vec![format!("requester: {error:?}")])?;
-    let (f0, f1) = super::scenario::runtime_binding(world, &provider)
+    let unselected_requester = unselected_requester_name(world)
+        .map_err(|error| vec![format!("unselected requester: {error:?}")])?;
+    let (f0, f1) = runtime_binding(world, &provider)
         .ok()
         .and_then(|binding| {
             super::events::era_protocols_from_path(&binding.runtime_dir.join("deployment.yaml"))
@@ -197,7 +202,7 @@ fn verify_scenario_evidence(
         assertions.entry(name.to_owned()).or_default().push(data);
     }
 
-    let required_assertions = [
+    let mut required_assertions = vec![
         "scenario_local_evidence_initialized",
         "established_f0_request_and_partial_progress",
         "expiry_cancellation_and_requester_detection",
@@ -208,6 +213,9 @@ fn verify_scenario_evidence(
         "per_node_experiment_configuration",
         "request_capacity_and_node_health",
     ];
+    if unselected_requester.is_some() {
+        required_assertions.push("concurrent_f0_request_lifecycle");
+    }
     for assertion in required_assertions {
         match assertions.get(assertion) {
             Some(entries)
@@ -269,17 +277,68 @@ fn verify_scenario_evidence(
 
     let provider_peer = node_peer_id(world, &provider);
     let requester_peer = node_peer_id(world, &requester);
+    let configured_hold_peer = node_config_value(
+        world,
+        &provider,
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_peer_id",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let expected_hold_peer = if unselected_requester.is_some() {
+        requester_peer.clone()
+    } else {
+        None
+    };
+    if configured_hold_peer != expected_hold_peer {
+        failures.push(format!(
+            "provider hold peer selector {configured_hold_peer:?} does not match the selected requester {expected_hold_peer:?}"
+        ));
+    }
     match (provider_peer, requester_peer) {
-        (Some(provider_peer), Some(requester_peer)) => verify_runtime_lifecycle(
-            events,
-            &provider,
-            &requester,
-            &provider_peer,
-            &requester_peer,
-            &f0,
-            &f1,
-            &mut failures,
-        ),
+        (Some(provider_peer), Some(requester_peer)) => {
+            verify_runtime_lifecycle(
+                events,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f0,
+                &f1,
+                &mut failures,
+            );
+            if let Some(unselected_requester) = &unselected_requester {
+                let unselected_peer = node_peer_id(world, unselected_requester);
+                match unselected_peer {
+                    Some(unselected_peer) => {
+                        let concurrent = lifecycle::original(
+                            events,
+                            &provider,
+                            &requester,
+                            &provider_peer,
+                            &requester_peer,
+                            &f0,
+                        )
+                        .and_then(|selected| {
+                            lifecycle::expiry(events, &selected, &provider, &requester, &f0, &f1)?;
+                            lifecycle::unselected_completion(
+                                events,
+                                &selected,
+                                &provider,
+                                &provider_peer,
+                                &requester_peer,
+                                unselected_requester,
+                                &unselected_peer,
+                                &f0,
+                            )
+                        });
+                        if let Err(error) = concurrent {
+                            failures.push(error.to_owned());
+                        }
+                    }
+                    None => failures
+                        .push("unselected requester runtime peer identity is missing".to_owned()),
+                }
+            }
+        }
         _ => failures.push("provider or requester runtime peer identity is missing".to_owned()),
     }
     verify_timeout_cause(events, &records, &provider, &requester, &f0, &mut failures);
@@ -589,8 +648,8 @@ pub(super) fn node_config_value(
     node_name: &str,
     path: &str,
 ) -> Option<serde_yaml::Value> {
-    let node = world.nodes_info.get(node_name)?;
-    let contents = fs::read_to_string(node.runtime_dir.join("node.yaml")).ok()?;
+    let binding = runtime_binding(world, node_name).ok()?;
+    let contents = fs::read_to_string(binding.runtime_dir.join("node.yaml")).ok()?;
     let config = serde_yaml::from_str::<serde_yaml::Value>(&contents).ok()?;
     yaml_path(&config, path).cloned()
 }

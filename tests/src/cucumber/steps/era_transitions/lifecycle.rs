@@ -115,6 +115,190 @@ pub(super) fn original<'a>(
     })
 }
 
+pub(super) struct UnselectedCompletion<'a> {
+    pub request: &'a RequestObservation,
+    pub provider_request: &'a RequestObservation,
+    pub started: &'a RuntimeObservation,
+    pub accepted: &'a RuntimeObservation,
+    pub sent: &'a RuntimeObservation,
+    pub received: &'a RuntimeObservation,
+    pub provider_completed: &'a RuntimeObservation,
+    pub requester_completed: &'a RuntimeObservation,
+    pub ibd_completed: &'a RuntimeObservation,
+}
+
+/// Correlates the second request by its peer and full protocol context. Local
+/// request IDs are checked only within the node that emitted them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the concurrent request proof is bound to both requester identities"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "ownership, correlation, and per-node ordering are one auditable proof"
+)]
+pub(super) fn unselected_completion<'a>(
+    events: &'a [RuntimeObservation],
+    selected: &Original<'a>,
+    provider: &str,
+    provider_peer: &str,
+    requester_peer: &str,
+    unselected_requester: &str,
+    unselected_peer: &str,
+    f0: &str,
+) -> Result<UnselectedCompletion<'a>, &'static str> {
+    if events.iter().any(|event| {
+        (event.node == provider && event.peer_id != provider_peer)
+            || (event.node == unselected_requester && event.peer_id != unselected_peer)
+    }) {
+        return Err("unselected request observation ownership does not match participant identity");
+    }
+    let provider_id = peer(provider_peer).ok_or("invalid provider peer identity")?;
+    let selected_requester_id = peer(requester_peer).ok_or("invalid requester peer identity")?;
+    let requester_id = peer(unselected_peer).ok_or("invalid unselected requester peer identity")?;
+    if selected.provider_request.remote_peer != selected_requester_id {
+        return Err("selected provider request is not owned by the declared requester");
+    }
+    // Tip polling can create later normal requests from this peer. Bind the
+    // regression to the first provider-local F0 acceptance while the selected
+    // request is held, then correlate that exact request across both journals.
+    let accepted_candidates = events
+        .iter()
+        .filter(|event| {
+            event.node == provider
+                && before(selected.hold, event)
+                && matches!(&event.record.event, Observation::ProviderRequestAccepted { request: accepted } if accepted.protocol == f0 && accepted.remote_peer == requester_id)
+        })
+        .collect::<Vec<_>>();
+    let earliest_sequence = accepted_candidates
+        .iter()
+        .map(|event| event.record.sequence)
+        .min()
+        .ok_or("unselected F0 provider acceptance is missing")?;
+    let earliest_acceptances = accepted_candidates
+        .into_iter()
+        .filter(|event| event.record.sequence == earliest_sequence)
+        .collect::<Vec<_>>();
+    let [accepted] = earliest_acceptances.as_slice() else {
+        return Err("earliest unselected F0 provider acceptance is ambiguous");
+    };
+    let Observation::ProviderRequestAccepted {
+        request: provider_request,
+    } = &accepted.record.event
+    else {
+        unreachable!()
+    };
+    let started = unique(events, |event| {
+        event.node == unselected_requester
+            && matches!(&event.record.event, Observation::RequesterRequestStarted { request } if request.protocol == f0 && request.remote_peer == provider_id && same_context(request, provider_request))
+    })
+    .ok_or("unselected F0 requester request context is missing or ambiguous")?;
+    let Observation::RequesterRequestStarted { request } = &started.record.event else {
+        unreachable!()
+    };
+    let sent = unique(events, |event| {
+        event.node == provider
+            && matches!(&event.record.event, Observation::ProviderBlockResponseSent { request, response_index: 1 } if same_local_request(provider_request, request))
+    })
+    .ok_or("unselected F0 provider response is missing or ambiguous")?;
+    let received = unique(events, |event| {
+        event.node == unselected_requester
+            && matches!(&event.record.event, Observation::RequesterBlockResponseReceived { request: received, response_index: 1 } if same_local_request(request, received))
+    })
+    .ok_or("unselected F0 requester response is missing or ambiguous")?;
+    let provider_completed = unique(events, |event| {
+        event.node == provider
+            && matches!(&event.record.event, Observation::ProviderRequestCompleted { request: completed, .. } if same_local_request(provider_request, completed))
+    })
+    .ok_or("unselected F0 provider completion is missing or ambiguous")?;
+    let requester_completed = unique(events, |event| {
+        event.node == unselected_requester
+            && matches!(&event.record.event, Observation::RequesterRequestCompleted { request: completed, .. } if same_local_request(request, completed))
+    })
+    .ok_or("unselected F0 requester completion is missing or ambiguous")?;
+    let ibd_completed = unique(events, |event| {
+        event.node == unselected_requester
+            && matches!(event.record.event, Observation::IbdCompleted)
+    })
+    .ok_or("unselected requester IBD completion is missing or ambiguous")?;
+    let Observation::ProviderRequestCompleted { blocks_sent, .. } =
+        &provider_completed.record.event
+    else {
+        unreachable!()
+    };
+    let Observation::RequesterRequestCompleted { response_count, .. } =
+        &requester_completed.record.event
+    else {
+        unreachable!()
+    };
+
+    if provider_request.remote_peer == selected.provider_request.remote_peer
+        || provider_request.local_request_id == selected.provider_request.local_request_id
+    {
+        return Err("selected and unselected provider requests are not distinguishable");
+    }
+    if *blocks_sent == 0 || blocks_sent != response_count {
+        return Err("unselected F0 response did not complete with matching nonempty progress");
+    }
+    let sent_count = events
+        .iter()
+        .filter(|event| {
+            event.node == provider
+                && matches!(&event.record.event, Observation::ProviderBlockResponseSent { request: sent, .. } if same_local_request(provider_request, sent))
+        })
+        .count();
+    let received_count = events
+        .iter()
+        .filter(|event| {
+            event.node == unselected_requester
+                && matches!(&event.record.event, Observation::RequesterBlockResponseReceived { request: received, .. } if same_local_request(request, received))
+        })
+        .count();
+    if usize::try_from(*blocks_sent).ok() != Some(sent_count)
+        || usize::try_from(*response_count).ok() != Some(received_count)
+    {
+        return Err("unselected F0 completion has missing or contradictory block observations");
+    }
+    if events.iter().any(|event| {
+        (event.node == provider
+            && matches!(&event.record.event, Observation::ProviderResponseHoldActivated { request: held, .. } | Observation::ProviderResponseHoldCancelled { request: held, .. } if same_local_request(provider_request, held)))
+            || (event.node == unselected_requester
+                && matches!(&event.record.event, Observation::RequesterInterruptionDetected { request: interrupted, .. } if same_local_request(request, interrupted)))
+    }) {
+        return Err("unselected F0 request was held, cancelled, or interrupted");
+    }
+    if !(before(accepted, sent)
+        && before(sent, provider_completed)
+        && before(started, received)
+        && before(received, requester_completed)
+        && before(requester_completed, ibd_completed)
+        && before(selected.hold, accepted)
+        && before(selected.hold, provider_completed))
+    {
+        return Err("concurrent F0 requests do not overlap through normal completion");
+    }
+    let expiries = events.iter().filter(|event| {
+        event.node == provider
+            && matches!(&event.record.event, Observation::EraTransitionExpired { old_protocol, .. } if old_protocol == f0)
+    });
+    for expiry in expiries {
+        if !before(provider_completed, expiry) {
+            return Err("unselected F0 request did not complete before provider expiry");
+        }
+    }
+    Ok(UnselectedCompletion {
+        request,
+        provider_request,
+        started,
+        accepted,
+        sent,
+        received,
+        provider_completed,
+        requester_completed,
+        ibd_completed,
+    })
+}
+
 pub(super) struct Expiry<'a> {
     pub provider_rotation: &'a RuntimeObservation,
     pub requester_rotation: &'a RuntimeObservation,

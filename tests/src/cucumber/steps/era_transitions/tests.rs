@@ -10,6 +10,7 @@ use super::{
         participant_configuration_is_verified, participant_suppression_is_verified,
         verify_partial_progress_record, verify_runtime_lifecycle, verify_shared_convergence,
     },
+    lifecycle,
 };
 
 fn id(n: u8) -> HeaderId {
@@ -235,6 +236,161 @@ fn failures(events: &[RuntimeObservation], provider: &str, requester: &str) -> V
     failures
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixture keeps each participant's monotonic event sequence explicit"
+)]
+fn add_unselected_request(events: &mut Vec<RuntimeObservation>, provider_peer: &str) -> String {
+    let unselected_peer = PeerId::random();
+    let unselected_peer_id = unselected_peer.to_string();
+    for event in events
+        .iter_mut()
+        .filter(|event| event.node == "provider" && event.record.sequence >= 4)
+    {
+        event.record.sequence += 4;
+    }
+    let provider_identity = provider_peer.parse::<PeerId>().unwrap();
+    let request = RequestObservation {
+        local_request_id: 5,
+        remote_peer: provider_identity.into(),
+        protocol: "f0".into(),
+        target: id(1),
+        requester_tip: id(2),
+        latest_immutable: id(3),
+    };
+    let provider_request = RequestObservation {
+        local_request_id: 99,
+        remote_peer: unselected_peer.into(),
+        ..request.clone()
+    };
+    let mut push = |node: &str, peer_id: &str, path: &str, sequence: u64, event| {
+        events.push(RuntimeObservation {
+            node: node.into(),
+            peer_id: peer_id.into(),
+            path: path.into(),
+            record: ObservationRecord {
+                schema_version: SCHEMA_VERSION,
+                sequence,
+                timestamp_unix_ms: 0,
+                elapsed_ns: sequence * 10,
+                event,
+            },
+        });
+    };
+    push(
+        "provider",
+        provider_peer,
+        "provider.ndjson",
+        4,
+        Observation::ProviderRequestAccepted {
+            request: provider_request.clone(),
+        },
+    );
+    push(
+        "provider",
+        provider_peer,
+        "provider.ndjson",
+        5,
+        Observation::ProviderBlockResponseSent {
+            request: provider_request.clone(),
+            response_index: 1,
+        },
+    );
+    push(
+        "provider",
+        provider_peer,
+        "provider.ndjson",
+        6,
+        Observation::ProviderBlockResponseSent {
+            request: provider_request.clone(),
+            response_index: 2,
+        },
+    );
+    push(
+        "provider",
+        provider_peer,
+        "provider.ndjson",
+        7,
+        Observation::ProviderRequestCompleted {
+            request: provider_request,
+            blocks_sent: 2,
+        },
+    );
+    push(
+        "unselected",
+        &unselected_peer_id,
+        "unselected.ndjson",
+        1,
+        Observation::RequesterRequestStarted {
+            request: request.clone(),
+        },
+    );
+    push(
+        "unselected",
+        &unselected_peer_id,
+        "unselected.ndjson",
+        2,
+        Observation::RequesterBlockResponseReceived {
+            request: request.clone(),
+            response_index: 1,
+        },
+    );
+    push(
+        "unselected",
+        &unselected_peer_id,
+        "unselected.ndjson",
+        3,
+        Observation::RequesterBlockResponseReceived {
+            request: request.clone(),
+            response_index: 2,
+        },
+    );
+    push(
+        "unselected",
+        &unselected_peer_id,
+        "unselected.ndjson",
+        4,
+        Observation::RequesterRequestCompleted {
+            request,
+            response_count: 2,
+        },
+    );
+    push(
+        "unselected",
+        &unselected_peer_id,
+        "unselected.ndjson",
+        5,
+        Observation::IbdCompleted,
+    );
+    unselected_peer_id
+}
+
+fn concurrent_completion<'a>(
+    events: &'a [RuntimeObservation],
+    provider_peer: &str,
+    requester_peer: &str,
+    unselected_peer: &str,
+) -> Result<lifecycle::UnselectedCompletion<'a>, &'static str> {
+    let selected = lifecycle::original(
+        events,
+        "provider",
+        "requester",
+        provider_peer,
+        requester_peer,
+        "f0",
+    )?;
+    lifecycle::unselected_completion(
+        events,
+        &selected,
+        "provider",
+        provider_peer,
+        requester_peer,
+        "unselected",
+        unselected_peer,
+        "f0",
+    )
+}
+
 #[test]
 fn typed_lifecycle_accepts_reversed_wall_clocks_and_distinct_local_ids() {
     let (events, provider, requester) = fixture();
@@ -242,6 +398,90 @@ fn typed_lifecycle_accepts_reversed_wall_clocks_and_distinct_local_ids() {
         failures(&events, &provider, &requester),
         Vec::<String>::new()
     );
+}
+
+#[test]
+fn concurrent_f0_requests_overlap_and_unselected_request_completes_normally() {
+    let (mut events, provider, requester) = fixture();
+    let unselected_peer = add_unselected_request(&mut events, &provider);
+    let completion = concurrent_completion(&events, &provider, &requester, &unselected_peer)
+        .expect("normal F0 completion should correlate independently");
+    assert_eq!(completion.provider_request.protocol, "f0");
+    assert_eq!(completion.request.protocol, "f0");
+    assert!(completion.provider_request.local_request_id != 11);
+}
+
+#[test]
+fn ambiguous_or_incomplete_unselected_lifecycle_fails_closed() {
+    let (mut events, provider, requester) = fixture();
+    let unselected_peer = add_unselected_request(&mut events, &provider);
+    let duplicate_start = events
+        .iter()
+        .find(|event| {
+            event.node == "unselected"
+                && matches!(
+                    event.record.event,
+                    Observation::RequesterRequestStarted { .. }
+                )
+        })
+        .unwrap()
+        .clone();
+    let mut duplicate_start = duplicate_start;
+    duplicate_start.record.sequence = 4;
+    events.push(duplicate_start);
+    assert!(concurrent_completion(&events, &provider, &requester, &unselected_peer).is_err());
+
+    let (mut events, provider, requester) = fixture();
+    let unselected_peer = add_unselected_request(&mut events, &provider);
+    events.retain(|event| {
+        !(event.node == "provider"
+            && matches!(&event.record.event, Observation::ProviderRequestCompleted { request, .. } if request.local_request_id == 99))
+    });
+    assert!(concurrent_completion(&events, &provider, &requester, &unselected_peer).is_err());
+}
+
+#[test]
+fn contradictory_unselected_interruption_or_late_completion_is_rejected() {
+    let (mut events, provider, requester) = fixture();
+    let unselected_peer = add_unselected_request(&mut events, &provider);
+    let request = events
+        .iter()
+        .find_map(|event| match &event.record.event {
+            Observation::RequesterRequestStarted { request } if event.node == "unselected" => {
+                Some(request.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    events.push(RuntimeObservation {
+        node: "unselected".into(),
+        peer_id: unselected_peer.clone(),
+        path: "unselected.ndjson".into(),
+        record: ObservationRecord {
+            schema_version: SCHEMA_VERSION,
+            sequence: 4,
+            timestamp_unix_ms: 0,
+            elapsed_ns: 40,
+            event: Observation::RequesterInterruptionDetected {
+                request,
+                response_count: 1,
+                kind: InterruptionKind::StreamError,
+            },
+        },
+    });
+    assert!(concurrent_completion(&events, &provider, &requester, &unselected_peer).is_err());
+
+    let (mut events, provider, requester) = fixture();
+    let unselected_peer = add_unselected_request(&mut events, &provider);
+    let expiry = events
+        .iter_mut()
+        .find(|event| {
+            event.node == "provider"
+                && matches!(event.record.event, Observation::EraTransitionExpired { .. })
+        })
+        .unwrap();
+    expiry.record.sequence = 5;
+    assert!(concurrent_completion(&events, &provider, &requester, &unselected_peer).is_err());
 }
 
 #[test]

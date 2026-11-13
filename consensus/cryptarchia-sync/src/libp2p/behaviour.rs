@@ -596,6 +596,12 @@ impl OngoingRequests {
         let response_hold = EraBoundaryResponseHold {
             evidence,
             after_blocks: hold_after_blocks,
+            selected_peer_id: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_peer_id.clone()),
+            selected_protocol: self.testing_hold_protocol.as_ref().map(ToString::to_string),
             claimed: Arc::clone(&self.testing_hold_claimed),
         };
 

@@ -27,7 +27,6 @@ use lb_node::{
     },
 };
 use rand::Rng as _;
-#[cfg(feature = "testing-era-boundaries")]
 use testing_framework_core::scenario::{Application, DynError, PeerSelection, StartNodeOptions};
 use testing_framework_runner_local::{
     BinaryProviderRef, BuildBinaryProvider, BuildCommand, DownloadBinaryProvider, DownloadChecksum,

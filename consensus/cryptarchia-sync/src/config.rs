@@ -37,4 +37,7 @@ pub struct EraBoundaryTestingConfig {
     /// Hold the provider after this many successfully sent blocks, but only if
     /// another valid block response is ready to send.
     pub hold_provider_after_blocks: Option<NonZeroUsize>,
+    /// Restrict the one-shot hold to requests from this peer. An absent value
+    /// preserves the original first-eligible-request behavior.
+    pub hold_provider_for_peer_id: Option<String>,
 }

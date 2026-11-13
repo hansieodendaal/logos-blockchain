@@ -207,6 +207,7 @@ pub struct ConfigOverride {
 pub enum EraTransitionParticipantRole {
     Provider,
     Requester,
+    UnselectedRequester,
     Observer,
 }
 
@@ -216,6 +217,8 @@ pub struct EraTransitionParticipant {
     pub node_name: String,
     pub role: EraTransitionParticipantRole,
     pub canonical_reference: bool,
+    /// Position in the table and in the corresponding generated node plan.
+    pub startup_index: usize,
 }
 
 #[cfg(feature = "testing-era-boundaries")]
@@ -233,6 +236,7 @@ pub struct EraTransitionScenarioState {
     pub participants: BTreeMap<String, EraTransitionParticipant>,
     pub runtime_bindings: BTreeMap<String, EraTransitionRuntimeBinding>,
     pub provider_hold_after_blocks: Option<usize>,
+    pub provider_hold_peer_id: Option<String>,
     pub proposal_publishing_suppression_required: bool,
     pub initial_proposal_publication: BTreeMap<String, bool>,
     pub accepted_f1_request: Option<EraTransitionAcceptedRequest>,

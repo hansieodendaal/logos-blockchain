@@ -12,7 +12,10 @@ use lb_libp2p::protocol_name::ProtocolScope;
 use lb_node::config::DeploymentSettings;
 use tokio::time::{Instant, sleep};
 
-use super::scenario::{participants, runtime_binding, validate_participant_topology};
+use super::scenario::{
+    participants, runtime_binding, validate_participant_topology,
+    validate_started_participant_topology,
+};
 use crate::cucumber::{
     error::StepError,
     world::{CucumberWorld, EraTransitionJournal, NodeInfo},
@@ -33,7 +36,11 @@ pub(super) fn collect_observations(
     world: &CucumberWorld,
     finished: bool,
 ) -> Result<Vec<RuntimeObservation>, String> {
-    validate_participant_topology(world).map_err(|error| format!("{error:?}"))?;
+    if finished {
+        validate_participant_topology(world).map_err(|error| format!("{error:?}"))?;
+    } else {
+        validate_started_participant_topology(world).map_err(|error| format!("{error:?}"))?;
+    }
     let state = world
         .era_transition
         .as_ref()
@@ -48,6 +55,9 @@ pub(super) fn collect_observations(
         .map_err(|error| format!("{error:?}"))?
         .values()
     {
+        if !finished && !world.nodes_info.contains_key(&participant.node_name) {
+            continue;
+        }
         let binding = runtime_binding(world, &participant.node_name)
             .map_err(|error| format!("participant runtime binding: {error:?}"))?;
         let path = binding.runtime_dir.join("era_observations.ndjson");
