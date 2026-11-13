@@ -50,6 +50,7 @@ pub struct EraBoundaryResponseHold {
     pub(super) after_blocks: Option<usize>,
     pub(super) selected_peer_id: Option<String>,
     pub(super) selected_protocol: Option<String>,
+    pub(super) requester_tip_not_equal_to: Option<String>,
     pub(super) claimed: Arc<AtomicBool>,
 }
 
@@ -340,6 +341,10 @@ fn provider_hold_is_armed(response_hold: &EraBoundaryResponseHold) -> bool {
                     .selected_protocol
                     .as_ref()
                     .is_none_or(|protocol| protocol == &evidence.protocol)
+                && response_hold
+                    .requester_tip_not_equal_to
+                    .as_ref()
+                    .is_none_or(|tip| tip != &format!("{:?}", evidence.requester_tip))
         })
         && !response_hold.claimed.load(Ordering::Acquire)
 }
@@ -676,6 +681,7 @@ mod era_boundary_tests {
             after_blocks: None,
             selected_peer_id: None,
             selected_protocol: None,
+            requester_tip_not_equal_to: None,
             claimed: std::sync::Arc::clone(&claimed),
         };
         assert!(!provider_hold_is_armed(&absent));
@@ -692,6 +698,7 @@ mod era_boundary_tests {
             after_blocks: Some(1),
             selected_peer_id: None,
             selected_protocol: Some("/test/era-boundary".into()),
+            requester_tip_not_equal_to: None,
             claimed: std::sync::Arc::clone(&claimed),
         };
         assert!(provider_hold_is_armed(&configured));
@@ -715,6 +722,7 @@ mod era_boundary_tests {
             after_blocks: Some(1),
             selected_peer_id: Some(requester.to_string()),
             selected_protocol: Some("/test/era-boundary".into()),
+            requester_tip_not_equal_to: None,
             claimed: std::sync::Arc::clone(&claimed),
         };
         assert!(provider_hold_is_armed(&selected));
@@ -730,6 +738,34 @@ mod era_boundary_tests {
             ..selected
         };
         assert!(!provider_hold_is_armed(&wrong_protocol));
+    }
+
+    #[test]
+    fn provider_hold_context_selector_skips_only_the_configured_requester_tip() {
+        let claimed = std::sync::Arc::new(AtomicBool::new(false));
+        let evidence = RequestEvidence::new(
+            PeerId::random(),
+            &StreamProtocol::new("/test/era-boundary"),
+            HeaderId::from([1; 32]),
+            HeaderId::from([2; 32]),
+            HeaderId::from([3; 32]),
+        );
+        let genesis_tip = format!("{:?}", evidence.requester_tip);
+        let selected = EraBoundaryResponseHold {
+            evidence: Some(evidence),
+            after_blocks: Some(1),
+            selected_peer_id: None,
+            selected_protocol: Some("/test/era-boundary".into()),
+            requester_tip_not_equal_to: Some(genesis_tip),
+            claimed,
+        };
+        assert!(!provider_hold_is_armed(&selected));
+
+        let advanced_tip = EraBoundaryResponseHold {
+            requester_tip_not_equal_to: Some(format!("{:?}", HeaderId::from([4; 32]))),
+            ..selected
+        };
+        assert!(provider_hold_is_armed(&advanced_tip));
     }
 
     #[tokio::test]

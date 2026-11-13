@@ -602,6 +602,13 @@ impl OngoingRequests {
                 .as_ref()
                 .and_then(|settings| settings.hold_provider_for_peer_id.clone()),
             selected_protocol: self.testing_hold_protocol.as_ref().map(ToString::to_string),
+            requester_tip_not_equal_to: self.config.testing_era_boundaries.as_ref().and_then(
+                |settings| {
+                    settings
+                        .hold_provider_for_requester_tip_not_equal_to
+                        .clone()
+                },
+            ),
             claimed: Arc::clone(&self.testing_hold_claimed),
         };
 

@@ -101,11 +101,40 @@ pub enum Observation {
         requester_tip: HeaderId,
         latest_immutable: HeaderId,
     },
+    OrphanProposalMissingParent {
+        orphan_id: HeaderId,
+        missing_parent: HeaderId,
+        requester_tip: HeaderId,
+        latest_immutable: HeaderId,
+    },
+    OrphanDownloadRequestStarted {
+        orphan_id: HeaderId,
+        missing_parent: Option<HeaderId>,
+        requester_tip: HeaderId,
+        latest_immutable: HeaderId,
+        known_block: Option<HeaderId>,
+    },
     IbdDownloaderDownloading {
+        target: HeaderId,
+    },
+    OrphanDownloaderDownloading {
         target: HeaderId,
     },
     IbdBlockApplied {
         block_id: HeaderId,
+    },
+    OrphanDownloadBlockApplied {
+        block_id: HeaderId,
+    },
+    OrphanDownloadCompleted {
+        orphan_id: HeaderId,
+        blocks_received: u64,
+    },
+    OrphanDownloadRecoveryScheduled {
+        orphan_id: HeaderId,
+        missing_parent: Option<HeaderId>,
+        known_block: Option<HeaderId>,
+        blocks_received: u64,
     },
     ProviderResponseHoldActivated {
         request: RequestObservation,
@@ -131,6 +160,10 @@ pub enum Observation {
     },
     IbdDownloadStreamError {
         target: HeaderId,
+        blocks_received: u64,
+    },
+    OrphanDownloadStreamError {
+        orphan_id: HeaderId,
         blocks_received: u64,
     },
     ProviderRequestCompleted {

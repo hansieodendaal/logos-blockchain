@@ -110,6 +110,27 @@ fn evidence_is_active(world: &mut CucumberWorld) -> StepResult {
     )
 }
 
+#[given("era-boundary orphan-download recovery evidence is active")]
+fn orphan_recovery_evidence_is_active(world: &mut CucumberWorld) -> StepResult {
+    evidence_is_active(world)?;
+    let state = world
+        .era_transition
+        .as_mut()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?;
+    if state.orphan_recovery {
+        return Err(failure(
+            "orphan recovery evidence mode was activated more than once",
+        ));
+    }
+    state.orphan_recovery = true;
+    record_assertion(
+        world,
+        "orphan_recovery_mode",
+        true,
+        "scenario verification requires the post-IBD runtime orphan downloader path",
+    )
+}
+
 pub(super) fn record_assertion(
     world: &CucumberWorld,
     assertion: &str,
@@ -202,6 +223,25 @@ fn verify_scenario_evidence(
         assertions.entry(name.to_owned()).or_default().push(data);
     }
 
+    if world
+        .era_transition
+        .as_ref()
+        .is_some_and(|state| state.orphan_recovery)
+    {
+        return verify_orphan_scenario_evidence(
+            world,
+            events,
+            participant_map,
+            &provider,
+            &requester,
+            &f0,
+            &f1,
+            &records,
+            &shared,
+            &assertions,
+        );
+    }
+
     let mut required_assertions = vec![
         "scenario_local_evidence_initialized",
         "established_f0_request_and_partial_progress",
@@ -283,14 +323,30 @@ fn verify_scenario_evidence(
         "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_peer_id",
     )
     .and_then(|value| value.as_str().map(str::to_owned));
+    let orphan_recovery = world
+        .era_transition
+        .as_ref()
+        .is_some_and(|state| state.orphan_recovery);
     let expected_hold_peer = if unselected_requester.is_some() {
         requester_peer.clone()
     } else {
         None
     };
-    if configured_hold_peer != expected_hold_peer {
+    let configured_context_tip = node_config_value(
+        world,
+        &provider,
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_requester_tip_not_equal_to",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let expected_context_tip = if orphan_recovery {
+        world.chain.genesis_block_id.map(|id| format!("{id:?}"))
+    } else {
+        None
+    };
+    if configured_hold_peer != expected_hold_peer || configured_context_tip != expected_context_tip
+    {
         failures.push(format!(
-            "provider hold peer selector {configured_hold_peer:?} does not match the selected requester {expected_hold_peer:?}"
+            "provider hold selectors peer={configured_hold_peer:?} expected={expected_hold_peer:?}, requester-tip-exclusion={configured_context_tip:?} expected={expected_context_tip:?}"
         ));
     }
     match (provider_peer, requester_peer) {
@@ -352,6 +408,237 @@ fn verify_scenario_evidence(
         Ok(())
     } else {
         Err(failures)
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the evidence gate validates one experiment against its journals and two evidence files"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the orphan gate lists each independent acceptance requirement explicitly"
+)]
+fn verify_orphan_scenario_evidence(
+    world: &CucumberWorld,
+    events: &[RuntimeObservation],
+    participant_map: &std::collections::BTreeMap<
+        String,
+        crate::cucumber::world::EraTransitionParticipant,
+    >,
+    provider: &str,
+    requester: &str,
+    f0: &str,
+    f1: &str,
+    records: &[Value],
+    shared: &[Value],
+    assertions: &HashMap<String, Vec<&Value>>,
+) -> Result<(), Vec<String>> {
+    let mut failures = Vec::new();
+    let required_assertions = [
+        "scenario_local_evidence_initialized",
+        "orphan_recovery_mode",
+        "orphan_initial_ibd_completed",
+        "orphan_f0_partial_progress",
+        "orphan_expiry_cancellation_and_detection",
+        "orphan_automatic_f1_recovery",
+        "orphan_progress_retained_and_target_resolved",
+        "canonical_convergence",
+        "per_node_experiment_configuration",
+        "request_capacity_and_node_health",
+    ];
+    for assertion in required_assertions {
+        match assertions.get(assertion) {
+            Some(entries)
+                if entries
+                    .iter()
+                    .any(|entry| entry.get("status").and_then(Value::as_str) == Some("failed")) =>
+            {
+                failures.push(format!("assertion `{assertion}` has a recorded failure"));
+            }
+            Some(entries)
+                if entries
+                    .iter()
+                    .any(|entry| entry.get("status").and_then(Value::as_str) == Some("passed")) => {
+            }
+            _ => failures.push(format!(
+                "required orphan assertion `{assertion}` is missing or unverified"
+            )),
+        }
+    }
+
+    for participant in participant_map.keys() {
+        if !assertions
+            .get("proposal_publishing_suppressed")
+            .into_iter()
+            .flatten()
+            .any(|entry| participant_suppression_is_verified(entry, participant))
+        {
+            failures.push(format!(
+                "participant `{participant}` lacks a disabled runtime publication observation"
+            ));
+        }
+        if !records
+            .iter()
+            .any(|record| participant_configuration_is_verified(record, participant))
+        {
+            failures.push(format!(
+                "participant `{participant}` lacks recorded effective configuration"
+            ));
+        }
+        if !records.iter().any(|record| {
+            record.get("event").and_then(Value::as_str) == Some("node_health")
+                && record
+                    .get("data")
+                    .and_then(|data| data.get("node"))
+                    .and_then(Value::as_str)
+                    == Some(participant)
+                && record
+                    .get("data")
+                    .and_then(|data| data.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("healthy")
+        }) {
+            failures.push(format!(
+                "participant `{participant}` has no healthy runtime observation"
+            ));
+        }
+    }
+
+    let expected_hold_peer = None;
+    let configured_hold_peer = node_config_value(
+        world,
+        provider,
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_peer_id",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let configured_hold_count = node_config_value(
+        world,
+        provider,
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_after_blocks",
+    )
+    .and_then(|value| value.as_u64());
+    let expected_hold_count = world
+        .era_transition
+        .as_ref()
+        .and_then(|state| state.provider_hold_after_blocks)
+        .and_then(|value| u64::try_from(value).ok());
+    let requester_tip_poll = node_config_value(
+        world,
+        requester,
+        "cryptarchia.network.sync.tip_poll.enabled",
+    )
+    .and_then(|value| value.as_bool());
+    let configured_context_tip = node_config_value(
+        world,
+        provider,
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_requester_tip_not_equal_to",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let expected_context_tip = world.chain.genesis_block_id.map(|id| format!("{id:?}"));
+    if configured_hold_peer != expected_hold_peer
+        || expected_hold_count.is_none()
+        || configured_hold_count != expected_hold_count
+        || requester_tip_poll != Some(false)
+        || configured_context_tip != expected_context_tip
+    {
+        failures.push(format!(
+            "orphan controls are not isolated: selected peer={configured_hold_peer:?}, expected={expected_hold_peer:?}, excluded requester tip={configured_context_tip:?}, expected={expected_context_tip:?}, hold count={configured_hold_count:?}, expected hold count={expected_hold_count:?}, requester tip polling={requester_tip_poll:?}"
+        ));
+    }
+
+    match (
+        node_peer_id(world, provider),
+        node_peer_id(world, requester),
+    ) {
+        (Some(provider_peer), Some(requester_peer)) => {
+            let lifecycle = (|| {
+                let original = lifecycle::orphan_original(
+                    events,
+                    provider,
+                    requester,
+                    &provider_peer,
+                    &requester_peer,
+                    f0,
+                )?;
+                let expiry =
+                    lifecycle::orphan_expiry(events, &original, provider, requester, f0, f1)?;
+                let replacement = lifecycle::orphan_replacement(
+                    events,
+                    &original,
+                    &expiry,
+                    provider,
+                    requester,
+                    &provider_peer,
+                    &requester_peer,
+                    f1,
+                )?;
+                lifecycle::orphan_completed(events, &original, &replacement, provider, requester)
+                    .map(|_| original)
+            })();
+            match lifecycle {
+                Ok(original) => verify_orphan_progress_record(records, &original, &mut failures),
+                Err(error) => failures.push(error.to_owned()),
+            }
+        }
+        _ => failures.push("provider or requester peer identity is missing".to_owned()),
+    }
+    verify_timeout_cause(events, records, provider, requester, f0, &mut failures);
+    verify_shared_convergence(
+        shared,
+        participant_map.keys().map(String::as_str),
+        &mut failures,
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
+}
+
+fn verify_orphan_progress_record(
+    records: &[Value],
+    original: &lifecycle::OrphanOriginal<'_>,
+    failures: &mut Vec<String>,
+) {
+    let matching = records
+        .iter()
+        .filter(|record| {
+            record.get("event").and_then(Value::as_str) == Some("orphan_progress_and_resolution")
+        })
+        .collect::<Vec<_>>();
+    let [record] = matching.as_slice() else {
+        failures.push("orphan progress and resolution record is missing or ambiguous".to_owned());
+        return;
+    };
+    let Some(data) = record.get("data") else {
+        failures.push("orphan progress record has no data".to_owned());
+        return;
+    };
+    if data.get("orphan_id")
+        != Some(&serde_json::to_value(original.orphan_id).unwrap_or(Value::Null))
+    {
+        failures.push("orphan progress record does not match the typed orphan identity".to_owned());
+    }
+    for field in [
+        "partial_block_available",
+        "partial_block_is_ancestor_of_final_tip",
+        "missing_parent_available",
+        "missing_parent_is_ancestor_of_final_tip",
+        "orphan_available",
+        "orphan_is_ancestor_of_final_tip",
+    ] {
+        if data.get(field).and_then(Value::as_bool) != Some(true) {
+            failures.push(format!("orphan progress record does not prove `{field}`"));
+        }
+    }
+    if data.get("missing_parent")
+        != Some(&serde_json::to_value(original.missing_parent).unwrap_or(Value::Null))
+        || data.get("partial_block")
+            != Some(&serde_json::to_value(original.partial_block).unwrap_or(Value::Null))
+    {
+        failures
+            .push("orphan progress record does not match typed lifecycle identities".to_owned());
     }
 }
 

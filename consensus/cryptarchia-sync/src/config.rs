@@ -40,4 +40,8 @@ pub struct EraBoundaryTestingConfig {
     /// Restrict the one-shot hold to requests from this peer. An absent value
     /// preserves the original first-eligible-request behavior.
     pub hold_provider_for_peer_id: Option<String>,
+    /// Restrict the one-shot hold to requests whose requester tip differs from
+    /// this header identity. This lets runtime-orphan tests leave genesis-tip
+    /// IBD requests on the ordinary response path.
+    pub hold_provider_for_requester_tip_not_equal_to: Option<String>,
 }

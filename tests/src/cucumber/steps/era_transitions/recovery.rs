@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use cucumber::then;
+use cucumber::{then, when};
 use tokio::time::{Instant, sleep};
 
 use super::{
@@ -30,6 +30,77 @@ fn failure(message: impl Into<String>) -> StepError {
 
 fn hold_setting_is_active(setting: Option<&serde_yaml::Value>) -> bool {
     setting.is_some_and(|value| !value.is_null())
+}
+
+#[then(
+    expr = "the requester completes initial IBD from the provider participant within {int} seconds"
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step callbacks require a mutable world reference"
+)]
+async fn requester_completes_initial_ibd(
+    world: &mut CucumberWorld,
+    timeout_seconds: u64,
+) -> StepResult {
+    let requester = requester_name(world)?;
+    let provider = provider_name(world)?;
+    let provider_peer = node_peer_id(world, &provider)
+        .ok_or_else(|| failure("provider peer identity was not retained"))?
+        .parse::<libp2p::PeerId>()
+        .map_err(|error| failure(format!("invalid provider peer identity: {error}")))?;
+    let (_, f0, _) = era_protocols_for_world(world, &provider)?;
+    let events = wait_for_observations(world, timeout_seconds, |events| {
+        events.iter().any(|event| {
+            event.node == requester
+                && matches!(
+                    event.record.event,
+                    lb_cryptarchia_sync::observation::Observation::IbdCompleted
+                )
+        })
+    })
+    .await?;
+    let ibd_completed = events
+        .iter()
+        .filter(|event| {
+            event.node == requester
+                && matches!(
+                    event.record.event,
+                    lb_cryptarchia_sync::observation::Observation::IbdCompleted
+                )
+        })
+        .collect::<Vec<_>>();
+    let [ibd_completed] = ibd_completed.as_slice() else {
+        return Err(failure(
+            "requester initial IBD completion is missing or ambiguous",
+        ));
+    };
+    let provider_request = events.iter().any(|ibd| {
+        ibd.node == requester
+            && ibd.record.sequence < ibd_completed.record.sequence
+            && matches!(&ibd.record.event, lb_cryptarchia_sync::observation::Observation::IbdRequestStarted { target, requester_tip, latest_immutable } if events.iter().any(|request| {
+                request.node == requester
+                    && request.record.sequence > ibd.record.sequence
+                    && request.record.sequence < ibd_completed.record.sequence
+                    && matches!(&request.record.event, lb_cryptarchia_sync::observation::Observation::RequesterRequestStarted { request } if request.remote_peer.0 == provider_peer.to_bytes() && request.protocol == f0 && request.target == *target && request.requester_tip == *requester_tip && request.latest_immutable == *latest_immutable)
+            }))
+    });
+    if !provider_request {
+        return Err(failure(
+            "requester IBD did not issue a matching F0 chain-sync request to the provider",
+        ));
+    }
+    append_record(
+        world,
+        "assertion",
+        serde_json::json!({
+            "assertion": "orphan_initial_ibd_completed",
+            "status": "passed",
+            "requester": requester,
+            "provider_peer_id": provider_peer.to_string(),
+            "ibd_completed": observation_reference(ibd_completed),
+        }),
+    )
 }
 
 #[then(
@@ -552,6 +623,7 @@ async fn partial_block_retained_and_ibd_completes(
 }
 
 #[then("all era-transition participants remain healthy after IBD recovery")]
+#[then("all era-transition participants remain healthy after orphan recovery")]
 #[expect(
     clippy::too_many_lines,
     reason = "the step verifies process health and outstanding request capacity for every declared participant"
@@ -617,6 +689,21 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_peer_id",
     )
     .and_then(|value| value.as_str().map(str::to_owned));
+    let configured_context_tip = node_config_value(
+        world,
+        provider.as_str(),
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_requester_tip_not_equal_to",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let orphan_recovery = world
+        .era_transition
+        .as_ref()
+        .is_some_and(|state| state.orphan_recovery);
+    let expected_context_tip = if orphan_recovery {
+        world.chain.genesis_block_id.map(|id| format!("{id:?}"))
+    } else {
+        None
+    };
     let expected_hold_peer = if unselected_requester.is_some() {
         Some(
             node_peer_id(world, &requester)
@@ -644,9 +731,10 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         || requester_tip_poll != Some(false)
         || unselected_requester.is_some() && unselected_tip_poll != Some(true)
         || configured_hold_peer != expected_hold_peer
+        || configured_context_tip != expected_context_tip
     {
         let message = format!(
-            "Effective per-participant controls were unexpected: provider `{provider}` hold={provider_hold:?} expected={expected_hold} selected_peer={configured_hold_peer:?} expected_peer={expected_hold_peer:?}; non-provider holds={unexpected_holds:?}; requester `{requester}` tip polling={requester_tip_poll:?}; unselected requester tip polling={unselected_tip_poll:?}"
+            "Effective per-participant controls were unexpected: provider `{provider}` hold={provider_hold:?} expected={expected_hold} selected_peer={configured_hold_peer:?} expected_peer={expected_hold_peer:?}; excluded_requester_tip={configured_context_tip:?} expected_tip={expected_context_tip:?}; non-provider holds={unexpected_holds:?}; requester `{requester}` tip polling={requester_tip_poll:?}; unselected requester tip polling={unselected_tip_poll:?}"
         );
         record_assertion(world, "per_node_experiment_configuration", false, &message)?;
         return Err(failure(message));
@@ -655,7 +743,11 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         world,
         "per_node_experiment_configuration",
         true,
-        "The provider hold selector matches the selected requester; only the unselected requester uses tip polling to maintain its live history",
+        if orphan_recovery {
+            "The provider hold excludes the requester's genesis-tip IBD context, and requester tip polling is disabled; typed lifecycle evidence binds the held request to the requester peer and F0 protocol"
+        } else {
+            "The provider hold selector matches the selected requester; only the unselected requester uses tip polling to maintain its live history"
+        },
     )?;
     let events = collect_observations(world, false).map_err(failure)?;
     let request_identity = world
@@ -670,35 +762,68 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
     let requester_peer = node_peer_id(world, requester.as_str())
         .ok_or_else(|| failure("Requester participant has no peer identity"))?;
     let (_, f0, f1) = era_protocols_for_world(world, &provider)?;
-    let complete_lifecycle = lifecycle::original(
-        &events,
-        &provider,
-        &requester,
-        &provider_peer,
-        &requester_peer,
-        &f0,
-    )
-    .and_then(|original| lifecycle::expiry(&events, &original, &provider, &requester, &f0, &f1))
-    .and_then(|expiry| {
-        lifecycle::replacement(
+    let complete_lifecycle = if orphan_recovery {
+        (|| {
+            let original = lifecycle::orphan_original(
+                &events,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f0,
+            )?;
+            let expiry =
+                lifecycle::orphan_expiry(&events, &original, &provider, &requester, &f0, &f1)?;
+            let replacement = lifecycle::orphan_replacement(
+                &events,
+                &original,
+                &expiry,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f1,
+            )?;
+            if request_identity.requester != *replacement.request
+                || request_identity.provider != *replacement.provider_request
+            {
+                return Err("replacement differs from retained local request identities");
+            }
+            lifecycle::orphan_completed(&events, &original, &replacement, &provider, &requester)
+                .map(|_| ())
+        })()
+        .is_ok()
+    } else {
+        lifecycle::original(
             &events,
-            &expiry,
             &provider,
             &requester,
             &provider_peer,
             &requester_peer,
-            &f1,
+            &f0,
         )
-    })
-    .and_then(|replacement| {
-        if request_identity.requester != *replacement.request
-            || request_identity.provider != *replacement.provider_request
-        {
-            return Err("replacement differs from retained local request identities");
-        }
-        lifecycle::completed(&events, &replacement, &provider, &requester)
-    })
-    .is_ok();
+        .and_then(|original| lifecycle::expiry(&events, &original, &provider, &requester, &f0, &f1))
+        .and_then(|expiry| {
+            lifecycle::replacement(
+                &events,
+                &expiry,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f1,
+            )
+        })
+        .and_then(|replacement| {
+            if request_identity.requester != *replacement.request
+                || request_identity.provider != *replacement.provider_request
+            {
+                return Err("replacement differs from retained local request identities");
+            }
+            lifecycle::completed(&events, &replacement, &provider, &requester)
+        })
+        .is_ok()
+    };
     if !complete_lifecycle {
         let message = "The exact accepted F1 replacement did not complete on both provider and requester paths in causal order; request cleanup is unverified";
         record_assertion(world, "request_capacity_and_node_health", false, message)?;
@@ -709,6 +834,406 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         "request_capacity_and_node_health",
         true,
         "Every declared participant answers APIs and the exact accepted F1 request completed on both provider and requester paths",
+    )
+}
+
+#[when(
+    expr = "the provider publishes one descendant that starts a held F0 orphan request within {int} seconds"
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step callbacks require a mutable world reference"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "This step arranges one genuine missing-parent proposal and proves the held F0 lifecycle"
+)]
+async fn provider_starts_held_orphan_request(
+    world: &mut CucumberWorld,
+    timeout_seconds: u64,
+) -> StepResult {
+    validate_started_participant_topology(world)?;
+    if !world
+        .era_transition
+        .as_ref()
+        .is_some_and(|state| state.orphan_recovery)
+    {
+        return Err(failure("orphan recovery scenario mode is not active"));
+    }
+    let provider = provider_name(world)?;
+    let requester = requester_name(world)?;
+    let provider_peer = node_peer_id(world, &provider)
+        .ok_or_else(|| failure("provider peer identity is missing"))?;
+    let requester_peer = node_peer_id(world, &requester)
+        .ok_or_else(|| failure("requester peer identity is missing"))?;
+    let (_, f0, _) = era_protocols_for_world(world, &provider)?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    super::scenario::set_publication(world, &provider, true).await?;
+
+    let proposal_events = loop {
+        let events = collect_observations(world, false).map_err(failure)?;
+        let proposals = events
+            .iter()
+            .filter(|event| {
+                event.node == requester
+                    && matches!(
+                        event.record.event,
+                        lb_cryptarchia_sync::observation::Observation::OrphanProposalMissingParent { .. }
+                    )
+            })
+            .count();
+        if proposals > 0 {
+            super::scenario::set_publication(world, &provider, false).await?;
+            if proposals != 1 {
+                return Err(failure(format!(
+                    "provider publication produced {proposals} missing-parent orphan proposals before suppression"
+                )));
+            }
+            break events;
+        }
+        if Instant::now() >= deadline {
+            super::scenario::set_publication(world, &provider, false).await?;
+            return Err(failure(format!(
+                "provider published no missing-ancestry block within {timeout_seconds}s"
+            )));
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
+
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs()
+        .max(1);
+    let events = wait_for_observations(world, remaining, |events| {
+        lifecycle::orphan_original(
+            events,
+            &provider,
+            &requester,
+            &provider_peer,
+            &requester_peer,
+            &f0,
+        )
+        .is_ok()
+    })
+    .await?;
+    let original = lifecycle::orphan_original(
+        &events,
+        &provider,
+        &requester,
+        &provider_peer,
+        &requester_peer,
+        &f0,
+    )
+    .map_err(failure)?;
+    if proposal_events.iter().filter(|event| {
+        event.node == requester
+            && matches!(event.record.event, lb_cryptarchia_sync::observation::Observation::OrphanProposalMissingParent { .. })
+    }).count() != 1 {
+        return Err(failure("orphan proposal trigger was ambiguous"));
+    }
+    append_record(
+        world,
+        "assertion",
+        serde_json::json!({
+            "assertion": "orphan_f0_partial_progress",
+            "status": "passed",
+            "orphan_id": original.orphan_id,
+            "missing_parent": original.missing_parent,
+            "initial_f0_request": observation_reference(original.requester_request_started),
+            "orphan_downloader_request": observation_reference(original.download_started),
+            "provider_acceptance": observation_reference(original.accepted),
+            "provider_first_response": observation_reference(original.sent),
+            "requester_first_response": observation_reference(original.received),
+            "provider_partial_progress_response": observation_reference(original.progress_sent),
+            "requester_partial_progress_response": observation_reference(original.progress_received),
+            "requester_first_block_decoded": observation_reference(original.decoded),
+            "runtime_orphan_downloader_entered": observation_reference(original.downloading),
+            "partial_valid_block": original.partial_block,
+            "partial_block_application": observation_reference(original.applied),
+            "held_response_count": original.held_blocks,
+            "provider_hold": observation_reference(original.hold),
+        }),
+    )
+}
+
+#[then(
+    expr = "expiry cancels the held F0 orphan request and schedules autonomous recovery within {int} seconds"
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step callbacks require a mutable world reference"
+)]
+async fn orphan_expiry_schedules_recovery(
+    world: &mut CucumberWorld,
+    timeout_seconds: u64,
+) -> StepResult {
+    let provider = provider_name(world)?;
+    let requester = requester_name(world)?;
+    let provider_peer = node_peer_id(world, &provider)
+        .ok_or_else(|| failure("provider peer identity is missing"))?;
+    let requester_peer = node_peer_id(world, &requester)
+        .ok_or_else(|| failure("requester peer identity is missing"))?;
+    let (_, f0, f1) = era_protocols_for_world(world, &provider)?;
+    let events = wait_for_observations(world, timeout_seconds, |events| {
+        lifecycle::orphan_original(
+            events,
+            &provider,
+            &requester,
+            &provider_peer,
+            &requester_peer,
+            &f0,
+        )
+        .and_then(|original| {
+            lifecycle::orphan_expiry(events, &original, &provider, &requester, &f0, &f1)
+        })
+        .is_ok()
+    })
+    .await?;
+    let original = lifecycle::orphan_original(
+        &events,
+        &provider,
+        &requester,
+        &provider_peer,
+        &requester_peer,
+        &f0,
+    )
+    .map_err(failure)?;
+    let expiry = lifecycle::orphan_expiry(&events, &original, &provider, &requester, &f0, &f1)
+        .map_err(failure)?;
+    append_record(
+        world,
+        "assertion",
+        serde_json::json!({
+            "assertion": "orphan_expiry_cancellation_and_detection",
+            "status": "passed",
+            "orphan_id": original.orphan_id,
+            "provider_rotation": observation_reference(expiry.provider_rotation),
+            "requester_rotation": observation_reference(expiry.requester_rotation),
+            "provider_expiry": observation_reference(expiry.expiry),
+            "provider_cancellation": observation_reference(expiry.cancelled),
+            "requester_interruption": observation_reference(expiry.interruption),
+            "runtime_orphan_stream_error": observation_reference(expiry.stream_error),
+            "automatic_recovery_decision": observation_reference(expiry.recovery_scheduled),
+        }),
+    )
+}
+
+#[then(expr = "the requester completes its exact F1 orphan replacement within {int} seconds")]
+async fn requester_completes_orphan_f1_replacement(
+    world: &mut CucumberWorld,
+    timeout_seconds: u64,
+) -> StepResult {
+    let provider = provider_name(world)?;
+    let requester = requester_name(world)?;
+    let provider_peer = node_peer_id(world, &provider)
+        .ok_or_else(|| failure("provider peer identity is missing"))?;
+    let requester_peer = node_peer_id(world, &requester)
+        .ok_or_else(|| failure("requester peer identity is missing"))?;
+    let (_, f0, f1) = era_protocols_for_world(world, &provider)?;
+    let events = wait_for_observations(world, timeout_seconds, |events| {
+        (|| {
+            let original = lifecycle::orphan_original(
+                events,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f0,
+            )?;
+            let expiry =
+                lifecycle::orphan_expiry(events, &original, &provider, &requester, &f0, &f1)?;
+            let replacement = lifecycle::orphan_replacement(
+                events,
+                &original,
+                &expiry,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f1,
+            )?;
+            lifecycle::orphan_completed(events, &original, &replacement, &provider, &requester)
+                .map(|_| ())
+        })()
+        .is_ok()
+    })
+    .await?;
+    let original = lifecycle::orphan_original(
+        &events,
+        &provider,
+        &requester,
+        &provider_peer,
+        &requester_peer,
+        &f0,
+    )
+    .map_err(failure)?;
+    let expiry = lifecycle::orphan_expiry(&events, &original, &provider, &requester, &f0, &f1)
+        .map_err(failure)?;
+    let replacement = lifecycle::orphan_replacement(
+        &events,
+        &original,
+        &expiry,
+        &provider,
+        &requester,
+        &provider_peer,
+        &requester_peer,
+        &f1,
+    )
+    .map_err(failure)?;
+    let completion =
+        lifecycle::orphan_completed(&events, &original, &replacement, &provider, &requester)
+            .map_err(failure)?;
+    world
+        .era_transition
+        .as_mut()
+        .ok_or_else(|| failure("era-transition scenario state is missing"))?
+        .accepted_f1_request = Some(crate::cucumber::world::EraTransitionAcceptedRequest {
+        requester: replacement.request.clone(),
+        provider: replacement.provider_request.clone(),
+    });
+    append_record(
+        world,
+        "assertion",
+        serde_json::json!({
+            "assertion": "orphan_automatic_f1_recovery",
+            "status": "passed",
+            "orphan_id": original.orphan_id,
+            "replacement_request": observation_reference(replacement.requester_request_started),
+            "replacement_acceptance": observation_reference(replacement.accepted),
+            "provider_completion": observation_reference(completion.provider_completed),
+            "requester_completion": observation_reference(completion.requester_completed),
+            "orphan_download_completion": observation_reference(completion.downloader_completed),
+            "orphan_block_application": observation_reference(completion.target_applied),
+        }),
+    )
+}
+
+#[then(
+    expr = "the requester retains partial orphan progress and resolves the original ancestry within {int} seconds"
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step callbacks require a mutable world reference"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "This step proves retained valid progress, ancestry resolution and canonical state for the original orphan"
+)]
+async fn requester_retains_orphan_progress(
+    world: &mut CucumberWorld,
+    timeout_seconds: u64,
+) -> StepResult {
+    let provider = provider_name(world)?;
+    let requester = requester_name(world)?;
+    let provider_peer = node_peer_id(world, &provider)
+        .ok_or_else(|| failure("provider peer identity is missing"))?;
+    let requester_peer = node_peer_id(world, &requester)
+        .ok_or_else(|| failure("requester peer identity is missing"))?;
+    let (_, f0, f1) = era_protocols_for_world(world, &provider)?;
+    let events = wait_for_observations(world, timeout_seconds, |events| {
+        (|| {
+            let original = lifecycle::orphan_original(
+                events,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f0,
+            )?;
+            let expiry =
+                lifecycle::orphan_expiry(events, &original, &provider, &requester, &f0, &f1)?;
+            let replacement = lifecycle::orphan_replacement(
+                events,
+                &original,
+                &expiry,
+                &provider,
+                &requester,
+                &provider_peer,
+                &requester_peer,
+                &f1,
+            )?;
+            lifecycle::orphan_completed(events, &original, &replacement, &provider, &requester)
+                .map(|_| ())
+        })()
+        .is_ok()
+    })
+    .await?;
+    let original = lifecycle::orphan_original(
+        &events,
+        &provider,
+        &requester,
+        &provider_peer,
+        &requester_peer,
+        &f0,
+    )
+    .map_err(failure)?;
+    let node = world
+        .nodes_info
+        .get(&requester)
+        .ok_or_else(|| failure("requester node is missing"))?;
+    let partial_block_available = node.client.block(&original.partial_block).await?.is_some();
+    let missing_parent_available = node.client.block(&original.missing_parent).await?.is_some();
+    let orphan_available = node.client.block(&original.orphan_id).await?.is_some();
+    let final_tip = node.client.consensus_info().await?.cryptarchia_info.tip;
+    let partial_on_final_history =
+        crate::cucumber::steps::nodes::era_boundaries::canonical_history_contains_block(
+            world,
+            &requester,
+            final_tip,
+            original.partial_block,
+            Duration::from_secs(timeout_seconds),
+        )
+        .await?;
+    let parent_on_final_history =
+        crate::cucumber::steps::nodes::era_boundaries::canonical_history_contains_block(
+            world,
+            &requester,
+            final_tip,
+            original.missing_parent,
+            Duration::from_secs(timeout_seconds),
+        )
+        .await?;
+    let orphan_on_final_history =
+        crate::cucumber::steps::nodes::era_boundaries::canonical_history_contains_block(
+            world,
+            &requester,
+            final_tip,
+            original.orphan_id,
+            Duration::from_secs(timeout_seconds),
+        )
+        .await?;
+    if !partial_block_available
+        || !missing_parent_available
+        || !orphan_available
+        || !partial_on_final_history
+        || !parent_on_final_history
+        || !orphan_on_final_history
+    {
+        return Err(failure(
+            "retained block, missing parent, or original orphan is absent from canonical ancestry",
+        ));
+    }
+    record_assertion(
+        world,
+        "orphan_progress_retained_and_target_resolved",
+        true,
+        "the F0 block, missing parent, and original orphan are available on final canonical ancestry after autonomous F1 recovery",
+    )?;
+    append_record(
+        world,
+        "orphan_progress_and_resolution",
+        serde_json::json!({
+            "orphan_id": original.orphan_id,
+            "missing_parent": original.missing_parent,
+            "partial_block": original.partial_block,
+            "final_tip": final_tip,
+            "partial_block_available": partial_block_available,
+            "partial_block_is_ancestor_of_final_tip": partial_on_final_history,
+            "missing_parent_available": missing_parent_available,
+            "missing_parent_is_ancestor_of_final_tip": parent_on_final_history,
+            "orphan_available": orphan_available,
+            "orphan_is_ancestor_of_final_tip": orphan_on_final_history,
+        }),
     )
 }
 

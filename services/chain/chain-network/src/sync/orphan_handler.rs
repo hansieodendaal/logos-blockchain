@@ -43,6 +43,7 @@ where
     pending_orphans_queue: HashMap<HeaderId, OrphanInfo>,
     /// Network interface
     network_adapter: NetAdapter,
+    kind: DownloadKind,
     /// Current state of the downloader with associated data
     state: DownloaderState<NetAdapter::Block>,
     /// Maximum number of orphans to queue
@@ -87,6 +88,7 @@ impl OrphanInfo {
 }
 
 pub struct ActiveDownload<Block> {
+    kind: DownloadKind,
     /// Original orphan information
     orphan_info: OrphanInfo,
     /// Last block ID received (used to continue fetching)
@@ -97,20 +99,36 @@ pub struct ActiveDownload<Block> {
     total_blocks_received: usize,
     /// Time when the current orphan download attempt started.
     download_started_at: Instant,
+    /// The old request crossed era rotation and must be restarted after expiry
+    /// if its stream is interrupted.
+    crossed_era_rotation: bool,
+    era_transition_expired: bool,
+    stream_interrupted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownloadKind {
+    InitialBlockDownload,
+    RuntimeOrphan,
 }
 
 impl<Block> ActiveDownload<Block> {
     fn new(
+        kind: DownloadKind,
         orphan_info: OrphanInfo,
         block_stream: BoxedStream<Result<(HeaderId, Block), DynError>>,
         download_started_at: Instant,
     ) -> Self {
         Self {
+            kind,
             orphan_info,
             last_block_id: None,
             block_stream: Some(block_stream),
             total_blocks_received: 0,
             download_started_at,
+            crossed_era_rotation: false,
+            era_transition_expired: false,
+            stream_interrupted: false,
         }
     }
 
@@ -130,9 +148,39 @@ where
         max_pending_orphans: NonZeroUsize,
         max_rejected_cache_size: usize,
     ) -> Self {
+        Self::new_with_kind(
+            network_adapter,
+            max_pending_orphans,
+            max_rejected_cache_size,
+            DownloadKind::InitialBlockDownload,
+        )
+    }
+
+    /// Creates the long-lived downloader used after initial block download.
+    /// It can retain and resume an active orphan request after era expiry.
+    pub fn new_for_runtime_orphans(
+        network_adapter: NetAdapter,
+        max_pending_orphans: NonZeroUsize,
+        max_rejected_cache_size: usize,
+    ) -> Self {
+        Self::new_with_kind(
+            network_adapter,
+            max_pending_orphans,
+            max_rejected_cache_size,
+            DownloadKind::RuntimeOrphan,
+        )
+    }
+
+    fn new_with_kind(
+        network_adapter: NetAdapter,
+        max_pending_orphans: NonZeroUsize,
+        max_rejected_cache_size: usize,
+        kind: DownloadKind,
+    ) -> Self {
         Self {
             pending_orphans_queue: HashMap::new(),
             network_adapter,
+            kind,
             state: DownloaderState::Idle,
             max_pending_orphans,
             rejected_blocks: RejectedBlocks::new(max_rejected_cache_size),
@@ -143,12 +191,26 @@ where
 
     pub async fn rotate_era(&mut self, era: Era) {
         self.network_adapter.rotate_era(era).await;
+        if let DownloaderState::Downloading(download) = &mut self.state
+            && download.kind == DownloadKind::RuntimeOrphan
+        {
+            download.crossed_era_rotation = true;
+        }
     }
 
     pub async fn complete_era_transition(&mut self, ended_era: Era) {
         self.network_adapter
             .complete_era_transition(ended_era)
             .await;
+        if let DownloaderState::Downloading(download) = &mut self.state
+            && download.kind == DownloadKind::RuntimeOrphan
+            && download.crossed_era_rotation
+        {
+            download.era_transition_expired = true;
+            if let Some(waker) = &self.waker {
+                waker.wake_by_ref();
+            }
+        }
     }
 
     /// Marks a block as rejected so the orphan pipeline will refuse to
@@ -273,17 +335,31 @@ where
         orphan_info: OrphanInfo,
         known_blocks: HashSet<HeaderId>,
         download_started_at: Instant,
+        kind: DownloadKind,
     ) -> Result<ActiveDownload<NetAdapter::Block>, DynError> {
         // `request_blocks_from_peers` fans out to multiple peers in parallel.
         // So, we don't do retry. A single try with multiple peers is enough.
         // It's better to drain the orphan queue quicker.
         #[cfg(feature = "testing-era-boundaries")]
         if observation::node_journal_is_active() {
-            observation::emit(Observation::IbdRequestStarted {
-                target: orphan_info.orphan_id,
-                requester_tip: orphan_info.tip,
-                latest_immutable: orphan_info.lib,
-            });
+            match kind {
+                DownloadKind::InitialBlockDownload => {
+                    observation::emit(Observation::IbdRequestStarted {
+                        target: orphan_info.orphan_id,
+                        requester_tip: orphan_info.tip,
+                        latest_immutable: orphan_info.lib,
+                    });
+                }
+                DownloadKind::RuntimeOrphan => {
+                    observation::emit(Observation::OrphanDownloadRequestStarted {
+                        orphan_id: orphan_info.orphan_id,
+                        missing_parent: orphan_info.parent_id,
+                        requester_tip: orphan_info.tip,
+                        latest_immutable: orphan_info.lib,
+                        known_block: known_blocks.iter().next().copied(),
+                    });
+                }
+            }
         }
         match network
             .request_blocks_from_peers(
@@ -295,6 +371,7 @@ where
             .await
         {
             Ok(stream) => Ok(ActiveDownload::new(
+                kind,
                 orphan_info,
                 stream,
                 download_started_at,
@@ -352,6 +429,28 @@ where
         self.dequeue_next_orphan()
             .map(|orphan_info| (orphan_info, HashSet::new()))
     }
+
+    fn take_expired_retry(&mut self) -> Option<(OrphanInfo, HashSet<HeaderId>, Instant, usize)> {
+        let DownloaderState::Downloading(download) = &mut self.state else {
+            return None;
+        };
+        if download.kind != DownloadKind::RuntimeOrphan
+            || !download.crossed_era_rotation
+            || !download.era_transition_expired
+            || !download.stream_interrupted
+        {
+            return None;
+        }
+
+        download.stream_interrupted = false;
+        let known_blocks = download.last_block_id.into_iter().collect();
+        Some((
+            download.orphan_info.clone(),
+            known_blocks,
+            download.download_started_at,
+            download.total_blocks_received,
+        ))
+    }
 }
 
 impl<NetAdapter, RuntimeServiceId> Stream for OrphanBlocksDownloader<NetAdapter, RuntimeServiceId>
@@ -373,6 +472,32 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.waker = Some(cx.waker().clone());
 
+        if let Some((orphan_info, known_blocks, download_started_at, blocks_received)) =
+            self.take_expired_retry()
+        {
+            #[cfg(feature = "testing-era-boundaries")]
+            if observation::node_journal_is_active() {
+                observation::emit(Observation::OrphanDownloadRecoveryScheduled {
+                    orphan_id: orphan_info.orphan_id,
+                    missing_parent: orphan_info.parent_id,
+                    known_block: known_blocks.iter().next().copied(),
+                    blocks_received: u64::try_from(blocks_received).expect("block count fits u64"),
+                });
+            }
+            #[cfg(not(feature = "testing-era-boundaries"))]
+            let _ = blocks_received;
+            let request_blocks_stream = Self::request_blocks_stream(
+                self.network_adapter.clone(),
+                orphan_info,
+                known_blocks,
+                download_started_at,
+                self.kind,
+            );
+            self.state = DownloaderState::Requesting(Box::pin(request_blocks_stream));
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
         match &mut self.state {
             DownloaderState::Idle => {
                 let Some((orphan_info, known_blocks)) = self.get_next_stream_input() else {
@@ -385,6 +510,7 @@ where
                     orphan_info,
                     known_blocks,
                     Instant::now(),
+                    self.kind,
                 );
 
                 self.state = DownloaderState::Requesting(Box::pin(request_blocks_stream_fut));
@@ -396,14 +522,28 @@ where
                 Poll::Ready(Ok(download)) => {
                     #[cfg(feature = "testing-era-boundaries")]
                     if observation::node_journal_is_active() {
-                        observation::emit(Observation::IbdDownloaderDownloading {
-                            target: download.orphan_info.orphan_id,
-                        });
+                        match download.kind {
+                            DownloadKind::InitialBlockDownload => {
+                                observation::emit(Observation::IbdDownloaderDownloading {
+                                    target: download.orphan_info.orphan_id,
+                                });
+                            }
+                            DownloadKind::RuntimeOrphan => {
+                                observation::emit(Observation::OrphanDownloaderDownloading {
+                                    target: download.orphan_info.orphan_id,
+                                });
+                            }
+                        }
                     }
+                    #[cfg(feature = "testing-era-boundaries")]
+                    let event_name = match download.kind {
+                        DownloadKind::InitialBlockDownload => "ibd_downloader_downloading",
+                        DownloadKind::RuntimeOrphan => "orphan_downloader_downloading",
+                    };
                     #[cfg(feature = "testing-era-boundaries")]
                     tracing::info!(
                         target: LOG_TARGET,
-                        era_transition_event = "ibd_downloader_downloading",
+                        era_transition_event = event_name,
                         timestamp_unix_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -413,7 +553,7 @@ where
                             .unwrap_or_default()
                             .as_nanos(),
                         target_block = ?download.orphan_info.orphan_id,
-                        "era-boundary experiment observed entry into the downloading state"
+                        "era-boundary experiment observed entry into the {event_name} state"
                     );
                     self.state = DownloaderState::Downloading(download);
 
@@ -431,6 +571,13 @@ where
             },
             DownloaderState::Downloading(download) => {
                 let Some(block_stream) = download.block_stream.as_mut() else {
+                    if download.kind == DownloadKind::RuntimeOrphan
+                        && download.crossed_era_rotation
+                        && download.stream_interrupted
+                        && !download.era_transition_expired
+                    {
+                        return Poll::Pending;
+                    }
                     self.state = DownloaderState::Idle;
                     return Poll::Pending;
                 };
@@ -455,6 +602,16 @@ where
                             metrics::orphan_observe_parent_fetch_ok(
                                 download.download_started_at.elapsed(),
                             );
+                            #[cfg(feature = "testing-era-boundaries")]
+                            if download.kind == DownloadKind::RuntimeOrphan
+                                && observation::node_journal_is_active()
+                            {
+                                observation::emit(Observation::OrphanDownloadCompleted {
+                                    orphan_id: download.orphan_info.orphan_id,
+                                    blocks_received: u64::try_from(download.total_blocks_received)
+                                        .expect("block count fits u64"),
+                                });
+                            }
                             self.state = DownloaderState::Idle;
                         }
 
@@ -467,16 +624,36 @@ where
                         error!(target: LOG_TARGET, "Error while fetching blocks: {e}");
                         #[cfg(feature = "testing-era-boundaries")]
                         if observation::node_journal_is_active() {
-                            observation::emit(Observation::IbdDownloadStreamError {
-                                target: download.orphan_info.orphan_id,
-                                blocks_received: u64::try_from(download.total_blocks_received)
-                                    .expect("block count fits u64"),
-                            });
+                            match download.kind {
+                                DownloadKind::InitialBlockDownload => {
+                                    observation::emit(Observation::IbdDownloadStreamError {
+                                        target: download.orphan_info.orphan_id,
+                                        blocks_received: u64::try_from(
+                                            download.total_blocks_received,
+                                        )
+                                        .expect("block count fits u64"),
+                                    });
+                                }
+                                DownloadKind::RuntimeOrphan => {
+                                    observation::emit(Observation::OrphanDownloadStreamError {
+                                        orphan_id: download.orphan_info.orphan_id,
+                                        blocks_received: u64::try_from(
+                                            download.total_blocks_received,
+                                        )
+                                        .expect("block count fits u64"),
+                                    });
+                                }
+                            }
                         }
+                        #[cfg(feature = "testing-era-boundaries")]
+                        let event_name = match download.kind {
+                            DownloadKind::InitialBlockDownload => "ibd_download_stream_error",
+                            DownloadKind::RuntimeOrphan => "orphan_download_stream_error",
+                        };
                         #[cfg(feature = "testing-era-boundaries")]
                         tracing::info!(
                             target: LOG_TARGET,
-                            era_transition_event = "ibd_download_stream_error",
+                            era_transition_event = event_name,
                             timestamp_unix_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -488,11 +665,21 @@ where
                             target_block = ?download.orphan_info.orphan_id,
                             blocks_received = download.total_blocks_received,
                             failure = %e,
-                            "era-boundary experiment observed the IBD downloader handling a stream error"
+                            "era-boundary experiment observed the {event_name} path handling a stream error"
                         );
 
-                        self.state = DownloaderState::Idle;
-                        metrics::orphan_blocks_fetch_failed_total();
+                        if download.kind == DownloadKind::RuntimeOrphan
+                            && download.crossed_era_rotation
+                        {
+                            download.block_stream = None;
+                            download.stream_interrupted = true;
+                            if download.era_transition_expired {
+                                cx.waker().wake_by_ref();
+                            }
+                        } else {
+                            self.state = DownloaderState::Idle;
+                            metrics::orphan_blocks_fetch_failed_total();
+                        }
 
                         cx.waker().wake_by_ref();
                         Poll::Pending
@@ -515,6 +702,7 @@ where
                                 orphan_info,
                                 known_blocks,
                                 download_started_at,
+                                self.kind,
                             );
 
                             self.state =
@@ -1370,5 +1558,52 @@ mod tests {
             downloader.as_mut().get_mut().state,
             DownloaderState::Idle
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_orphan_download_resumes_after_expiry_from_last_valid_block() {
+        let chain = create_chain(4);
+        let parent = chain[2];
+        let orphan = chain[3];
+        let network = MockNetworkAdapter::new()
+            .with_stream(
+                orphan,
+                None,
+                vec![Ok(parent), Err("old-era response expired".to_owned())],
+            )
+            .with_stream(orphan, Some(parent), vec![Ok(orphan)]);
+        let requests = Arc::clone(&network.requests);
+        let mut downloader = OrphanBlocksDownloader::<_, usize>::new_for_runtime_orphans(
+            network,
+            ORPHAN_CACHE_SIZE,
+            REJECTED_CACHE_SIZE,
+        );
+        downloader
+            .enqueue_orphan(orphan, Some(parent), TEST_TIP.into(), TEST_LIB.into())
+            .unwrap();
+        let mut downloader = pin::pin!(downloader);
+
+        let first = collect_next_blocks(&mut downloader, 1).await;
+        assert_eq!(first, [parent]);
+
+        downloader.as_mut().get_mut().rotate_era(Era::new(1)).await;
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(downloader.as_mut().poll_next(&mut cx).is_pending());
+        downloader
+            .as_mut()
+            .get_mut()
+            .complete_era_transition(Era::new(0))
+            .await;
+
+        let resumed = collect_next_blocks(&mut downloader, 1).await;
+        assert_eq!(resumed, [orphan]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].target, orphan);
+        assert!(requests[0].additional_blocks.is_empty());
+        assert_eq!(requests[1].target, orphan);
+        assert_eq!(requests[1].additional_blocks, HashSet::from([parent]));
+        assert_eq!(requests[1].local_tip, TEST_TIP.into());
+        assert_eq!(requests[1].lib, TEST_LIB.into());
     }
 }

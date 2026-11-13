@@ -237,6 +237,8 @@ pub struct EraTransitionScenarioState {
     pub runtime_bindings: BTreeMap<String, EraTransitionRuntimeBinding>,
     pub provider_hold_after_blocks: Option<usize>,
     pub provider_hold_peer_id: Option<String>,
+    pub orphan_recovery: bool,
+    pub provider_hold_excludes_genesis_tip: bool,
     pub proposal_publishing_suppression_required: bool,
     pub initial_proposal_publication: BTreeMap<String, bool>,
     pub accepted_f1_request: Option<EraTransitionAcceptedRequest>,

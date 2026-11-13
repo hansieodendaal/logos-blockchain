@@ -430,7 +430,7 @@ where
         let mut incoming_proposals = network_adapter.proposals_stream().await?;
         let mut chainsync_events = network_adapter.chainsync_events_stream().await?;
 
-        let mut orphan_downloader = Box::pin(OrphanBlocksDownloader::new(
+        let mut orphan_downloader = Box::pin(OrphanBlocksDownloader::new_for_runtime_orphans(
             network_adapter.clone(),
             sync_config.orphan.max_orphan_cache_size,
             sync_config.orphan.max_rejected_cache_size,
@@ -524,6 +524,14 @@ where
 
                         match Self::apply_block(block, &relays).await {
                             Ok(()) => {
+                                #[cfg(feature = "testing-era-boundaries")]
+                                if era_observation::node_journal_is_active() {
+                                    era_observation::emit(
+                                        era_observation::Observation::OrphanDownloadBlockApplied {
+                                            block_id: header_id,
+                                        },
+                                    );
+                                }
                                 trace!(target: LOG_TARGET, {
                                     counter.consensus_processed_blocks = 1
                                 }, "Processed consensus block");
@@ -737,13 +745,27 @@ where
                     target: LOG_TARGET, ?block_id, ?parent,
                     "Parent block missing. Trying to enqueue block for orphan processing",
                 );
-                if let Err(e) =
-                    orphan_downloader.enqueue_orphan(block_id, Some(parent), info.tip, info.lib)
-                {
-                    error!(
-                        target: LOG_TARGET, %e, ?block_id, ?parent,
-                        "Failed to enqueue block for orphan processing",
-                    );
+                match orphan_downloader.enqueue_orphan(block_id, Some(parent), info.tip, info.lib) {
+                    Ok(()) =>
+                    {
+                        #[cfg(feature = "testing-era-boundaries")]
+                        if era_observation::node_journal_is_active() {
+                            era_observation::emit(
+                                era_observation::Observation::OrphanProposalMissingParent {
+                                    orphan_id: block_id,
+                                    missing_parent: parent,
+                                    requester_tip: info.tip,
+                                    latest_immutable: info.lib,
+                                },
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            target: LOG_TARGET, %error, ?block_id, ?parent,
+                            "Failed to enqueue block for orphan processing",
+                        );
+                    }
                 }
             }
             Error::Cryptarchia(ApiError::FutureBlock {

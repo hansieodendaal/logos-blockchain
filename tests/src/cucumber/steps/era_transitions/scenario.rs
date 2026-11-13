@@ -192,16 +192,25 @@ fn validate_participant_topology_impl(
     require_all_started: bool,
 ) -> Result<(), StepError> {
     let declared = participants(world)?;
-    let started = world.nodes_info.keys().cloned().collect::<HashSet<_>>();
     let expected = declared.keys().cloned().collect::<HashSet<_>>();
+    let state = world
+        .era_transition
+        .as_ref()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?;
+    let started_all = world.nodes_info.keys().cloned().collect::<HashSet<_>>();
+    if started_all.iter().any(|name| !expected.contains(name)) {
+        return Err(failure(format!(
+            "started era-transition nodes {started_all:?} include undeclared participants (declared {expected:?})"
+        )));
+    }
+    let started = started_all
+        .intersection(&expected)
+        .cloned()
+        .collect::<HashSet<_>>();
     if started.is_empty() {
         if !require_all_started {
             return Err(failure("no era-transition participants have started"));
         }
-        let state = world
-            .era_transition
-            .as_ref()
-            .ok_or_else(|| failure("era-transition scenario state is not initialized"))?;
         let bound = state
             .runtime_bindings
             .keys()
@@ -229,12 +238,6 @@ fn validate_participant_topology_impl(
             "declared era-transition participants {expected:?} do not match started nodes {started:?}"
         )));
     }
-    if !expected.is_superset(&started) {
-        return Err(failure(format!(
-            "started era-transition nodes {started:?} include undeclared participants (declared {expected:?})"
-        )));
-    }
-
     let mut bindings = Vec::new();
     for participant in declared
         .values()
@@ -466,7 +469,11 @@ fn publication_override(world: &CucumberWorld, name: &str) -> Result<ConfigOverr
     })
 }
 
-async fn set_publication(world: &CucumberWorld, name: &str, enabled: bool) -> StepResult {
+pub(super) async fn set_publication(
+    world: &CucumberWorld,
+    name: &str,
+    enabled: bool,
+) -> StepResult {
     let node = world
         .nodes_info
         .get(name)
@@ -646,6 +653,7 @@ fn select_requester_for_provider_hold(world: &mut CucumberWorld) -> StepResult {
         let participant = participants(world)?
             .get(&requester)
             .ok_or_else(|| failure(format!("requester `{requester}` was not declared")))?;
+        let config_index = participant.startup_index;
         let cluster = world
             .cluster
             .logos_cluster()
@@ -655,11 +663,10 @@ fn select_requester_for_provider_hold(world: &mut CucumberWorld) -> StepResult {
             .as_ref()
             .ok_or_else(|| failure("prepared Logos cluster has no node deployment plan"))?
             .nodes()
-            .get(participant.startup_index)
+            .get(config_index)
             .ok_or_else(|| {
                 failure(format!(
-                    "no prepared node config at requester startup index {}",
-                    participant.startup_index
+                    "no prepared node config at requester config index {config_index}"
                 ))
             })?;
         Keypair::from(ed25519::Keypair::from(
@@ -705,6 +712,19 @@ async fn start_provider_with_response_hold(world: &mut CucumberWorld) -> StepRes
             serde_yaml::Value::String(peer_id.clone()),
         );
     }
+    if world
+        .era_transition
+        .as_ref()
+        .is_some_and(|state| state.provider_hold_excludes_genesis_tip)
+    {
+        let genesis_id = world.chain.genesis_block_id.ok_or_else(|| {
+            failure("the genesis-tip selector requires a prepared genesis identity")
+        })?;
+        hold_settings.insert(
+            serde_yaml::Value::String("hold_provider_for_requester_tip_not_equal_to".to_owned()),
+            serde_yaml::Value::String(format!("{genesis_id:?}")),
+        );
+    }
     let override_value = ConfigOverride {
         path: "network.backend.swarm.chain_sync.testing_era_boundaries".to_owned(),
         value: serde_yaml::Value::Mapping(hold_settings),
@@ -719,6 +739,25 @@ async fn start_provider_with_response_hold(world: &mut CucumberWorld) -> StepRes
         &[override_value, publication_override(world, &node_name)?],
     )
     .await
+}
+
+#[given("the provider response hold excludes the requester's genesis-tip IBD request")]
+fn exclude_genesis_tip_request_from_provider_hold(world: &mut CucumberWorld) -> StepResult {
+    let state = world.era_transition.as_mut().ok_or_else(|| {
+        failure("declare era-transition participants before configuring the hold")
+    })?;
+    if !state.orphan_recovery {
+        return Err(failure(
+            "the genesis-tip hold selector is only valid for runtime orphan recovery",
+        ));
+    }
+    if state.provider_hold_excludes_genesis_tip {
+        return Err(failure(
+            "the provider response hold genesis-tip selector was configured more than once",
+        ));
+    }
+    state.provider_hold_excludes_genesis_tip = true;
+    Ok(())
 }
 
 #[given(
