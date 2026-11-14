@@ -14,6 +14,7 @@ pub struct RequestEvidence {
     pub target_block: HeaderId,
     pub requester_tip: HeaderId,
     pub latest_immutable_block: HeaderId,
+    pub additional_blocks: Vec<String>,
 }
 
 impl RequestEvidence {
@@ -25,6 +26,7 @@ impl RequestEvidence {
             target: self.target_block,
             requester_tip: self.requester_tip,
             latest_immutable: self.latest_immutable_block,
+            additional_blocks: self.additional_blocks.clone(),
         }
     }
 
@@ -34,8 +36,12 @@ impl RequestEvidence {
         target_block: HeaderId,
         requester_tip: HeaderId,
         latest_immutable_block: HeaderId,
+        mut additional_blocks: Vec<String>,
     ) -> Self {
-        let request_key = format!("{target_block:?}:{requester_tip:?}:{latest_immutable_block:?}");
+        additional_blocks.sort();
+        let request_key = format!(
+            "{peer_id}:{protocol}:{target_block:?}:{requester_tip:?}:{latest_immutable_block:?}:{additional_blocks:?}"
+        );
         Self {
             request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             request_key,
@@ -44,6 +50,7 @@ impl RequestEvidence {
             target_block,
             requester_tip,
             latest_immutable_block,
+            additional_blocks,
         }
     }
 }

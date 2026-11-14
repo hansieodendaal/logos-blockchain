@@ -31,6 +31,18 @@ fn same_context(a: &RequestObservation, b: &RequestObservation) -> bool {
         && a.target == b.target
         && a.requester_tip == b.requester_tip
         && a.latest_immutable == b.latest_immutable
+        && a.additional_blocks == b.additional_blocks
+}
+
+fn same_cross_node_request(
+    requester_request: &RequestObservation,
+    requester_peer: &PeerIdentity,
+    provider_request: &RequestObservation,
+    provider_peer: &PeerIdentity,
+) -> bool {
+    &requester_request.remote_peer == provider_peer
+        && &provider_request.remote_peer == requester_peer
+        && same_context(requester_request, provider_request)
 }
 
 fn same_local_request(a: &RequestObservation, b: &RequestObservation) -> bool {
@@ -67,20 +79,41 @@ pub(super) fn original<'a>(
     }
     let provider_id = peer(provider_peer).ok_or("invalid provider peer identity")?;
     let requester_id = peer(requester_peer).ok_or("invalid requester peer identity")?;
-    let request_event = unique(events, |e| e.node == requester && matches!(&e.record.event, Observation::RequesterRequestStarted { request } if request.protocol == f0 && request.remote_peer == provider_id)).ok_or("original F0 requester request is missing or ambiguous")?;
+    // The provider's selected hold event is the authoritative local identity
+    // of the request actually faulted. Match its complete context and peer
+    // direction back to one requester-local ID instead of choosing the first
+    // eligible request from that peer.
+    let hold = unique(events, |event| {
+        event.node == provider
+            && matches!(&event.record.event, Observation::ProviderResponseHoldActivated { request, blocks_sent: 1 }
+                if request.protocol == f0 && request.remote_peer == requester_id)
+    })
+    .ok_or("selected F0 provider hold is missing or ambiguous")?;
+    let Observation::ProviderResponseHoldActivated {
+        request: provider_request,
+        ..
+    } = &hold.record.event
+    else {
+        unreachable!()
+    };
+    let accepted = unique(events, |event| {
+        event.node == provider
+            && matches!(&event.record.event, Observation::ProviderRequestAccepted { request }
+                if same_local_request(provider_request, request))
+    })
+    .ok_or("accepted provider request for the selected F0 hold is missing or ambiguous")?;
+    let request_event = unique(events, |event| {
+        event.node == requester
+            && matches!(&event.record.event, Observation::RequesterRequestStarted { request }
+                if same_cross_node_request(request, &requester_id, provider_request, &provider_id))
+    })
+    .ok_or("requester-local identity for the selected F0 hold is missing or ambiguous")?;
     let Observation::RequesterRequestStarted { request } = &request_event.record.event else {
         unreachable!()
     };
     let interruption = events.iter().filter(|event| event.node == requester && matches!(&event.record.event, Observation::RequesterInterruptionDetected { request: observed, .. } if same_local_request(request, observed))).min_by_key(|event| event.record.sequence);
     let in_original_window = |event: &RuntimeObservation| {
         before(request_event, event) && interruption.is_none_or(|end| before(event, end))
-    };
-    let accepted = unique(events, |e| e.node == provider && matches!(&e.record.event, Observation::ProviderRequestAccepted { request: r } if r.remote_peer == requester_id && same_context(request, r))).ok_or("matching F0 provider acceptance is missing or ambiguous")?;
-    let Observation::ProviderRequestAccepted {
-        request: provider_request,
-    } = &accepted.record.event
-    else {
-        unreachable!()
     };
     let sent = unique(events, |e| e.node == provider && matches!(&e.record.event, Observation::ProviderBlockResponseSent { request: r, response_index: 1 } if same_local_request(provider_request, r))).ok_or("provider first F0 response is missing or ambiguous")?;
     let received = unique(events, |e| e.node == requester && matches!(&e.record.event, Observation::RequesterBlockResponseReceived { request: r, response_index: 1 } if same_local_request(request, r))).ok_or("requester first F0 response is missing or ambiguous")?;
@@ -90,7 +123,6 @@ pub(super) fn original<'a>(
     };
     let downloading = unique(events, |e| e.node == requester && in_original_window(e) && matches!(&e.record.event, Observation::IbdDownloaderDownloading { target } if *target == request.target)).ok_or("IBD Downloading observation is missing or ambiguous")?;
     let applied = unique(events, |e| e.node == requester && in_original_window(e) && matches!(&e.record.event, Observation::IbdBlockApplied { block_id: id } if id == block_id)).ok_or("first block application is missing or ambiguous")?;
-    let hold = unique(events, |e| e.node == provider && matches!(&e.record.event, Observation::ProviderResponseHoldActivated { request: r, blocks_sent: 1 } if same_local_request(provider_request, r))).ok_or("provider hold for F0 request is missing or ambiguous")?;
     if !(before(request_event, received)
         && before(received, decoded)
         && before(decoded, downloading)
@@ -127,12 +159,15 @@ pub(super) struct UnselectedCompletion<'a> {
     pub ibd_completed: &'a RuntimeObservation,
 }
 
+pub(super) struct InteractionPeers<'a> {
+    pub provider: &'a str,
+    pub provider_peer: &'a str,
+    pub requester: &'a str,
+    pub requester_peer: &'a str,
+}
+
 /// Correlates the second request by its peer and full protocol context. Local
 /// request IDs are checked only within the node that emitted them.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the concurrent request proof is bound to both requester identities"
-)]
 #[expect(
     clippy::too_many_lines,
     reason = "ownership, correlation, and per-node ordering are one auditable proof"
@@ -140,33 +175,39 @@ pub(super) struct UnselectedCompletion<'a> {
 pub(super) fn unselected_completion<'a>(
     events: &'a [RuntimeObservation],
     selected: &Original<'a>,
-    provider: &str,
-    provider_peer: &str,
-    requester_peer: &str,
-    unselected_requester: &str,
-    unselected_peer: &str,
+    control: &InteractionPeers<'_>,
     f0: &str,
 ) -> Result<UnselectedCompletion<'a>, &'static str> {
     if events.iter().any(|event| {
-        (event.node == provider && event.peer_id != provider_peer)
-            || (event.node == unselected_requester && event.peer_id != unselected_peer)
+        (event.node == control.provider && event.peer_id != control.provider_peer)
+            || (event.node == control.requester && event.peer_id != control.requester_peer)
     }) {
         return Err("unselected request observation ownership does not match participant identity");
     }
-    let provider_id = peer(provider_peer).ok_or("invalid provider peer identity")?;
-    let selected_requester_id = peer(requester_peer).ok_or("invalid requester peer identity")?;
-    let requester_id = peer(unselected_peer).ok_or("invalid unselected requester peer identity")?;
+    let provider_id =
+        peer(control.provider_peer).ok_or("invalid unselected provider peer identity")?;
+    let requester_id =
+        peer(control.requester_peer).ok_or("invalid unselected requester peer identity")?;
+    let selected_provider_id = peer(&selected.accepted.peer_id)
+        .ok_or("selected provider observation has an invalid owner identity")?;
+    let selected_requester_id = peer(&selected.request_event.peer_id)
+        .ok_or("selected requester observation has an invalid owner identity")?;
+    if selected.request.remote_peer != selected_provider_id {
+        return Err("selected requester request is not directed to the declared provider");
+    }
     if selected.provider_request.remote_peer != selected_requester_id {
         return Err("selected provider request is not owned by the declared requester");
     }
-    // Tip polling can create later normal requests from this peer. Bind the
-    // regression to the first provider-local F0 acceptance while the selected
-    // request is held, then correlate that exact request across both journals.
+    if requester_id == selected_requester_id {
+        return Err("selected and control interactions use the same requester identity");
+    }
+    // Select the first provider-local acceptance from the declared control
+    // requester. Full request context then correlates it to one requester
+    // journal event; local IDs are never compared across nodes.
     let accepted_candidates = events
         .iter()
         .filter(|event| {
-            event.node == provider
-                && before(selected.hold, event)
+            event.node == control.provider
                 && matches!(&event.record.event, Observation::ProviderRequestAccepted { request: accepted } if accepted.protocol == f0 && accepted.remote_peer == requester_id)
         })
         .collect::<Vec<_>>();
@@ -189,36 +230,35 @@ pub(super) fn unselected_completion<'a>(
         unreachable!()
     };
     let started = unique(events, |event| {
-        event.node == unselected_requester
-            && matches!(&event.record.event, Observation::RequesterRequestStarted { request } if request.protocol == f0 && request.remote_peer == provider_id && same_context(request, provider_request))
+        event.node == control.requester
+            && matches!(&event.record.event, Observation::RequesterRequestStarted { request } if request.protocol == f0 && same_cross_node_request(request, &requester_id, provider_request, &provider_id))
     })
     .ok_or("unselected F0 requester request context is missing or ambiguous")?;
     let Observation::RequesterRequestStarted { request } = &started.record.event else {
         unreachable!()
     };
     let sent = unique(events, |event| {
-        event.node == provider
+        event.node == control.provider
             && matches!(&event.record.event, Observation::ProviderBlockResponseSent { request, response_index: 1 } if same_local_request(provider_request, request))
     })
     .ok_or("unselected F0 provider response is missing or ambiguous")?;
     let received = unique(events, |event| {
-        event.node == unselected_requester
+        event.node == control.requester
             && matches!(&event.record.event, Observation::RequesterBlockResponseReceived { request: received, response_index: 1 } if same_local_request(request, received))
     })
     .ok_or("unselected F0 requester response is missing or ambiguous")?;
     let provider_completed = unique(events, |event| {
-        event.node == provider
+        event.node == control.provider
             && matches!(&event.record.event, Observation::ProviderRequestCompleted { request: completed, .. } if same_local_request(provider_request, completed))
     })
     .ok_or("unselected F0 provider completion is missing or ambiguous")?;
     let requester_completed = unique(events, |event| {
-        event.node == unselected_requester
+        event.node == control.requester
             && matches!(&event.record.event, Observation::RequesterRequestCompleted { request: completed, .. } if same_local_request(request, completed))
     })
     .ok_or("unselected F0 requester completion is missing or ambiguous")?;
     let ibd_completed = unique(events, |event| {
-        event.node == unselected_requester
-            && matches!(event.record.event, Observation::IbdCompleted)
+        event.node == control.requester && matches!(event.record.event, Observation::IbdCompleted)
     })
     .ok_or("unselected requester IBD completion is missing or ambiguous")?;
     let Observation::ProviderRequestCompleted { blocks_sent, .. } =
@@ -232,10 +272,13 @@ pub(super) fn unselected_completion<'a>(
         unreachable!()
     };
 
-    if provider_request.remote_peer == selected.provider_request.remote_peer
-        || provider_request.local_request_id == selected.provider_request.local_request_id
+    if control.provider == selected.accepted.node
+        && (provider_request.remote_peer == selected.provider_request.remote_peer
+            || provider_request.local_request_id == selected.provider_request.local_request_id)
     {
-        return Err("selected and unselected provider requests are not distinguishable");
+        return Err(
+            "selected and control requests are not distinguishable within the provider process",
+        );
     }
     if *blocks_sent == 0 || blocks_sent != response_count {
         return Err("unselected F0 response did not complete with matching nonempty progress");
@@ -243,14 +286,14 @@ pub(super) fn unselected_completion<'a>(
     let sent_count = events
         .iter()
         .filter(|event| {
-            event.node == provider
+            event.node == control.provider
                 && matches!(&event.record.event, Observation::ProviderBlockResponseSent { request: sent, .. } if same_local_request(provider_request, sent))
         })
         .count();
     let received_count = events
         .iter()
         .filter(|event| {
-            event.node == unselected_requester
+            event.node == control.requester
                 && matches!(&event.record.event, Observation::RequesterBlockResponseReceived { request: received, .. } if same_local_request(request, received))
         })
         .count();
@@ -260,9 +303,9 @@ pub(super) fn unselected_completion<'a>(
         return Err("unselected F0 completion has missing or contradictory block observations");
     }
     if events.iter().any(|event| {
-        (event.node == provider
+        (event.node == control.provider
             && matches!(&event.record.event, Observation::ProviderResponseHoldActivated { request: held, .. } | Observation::ProviderResponseHoldCancelled { request: held, .. } if same_local_request(provider_request, held)))
-            || (event.node == unselected_requester
+            || (event.node == control.requester
                 && matches!(&event.record.event, Observation::RequesterInterruptionDetected { request: interrupted, .. } if same_local_request(request, interrupted)))
     }) {
         return Err("unselected F0 request was held, cancelled, or interrupted");
@@ -272,17 +315,17 @@ pub(super) fn unselected_completion<'a>(
         && before(started, received)
         && before(received, requester_completed)
         && before(requester_completed, ibd_completed)
-        && before(selected.hold, accepted)
-        && before(selected.hold, provider_completed))
+        && (control.provider != selected.accepted.node
+            || before(selected.hold, accepted) && before(selected.hold, provider_completed)))
     {
         return Err("concurrent F0 requests do not overlap through normal completion");
     }
     let expiries = events.iter().filter(|event| {
-        event.node == provider
+        event.node == selected.accepted.node
             && matches!(&event.record.event, Observation::EraTransitionExpired { old_protocol, .. } if old_protocol == f0)
     });
     for expiry in expiries {
-        if !before(provider_completed, expiry) {
+        if control.provider == selected.accepted.node && !before(provider_completed, expiry) {
             return Err("unselected F0 request did not complete before provider expiry");
         }
     }
@@ -403,7 +446,7 @@ pub(super) fn replacement<'a>(
         return Err("F1 replacement began before the requester's F1 rotation");
     }
     if events.iter().filter(|e| e.node == requester && matches!(&e.record.event, Observation::RequesterRequestStarted { request: other } if same_context(request, other) && other.remote_peer == provider_id)).count() != 1 { return Err("F1 requester context is ambiguous"); }
-    let accepted = unique(events, |e| e.node == provider && matches!(&e.record.event, Observation::ProviderRequestAccepted { request: other } if other.remote_peer == requester_id && same_context(request, other))).ok_or("matching F1 provider acceptance is missing or ambiguous")?;
+    let accepted = unique(events, |e| e.node == provider && matches!(&e.record.event, Observation::ProviderRequestAccepted { request: other } if same_cross_node_request(request, &requester_id, other, &provider_id))).ok_or("matching F1 provider acceptance is missing or ambiguous")?;
     if !before(expiry.expiry, accepted) {
         return Err("F1 provider acceptance did not follow F0 expiry on the provider");
     }
@@ -977,7 +1020,7 @@ pub(super) fn orphan_replacement<'a>(
     let accepted = unique(events, |event| {
         event.node == provider
             && matches!(&event.record.event, Observation::ProviderRequestAccepted { request: observed }
-                if observed.remote_peer == requester_id && same_context(request, observed))
+                if same_cross_node_request(request, &requester_id, observed, &provider_id))
     })
     .ok_or("matching provider acceptance for the F1 orphan request is missing or ambiguous")?;
     if !before(expiry.expiry, accepted) {

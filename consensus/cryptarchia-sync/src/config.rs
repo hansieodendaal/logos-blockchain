@@ -40,8 +40,22 @@ pub struct EraBoundaryTestingConfig {
     /// Restrict the one-shot hold to requests from this peer. An absent value
     /// preserves the original first-eligible-request behavior.
     pub hold_provider_for_peer_id: Option<String>,
+    /// Restrict the hold to this exact chain-sync protocol name.
+    pub hold_provider_for_protocol: Option<String>,
     /// Restrict the one-shot hold to requests whose requester tip differs from
     /// this header identity. This lets runtime-orphan tests leave genesis-tip
     /// IBD requests on the ordinary response path.
     pub hold_provider_for_requester_tip_not_equal_to: Option<String>,
+    /// Restrict the hold to this local provider identity. The node's
+    /// libp2p identity is checked at runtime, before any request can claim it.
+    pub hold_provider_for_provider_peer_id: Option<String>,
+    /// Restrict the hold to a request from this peer (the existing peer
+    /// selector remains the requester identity).
+    pub hold_provider_for_target: Option<String>,
+    /// Restrict the hold to an exact requester's canonical tip.
+    pub hold_provider_for_requester_tip: Option<String>,
+    /// Restrict the hold to an exact latest immutable block.
+    pub hold_provider_for_latest_immutable: Option<String>,
+    /// Restrict the hold to the exact set of additional known blocks.
+    pub hold_provider_for_additional_blocks: Option<Vec<String>>,
 }

@@ -9,8 +9,8 @@ use crate::cucumber::{
     error::{StepError, StepResult},
     steps::nodes::start_node,
     world::{
-        ConfigOverride, CucumberWorld, EraTransitionParticipant, EraTransitionParticipantRole,
-        EraTransitionRuntimeBinding, EraTransitionScenarioState,
+        ConfigOverride, CucumberWorld, EraTransitionInteraction, EraTransitionParticipant,
+        EraTransitionParticipantRole, EraTransitionRuntimeBinding, EraTransitionScenarioState,
     },
 };
 
@@ -49,7 +49,6 @@ pub(super) fn parse_participants(
     let mut participants = BTreeMap::new();
     let mut provider_count = 0;
     let mut requester_count = 0;
-    let mut unselected_requester_count = 0;
     let mut canonical_reference_count = 0;
     for (startup_index, row) in rows[1..].iter().enumerate() {
         let [node_name, role, canonical] = row.as_slice() else {
@@ -70,10 +69,7 @@ pub(super) fn parse_participants(
                 requester_count += 1;
                 EraTransitionParticipantRole::Requester
             }
-            "unselected_requester" => {
-                unselected_requester_count += 1;
-                EraTransitionParticipantRole::UnselectedRequester
-            }
+            "unselected_requester" => EraTransitionParticipantRole::UnselectedRequester,
             "observer" => EraTransitionParticipantRole::Observer,
             other => {
                 return Err(format!(
@@ -104,20 +100,117 @@ pub(super) fn parse_participants(
         );
     }
 
-    if provider_count != 1 || requester_count != 1 {
+    if provider_count == 0 || requester_count == 0 {
         return Err(format!(
-            "recovery requires exactly one provider and one requester; found {provider_count} provider(s) and {requester_count} requester(s)"
+            "recovery requires at least one provider and one requester; found {provider_count} provider(s) and {requester_count} requester(s)"
         ));
     }
-    if unselected_requester_count > 1 {
+    if canonical_reference_count != 1 {
         return Err(format!(
-            "recovery supports at most one unselected requester; found {unselected_requester_count}"
+            "exactly one canonical reference must be declared; found {canonical_reference_count}"
         ));
-    }
-    if canonical_reference_count > 1 {
-        return Err("only one canonical reference may be declared".into());
     }
     Ok(participants)
+}
+
+#[given("the era-transition interactions are:")]
+fn declare_interactions(world: &mut CucumberWorld, step: &Step) -> StepResult {
+    let participant_map = participants(world)?.clone();
+    let state = world
+        .era_transition
+        .as_mut()
+        .ok_or_else(|| failure("declare participants before interactions"))?;
+    if !state.interactions.is_empty() {
+        return Err(failure("era-transition interactions were already declared"));
+    }
+    let rows = &step.table.as_ref().ok_or(StepError::MissingTable)?.rows;
+    state.interactions = parse_interactions(rows, &participant_map).map_err(failure)?;
+    Ok(())
+}
+
+fn parse_interactions(
+    rows: &[Vec<String>],
+    participants: &BTreeMap<String, EraTransitionParticipant>,
+) -> Result<BTreeMap<String, EraTransitionInteraction>, String> {
+    if rows.first().map(Vec::as_slice)
+        != Some(&[
+            "interaction".to_owned(),
+            "provider".to_owned(),
+            "requester".to_owned(),
+            "selected".to_owned(),
+        ])
+    {
+        return Err(
+            "interaction table requires interaction, provider, requester and selected columns"
+                .into(),
+        );
+    }
+    let mut interactions = BTreeMap::new();
+    let mut pairs = HashSet::new();
+    let mut selected_count = 0;
+    for row in &rows[1..] {
+        let [name, provider, requester, selected] = row.as_slice() else {
+            return Err("each interaction row requires exactly four values".into());
+        };
+        let name = name.trim();
+        if name.is_empty() || interactions.contains_key(name) {
+            return Err(format!("interaction name `{name}` is empty or duplicated"));
+        }
+        let provider = provider.trim();
+        let requester = requester.trim();
+        let provider_participant = participants.get(provider).ok_or_else(|| {
+            format!("interaction `{name}` refers to undeclared provider `{provider}`")
+        })?;
+        let requester_participant = participants.get(requester).ok_or_else(|| {
+            format!("interaction `{name}` refers to undeclared requester `{requester}`")
+        })?;
+        if provider_participant.role != EraTransitionParticipantRole::Provider {
+            return Err(format!(
+                "interaction `{name}` provider `{provider}` is not declared as a provider"
+            ));
+        }
+        if !matches!(
+            requester_participant.role,
+            EraTransitionParticipantRole::Requester
+                | EraTransitionParticipantRole::UnselectedRequester
+        ) {
+            return Err(format!(
+                "interaction `{name}` requester `{requester}` is not declared as a requester"
+            ));
+        }
+        if !pairs.insert((provider.to_owned(), requester.to_owned())) {
+            return Err(format!(
+                "interaction `{name}` duplicates an existing provider/requester binding"
+            ));
+        }
+        let selected = match selected.as_str() {
+            "yes" => {
+                selected_count += 1;
+                true
+            }
+            "no" => false,
+            other => {
+                return Err(format!(
+                    "selected for interaction `{name}` must be yes or no, got `{other}`"
+                ));
+            }
+        };
+        interactions.insert(
+            name.to_owned(),
+            EraTransitionInteraction {
+                name: name.to_owned(),
+                provider: provider.to_owned(),
+                requester: requester.to_owned(),
+                selected,
+            },
+        );
+    }
+    if interactions.is_empty() || selected_count != 1 {
+        return Err(format!(
+            "interaction table requires exactly one selected interaction; found {selected_count}"
+        ));
+    }
+    Ok(interactions)
 }
 
 pub(super) fn participants(
@@ -133,32 +226,108 @@ pub(super) fn participants(
     Ok(&state.participants)
 }
 
-fn node_for_role(
+fn unique_node_for_role(
     world: &CucumberWorld,
     role: EraTransitionParticipantRole,
 ) -> Result<String, StepError> {
-    participants(world)?
+    let matches = participants(world)?
         .values()
-        .find(|participant| participant.role == role)
+        .filter(|participant| participant.role == role)
         .map(|participant| participant.node_name.clone())
-        .ok_or_else(|| failure(format!("no {role:?} participant was declared")))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [node] => Ok(node.clone()),
+        [] => Err(failure(format!("no {role:?} participant was declared"))),
+        _ => Err(failure(format!(
+            "multiple {role:?} participants require explicit interaction bindings"
+        ))),
+    }
+}
+
+pub(super) fn selected_interaction(
+    world: &CucumberWorld,
+) -> Result<EraTransitionInteraction, StepError> {
+    let interactions = &world
+        .era_transition
+        .as_ref()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?
+        .interactions;
+    if !interactions.is_empty() {
+        let selected = interactions
+            .values()
+            .filter(|interaction| interaction.selected)
+            .collect::<Vec<_>>();
+        return match selected.as_slice() {
+            [interaction] => Ok((*interaction).clone()),
+            _ => Err(failure("selected interaction is missing or ambiguous")),
+        };
+    }
+    Ok(EraTransitionInteraction {
+        name: "legacy-selected".into(),
+        provider: unique_node_for_role(world, EraTransitionParticipantRole::Provider)?,
+        requester: unique_node_for_role(world, EraTransitionParticipantRole::Requester)?,
+        selected: true,
+    })
+}
+
+pub(super) fn unselected_interactions(
+    world: &CucumberWorld,
+) -> Result<Vec<EraTransitionInteraction>, StepError> {
+    let state = world
+        .era_transition
+        .as_ref()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?;
+    if !state.interactions.is_empty() {
+        return Ok(state
+            .interactions
+            .values()
+            .filter(|interaction| !interaction.selected)
+            .cloned()
+            .collect());
+    }
+    let selected = selected_interaction(world)?;
+    Ok(participants(world)?
+        .values()
+        .filter(|participant| participant.role == EraTransitionParticipantRole::UnselectedRequester)
+        .enumerate()
+        .map(|(index, participant)| EraTransitionInteraction {
+            name: format!("legacy-unselected-{index}"),
+            provider: selected.provider.clone(),
+            requester: participant.node_name.clone(),
+            selected: false,
+        })
+        .collect())
+}
+
+pub(super) fn unselected_interaction(
+    world: &CucumberWorld,
+) -> Result<Option<EraTransitionInteraction>, StepError> {
+    let mut interactions = unselected_interactions(world)?;
+    match interactions.len() {
+        0 => Ok(None),
+        1 => Ok(interactions.pop()),
+        _ => Err(failure(
+            "the single-interaction lifecycle step is ambiguous; use explicit participant startup",
+        )),
+    }
 }
 
 pub(super) fn provider_name(world: &CucumberWorld) -> Result<String, StepError> {
-    node_for_role(world, EraTransitionParticipantRole::Provider)
+    Ok(selected_interaction(world)?.provider)
 }
 
 pub(super) fn requester_name(world: &CucumberWorld) -> Result<String, StepError> {
-    node_for_role(world, EraTransitionParticipantRole::Requester)
+    Ok(selected_interaction(world)?.requester)
 }
 
 pub(super) fn unselected_requester_name(
     world: &CucumberWorld,
 ) -> Result<Option<String>, StepError> {
-    Ok(participants(world)?
-        .values()
-        .find(|participant| participant.role == EraTransitionParticipantRole::UnselectedRequester)
-        .map(|participant| participant.node_name.clone()))
+    Ok(unselected_interaction(world)?.map(|interaction| interaction.requester))
+}
+
+pub(super) fn unselected_provider_name(world: &CucumberWorld) -> Result<Option<String>, StepError> {
+    Ok(unselected_interaction(world)?.map(|interaction| interaction.provider))
 }
 
 fn canonical_reference_name(world: &CucumberWorld) -> Result<String, StepError> {
@@ -192,6 +361,7 @@ fn validate_participant_topology_impl(
     require_all_started: bool,
 ) -> Result<(), StepError> {
     let declared = participants(world)?;
+    selected_interaction(world)?;
     let expected = declared.keys().cloned().collect::<HashSet<_>>();
     let state = world
         .era_transition
@@ -646,36 +816,11 @@ fn configure_provider_hold(world: &mut CucumberWorld, block_count: u64) -> StepR
 
 #[given("the provider response hold selects the requester participant by peer identity")]
 fn select_requester_for_provider_hold(world: &mut CucumberWorld) -> StepResult {
-    let requester = requester_name(world)?;
-    let peer_id = if let Some(peer_id) = world.cluster.node_peer_ids.get(&requester) {
-        peer_id.to_string()
-    } else {
-        let participant = participants(world)?
-            .get(&requester)
-            .ok_or_else(|| failure(format!("requester `{requester}` was not declared")))?;
-        let config_index = participant.startup_index;
-        let cluster = world
-            .cluster
-            .logos_cluster()
-            .ok_or_else(|| failure("peer selection requires the prepared Logos cluster"))?;
-        let plan = cluster
-            .deployment()
-            .as_ref()
-            .ok_or_else(|| failure("prepared Logos cluster has no node deployment plan"))?
-            .nodes()
-            .get(config_index)
-            .ok_or_else(|| {
-                failure(format!(
-                    "no prepared node config at requester config index {config_index}"
-                ))
-            })?;
-        Keypair::from(ed25519::Keypair::from(
-            plan.general.network_config.backend.swarm.node_key.clone(),
-        ))
-        .public()
-        .to_peer_id()
-        .to_string()
-    };
+    let interaction = selected_interaction(world)?;
+    let requester = interaction.requester;
+    let provider = interaction.provider;
+    let peer_id = configured_peer_id(world, &requester)?;
+    let provider_peer_id = configured_peer_id(world, &provider)?;
     let state = world
         .era_transition
         .as_mut()
@@ -685,7 +830,124 @@ fn select_requester_for_provider_hold(world: &mut CucumberWorld) -> StepResult {
             "provider hold peer selector was configured more than once",
         ));
     }
+    if state
+        .provider_hold_provider_peer_id
+        .replace(provider_peer_id)
+        .is_some()
+    {
+        return Err(failure(
+            "provider hold provider selector was configured more than once",
+        ));
+    }
     Ok(())
+}
+
+#[given("the provider response hold selects exact request context:")]
+fn select_exact_request_context(world: &mut CucumberWorld, step: &Step) -> StepResult {
+    let rows = &step.table.as_ref().ok_or(StepError::MissingTable)?.rows;
+    let expected_header = [
+        "protocol",
+        "target",
+        "requester_tip",
+        "latest_immutable",
+        "additional_blocks",
+    ];
+    if rows
+        .first()
+        .map(|row| row.iter().map(String::as_str).collect::<Vec<_>>())
+        != Some(expected_header.to_vec())
+        || rows.len() != 2
+        || rows[1].len() != expected_header.len()
+    {
+        return Err(failure(
+            "exact request context requires one row with protocol, target, requester_tip, latest_immutable and additional_blocks columns",
+        ));
+    }
+    let exact = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty() && value != "*").then(|| value.to_owned())
+    };
+    let protocol = exact(&rows[1][0]);
+    let target = exact(&rows[1][1]);
+    let requester_tip = exact(&rows[1][2]);
+    let latest_immutable = exact(&rows[1][3]);
+    let additional_blocks = match rows[1][4].trim() {
+        "*" => None,
+        "<empty>" => Some(Vec::new()),
+        value => {
+            let blocks = value
+                .split(',')
+                .map(str::trim)
+                .filter(|block| !block.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if blocks.is_empty() {
+                return Err(failure(
+                    "additional_blocks must be `*`, `<empty>`, or a comma-separated identity list",
+                ));
+            }
+            Some(blocks)
+        }
+    };
+    if protocol.is_none()
+        && target.is_none()
+        && requester_tip.is_none()
+        && latest_immutable.is_none()
+        && additional_blocks.is_none()
+    {
+        return Err(failure("exact request context contains no selectors"));
+    }
+    let state = world
+        .era_transition
+        .as_mut()
+        .ok_or_else(|| failure("declare era-transition participants first"))?;
+    if state.provider_hold_protocol.is_some()
+        || state.provider_hold_target.is_some()
+        || state.provider_hold_requester_tip.is_some()
+        || state.provider_hold_latest_immutable.is_some()
+        || state.provider_hold_additional_blocks.is_some()
+    {
+        return Err(failure(
+            "exact request context was configured more than once",
+        ));
+    }
+    state.provider_hold_protocol = protocol;
+    state.provider_hold_target = target;
+    state.provider_hold_requester_tip = requester_tip;
+    state.provider_hold_latest_immutable = latest_immutable;
+    state.provider_hold_additional_blocks = additional_blocks;
+    Ok(())
+}
+
+fn configured_peer_id(world: &CucumberWorld, node_name: &str) -> Result<String, StepError> {
+    if let Some(peer_id) = world.cluster.node_peer_ids.get(node_name) {
+        return Ok(peer_id.to_string());
+    }
+    let participant = participants(world)?
+        .get(node_name)
+        .ok_or_else(|| failure(format!("participant `{node_name}` was not declared")))?;
+    let config_index = participant.startup_index;
+    let cluster = world
+        .cluster
+        .logos_cluster()
+        .ok_or_else(|| failure("peer selection requires the prepared Logos cluster"))?;
+    let plan = cluster
+        .deployment()
+        .as_ref()
+        .ok_or_else(|| failure("prepared Logos cluster has no node deployment plan"))?
+        .nodes()
+        .get(config_index)
+        .ok_or_else(|| {
+            failure(format!(
+                "no prepared node config at participant config index {config_index}"
+            ))
+        })?;
+    Ok(Keypair::from(ed25519::Keypair::from(
+        plan.general.network_config.backend.swarm.node_key.clone(),
+    ))
+    .public()
+    .to_peer_id()
+    .to_string())
 }
 
 #[given("I start the provider participant with its configured era-transition response hold")]
@@ -696,27 +958,78 @@ async fn start_provider_with_response_hold(world: &mut CucumberWorld) -> StepRes
         .as_ref()
         .and_then(|state| state.provider_hold_after_blocks)
         .ok_or_else(|| failure("provider response hold was not configured in Gherkin"))?;
+    let hold_override = provider_hold_override(world, block_count)?;
+    start_node(
+        world,
+        "start declared provider with configured era-transition response hold",
+        &node_name,
+        &[],
+        &[],
+        false,
+        &[hold_override, publication_override(world, &node_name)?],
+    )
+    .await
+}
+
+fn insert_optional_string(settings: &mut serde_yaml::Mapping, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        settings.insert(
+            serde_yaml::Value::String(key.to_owned()),
+            serde_yaml::Value::String(value),
+        );
+    }
+}
+
+fn provider_hold_override(
+    world: &CucumberWorld,
+    block_count: usize,
+) -> Result<ConfigOverride, StepError> {
+    let state = world
+        .era_transition
+        .as_ref()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?;
     let mut hold_settings = serde_yaml::Mapping::new();
     hold_settings.insert(
         serde_yaml::Value::String("hold_provider_after_blocks".to_owned()),
         serde_yaml::to_value(block_count)
             .map_err(|error| failure(format!("Invalid hold block count: {error}")))?,
     );
-    if let Some(peer_id) = world
-        .era_transition
-        .as_ref()
-        .and_then(|state| state.provider_hold_peer_id.as_ref())
-    {
+    for (key, value) in [
+        (
+            "hold_provider_for_peer_id",
+            state.provider_hold_peer_id.clone(),
+        ),
+        (
+            "hold_provider_for_protocol",
+            state.provider_hold_protocol.clone(),
+        ),
+        (
+            "hold_provider_for_provider_peer_id",
+            state.provider_hold_provider_peer_id.clone(),
+        ),
+        (
+            "hold_provider_for_target",
+            state.provider_hold_target.clone(),
+        ),
+        (
+            "hold_provider_for_requester_tip",
+            state.provider_hold_requester_tip.clone(),
+        ),
+        (
+            "hold_provider_for_latest_immutable",
+            state.provider_hold_latest_immutable.clone(),
+        ),
+    ] {
+        insert_optional_string(&mut hold_settings, key, value);
+    }
+    if let Some(blocks) = &state.provider_hold_additional_blocks {
         hold_settings.insert(
-            serde_yaml::Value::String("hold_provider_for_peer_id".to_owned()),
-            serde_yaml::Value::String(peer_id.clone()),
+            serde_yaml::Value::String("hold_provider_for_additional_blocks".to_owned()),
+            serde_yaml::to_value(blocks)
+                .map_err(|error| failure(format!("Invalid additional block selector: {error}")))?,
         );
     }
-    if world
-        .era_transition
-        .as_ref()
-        .is_some_and(|state| state.provider_hold_excludes_genesis_tip)
-    {
+    if state.provider_hold_excludes_genesis_tip {
         let genesis_id = world.chain.genesis_block_id.ok_or_else(|| {
             failure("the genesis-tip selector requires a prepared genesis identity")
         })?;
@@ -725,20 +1038,10 @@ async fn start_provider_with_response_hold(world: &mut CucumberWorld) -> StepRes
             serde_yaml::Value::String(format!("{genesis_id:?}")),
         );
     }
-    let override_value = ConfigOverride {
+    Ok(ConfigOverride {
         path: "network.backend.swarm.chain_sync.testing_era_boundaries".to_owned(),
         value: serde_yaml::Value::Mapping(hold_settings),
-    };
-    start_node(
-        world,
-        "start declared provider with configured era-transition response hold",
-        &node_name,
-        &[],
-        &[],
-        false,
-        &[override_value, publication_override(world, &node_name)?],
-    )
-    .await
+    })
 }
 
 #[given("the provider response hold excludes the requester's genesis-tip IBD request")]
@@ -798,7 +1101,8 @@ async fn start_requester_with_recovery_observation(world: &mut CucumberWorld) ->
 async fn start_unselected_requester(world: &mut CucumberWorld) -> StepResult {
     let requester = unselected_requester_name(world)?
         .ok_or_else(|| failure("no unselected requester participant was declared"))?;
-    let provider = provider_name(world)?;
+    let provider = unselected_provider_name(world)?
+        .ok_or_else(|| failure("no unselected interaction provider was declared"))?;
     let overrides = [
         publication_override(world, &requester)?,
         ConfigOverride {
@@ -816,6 +1120,107 @@ async fn start_unselected_requester(world: &mut CucumberWorld) -> StepResult {
         &requester,
         &[],
         &[provider],
+        false,
+        &overrides,
+    )
+    .await
+}
+
+#[when(expr = "I start participant {string} as a provider connected to participant {string}")]
+async fn start_additional_provider(
+    world: &mut CucumberWorld,
+    provider: String,
+    peer: String,
+) -> StepResult {
+    start_additional_participant(
+        world,
+        &provider,
+        &peer,
+        EraTransitionParticipantRole::Provider,
+        None,
+    )
+    .await
+}
+
+#[when(
+    expr = "I start participant {string} as a requester connected to provider participant {string} with tip polling {word}"
+)]
+async fn start_additional_requester(
+    world: &mut CucumberWorld,
+    requester: String,
+    provider: String,
+    polling: String,
+) -> StepResult {
+    let tip_polling = match polling.as_str() {
+        "enabled" => true,
+        "disabled" => false,
+        _ => return Err(failure("tip polling must be enabled or disabled")),
+    };
+    start_additional_participant(
+        world,
+        &requester,
+        &provider,
+        EraTransitionParticipantRole::Requester,
+        Some(tip_polling),
+    )
+    .await
+}
+
+async fn start_additional_participant(
+    world: &mut CucumberWorld,
+    participant_name: &str,
+    peer_name: &str,
+    expected_role: EraTransitionParticipantRole,
+    tip_polling: Option<bool>,
+) -> StepResult {
+    let participant = participants(world)?
+        .get(participant_name)
+        .ok_or_else(|| failure(format!("undeclared participant `{participant_name}`")))?;
+    if participant.role != expected_role {
+        return Err(failure(format!(
+            "participant `{participant_name}` has role {:?}, expected {expected_role:?}",
+            participant.role
+        )));
+    }
+    if !participants(world)?.contains_key(peer_name) {
+        return Err(failure(format!(
+            "undeclared peer participant `{peer_name}`"
+        )));
+    }
+    if participants(world)?[peer_name].role != EraTransitionParticipantRole::Provider {
+        return Err(failure(format!(
+            "participant `{peer_name}` must be a provider for `{participant_name}`"
+        )));
+    }
+    if !world.nodes_info.contains_key(peer_name) {
+        return Err(failure(format!(
+            "peer participant `{peer_name}` must be running before `{participant_name}`"
+        )));
+    }
+    if world.nodes_info.contains_key(participant_name) {
+        return Err(failure(format!(
+            "participant `{participant_name}` is already running"
+        )));
+    }
+    let mut overrides = vec![
+        publication_override(world, participant_name)?,
+        ConfigOverride {
+            path: "network.backend.swarm.chain_sync.testing_era_boundaries".to_owned(),
+            value: serde_yaml::Value::Mapping(serde_yaml::Mapping::default()),
+        },
+    ];
+    if let Some(enabled) = tip_polling {
+        overrides.push(ConfigOverride {
+            path: "cryptarchia.network.sync.tip_poll.enabled".to_owned(),
+            value: serde_yaml::Value::Bool(enabled),
+        });
+    }
+    start_node(
+        world,
+        "start explicitly bound era-transition participant",
+        participant_name,
+        &[],
+        &[peer_name.to_owned()],
         false,
         &overrides,
     )
@@ -881,28 +1286,120 @@ mod tests {
     }
 
     #[test]
-    fn parses_one_unselected_requester_for_concurrent_recovery() {
+    fn parses_multiple_providers_and_requesters_for_interaction_topology() {
         let parsed = parse_participants(&rows(&[
             ("NODE_1", "provider", "yes"),
             ("NODE_2", "requester", "no"),
-            ("NODE_3", "unselected_requester", "no"),
+            ("NODE_3", "provider", "no"),
+            ("NODE_4", "requester", "no"),
+            ("NODE_5", "observer", "no"),
         ]))
         .unwrap();
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 5);
         assert_eq!(
             parsed["NODE_3"].role,
-            EraTransitionParticipantRole::UnselectedRequester
+            EraTransitionParticipantRole::Provider
         );
-        assert_eq!(parsed["NODE_3"].startup_index, 2);
+        assert_eq!(
+            parsed["NODE_4"].role,
+            EraTransitionParticipantRole::Requester
+        );
+    }
+
+    #[test]
+    fn explicit_interactions_bind_declared_provider_requester_pairs() {
+        let parsed = parse_participants(&rows(&[
+            ("NODE_1", "provider", "yes"),
+            ("NODE_2", "requester", "no"),
+            ("NODE_3", "provider", "no"),
+            ("NODE_4", "requester", "no"),
+            ("NODE_5", "observer", "no"),
+        ]))
+        .unwrap();
+        let rows = vec![
+            vec![
+                "interaction".into(),
+                "provider".into(),
+                "requester".into(),
+                "selected".into(),
+            ],
+            vec![
+                "selected-path".into(),
+                "NODE_1".into(),
+                "NODE_2".into(),
+                "yes".into(),
+            ],
+            vec![
+                "control-path".into(),
+                "NODE_3".into(),
+                "NODE_4".into(),
+                "no".into(),
+            ],
+        ];
+        let interactions = parse_interactions(&rows, &parsed).unwrap();
+        assert_eq!(interactions.len(), 2);
+        assert!(interactions["selected-path"].selected);
+        assert_eq!(interactions["control-path"].provider, "NODE_3");
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_conflicting_interaction_bindings() {
+        let parsed = parse_participants(&rows(&[
+            ("NODE_1", "provider", "yes"),
+            ("NODE_2", "requester", "no"),
+            ("NODE_3", "provider", "no"),
+            ("NODE_4", "requester", "no"),
+        ]))
+        .unwrap();
+        let header = vec![
+            "interaction".into(),
+            "provider".into(),
+            "requester".into(),
+            "selected".into(),
+        ];
         assert!(
-            parse_participants(&rows(&[
-                ("NODE_1", "provider", "yes"),
-                ("NODE_2", "requester", "no"),
-                ("NODE_3", "unselected_requester", "no"),
-                ("NODE_4", "unselected_requester", "no"),
-            ]))
-            .unwrap_err()
-            .contains("at most one unselected requester")
+            parse_interactions(std::slice::from_ref(&header), &parsed)
+                .unwrap_err()
+                .contains("exactly one selected")
+        );
+        let duplicate = vec![
+            header.clone(),
+            vec![
+                "path".into(),
+                "NODE_1".into(),
+                "NODE_2".into(),
+                "yes".into(),
+            ],
+            vec!["path".into(), "NODE_3".into(), "NODE_4".into(), "no".into()],
+        ];
+        assert!(
+            parse_interactions(&duplicate, &parsed)
+                .unwrap_err()
+                .contains("duplicated")
+        );
+        let twice_selected = vec![
+            header,
+            vec!["one".into(), "NODE_1".into(), "NODE_2".into(), "yes".into()],
+            vec!["two".into(), "NODE_3".into(), "NODE_4".into(), "yes".into()],
+        ];
+        assert!(
+            parse_interactions(&twice_selected, &parsed)
+                .unwrap_err()
+                .contains("exactly one selected")
+        );
+        let wrong_role = vec![
+            vec![
+                "interaction".into(),
+                "provider".into(),
+                "requester".into(),
+                "selected".into(),
+            ],
+            vec!["bad".into(), "NODE_2".into(), "NODE_4".into(), "yes".into()],
+        ];
+        assert!(
+            parse_interactions(&wrong_role, &parsed)
+                .unwrap_err()
+                .contains("not declared as a provider")
         );
     }
 
@@ -927,7 +1424,7 @@ mod tests {
         assert!(
             parse_participants(&rows(&[("NODE_1", "provider", "yes")]))
                 .unwrap_err()
-                .contains("exactly one provider and one requester")
+                .contains("at least one provider and one requester")
         );
         assert!(
             parse_participants(&rows(&[
@@ -935,7 +1432,7 @@ mod tests {
                 ("NODE_2", "requester", "yes"),
             ]))
             .unwrap_err()
-            .contains("only one canonical")
+            .contains("exactly one canonical reference")
         );
         let observer_reference = parse_participants(&rows(&[
             ("NODE_1", "provider", "no"),
@@ -949,7 +1446,8 @@ mod tests {
                 ("NODE_1", "provider", "no"),
                 ("NODE_2", "requester", "no"),
             ]))
-            .is_ok()
+            .unwrap_err()
+            .contains("exactly one canonical reference")
         );
     }
 

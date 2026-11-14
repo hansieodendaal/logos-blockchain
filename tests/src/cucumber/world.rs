@@ -223,6 +223,15 @@ pub struct EraTransitionParticipant {
 
 #[cfg(feature = "testing-era-boundaries")]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EraTransitionInteraction {
+    pub name: String,
+    pub provider: String,
+    pub requester: String,
+    pub selected: bool,
+}
+
+#[cfg(feature = "testing-era-boundaries")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EraTransitionRuntimeBinding {
     pub node_name: String,
     pub runtime_name: String,
@@ -234,15 +243,23 @@ pub struct EraTransitionRuntimeBinding {
 #[derive(Debug, Default)]
 pub struct EraTransitionScenarioState {
     pub participants: BTreeMap<String, EraTransitionParticipant>,
+    pub interactions: BTreeMap<String, EraTransitionInteraction>,
     pub runtime_bindings: BTreeMap<String, EraTransitionRuntimeBinding>,
     pub provider_hold_after_blocks: Option<usize>,
     pub provider_hold_peer_id: Option<String>,
+    pub provider_hold_provider_peer_id: Option<String>,
+    pub provider_hold_protocol: Option<String>,
+    pub provider_hold_target: Option<String>,
+    pub provider_hold_requester_tip: Option<String>,
+    pub provider_hold_latest_immutable: Option<String>,
+    pub provider_hold_additional_blocks: Option<Vec<String>>,
     pub orphan_recovery: bool,
     pub provider_hold_excludes_genesis_tip: bool,
     pub proposal_publishing_suppression_required: bool,
     pub initial_proposal_publication: BTreeMap<String, bool>,
     pub accepted_f1_request: Option<EraTransitionAcceptedRequest>,
     pub observation_journals: Mutex<BTreeMap<String, EraTransitionJournal>>,
+    pub evidence_sequence: AtomicUsize,
 }
 
 #[cfg(feature = "testing-era-boundaries")]

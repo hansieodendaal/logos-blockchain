@@ -212,6 +212,8 @@ struct OngoingRequests {
     #[cfg(feature = "testing-era-boundaries")]
     protocol_name: StreamProtocol,
     #[cfg(feature = "testing-era-boundaries")]
+    local_peer_id: PeerId,
+    #[cfg(feature = "testing-era-boundaries")]
     testing_hold_protocol: Option<StreamProtocol>,
     #[cfg(feature = "testing-era-boundaries")]
     testing_hold_claimed: Arc<AtomicBool>,
@@ -227,7 +229,12 @@ impl Behaviour {
     /// If a response carrying a block of `max_block_size` bytes is larger than
     /// the largest message the network carries.
     #[must_use]
-    pub fn new(protocol_name: StreamProtocol, config: Config, max_block_size: usize) -> Self {
+    pub fn new(
+        #[cfg(feature = "testing-era-boundaries")] local_peer_id: PeerId,
+        protocol_name: StreamProtocol,
+        config: Config,
+        max_block_size: usize,
+    ) -> Self {
         let max_blocks_response_size = max_blocks_response_bincode_size(max_block_size);
         assert!(
             max_blocks_response_size <= lb_utils::net::MAX_WIRE_MESSAGE_SIZE,
@@ -247,6 +254,8 @@ impl Behaviour {
             protocol_name,
             config.clone(),
             max_blocks_response_size,
+            #[cfg(feature = "testing-era-boundaries")]
+            local_peer_id,
             #[cfg(feature = "testing-era-boundaries")]
             testing_hold_protocol.clone(),
             #[cfg(feature = "testing-era-boundaries")]
@@ -314,6 +323,8 @@ impl Behaviour {
                 "era-boundary experiment observed a chain-sync era rotation"
             );
         }
+        #[cfg(feature = "testing-era-boundaries")]
+        let local_peer_id = self.sync_protocol_state.ongoing_requests.local_peer_id;
         let previous_sync_state = mem::replace(
             &mut self.sync_protocol_state,
             SyncProtocolState::new(
@@ -321,6 +332,8 @@ impl Behaviour {
                 new_era_protocol_name,
                 self.config.clone(),
                 self.max_blocks_response_size,
+                #[cfg(feature = "testing-era-boundaries")]
+                local_peer_id,
                 #[cfg(feature = "testing-era-boundaries")]
                 self.testing_hold_protocol.clone(),
                 #[cfg(feature = "testing-era-boundaries")]
@@ -398,6 +411,7 @@ impl SyncProtocolState {
         protocol_name: StreamProtocol,
         config: Config,
         max_blocks_response_size: usize,
+        #[cfg(feature = "testing-era-boundaries")] local_peer_id: PeerId,
         #[cfg(feature = "testing-era-boundaries")] testing_hold_protocol: Option<StreamProtocol>,
         #[cfg(feature = "testing-era-boundaries")] testing_hold_claimed: Arc<AtomicBool>,
     ) -> Self {
@@ -412,6 +426,8 @@ impl SyncProtocolState {
                 max_blocks_response_size,
                 #[cfg(feature = "testing-era-boundaries")]
                 protocol_name.clone(),
+                #[cfg(feature = "testing-era-boundaries")]
+                local_peer_id,
                 #[cfg(feature = "testing-era-boundaries")]
                 testing_hold_protocol,
                 #[cfg(feature = "testing-era-boundaries")]
@@ -470,6 +486,12 @@ impl SyncProtocolState {
                     request.target_block,
                     request.known_blocks.local_tip,
                     request.known_blocks.latest_immutable_block,
+                    request
+                        .known_blocks
+                        .additional_blocks
+                        .iter()
+                        .map(|id| format!("{id:?}"))
+                        .collect(),
                 )
             });
 
@@ -510,6 +532,7 @@ impl OngoingRequests {
         config: Config,
         max_blocks_response_size: usize,
         #[cfg(feature = "testing-era-boundaries")] protocol_name: StreamProtocol,
+        #[cfg(feature = "testing-era-boundaries")] local_peer_id: PeerId,
         #[cfg(feature = "testing-era-boundaries")] testing_hold_protocol: Option<StreamProtocol>,
         #[cfg(feature = "testing-era-boundaries")] testing_hold_claimed: Arc<AtomicBool>,
     ) -> Self {
@@ -528,6 +551,8 @@ impl OngoingRequests {
             #[cfg(feature = "testing-era-boundaries")]
             protocol_name,
             #[cfg(feature = "testing-era-boundaries")]
+            local_peer_id,
+            #[cfg(feature = "testing-era-boundaries")]
             testing_hold_protocol,
             #[cfg(feature = "testing-era-boundaries")]
             testing_hold_claimed,
@@ -544,6 +569,13 @@ impl OngoingRequests {
         Poll::Ready(ToSwarm::GenerateEvent(Event::TipRequest { reply_sender }))
     }
 
+    #[cfg_attr(
+        feature = "testing-era-boundaries",
+        expect(
+            clippy::too_many_lines,
+            reason = "Keep feature-gated request observation and hold setup adjacent to provider dispatch."
+        )
+    )]
     fn handle_blocks_request(
         &self,
         peer_id: PeerId,
@@ -560,6 +592,12 @@ impl OngoingRequests {
                 request.target_block,
                 request.known_blocks.local_tip,
                 request.known_blocks.latest_immutable_block,
+                request
+                    .known_blocks
+                    .additional_blocks
+                    .iter()
+                    .map(|id| format!("{id:?}"))
+                    .collect(),
             )
         });
         #[cfg(feature = "testing-era-boundaries")]
@@ -595,13 +633,19 @@ impl OngoingRequests {
         #[cfg(feature = "testing-era-boundaries")]
         let response_hold = EraBoundaryResponseHold {
             evidence,
+            provider_peer_id: self.local_peer_id,
             after_blocks: hold_after_blocks,
             selected_peer_id: self
                 .config
                 .testing_era_boundaries
                 .as_ref()
                 .and_then(|settings| settings.hold_provider_for_peer_id.clone()),
-            selected_protocol: self.testing_hold_protocol.as_ref().map(ToString::to_string),
+            selected_protocol: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_protocol.clone())
+                .or_else(|| self.testing_hold_protocol.as_ref().map(ToString::to_string)),
             requester_tip_not_equal_to: self.config.testing_era_boundaries.as_ref().and_then(
                 |settings| {
                     settings
@@ -609,6 +653,31 @@ impl OngoingRequests {
                         .clone()
                 },
             ),
+            selected_provider_peer_id: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_provider_peer_id.clone()),
+            selected_target: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_target.clone()),
+            selected_requester_tip: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_requester_tip.clone()),
+            selected_latest_immutable: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_latest_immutable.clone()),
+            selected_additional_blocks: self
+                .config
+                .testing_era_boundaries
+                .as_ref()
+                .and_then(|settings| settings.hold_provider_for_additional_blocks.clone()),
             claimed: Arc::clone(&self.testing_hold_claimed),
         };
 
@@ -1877,13 +1946,17 @@ mod tests {
 
     fn new_swarm_with_quic(config: Config) -> Swarm<Behaviour> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
+        #[cfg(feature = "testing-era-boundaries")]
+        let local_peer_id = PeerId::from(keypair.public());
         libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
             .with_dns()
             .unwrap()
-            .with_behaviour(|_| {
+            .with_behaviour(|_keypair| {
                 Behaviour::new(
+                    #[cfg(feature = "testing-era-boundaries")]
+                    local_peer_id,
                     StreamProtocol::new("/tests/chain-sync"),
                     config,
                     Block::<()>::max_encoded_size(BLOCK_LIMITS),

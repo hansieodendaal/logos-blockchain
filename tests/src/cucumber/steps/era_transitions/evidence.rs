@@ -1,6 +1,8 @@
 //! Scenario provenance, evidence records, and artifact checksums.
 
-use std::{collections::HashMap, fs, fs::OpenOptions, io::Write as _, path::Path};
+use std::{
+    collections::HashMap, fs, fs::OpenOptions, io::Write as _, path::Path, sync::atomic::Ordering,
+};
 
 use cucumber::given;
 use serde_json::Value;
@@ -9,7 +11,7 @@ use super::{
     events::{RuntimeObservation, collect_observations, node_peer_id},
     lifecycle,
     scenario::{
-        participants, provider_name, requester_name, runtime_binding, unselected_requester_name,
+        participants, provider_name, requester_name, runtime_binding, unselected_interactions,
         validate_participant_topology,
     },
 };
@@ -32,6 +34,13 @@ fn failure(message: impl Into<String>) -> StepError {
     reason = "Evidence callers build each JSON record inline for immediate serialization"
 )]
 pub(super) fn append_record(world: &CucumberWorld, event: &str, data: Value) -> StepResult {
+    let scenario_sequence = world
+        .era_transition
+        .as_ref()
+        .ok_or_else(|| failure("era-transition scenario state is not initialized"))?
+        .evidence_sequence
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
     let path = world.lifecycle.scenario_base_dir.join(EVIDENCE_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -43,6 +52,7 @@ pub(super) fn append_record(world: &CucumberWorld, event: &str, data: Value) -> 
         &mut writer,
         &serde_json::json!({
             "event": event,
+            "scenario_sequence": scenario_sequence,
             "timestamp_unix_ms": now_unix_ms(),
             "timestamp_unix_ns": now_unix_ns(),
             "data": data,
@@ -76,6 +86,7 @@ pub fn initialize_evidence_file(scenario_dir: &Path) -> std::io::Result<()> {
     let path = scenario_dir.join(EVIDENCE_FILE);
     let entry = serde_json::json!({
         "event": "experiment_provenance",
+        "scenario_sequence": 0,
         "timestamp_unix_ms": now_unix_ms(),
         "experiment": "RFC 439 era-transition recovery",
         "rfc": "RFC 439: Bedrock Eras",
@@ -173,6 +184,36 @@ pub fn capture_scenario_evidence(world: &CucumberWorld) -> StepResult {
     verification.map_err(|failures| failure(failures.join("; ")))
 }
 
+fn unique_scenario_sequence(records: &[Value], event_name: &str) -> Result<u64, String> {
+    let mut matches = records
+        .iter()
+        .filter(|record| record.get("event").and_then(Value::as_str) == Some(event_name));
+    let record = matches
+        .next()
+        .ok_or_else(|| format!("scenario-order evidence `{event_name}` is missing"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "scenario-order evidence `{event_name}` is duplicated"
+        ));
+    }
+    record
+        .get("scenario_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("scenario-order evidence `{event_name}` has no sequence"))
+}
+
+fn verify_concurrent_scenario_order(records: &[Value]) -> Result<(), String> {
+    let hold = unique_scenario_sequence(records, "selected_request_hold_barrier")?;
+    let concurrent = unique_scenario_sequence(records, "concurrent_f0_request_lifecycle")?;
+    let expiry = unique_scenario_sequence(records, "expiry_and_interruption")?;
+    if !(hold < concurrent && concurrent < expiry) {
+        return Err(format!(
+            "scenario orchestration order is contradictory: hold={hold}, concurrent={concurrent}, expiry={expiry}"
+        ));
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the top-level evidence gate enumerates all mandatory independent acceptance records"
@@ -186,8 +227,8 @@ fn verify_scenario_evidence(
         participants(world).map_err(|error| vec![format!("participants: {error:?}")])?;
     let provider = provider_name(world).map_err(|error| vec![format!("provider: {error:?}")])?;
     let requester = requester_name(world).map_err(|error| vec![format!("requester: {error:?}")])?;
-    let unselected_requester = unselected_requester_name(world)
-        .map_err(|error| vec![format!("unselected requester: {error:?}")])?;
+    let control_interactions = unselected_interactions(world)
+        .map_err(|error| vec![format!("control interactions: {error:?}")])?;
     let (f0, f1) = runtime_binding(world, &provider)
         .ok()
         .and_then(|binding| {
@@ -253,8 +294,11 @@ fn verify_scenario_evidence(
         "per_node_experiment_configuration",
         "request_capacity_and_node_health",
     ];
-    if unselected_requester.is_some() {
+    if !control_interactions.is_empty() {
         required_assertions.push("concurrent_f0_request_lifecycle");
+        if let Err(error) = verify_concurrent_scenario_order(&records) {
+            failures.push(error);
+        }
     }
     for assertion in required_assertions {
         match assertions.get(assertion) {
@@ -327,10 +371,10 @@ fn verify_scenario_evidence(
         .era_transition
         .as_ref()
         .is_some_and(|state| state.orphan_recovery);
-    let expected_hold_peer = if unselected_requester.is_some() {
-        requester_peer.clone()
-    } else {
+    let expected_hold_peer = if control_interactions.is_empty() {
         None
+    } else {
+        requester_peer.clone()
     };
     let configured_context_tip = node_config_value(
         world,
@@ -361,37 +405,34 @@ fn verify_scenario_evidence(
                 &f1,
                 &mut failures,
             );
-            if let Some(unselected_requester) = &unselected_requester {
-                let unselected_peer = node_peer_id(world, unselected_requester);
-                match unselected_peer {
-                    Some(unselected_peer) => {
-                        let concurrent = lifecycle::original(
-                            events,
-                            &provider,
-                            &requester,
-                            &provider_peer,
-                            &requester_peer,
-                            &f0,
-                        )
-                        .and_then(|selected| {
-                            lifecycle::expiry(events, &selected, &provider, &requester, &f0, &f1)?;
-                            lifecycle::unselected_completion(
-                                events,
-                                &selected,
-                                &provider,
-                                &provider_peer,
-                                &requester_peer,
-                                unselected_requester,
-                                &unselected_peer,
-                                &f0,
-                            )
-                        });
-                        if let Err(error) = concurrent {
-                            failures.push(error.to_owned());
-                        }
+            if !control_interactions.is_empty() {
+                let concurrent = lifecycle::original(
+                    events,
+                    &provider,
+                    &requester,
+                    &provider_peer,
+                    &requester_peer,
+                    &f0,
+                )
+                .and_then(|selected| {
+                    lifecycle::expiry(events, &selected, &provider, &requester, &f0, &f1)?;
+                    for interaction in &control_interactions {
+                        let control_provider_peer = node_peer_id(world, &interaction.provider)
+                            .ok_or("control provider runtime identity is missing")?;
+                        let control_requester_peer = node_peer_id(world, &interaction.requester)
+                            .ok_or("control requester runtime identity is missing")?;
+                        let control = lifecycle::InteractionPeers {
+                            provider: &interaction.provider,
+                            provider_peer: &control_provider_peer,
+                            requester: &interaction.requester,
+                            requester_peer: &control_requester_peer,
+                        };
+                        lifecycle::unselected_completion(events, &selected, &control, &f0)?;
                     }
-                    None => failures
-                        .push("unselected requester runtime peer identity is missing".to_owned()),
+                    Ok(())
+                });
+                if let Err(error) = concurrent {
+                    failures.push(error.to_owned());
                 }
             }
         }
@@ -947,4 +988,50 @@ fn yaml_path<'a>(value: &'a serde_yaml::Value, path: &str) -> Option<&'a serde_y
             .as_mapping()?
             .get(serde_yaml::Value::String(part.to_owned()))
     })
+}
+
+#[cfg(test)]
+mod scenario_order_tests {
+    use super::verify_concurrent_scenario_order;
+
+    fn record(event: &str, scenario_sequence: u64) -> serde_json::Value {
+        serde_json::json!({
+            "event": event,
+            "scenario_sequence": scenario_sequence,
+        })
+    }
+
+    #[test]
+    fn concurrent_control_must_be_between_hold_barrier_and_expiry() {
+        assert!(
+            verify_concurrent_scenario_order(&[
+                record("selected_request_hold_barrier", 2),
+                record("concurrent_f0_request_lifecycle", 5),
+                record("expiry_and_interruption", 8),
+            ])
+            .is_ok()
+        );
+        assert!(
+            verify_concurrent_scenario_order(&[
+                record("selected_request_hold_barrier", 5),
+                record("concurrent_f0_request_lifecycle", 2),
+                record("expiry_and_interruption", 8),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_or_duplicate_scenario_order_evidence_fails_closed() {
+        assert!(verify_concurrent_scenario_order(&[]).is_err());
+        assert!(
+            verify_concurrent_scenario_order(&[
+                record("selected_request_hold_barrier", 1),
+                record("selected_request_hold_barrier", 2),
+                record("concurrent_f0_request_lifecycle", 3),
+                record("expiry_and_interruption", 4),
+            ])
+            .is_err()
+        );
+    }
 }

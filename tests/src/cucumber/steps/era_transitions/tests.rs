@@ -31,9 +31,10 @@ fn fixture() -> (Vec<RuntimeObservation>, String, String) {
         target: id(1),
         requester_tip: id(2),
         latest_immutable: id(3),
+        additional_blocks: Vec::new(),
     };
     let original_provider = RequestObservation {
-        local_request_id: 11,
+        local_request_id: 1,
         remote_peer: requester.into(),
         ..original.clone()
     };
@@ -250,6 +251,7 @@ fn orphan_fixture() -> (Vec<RuntimeObservation>, String, String) {
         target: id(40),
         requester_tip: id(41),
         latest_immutable: id(42),
+        additional_blocks: Vec::new(),
     };
     let ibd_provider_request = RequestObservation {
         local_request_id: 19,
@@ -263,6 +265,7 @@ fn orphan_fixture() -> (Vec<RuntimeObservation>, String, String) {
         target: id(30),
         requester_tip: id(41),
         latest_immutable: id(42),
+        additional_blocks: Vec::new(),
     };
     let f0_provider_request = RequestObservation {
         local_request_id: 20,
@@ -641,6 +644,7 @@ fn add_unselected_request(events: &mut Vec<RuntimeObservation>, provider_peer: &
         target: id(1),
         requester_tip: id(2),
         latest_immutable: id(3),
+        additional_blocks: Vec::new(),
     };
     let provider_request = RequestObservation {
         local_request_id: 99,
@@ -763,24 +767,250 @@ fn concurrent_completion<'a>(
         requester_peer,
         "f0",
     )?;
-    lifecycle::unselected_completion(
-        events,
-        &selected,
-        "provider",
+    let control_provider_peer = provider_peer.to_owned();
+    let control = lifecycle::InteractionPeers {
+        provider: "provider",
+        provider_peer: &control_provider_peer,
+        requester: "unselected",
+        requester_peer: unselected_peer,
+    };
+    lifecycle::unselected_completion(events, &selected, &control, "f0")
+}
+
+fn add_request_on_second_provider(
+    events: &mut Vec<RuntimeObservation>,
+    provider_peer: PeerId,
+    requester_peer: PeerId,
+) {
+    let requester_request = RequestObservation {
+        local_request_id: 1,
+        remote_peer: provider_peer.into(),
+        protocol: "f0".into(),
+        target: id(30),
+        requester_tip: id(31),
+        latest_immutable: id(32),
+        additional_blocks: Vec::new(),
+    };
+    let provider_request = RequestObservation {
+        local_request_id: 1,
+        remote_peer: requester_peer.into(),
+        ..requester_request.clone()
+    };
+    let mut push = |node: &str, peer_id: PeerId, sequence: u64, event| {
+        events.push(RuntimeObservation {
+            node: node.into(),
+            peer_id: peer_id.to_string(),
+            path: format!("{node}.ndjson").into(),
+            record: ObservationRecord {
+                schema_version: SCHEMA_VERSION,
+                sequence,
+                timestamp_unix_ms: 0,
+                elapsed_ns: sequence * 10,
+                event,
+            },
+        });
+    };
+    push(
+        "control-provider",
         provider_peer,
+        1,
+        Observation::ProviderRequestAccepted {
+            request: provider_request.clone(),
+        },
+    );
+    push(
+        "control-provider",
+        provider_peer,
+        2,
+        Observation::ProviderBlockResponseSent {
+            request: provider_request.clone(),
+            response_index: 1,
+        },
+    );
+    push(
+        "control-provider",
+        provider_peer,
+        3,
+        Observation::ProviderRequestCompleted {
+            request: provider_request,
+            blocks_sent: 1,
+        },
+    );
+    push(
+        "control-requester",
         requester_peer,
-        "unselected",
-        unselected_peer,
+        1,
+        Observation::RequesterRequestStarted {
+            request: requester_request.clone(),
+        },
+    );
+    push(
+        "control-requester",
+        requester_peer,
+        2,
+        Observation::RequesterBlockResponseReceived {
+            request: requester_request.clone(),
+            response_index: 1,
+        },
+    );
+    push(
+        "control-requester",
+        requester_peer,
+        3,
+        Observation::RequesterRequestCompleted {
+            request: requester_request,
+            response_count: 1,
+        },
+    );
+    push(
+        "control-requester",
+        requester_peer,
+        4,
+        Observation::IbdCompleted,
+    );
+}
+
+fn completion_for_interaction<'a>(
+    events: &'a [RuntimeObservation],
+    selected_provider_peer: &str,
+    selected_requester_peer: &str,
+    control_provider: &str,
+    control_provider_peer: &str,
+    control_requester_peer: &str,
+) -> Result<lifecycle::UnselectedCompletion<'a>, &'static str> {
+    let selected = lifecycle::original(
+        events,
+        "provider",
+        "requester",
+        selected_provider_peer,
+        selected_requester_peer,
         "f0",
-    )
+    )?;
+    let control = lifecycle::InteractionPeers {
+        provider: control_provider,
+        provider_peer: control_provider_peer,
+        requester: "control-requester",
+        requester_peer: control_requester_peer,
+    };
+    lifecycle::unselected_completion(events, &selected, &control, "f0")
 }
 
 #[test]
-fn typed_lifecycle_accepts_reversed_wall_clocks_and_distinct_local_ids() {
+fn typed_lifecycle_accepts_reversed_wall_clocks_and_process_local_request_ids() {
     let (events, provider, requester) = fixture();
     assert_eq!(
         failures(&events, &provider, &requester),
         Vec::<String>::new()
+    );
+}
+
+#[test]
+fn selected_hold_identifies_one_of_multiple_same_peer_request_contexts() {
+    let (mut events, provider, requester) = fixture();
+    let selected = events
+        .iter()
+        .find_map(|event| match &event.record.event {
+            Observation::RequesterRequestStarted { request } if event.node == "requester" => {
+                Some(request.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let mut competing = selected;
+    competing.local_request_id = 42;
+    competing.target = id(42);
+    competing.requester_tip = id(43);
+    events.push(RuntimeObservation {
+        node: "requester".into(),
+        peer_id: requester.clone(),
+        path: "requester.ndjson".into(),
+        record: ObservationRecord {
+            schema_version: SCHEMA_VERSION,
+            sequence: 100,
+            timestamp_unix_ms: 999,
+            elapsed_ns: 1000,
+            event: Observation::RequesterRequestStarted { request: competing },
+        },
+    });
+    assert_eq!(
+        lifecycle::original(
+            &events,
+            "provider",
+            "requester",
+            &provider,
+            &requester,
+            "f0"
+        )
+        .unwrap()
+        .request
+        .local_request_id,
+        1
+    );
+}
+
+#[test]
+fn identical_request_contexts_and_duplicate_hold_evidence_fail_closed() {
+    let (mut events, provider, requester) = fixture();
+    let mut duplicate_request = events
+        .iter()
+        .find_map(|event| match &event.record.event {
+            Observation::RequesterRequestStarted { request } if event.node == "requester" => {
+                Some(request.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    duplicate_request.local_request_id = 77;
+    events.push(RuntimeObservation {
+        node: "requester".into(),
+        peer_id: requester.clone(),
+        path: "requester.ndjson".into(),
+        record: ObservationRecord {
+            schema_version: SCHEMA_VERSION,
+            sequence: 100,
+            timestamp_unix_ms: 999,
+            elapsed_ns: 1000,
+            event: Observation::RequesterRequestStarted {
+                request: duplicate_request,
+            },
+        },
+    });
+    assert!(
+        lifecycle::original(
+            &events,
+            "provider",
+            "requester",
+            &provider,
+            &requester,
+            "f0"
+        )
+        .is_err()
+    );
+
+    let (mut events, provider, requester) = fixture();
+    let duplicate_hold = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.record.event,
+                Observation::ProviderResponseHoldActivated { .. }
+            )
+        })
+        .unwrap()
+        .clone();
+    let mut duplicate_hold = duplicate_hold;
+    duplicate_hold.record.sequence = 100;
+    events.push(duplicate_hold);
+    assert!(
+        lifecycle::original(
+            &events,
+            "provider",
+            "requester",
+            &provider,
+            &requester,
+            "f0"
+        )
+        .is_err()
     );
 }
 
@@ -793,6 +1023,25 @@ fn concurrent_f0_requests_overlap_and_unselected_request_completes_normally() {
     assert_eq!(completion.provider_request.protocol, "f0");
     assert_eq!(completion.request.protocol, "f0");
     assert!(completion.provider_request.local_request_id != 11);
+}
+
+#[test]
+fn request_ids_are_local_across_distinct_provider_requester_interactions() {
+    let (mut events, selected_provider_peer, selected_requester_peer) = fixture();
+    let control_provider = PeerId::random();
+    let control_requester = PeerId::random();
+    add_request_on_second_provider(&mut events, control_provider, control_requester);
+    let completion = completion_for_interaction(
+        &events,
+        &selected_provider_peer,
+        &selected_requester_peer,
+        "control-provider",
+        &control_provider.to_string(),
+        &control_requester.to_string(),
+    )
+    .expect("independent provider/requester request IDs may be equal");
+    assert_eq!(completion.provider_request.local_request_id, 1);
+    assert_eq!(completion.request.local_request_id, 1);
 }
 
 #[test]

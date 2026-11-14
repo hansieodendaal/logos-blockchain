@@ -105,6 +105,8 @@ impl<Rng: Clone + Send + RngCore + 'static> Behaviour<Rng> {
         let nat = nat::Behaviour::new(rng, &nat_config);
 
         let chain_sync = lb_cryptarchia_sync::Behaviour::new(
+            #[cfg(feature = "testing-era-boundaries")]
+            peer_id,
             chain_sync_protocol_name,
             chain_sync_config,
             chain_sync_max_block_size,

@@ -62,6 +62,9 @@ pub struct RequestObservation {
     pub target: HeaderId,
     pub requester_tip: HeaderId,
     pub latest_immutable: HeaderId,
+    /// Canonically sorted additional block identities carried by the request.
+    #[serde(default)]
+    pub additional_blocks: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

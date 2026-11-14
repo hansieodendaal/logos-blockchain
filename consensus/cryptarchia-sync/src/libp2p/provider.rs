@@ -47,10 +47,16 @@ pub struct ReceivedRequest {
 #[derive(Clone)]
 pub struct EraBoundaryResponseHold {
     pub(super) evidence: Option<RequestEvidence>,
+    pub(super) provider_peer_id: PeerId,
     pub(super) after_blocks: Option<usize>,
     pub(super) selected_peer_id: Option<String>,
     pub(super) selected_protocol: Option<String>,
     pub(super) requester_tip_not_equal_to: Option<String>,
+    pub(super) selected_provider_peer_id: Option<String>,
+    pub(super) selected_target: Option<String>,
+    pub(super) selected_requester_tip: Option<String>,
+    pub(super) selected_latest_immutable: Option<String>,
+    pub(super) selected_additional_blocks: Option<Vec<String>>,
     pub(super) claimed: Arc<AtomicBool>,
 }
 
@@ -334,9 +340,13 @@ fn provider_hold_is_armed(response_hold: &EraBoundaryResponseHold) -> bool {
     response_hold.after_blocks.is_some()
         && response_hold.evidence.as_ref().is_some_and(|evidence| {
             response_hold
-                .selected_peer_id
+                .selected_provider_peer_id
                 .as_ref()
-                .is_none_or(|peer_id| peer_id == &evidence.peer_id.to_string())
+                .is_none_or(|peer_id| peer_id == &response_hold.provider_peer_id.to_string())
+                && response_hold
+                    .selected_peer_id
+                    .as_ref()
+                    .is_none_or(|peer_id| peer_id == &evidence.peer_id.to_string())
                 && response_hold
                     .selected_protocol
                     .as_ref()
@@ -345,6 +355,26 @@ fn provider_hold_is_armed(response_hold: &EraBoundaryResponseHold) -> bool {
                     .requester_tip_not_equal_to
                     .as_ref()
                     .is_none_or(|tip| tip != &format!("{:?}", evidence.requester_tip))
+                && response_hold
+                    .selected_target
+                    .as_ref()
+                    .is_none_or(|target| target == &format!("{:?}", evidence.target_block))
+                && response_hold
+                    .selected_requester_tip
+                    .as_ref()
+                    .is_none_or(|tip| tip == &format!("{:?}", evidence.requester_tip))
+                && response_hold
+                    .selected_latest_immutable
+                    .as_ref()
+                    .is_none_or(|block| block == &format!("{:?}", evidence.latest_immutable_block))
+                && response_hold
+                    .selected_additional_blocks
+                    .as_ref()
+                    .is_none_or(|blocks| {
+                        let mut selected = blocks.clone();
+                        selected.sort();
+                        selected == evidence.additional_blocks
+                    })
         })
         && !response_hold.claimed.load(Ordering::Acquire)
 }
@@ -621,7 +651,7 @@ async fn send_message_with_timeout<M: Serialize + Sync>(
 
 #[cfg(all(test, feature = "testing-era-boundaries"))]
 mod era_boundary_tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use lb_core::header::HeaderId;
     use libp2p::{PeerId, StreamProtocol};
@@ -675,14 +705,20 @@ mod era_boundary_tests {
 
     #[test]
     fn absent_or_consumed_control_keeps_the_normal_response_path_armed() {
-        let claimed = std::sync::Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
         let absent = EraBoundaryResponseHold {
             evidence: None,
+            provider_peer_id: PeerId::random(),
             after_blocks: None,
             selected_peer_id: None,
             selected_protocol: None,
             requester_tip_not_equal_to: None,
-            claimed: std::sync::Arc::clone(&claimed),
+            selected_provider_peer_id: None,
+            selected_target: None,
+            selected_requester_tip: None,
+            selected_latest_immutable: None,
+            selected_additional_blocks: None,
+            claimed: Arc::clone(&claimed),
         };
         assert!(!provider_hold_is_armed(&absent));
 
@@ -692,14 +728,21 @@ mod era_boundary_tests {
             HeaderId::from([1; 32]),
             HeaderId::from([2; 32]),
             HeaderId::from([3; 32]),
+            Vec::new(),
         );
         let configured = EraBoundaryResponseHold {
             evidence: Some(evidence),
+            provider_peer_id: PeerId::random(),
             after_blocks: Some(1),
             selected_peer_id: None,
             selected_protocol: Some("/test/era-boundary".into()),
             requester_tip_not_equal_to: None,
-            claimed: std::sync::Arc::clone(&claimed),
+            selected_provider_peer_id: None,
+            selected_target: None,
+            selected_requester_tip: None,
+            selected_latest_immutable: None,
+            selected_additional_blocks: None,
+            claimed: Arc::clone(&claimed),
         };
         assert!(provider_hold_is_armed(&configured));
         claimed.store(true, std::sync::atomic::Ordering::Release);
@@ -708,7 +751,7 @@ mod era_boundary_tests {
 
     #[test]
     fn provider_hold_selector_matches_peer_and_protocol() {
-        let claimed = std::sync::Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
         let requester = PeerId::random();
         let evidence = RequestEvidence::new(
             requester,
@@ -716,14 +759,21 @@ mod era_boundary_tests {
             HeaderId::from([1; 32]),
             HeaderId::from([2; 32]),
             HeaderId::from([3; 32]),
+            Vec::new(),
         );
         let selected = EraBoundaryResponseHold {
             evidence: Some(evidence),
+            provider_peer_id: PeerId::random(),
             after_blocks: Some(1),
             selected_peer_id: Some(requester.to_string()),
             selected_protocol: Some("/test/era-boundary".into()),
             requester_tip_not_equal_to: None,
-            claimed: std::sync::Arc::clone(&claimed),
+            selected_provider_peer_id: None,
+            selected_target: None,
+            selected_requester_tip: None,
+            selected_latest_immutable: None,
+            selected_additional_blocks: None,
+            claimed: Arc::clone(&claimed),
         };
         assert!(provider_hold_is_armed(&selected));
 
@@ -741,22 +791,110 @@ mod era_boundary_tests {
     }
 
     #[test]
+    fn exact_hold_selector_matches_provider_peer_protocol_and_full_context() {
+        let provider = PeerId::random();
+        let requester = PeerId::random();
+        let protocol = StreamProtocol::new("/test/era-boundary");
+        let target = HeaderId::from([1; 32]);
+        let requester_tip = HeaderId::from([2; 32]);
+        let latest_immutable = HeaderId::from([3; 32]);
+        let evidence = RequestEvidence::new(
+            requester,
+            &protocol,
+            target,
+            requester_tip,
+            latest_immutable,
+            vec!["block-b".into(), "block-a".into()],
+        );
+        let selected = EraBoundaryResponseHold {
+            evidence: Some(evidence),
+            provider_peer_id: provider,
+            after_blocks: Some(1),
+            selected_peer_id: Some(requester.to_string()),
+            selected_protocol: Some(protocol.to_string()),
+            requester_tip_not_equal_to: None,
+            selected_provider_peer_id: Some(provider.to_string()),
+            selected_target: Some(format!("{target:?}")),
+            selected_requester_tip: Some(format!("{requester_tip:?}")),
+            selected_latest_immutable: Some(format!("{latest_immutable:?}")),
+            selected_additional_blocks: Some(vec!["block-a".into(), "block-b".into()]),
+            claimed: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(provider_hold_is_armed(&selected));
+
+        let wrong_provider = EraBoundaryResponseHold {
+            provider_peer_id: PeerId::random(),
+            ..selected.clone()
+        };
+        assert!(!provider_hold_is_armed(&wrong_provider));
+
+        let candidates = [
+            RequestEvidence::new(
+                requester,
+                &protocol,
+                HeaderId::from([9; 32]),
+                requester_tip,
+                latest_immutable,
+                vec!["block-a".into(), "block-b".into()],
+            ),
+            RequestEvidence::new(
+                requester,
+                &protocol,
+                target,
+                HeaderId::from([9; 32]),
+                latest_immutable,
+                vec!["block-a".into(), "block-b".into()],
+            ),
+            RequestEvidence::new(
+                requester,
+                &protocol,
+                target,
+                requester_tip,
+                HeaderId::from([9; 32]),
+                vec!["block-a".into(), "block-b".into()],
+            ),
+            RequestEvidence::new(
+                requester,
+                &protocol,
+                target,
+                requester_tip,
+                latest_immutable,
+                vec!["block-a".into()],
+            ),
+        ];
+        for evidence in candidates {
+            let wrong_context = EraBoundaryResponseHold {
+                evidence: Some(evidence),
+                ..selected.clone()
+            };
+            assert!(!provider_hold_is_armed(&wrong_context));
+        }
+    }
+
+    #[test]
     fn provider_hold_context_selector_skips_only_the_configured_requester_tip() {
-        let claimed = std::sync::Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
         let evidence = RequestEvidence::new(
             PeerId::random(),
             &StreamProtocol::new("/test/era-boundary"),
             HeaderId::from([1; 32]),
             HeaderId::from([2; 32]),
             HeaderId::from([3; 32]),
+            Vec::new(),
         );
         let genesis_tip = format!("{:?}", evidence.requester_tip);
         let selected = EraBoundaryResponseHold {
             evidence: Some(evidence),
+            provider_peer_id: PeerId::random(),
             after_blocks: Some(1),
             selected_peer_id: None,
             selected_protocol: Some("/test/era-boundary".into()),
             requester_tip_not_equal_to: Some(genesis_tip),
+            selected_provider_peer_id: None,
+            selected_target: None,
+            selected_requester_tip: None,
+            selected_latest_immutable: None,
+            selected_additional_blocks: None,
             claimed,
         };
         assert!(!provider_hold_is_armed(&selected));
@@ -776,9 +914,10 @@ mod era_boundary_tests {
             HeaderId::from([1; 32]),
             HeaderId::from([2; 32]),
             HeaderId::from([3; 32]),
+            Vec::new(),
         );
-        let cancellation_observed = std::sync::Arc::new(AtomicBool::new(false));
-        let observed_by_task = std::sync::Arc::clone(&cancellation_observed);
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let observed_by_task = Arc::clone(&cancellation_observed);
         let guard = ResponseHoldGuard {
             evidence,
             blocks_sent: 1,

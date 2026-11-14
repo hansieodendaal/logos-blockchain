@@ -13,7 +13,7 @@ use super::{
     evidence::{append_record, node_config_value, record_assertion},
     lifecycle,
     scenario::{
-        participants, provider_name, requester_name, unselected_requester_name,
+        participants, provider_name, requester_name, unselected_interactions,
         validate_participant_topology, validate_started_participant_topology,
     },
 };
@@ -231,6 +231,16 @@ async fn establish_f0_request_and_hold(
             "downloading": observation_reference(original.downloading),
             "applied": observation_reference(original.applied), "hold": observation_reference(original.hold)
         }),
+    )?;
+    append_record(
+        world,
+        "selected_request_hold_barrier",
+        serde_json::json!({
+            "selected_provider": provider,
+            "selected_requester": requester,
+            "selected_request": original.provider_request,
+            "selected_hold": observation_reference(original.hold),
+        }),
     )
 }
 
@@ -247,37 +257,47 @@ async fn concurrent_f0_request_completes_normally(
 ) -> StepResult {
     let provider = provider_name(world)?;
     let requester = requester_name(world)?;
-    let unselected_requester = unselected_requester_name(world)?
-        .ok_or_else(|| failure("no unselected requester participant was declared"))?;
+    let interactions = unselected_interactions(world)?;
+    if interactions.is_empty() {
+        return Err(failure("no unselected interaction was declared"));
+    }
     let (_, f0, _) = era_protocols_for_world(world, &provider)?;
     let provider_peer =
         node_peer_id(world, &provider).ok_or_else(|| failure("provider peer is missing"))?;
     let requester_peer =
         node_peer_id(world, &requester).ok_or_else(|| failure("requester peer is missing"))?;
-    let unselected_peer = node_peer_id(world, &unselected_requester)
-        .ok_or_else(|| failure("unselected requester peer is missing"))?;
+    let controls = interactions
+        .into_iter()
+        .map(|interaction| {
+            let provider_peer = node_peer_id(world, &interaction.provider)
+                .ok_or_else(|| failure("unselected provider peer is missing"))?;
+            let requester_peer = node_peer_id(world, &interaction.requester)
+                .ok_or_else(|| failure("unselected requester peer is missing"))?;
+            Ok((interaction, provider_peer, requester_peer))
+        })
+        .collect::<Result<Vec<_>, StepError>>()?;
     let events = wait_for_observations(world, timeout_seconds, |events| {
-        lifecycle::original(
+        let Ok(selected) = lifecycle::original(
             events,
             &provider,
             &requester,
             &provider_peer,
             &requester_peer,
             &f0,
-        )
-        .and_then(|selected| {
-            lifecycle::unselected_completion(
-                events,
-                &selected,
-                &provider,
-                &provider_peer,
-                &requester_peer,
-                &unselected_requester,
-                &unselected_peer,
-                &f0,
-            )
-        })
-        .is_ok()
+        ) else {
+            return false;
+        };
+        controls
+            .iter()
+            .all(|(interaction, provider_peer, requester_peer)| {
+                let control = lifecycle::InteractionPeers {
+                    provider: &interaction.provider,
+                    provider_peer,
+                    requester: &interaction.requester,
+                    requester_peer,
+                };
+                lifecycle::unselected_completion(events, &selected, &control, &f0).is_ok()
+            })
     })
     .await?;
     let selected = lifecycle::original(
@@ -289,39 +309,46 @@ async fn concurrent_f0_request_completes_normally(
         &f0,
     )
     .map_err(failure)?;
-    let unselected = lifecycle::unselected_completion(
-        &events,
-        &selected,
-        &provider,
-        &provider_peer,
-        &requester_peer,
-        &unselected_requester,
-        &unselected_peer,
-        &f0,
-    )
-    .map_err(failure)?;
+    let unselected = controls
+        .iter()
+        .map(|(interaction, provider_peer, requester_peer)| {
+            let control = lifecycle::InteractionPeers {
+                provider: &interaction.provider,
+                provider_peer,
+                requester: &interaction.requester,
+                requester_peer,
+            };
+            lifecycle::unselected_completion(&events, &selected, &control, &f0).map_err(failure)
+        })
+        .collect::<Result<Vec<_>, StepError>>()?;
     record_assertion(
         world,
         "concurrent_f0_request_lifecycle",
         true,
-        "provider-local events prove the selected request remained held while the unselected request completed normally",
+        "typed participant-local events prove every unselected interaction completed normally while the selected request remained held",
     )?;
     append_record(
         world,
         "concurrent_f0_request_lifecycle",
         serde_json::json!({
             "selected_request": selected.provider_request,
+            "selected_provider": provider,
             "selected_hold": observation_reference(selected.hold),
-            "unselected_requester_request": unselected.request,
-            "unselected_request": unselected.provider_request,
-            "unselected_request_start": observation_reference(unselected.started),
-            "unselected_provider_acceptance": observation_reference(unselected.accepted),
-            "unselected_first_response_sent": observation_reference(unselected.sent),
-            "unselected_first_response_received": observation_reference(unselected.received),
-            "unselected_provider_completion": observation_reference(unselected.provider_completed),
-            "unselected_requester_completion": observation_reference(unselected.requester_completed),
-            "unselected_ibd_completion": observation_reference(unselected.ibd_completed),
-            "provider_request_ids_differ": selected.provider_request.local_request_id != unselected.provider_request.local_request_id,
+            "control_lifecycles": controls.iter().zip(&unselected).map(|(interaction, completion)| serde_json::json!({
+                "interaction": interaction.0.name,
+                "provider": interaction.0.provider,
+                "requester": interaction.0.requester,
+                "requester_request": completion.request,
+                "provider_request": completion.provider_request,
+                "request_start": observation_reference(completion.started),
+                "provider_acceptance": observation_reference(completion.accepted),
+                "first_response_sent": observation_reference(completion.sent),
+                "first_response_received": observation_reference(completion.received),
+                "provider_completion": observation_reference(completion.provider_completed),
+                "requester_completion": observation_reference(completion.requester_completed),
+                "ibd_completion": observation_reference(completion.ibd_completed),
+                "provider_local_ids_compared_only_when_same_provider": provider == interaction.0.provider,
+            })).collect::<Vec<_>>(),
             "request_ids_are_process_local": true
         }),
     )
@@ -678,10 +705,15 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         "cryptarchia.network.sync.tip_poll.enabled",
     )
     .and_then(|value| value.as_bool());
-    let unselected_requester = unselected_requester_name(world)?;
-    let unselected_tip_poll = unselected_requester.as_deref().and_then(|name| {
-        let value = node_config_value(world, name, "cryptarchia.network.sync.tip_poll.enabled")?;
-        value.as_bool()
+    let controls = unselected_interactions(world)?;
+    let unselected_tip_poll = controls.iter().all(|interaction| {
+        node_config_value(
+            world,
+            &interaction.requester,
+            "cryptarchia.network.sync.tip_poll.enabled",
+        )
+        .and_then(|value| value.as_bool())
+            == Some(true)
     });
     let configured_hold_peer = node_config_value(
         world,
@@ -695,6 +727,16 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
         "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_requester_tip_not_equal_to",
     )
     .and_then(|value| value.as_str().map(str::to_owned));
+    let configured_hold_provider = node_config_value(
+        world,
+        provider.as_str(),
+        "network.backend.swarm.chain_sync.testing_era_boundaries.hold_provider_for_provider_peer_id",
+    )
+    .and_then(|value| value.as_str().map(str::to_owned));
+    let expected_hold_provider = world
+        .era_transition
+        .as_ref()
+        .and_then(|state| state.provider_hold_provider_peer_id.clone());
     let orphan_recovery = world
         .era_transition
         .as_ref()
@@ -704,13 +746,13 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
     } else {
         None
     };
-    let expected_hold_peer = if unselected_requester.is_some() {
+    let expected_hold_peer = if controls.is_empty() {
+        None
+    } else {
         Some(
             node_peer_id(world, &requester)
                 .ok_or_else(|| failure("selected requester peer identity is missing"))?,
         )
-    } else {
-        None
     };
     let unexpected_holds = participants(world)?
         .values()
@@ -729,12 +771,13 @@ async fn both_nodes_remain_healthy(world: &mut CucumberWorld) -> StepResult {
     if provider_hold != u64::try_from(expected_hold).ok()
         || !unexpected_holds.is_empty()
         || requester_tip_poll != Some(false)
-        || unselected_requester.is_some() && unselected_tip_poll != Some(true)
+        || !unselected_tip_poll
         || configured_hold_peer != expected_hold_peer
         || configured_context_tip != expected_context_tip
+        || configured_hold_provider != expected_hold_provider
     {
         let message = format!(
-            "Effective per-participant controls were unexpected: provider `{provider}` hold={provider_hold:?} expected={expected_hold} selected_peer={configured_hold_peer:?} expected_peer={expected_hold_peer:?}; excluded_requester_tip={configured_context_tip:?} expected_tip={expected_context_tip:?}; non-provider holds={unexpected_holds:?}; requester `{requester}` tip polling={requester_tip_poll:?}; unselected requester tip polling={unselected_tip_poll:?}"
+            "Effective per-participant controls were unexpected: provider `{provider}` hold={provider_hold:?} expected={expected_hold} selected_peer={configured_hold_peer:?} expected_peer={expected_hold_peer:?}; selected_provider={configured_hold_provider:?} expected_provider={expected_hold_provider:?}; excluded_requester_tip={configured_context_tip:?} expected_tip={expected_context_tip:?}; non-provider holds={unexpected_holds:?}; requester `{requester}` tip polling={requester_tip_poll:?}; all control requesters tip polling enabled={unselected_tip_poll}"
         );
         record_assertion(world, "per_node_experiment_configuration", false, &message)?;
         return Err(failure(message));
