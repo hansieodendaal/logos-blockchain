@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use lb_key_management_system_keys::keys::{
-    Key, KeyOperators, errors::KeyError, secured_key::SecuredKey,
+    Key, KeyOperators, LeadershipKey, errors::KeyError, secured_key::SecuredKey,
 };
 use serde::Deserialize;
 
@@ -58,6 +58,28 @@ impl KMSBackend for PreloadKMSBackend {
         self.keys.insert(key_id.clone(), key);
 
         Ok(())
+    }
+
+    fn register_default_leadership(
+        &mut self,
+        source: &Self::KeyId,
+        destination: &Self::KeyId,
+    ) -> Result<(), Self::Error> {
+        let key = self
+            .keys
+            .get(source)
+            .ok_or_else(|| PreloadBackendError::NotRegisteredKeyId(source.clone()))?;
+        let Key::Zk(key) = key else {
+            return Err(KeyError::UnsupportedKey(
+                "default leadership requires a Zk spending key".into(),
+            )
+            .into());
+        };
+        let nf_sk = key.nullifier_key();
+        self.register(
+            destination,
+            Key::Leadership(LeadershipKey::new(nf_sk, nf_sk)),
+        )
     }
 
     fn public_key(
@@ -233,6 +255,57 @@ mod tests {
 
         // Registering the key works
         assert!(matches!(backend.register(&key_id, key), Ok(())));
+    }
+
+    #[test]
+    fn leadership_credentials_round_trip_without_signing_authority() {
+        use lb_key_management_system_keys::keys::{LeadershipKey, PublicKeyEncoding};
+
+        let key_id = "delegated".to_owned();
+        let key = LeadershipKey::new(7u64.into(), 11u64.into());
+        let public = key.as_public_key();
+        let settings = PreloadKMSBackendSettings {
+            keys: HashMap::from([(key_id.clone(), Key::Leadership(key))]),
+        };
+        let yaml = serde_yaml::to_string(&settings).unwrap();
+        let loaded: PreloadKMSBackendSettings = serde_yaml::from_str(&yaml).unwrap();
+        let backend = PreloadKMSBackend::new(loaded);
+        assert_eq!(
+            backend.public_key(&key_id).unwrap(),
+            PublicKeyEncoding::Leadership(public)
+        );
+        assert!(
+            backend
+                .sign(&key_id, PayloadEncoding::Leadership(()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn default_leadership_credentials_are_derived_inside_the_backend() {
+        use lb_key_management_system_keys::keys::PublicKeyEncoding;
+
+        let spending = ZkKey::new(7u64.into());
+        let expected = spending.to_public_key();
+        let mut backend = PreloadKMSBackend::new(PreloadKMSBackendSettings {
+            keys: HashMap::from([("spending".into(), Key::Zk(spending))]),
+        });
+        let source = "spending".to_owned();
+        let destination = "leadership".to_owned();
+        backend
+            .register_default_leadership(&source, &destination)
+            .unwrap();
+        let PublicKeyEncoding::Leadership(public) = backend.public_key(&destination).unwrap()
+        else {
+            panic!("expected leadership credentials");
+        };
+        assert_eq!(public.nullifier_public_key, expected);
+        assert_eq!(public.staking_public_key, expected);
+        assert!(
+            backend
+                .sign(&destination, PayloadEncoding::Leadership(()))
+                .is_err()
+        );
     }
 
     #[test]

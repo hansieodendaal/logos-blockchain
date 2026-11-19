@@ -254,7 +254,8 @@ pub fn check_winning(
     nullifier_key: Fr,
     staking_secret_key: Fr,
 ) -> bool {
-    note.public_key == kdf_public_key(&nullifier_key)
+    note.stake_public_key != lb_key_management_system_keys::keys::ZkPublicKey::zero()
+        && note.public_key == kdf_public_key(&nullifier_key)
         && note.stake_public_key == kdf_public_key(&staking_secret_key)
         && public_inputs.check_winning(note.value, note.commitment().0, staking_secret_key)
 }
@@ -870,6 +871,17 @@ mod tests {
         ));
         assert!(check_winning(
             &staked,
+            public,
+            nullifier_key,
+            staking_secret_key
+        ));
+
+        let unstaked = notes::Note {
+            stake_public_key: ZkPublicKey::zero(),
+            ..note
+        };
+        assert!(!check_winning(
+            &unstaked,
             public,
             nullifier_key,
             staking_secret_key

@@ -24,6 +24,11 @@ where
         key_type: Backend::Key,
         reply_channel: oneshot::Sender<Result<KeyDescriptor<Backend>, Backend::Error>>,
     },
+    RegisterDefaultLeadership {
+        source: Backend::KeyId,
+        destination: Backend::KeyId,
+        reply_channel: oneshot::Sender<Result<KeyDescriptor<Backend>, Backend::Error>>,
+    },
     PublicKey {
         key_id: Backend::KeyId,
         reply_channel:

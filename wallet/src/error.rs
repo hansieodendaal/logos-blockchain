@@ -15,6 +15,8 @@ pub enum WalletError {
     UnknownBlock(HeaderId),
     #[error("Wallet does not have enough funds, available={available}")]
     InsufficientFunds { available: u64 },
+    #[error("A transaction input is reserved by another request")]
+    InputReserved,
     #[error(transparent)]
     GasOverflow(#[from] GasOverflow),
     #[error("Transaction builder error: {0}")]

@@ -56,7 +56,7 @@ where
             Err(error) => Err(error.into()),
         };
         if checked.is_err() {
-            self.api.release_pending_notes(reserved).await;
+            self.api.release_pending_notes(funded, reserved).await;
         }
         checked
     }
@@ -125,7 +125,9 @@ where
         let tx_builder = match declared {
             Ok(tx_builder) => tx_builder,
             Err(error) => {
-                self.api.release_pending_notes(split_notes).await;
+                self.api
+                    .release_pending_notes(&split_builder, split_notes)
+                    .await;
                 return Err(error);
             }
         };
@@ -172,7 +174,7 @@ where
     ) -> Result<SignedOps<Preverified, StandardMode>, SdpWalletError> {
         let service_note = self
             .api
-            .owned_note(None, declaration.service_note)
+            .owned_note(None, NoteSetIndex::Sdp, declaration.service_note)
             .await
             .map_err(|e| SdpWalletError::WalletApi(e.into()))?
             .response
@@ -330,7 +332,7 @@ mod tests {
         ));
         assert!(matches!(
             msg_receiver.try_recv(),
-            Ok(WalletMsg::ReleasePendingNotes { nullifiers }) if nullifiers == [nullifier]
+            Ok(WalletMsg::ReleasePendingNotes { nullifiers, .. }) if nullifiers == [nullifier]
         ));
     }
 }

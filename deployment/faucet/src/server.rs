@@ -7,6 +7,7 @@ use std::{
 use axum::{
     Router,
     extract::{Path, State},
+    http::HeaderMap,
     response::IntoResponse,
     routing::post,
 };
@@ -15,19 +16,27 @@ use lb_key_management_system_keys::keys::ZkPublicKey;
 use reqwest::StatusCode;
 use tokio::sync::mpsc;
 
+use crate::faucet::{DripRequest, FaucetReadiness, FaucetStatus};
+
 pub struct FaucetServerState {
-    queue: mpsc::Sender<ZkPublicKey>,
+    queue: mpsc::Sender<DripRequest>,
     cooldowns: Mutex<HashMap<ZkPublicKey, Instant>>,
     cooldown: Duration,
+    status: Arc<FaucetStatus>,
 }
 
 impl FaucetServerState {
     #[must_use]
-    pub fn new(queue: mpsc::Sender<ZkPublicKey>, cooldown: Duration) -> Self {
+    pub fn new(
+        queue: mpsc::Sender<DripRequest>,
+        cooldown: Duration,
+        status: Arc<FaucetStatus>,
+    ) -> Self {
         Self {
             queue,
             cooldowns: Mutex::new(HashMap::new()),
             cooldown,
+            status,
         }
     }
 
@@ -61,7 +70,20 @@ impl FaucetServerState {
 async fn transfer_funds(
     State(state): State<Arc<FaucetServerState>>,
     Path(key_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    let Some(id) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| hex::decode(value).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Idempotency-Key must be a 32-byte hex value",
+        )
+            .into_response();
+    };
     let bytes = match hex::decode(&key_id) {
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid hex: {e}")).into_response(),
@@ -78,6 +100,22 @@ async fn transfer_funds(
         }
     };
 
+    let status = state.status.get();
+    if matches!(
+        status,
+        FaucetReadiness::NodeUnavailable | FaucetReadiness::InterventionRequired
+    ) {
+        let reason = match status {
+            FaucetReadiness::NodeUnavailable => "node_unavailable",
+            _ => "intervention_required",
+        };
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"status": reason}).to_string(),
+        )
+            .into_response();
+    }
+
     if let Err(remaining) = state.try_start_cooldown(recipient_pk) {
         let retry_after_secs = remaining.as_secs().max(1);
         return (
@@ -91,7 +129,14 @@ async fn transfer_funds(
             .into_response();
     }
 
-    if state.queue.try_send(recipient_pk).is_ok() {
+    if state
+        .queue
+        .try_send(DripRequest {
+            recipient: recipient_pk,
+            id,
+        })
+        .is_ok()
+    {
         (
             StatusCode::ACCEPTED,
             serde_json::json!({
@@ -117,4 +162,70 @@ pub fn faucet_app(state: Arc<FaucetServerState>) -> Router {
     Router::new()
         .route("/faucet/{pk}", post(transfer_funds))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn requests_require_and_queue_a_stable_id() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let state = Arc::new(FaucetServerState::new(
+            sender,
+            Duration::from_secs(1),
+            Arc::new(FaucetStatus::new(FaucetReadiness::Ready)),
+        ));
+        let recipient = "00".repeat(32);
+        let response = transfer_funds(
+            State(Arc::clone(&state)),
+            Path(recipient.clone()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(receiver.try_recv().is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "ab".repeat(32).parse().unwrap());
+        let response = transfer_funds(State(state), Path(recipient), headers)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(receiver.recv().await.unwrap().id, [0xab; 32]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_blocked_worker_rejects_new_payments_without_cooldown() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let status = Arc::new(FaucetStatus::new(FaucetReadiness::NodeUnavailable));
+        let state = Arc::new(FaucetServerState::new(
+            sender,
+            Duration::from_secs(60),
+            Arc::clone(&status),
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "ab".repeat(32).parse().unwrap());
+        for readiness in [
+            FaucetReadiness::NodeUnavailable,
+            FaucetReadiness::InterventionRequired,
+        ] {
+            status.set(readiness);
+            let response = transfer_funds(
+                State(Arc::clone(&state)),
+                Path("00".repeat(32)),
+                headers.clone(),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(receiver.try_recv().is_err());
+        }
+        status.set(FaucetReadiness::Ready);
+        let response = transfer_funds(State(state), Path("00".repeat(32)), headers)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(receiver.recv().await.unwrap().id, [0xab; 32]);
+    }
 }

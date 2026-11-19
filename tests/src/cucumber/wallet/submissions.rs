@@ -1563,6 +1563,7 @@ pub(crate) async fn import_notes_into_node(
                 WalletImportNoteRequestBody {
                     note,
                     note_set: NoteSetIndex::Ledger,
+                    historical_path: None,
                 },
             )
             .await

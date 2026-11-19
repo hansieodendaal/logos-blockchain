@@ -1,12 +1,14 @@
 pub mod api;
 mod channel;
+mod recovery;
 mod states;
+pub use recovery::RecoveryOpening;
 
 #[cfg(test)]
 mod tests;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZero,
     pin::Pin,
     sync::Arc,
@@ -27,6 +29,7 @@ use lb_core::{
     header::HeaderId,
     mantle::{
         Note, Op, OpProof, SignedOps, TxHash, Value, VerificationError,
+        channel::channel_note_set,
         gas::{GasCost, GasOverflow, GasProfile},
         ledger::verification_mode::StandardMode,
         note_set::NoteSetIndex,
@@ -46,6 +49,8 @@ use lb_core::{
     proofs::channel_multi_sig_proof::ChannelMultiSigProof,
     sdp::DeclarationId,
 };
+#[cfg(test)]
+use lb_core::{crypto::ZkHasher, mantle::note_set::CommitmentMmr};
 use lb_cryptarchia_engine::Epoch;
 use lb_groth16::Fr;
 use lb_key_management_system_service::{
@@ -53,9 +58,13 @@ use lb_key_management_system_service::{
     backend::{KMSBackend, preload::PreloadKMSBackend},
     keys::{
         ED25519_PUBLIC_KEY_SIZE, Ed25519Key, Ed25519PublicKey, Ed25519Signature, Key, KeyOperators,
-        PayloadEncoding, SignatureEncoding, ZkKey, ZkPublicKey, secured_key::SecuredKey,
+        LeadershipPublicKeys, PK0, PayloadEncoding, PublicKeyEncoding, SignatureEncoding, ZkKey,
+        ZkPublicKey, secured_key::SecuredKey,
     },
-    operators::zk::{nullifier::DeriveNullifier, voucher::UnsafeVoucherOperator},
+    operators::zk::{
+        nullifier::{DeriveLeadershipNullifier, DeriveNullifier},
+        voucher::UnsafeVoucherOperator,
+    },
 };
 use lb_ledger::LedgerState;
 use lb_log_targets::wallet;
@@ -70,7 +79,8 @@ use lb_time_service::{EraEvent, TimeService, api::TimeServiceApi};
 use lb_utils::{bounded::BoundedError, tokio::task::spawn_blocking};
 pub use lb_wallet::{DEFAULT_FEE_MARGIN_PERCENT, SPEND_ROOT_DEPTH};
 use lb_wallet::{
-    KnownNote, KnownNotes, OwnedNote, WalletBalance, WalletBlock, WalletError, WalletState,
+    KnownNote, NoteId, OwnedNote, SpentNullifier, WalletBalance, WalletBlock, WalletError,
+    WalletState,
     transaction::{OpWitness, WitnessContext, op_witness_at, op_witnesses},
 };
 use overwatch::{
@@ -98,9 +108,35 @@ const LOG_TARGET: &str = wallet::SERVICE;
 /// How many signings run at once. Each one proves, so this keeps a burst of
 /// requests from crowding out the proofs consensus depends on.
 const MAX_CONCURRENT_SIGNINGS: usize = 4;
+const HISTORY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+#[cfg(test)]
+fn valid_historical_path(mmr: &CommitmentMmr, note: Note, path: &MerklePath) -> bool {
+    path.siblings().len() == 40
+        && path.leaf_index() < mmr.len()
+        && path.verify::<ZkHasher>(note.commitment().0, mmr.frontier_root())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalletServiceError {
+    #[error(
+        "Historical recovery is an operator startup operation; configure wallet.historical_recovery and restart the node"
+    )]
+    RecoveryRequiresRestart,
+    #[error("Historical recovery did not find membership {0:?} in retained history")]
+    RecoveryNoteNotFound(NoteId),
+    #[error(
+        "Recovery request {0} is unknown or already completed; only pending requests can be withdrawn"
+    )]
+    RecoveryWithdrawalNotPending(u64),
+    #[error(
+        "Cannot request and withdraw the same recovery authority for {0:?}; remove the withdrawn opening from historical_recovery"
+    )]
+    RecoveryWithdrawalConflict(NoteId),
+    #[error("Wallet recovery request revision overflow")]
+    RecoveryRevisionOverflow,
+    #[error("A wallet history query timed out; recovery remains pending")]
+    HistoryQueryTimeout,
     #[error("Ledger state corresponding to block {0} not found")]
     LedgerStateNotFound(HeaderId),
 
@@ -142,6 +178,15 @@ pub enum WalletServiceError {
 
     #[error("The wallet holds no key for {0:?}")]
     UnknownKey(ZkPublicKey),
+
+    #[error("The historical opening does not have a valid path to the current note-set root")]
+    InvalidHistoricalPath,
+
+    #[error("Historical note recovery is rate limited; retry later")]
+    HistoricalReplayRateLimited,
+
+    #[error("Historical note recovery exceeded its processing limit")]
+    HistoricalReplayTimeout,
 
     #[error("Channel {0:?} has no note set")]
     ChannelWithoutNoteSet(ChannelId),
@@ -228,6 +273,7 @@ pub enum WalletMsg {
     },
     OwnedNote {
         tip: Option<HeaderId>,
+        note_set: NoteSetIndex,
         commitment: NoteCommitment,
         resp_tx: Sender<Result<TipResponse<Option<OwnedNote>>, WalletServiceError>>,
     },
@@ -261,6 +307,16 @@ pub enum WalletMsg {
         note_set: NoteSetIndex,
         resp_tx: Sender<Result<KnownNote, WalletServiceError>>,
     },
+    ImportNotes {
+        notes: Vec<(Note, NoteSetIndex)>,
+        resp_tx: Sender<Result<Vec<KnownNote>, WalletServiceError>>,
+    },
+    RecoverNote {
+        note: Note,
+        note_set: NoteSetIndex,
+        path: MerklePath,
+        resp_tx: Sender<Result<KnownNote, WalletServiceError>>,
+    },
     ProveChannelStep {
         tip: Option<HeaderId>,
         request: ChannelStepRequest,
@@ -287,6 +343,8 @@ pub enum WalletMsg {
     // not be submitted, so that they fund the next request.
     ReleasePendingNotes {
         nullifiers: Vec<NoteNullifier>,
+        owner: Option<[u8; 32]>,
+        builder: MantleTxBuilder,
     },
 }
 
@@ -299,7 +357,7 @@ pub struct TipResponse<R> {
     pub response: R,
 }
 
-// An owned note of the aged snapshot, with the key that spends it.
+// A note in the aged snapshot, with its KMS leadership credential pair.
 #[derive(Debug)]
 pub struct AgedNote {
     pub note: OwnedNote,
@@ -354,7 +412,16 @@ where
 /// A signing under way, which the service loop polls along with its other
 /// inputs. It comes to the notes funding the transaction, for the loop to
 /// release, if the requester doesn't end up with the transaction.
-type PendingSigning = Pin<Box<dyn Future<Output = Vec<NoteNullifier>> + Send + Sync>>;
+enum PendingRelease {
+    Transaction(MantleTxBuilder),
+    Channel {
+        note_set: NoteSetIndex,
+        nullifiers: Vec<NoteNullifier>,
+        owner: [u8; 32],
+    },
+}
+
+type PendingSigning = Pin<Box<dyn Future<Output = Option<PendingRelease>> + Send + Sync>>;
 
 async fn signing_permit(permits: &Semaphore) -> SemaphorePermit<'_> {
     permits
@@ -363,7 +430,27 @@ async fn signing_permit(permits: &Semaphore) -> SemaphorePermit<'_> {
         .expect("The semaphore is never closed.")
 }
 
-/// One wallet-owned UTXO old enough to take part in the leadership lottery.
+fn select_leader_notes(
+    keys: &HashMap<LeadershipPublicKeys, KeyId>,
+    aged: Vec<(OwnedNote, MerklePath)>,
+) -> Vec<AgedNote> {
+    aged.into_iter()
+        .filter(|(note, _)| note.note.stake_public_key != ZkPublicKey::zero())
+        .filter_map(|(note, aged_path)| {
+            keys.get(&LeadershipPublicKeys {
+                nullifier_public_key: note.note.public_key,
+                staking_public_key: note.note.stake_public_key,
+            })
+            .map(|key_id| AgedNote {
+                note,
+                aged_path,
+                key_id: key_id.clone(),
+            })
+        })
+        .collect()
+}
+
+/// One tracked UTXO old enough to take part in the leadership lottery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaderAgedNoteInfo {
     pub commitment: NoteCommitment,
@@ -373,13 +460,12 @@ pub struct LeaderAgedNoteInfo {
     pub public_key: ZkPublicKey,
 }
 
-/// The wallet's UTXOs that are eligible to lead at a given tip.
+/// The tracked UTXOs eligible to lead at a given tip.
 ///
 /// A note is eligible when it is present in the epoch's aged UTXO snapshot —
 /// the same stake distribution the leadership proof is built against — and its
-/// public key is one the wallet holds a key for. An empty `notes` means this
-/// node cannot win a slot at that tip: either it owns no notes, or none of
-/// them have aged into the current epoch's snapshot yet.
+/// public keys match a configured leadership credential pair. An empty `notes`
+/// means no tracked note has both eligible paths and matching credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderAgedNotesInfo {
     pub notes: Vec<LeaderAgedNoteInfo>,
@@ -445,6 +531,8 @@ impl WalletMsg {
             | Self::NewLeaderReward { .. }
             | Self::TrackLeaderReward { .. }
             | Self::ImportNote { .. }
+            | Self::ImportNotes { .. }
+            | Self::RecoverNote { .. }
             | Self::GetKnownAddresses { .. }
             | Self::ReleasePendingNotes { .. } => None,
         }
@@ -453,7 +541,10 @@ impl WalletMsg {
 
 #[derive(Clone, Debug)]
 pub struct WalletServiceSettings {
+    pub historical_recovery: Vec<RecoveryOpening>,
+    pub historical_recovery_withdrawals: Vec<u64>,
     pub known_keys: HashMap<KeyId, ZkPublicKey>,
+    pub leadership_keys: HashMap<KeyId, LeadershipPublicKeys>,
     pub voucher_master_key_id: KeyId,
     pub recovery_data: RecoveryData,
     /// How much LIB progress a pending note reservation survives before being
@@ -514,8 +605,9 @@ impl<Kms, Cryptarchia, Tx, TimeBackend, RuntimeServiceId> ServiceData
 {
     type Settings = WalletServiceSettings;
     type State = RecoveryState;
-    type StateOperator =
-        RecoveryOperator<StorageRecoveryBackend<Self::State, Self::Settings, RuntimeServiceId>>;
+    type StateOperator = RecoveryOperator<
+        StorageRecoveryBackend<RecoveryState, WalletServiceSettings, RuntimeServiceId>,
+    >;
     type Message = WalletMsg;
 }
 
@@ -560,6 +652,10 @@ where
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Service startup resolves wallet credentials before processing messages"
+    )]
     async fn run(mut self) -> Result<(), DynError> {
         let Self {
             mut service_resources_handle,
@@ -576,7 +672,7 @@ where
         )
         .await?;
 
-        let settings = service_resources_handle
+        let mut settings = service_resources_handle
             .settings_handle
             .notifier()
             .get_updated_settings();
@@ -598,6 +694,42 @@ where
                 .relay::<Kms>()
                 .await?,
         );
+
+        let mut configured = HashSet::new();
+        for public in settings.leadership_keys.values() {
+            if public.staking_public_key == ZkPublicKey::zero() || !configured.insert(*public) {
+                return Err("Leadership credential mappings require unique key pairs and nonzero staking keys".into());
+            }
+        }
+
+        for (id, expected) in settings.leadership_keys.clone() {
+            if !matches!(Box::pin(kms.public_key(id.clone())).await, Ok(PublicKeyEncoding::Leadership(actual)) if actual == expected)
+            {
+                warn!(target: LOG_TARGET, key_id = %id, "Leadership credentials are unavailable or do not match their configured public keys");
+                settings.leadership_keys.remove(&id);
+            }
+        }
+
+        for (spending_id, pk) in settings.known_keys.clone() {
+            if pk == *PK0 {
+                continue;
+            }
+            let public = LeadershipPublicKeys {
+                nullifier_public_key: pk,
+                staking_public_key: pk,
+            };
+            if configured.contains(&public) {
+                continue;
+            }
+            match Self::register_default_leadership(&kms, spending_id, pk).await {
+                Ok(id) => {
+                    settings.leadership_keys.insert(id, public);
+                }
+                Err(error) => {
+                    warn!(target: LOG_TARGET, ?error, "Unable to register default leadership credentials");
+                }
+            }
+        }
 
         // Query chain service for current state using the API
         let ChainServiceInfo {
@@ -641,6 +773,32 @@ where
         )
         .await?;
 
+        // Recovery is maintenance during startup. Reconcile chain movement
+        // before confirming the covered checkpoint and advertising readiness.
+        let latest = cryptarchia_api.info().await?.cryptarchia_info;
+        Self::backfill_if_not_in_sync(
+            Some(latest.tip),
+            &mut state,
+            &storage,
+            &cryptarchia_api,
+            &kms,
+            &settings.era_schedule,
+        )
+        .await?;
+        if !state.wallet().has_processed_block(latest.lib) {
+            Self::backfill_missing_blocks(
+                latest.lib,
+                &mut state,
+                &storage,
+                &cryptarchia_api,
+                &kms,
+                &settings.era_schedule,
+            )
+            .await?;
+        }
+        state.advance_lib(latest.lib, 0);
+        Self::complete_startup_recovery(&mut state, latest.tip, &storage).await?;
+
         // The transactions the wallet signs carry the fork digest of the era
         // the clock is in, and are funded for what that era charges: they can
         // only land in it or in a later one, even while the tip is older.
@@ -663,7 +821,13 @@ where
                 Some(msg) = service_resources_handle.inbound_relay.recv() => {
                     Box::pin(Self::handle_wallet_message(msg, &mut state, &voucher_master_key_id, &storage, &cryptarchia_api, &signer, &signings, &settings.era_schedule, era_in_force.parameters)).await;
                 }
-                Some(unused) = signings.next() => state.release_pending_notes(unused),
+                Some(unused) = signings.next() => match unused {
+                    Some(PendingRelease::Transaction(builder)) => state.release_transaction_notes(&builder),
+                    Some(PendingRelease::Channel { note_set, nullifiers, owner }) => {
+                        state.release_pending_notes_in(note_set, nullifiers, owner);
+                    }
+                    None => {},
+                },
                 Some(EraEvent::NewEra { era: new_era, .. }) = era_ticks.next() => {
                     if new_era > era_in_force.era {
                         era_in_force = settings.era_schedule.get(new_era).unwrap();
@@ -692,6 +856,10 @@ fn warn_lagged(stream: &str, skipped: u64) {
     warn!(target: LOG_TARGET, stream, skipped, "Wallet fell behind a chain subscription");
 }
 
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "startup recovery is grouped in its module"
+)]
 impl<Kms, Cryptarchia, Tx, TimeBackend, RuntimeServiceId>
     WalletService<Kms, Cryptarchia, Tx, TimeBackend, RuntimeServiceId>
 where
@@ -804,13 +972,19 @@ where
                 max_tx_fee,
                 resp_tx,
             } => {
+                let owner = tx_builder.reservation_id().unwrap_or_else(rand::random);
+                let tx_builder = tx_builder.with_reservation_id(owner);
+                if state.has_reserved_funding(&tx_builder) {
+                    Self::send_err(resp_tx, WalletError::InputReserved.into());
+                    return;
+                }
                 // Like a funding that fails, a request that fails before
                 // funding releases the notes `tx_builder`
                 // spends, such as a split.
                 let tip = match Self::msg_tip_or_latest(tip, cryptarchia).await {
                     Ok(tip) => tip,
                     Err(err) => {
-                        state.release_pending_notes(tx_builder.nullifiers_consumed());
+                        state.release_transaction_notes(&tx_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -823,7 +997,7 @@ where
                 let context = match Self::ledger_state_at(tip, cryptarchia).await {
                     Ok(ledger) => ledger.tx_context(era_settings.gas_profile),
                     Err(err) => {
-                        state.release_pending_notes(tx_builder.nullifiers_consumed());
+                        state.release_transaction_notes(&tx_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -853,13 +1027,18 @@ where
                     Self::add_change_note(&funded, change_pk, change_nonce, state, storage, kms)
                         .await
                 {
-                    state.release_pending_notes(funded.nullifiers_consumed());
+                    state.release_transaction_notes(&funded);
                     Self::send_err(resp_tx, err);
                     return;
                 }
 
-                let funded_notes: Vec<NoteNullifier> = funded.nullifiers_consumed().collect();
-                state.reserve_pending_notes(funded_notes.iter().copied());
+                // Rotate ownership when funding succeeds. Older copies of a
+                // partially built transaction cannot release this request's
+                // reservations if a later operation using them fails.
+                let funding_owner = rand::random();
+                state.reserve_transaction_notes(&funded, funding_owner);
+                let funded = funded.with_reservation_id(funding_owner);
+                let reservation_builder = funded.clone();
 
                 if resp_tx
                     .send(Ok(TipResponse {
@@ -868,7 +1047,7 @@ where
                     }))
                     .is_err()
                 {
-                    state.release_pending_notes(funded_notes);
+                    state.release_transaction_notes(&reservation_builder);
                     debug!(target: LOG_TARGET, "Failed to respond to FundTx");
                 }
             }
@@ -877,12 +1056,12 @@ where
                 tx_builder,
                 resp_tx,
             } => {
-                let funded_notes: Vec<NoteNullifier> = tx_builder.nullifiers_consumed().collect();
+                let reservation_builder = tx_builder.clone();
 
                 let tip = match Self::msg_tip_or_latest(tip, cryptarchia).await {
                     Ok(tip) => tip,
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -891,7 +1070,7 @@ where
                 let ledger = match Self::ledger_state_at(tip, cryptarchia).await {
                     Ok(ledger) => ledger,
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -905,10 +1084,16 @@ where
                     state.wallet(),
                 ) {
                     Ok(job) => {
-                        signings.push(Self::signing(job, tip, funded_notes, signer, resp_tx));
+                        signings.push(Self::signing(
+                            job,
+                            tip,
+                            reservation_builder,
+                            signer,
+                            resp_tx,
+                        ));
                     }
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                     }
                 }
@@ -918,12 +1103,12 @@ where
                 tx_builder,
                 resp_tx,
             } => {
-                let funded_notes: Vec<NoteNullifier> = tx_builder.nullifiers_consumed().collect();
+                let reservation_builder = tx_builder.clone();
 
                 let tip = match Self::msg_tip_or_latest(tip, cryptarchia).await {
                     Ok(tip) => tip,
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -932,7 +1117,7 @@ where
                 let ledger = match Self::ledger_state_at(tip, cryptarchia).await {
                     Ok(ledger) => ledger,
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
@@ -946,10 +1131,16 @@ where
                     state.wallet(),
                 ) {
                     Ok(job) => {
-                        signings.push(Self::funding_proof(job, tip, funded_notes, signer, resp_tx));
+                        signings.push(Self::funding_proof(
+                            job,
+                            tip,
+                            reservation_builder,
+                            signer,
+                            resp_tx,
+                        ));
                     }
                     Err(err) => {
-                        state.release_pending_notes(funded_notes);
+                        state.release_transaction_notes(&reservation_builder);
                         Self::send_err(resp_tx, err);
                     }
                 }
@@ -962,14 +1153,18 @@ where
                 funding_pks,
                 resp_tx,
             } => {
+                let reservation_owner = tx_builder.reservation_id().unwrap_or_else(rand::random);
+                let tx_builder = tx_builder.with_reservation_id(reservation_owner);
                 let tip = match Self::msg_tip_or_latest(tip, cryptarchia).await {
                     Ok(tip) => tip,
                     Err(err) => {
+                        state.release_transaction_notes(&tx_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
                 };
 
+                let previous_builder = tx_builder.clone();
                 let (tx_builder, exact_note, split_notes) = match Self::prepare_exact_note(
                     tip,
                     tx_builder,
@@ -984,11 +1179,13 @@ where
                 {
                     Ok(prepared) => prepared,
                     Err(err) => {
+                        state.release_transaction_notes(&previous_builder);
                         Self::send_err(resp_tx, err);
                         return;
                     }
                 };
-                state.reserve_pending_notes(split_notes.iter().copied());
+                state.reserve_pending_notes(split_notes.iter().copied(), reservation_owner);
+                let reservation_builder = tx_builder.clone();
 
                 if resp_tx
                     .send(Ok(TipResponse {
@@ -997,17 +1194,19 @@ where
                     }))
                     .is_err()
                 {
-                    state.release_pending_notes(split_notes);
+                    state.release_transaction_notes(&reservation_builder);
                     debug!(target: LOG_TARGET, "Failed to respond to PrepareExactNote");
                 }
             }
             WalletMsg::OwnedNote {
                 tip,
+                note_set,
                 commitment,
                 resp_tx,
             } => {
                 let response =
-                    Self::owned_note_at(tip, &commitment, state.wallet(), cryptarchia).await;
+                    Self::owned_note_at(tip, note_set, &commitment, state.wallet(), cryptarchia)
+                        .await;
                 if resp_tx.send(response).is_err() {
                     debug!(target: LOG_TARGET, "Failed to respond to OwnedNote");
                 }
@@ -1028,14 +1227,13 @@ where
                 resp_tx,
             } => {
                 let response =
-                    Self::leader_aged_notes_for_epoch(tip, epoch, state.wallet(), cryptarchia)
-                        .await;
+                    Self::leader_aged_notes_for_epoch(tip, epoch, state, cryptarchia).await;
                 if resp_tx.send(response).is_err() {
                     debug!(target: LOG_TARGET, "Failed to respond to GetLeaderAgedNotes");
                 }
             }
             WalletMsg::GetLeaderAgedNotesInfo { tip, resp_tx } => {
-                let response = Self::leader_aged_notes_at(tip, state.wallet(), cryptarchia)
+                let response = Self::leader_aged_notes_at(tip, state, cryptarchia)
                     .await
                     .map(|TipResponse { tip, response }| TipResponse {
                         tip,
@@ -1091,6 +1289,18 @@ where
                     debug!(target: LOG_TARGET, "Failed to respond to ImportNote");
                 }
             }
+            WalletMsg::ImportNotes { notes, resp_tx } => {
+                let result = Self::register_notes(notes, state, storage, kms).await;
+                if resp_tx.send(result).is_err() {
+                    debug!(target: LOG_TARGET, "Failed to respond to ImportNotes");
+                }
+            }
+            WalletMsg::RecoverNote { resp_tx, .. } => {
+                let result = Err(WalletServiceError::RecoveryRequiresRestart);
+                if resp_tx.send(result).is_err() {
+                    debug!(target: LOG_TARGET, "Failed to respond to RecoverNote");
+                }
+            }
             WalletMsg::ProveChannelStep {
                 tip,
                 request,
@@ -1104,15 +1314,18 @@ where
                     }
                 };
                 match Self::channel_step_job(tip, request, state, storage, kms).await {
-                    Ok((step, outputs, witness)) => {
+                    Ok((step, outputs, witness, note_set)) => {
                         // The proof runs off the loop: the notes are held from
                         // now, so that no other request spends them meanwhile.
                         let spent: Vec<NoteNullifier> = step.inputs().iter().copied().collect();
-                        state.reserve_pending_notes(spent.iter().copied());
+                        let owner = rand::random();
+                        state.reserve_pending_notes_in(note_set, spent.iter().copied(), owner);
                         signings.push(Self::channel_step_proof(
                             (step, outputs, witness),
                             tip,
+                            note_set,
                             spent,
+                            owner,
                             signer,
                             resp_tx,
                         ));
@@ -1137,7 +1350,28 @@ where
                     Self::channel_withdrawal(tip, channel_id, &notes, state, storage, kms)
                         .await
                         .map(|response| TipResponse { tip, response });
+                let reservation = response.as_ref().ok().and_then(|response| {
+                    channel_note_set(channel_id).map(|set| {
+                        (
+                            set,
+                            response
+                                .response
+                                .op
+                                .inputs
+                                .iter()
+                                .copied()
+                                .collect::<Vec<_>>(),
+                            response.response.reservation_id,
+                        )
+                    })
+                });
+                if let Some((set, inputs, owner)) = &reservation {
+                    state.reserve_pending_notes_in(*set, inputs.iter().copied(), *owner);
+                }
                 if resp_tx.send(response).is_err() {
+                    if let Some((set, inputs, owner)) = reservation {
+                        state.release_pending_notes_in(set, inputs, owner);
+                    }
                     debug!(target: LOG_TARGET, "Failed to respond to ChannelWithdrawal");
                 }
             }
@@ -1165,8 +1399,13 @@ where
                     debug!(target: LOG_TARGET, "Failed to respond to SpendRoot");
                 }
             }
-            WalletMsg::ReleasePendingNotes { nullifiers } => {
-                state.release_pending_notes(nullifiers);
+            WalletMsg::ReleasePendingNotes {
+                nullifiers,
+                owner,
+                builder,
+            } => {
+                state.release_pending_notes(nullifiers, owner);
+                state.release_transaction_notes(&builder);
             }
         }
     }
@@ -1225,7 +1464,7 @@ where
     fn signing(
         job: TxSigningRequest,
         tip: HeaderId,
-        funded_notes: Vec<NoteNullifier>,
+        reservation_builder: MantleTxBuilder,
         signer: &TxSigner<Kms, RuntimeServiceId>,
         resp_tx: Sender<
             Result<TipResponse<SignedOps<Preverified, StandardMode>>, WalletServiceError>,
@@ -1249,11 +1488,8 @@ where
                 debug!(target: LOG_TARGET, "Failed to respond to a signing request");
             }
 
-            if signing_failed || !response_delivered {
-                funded_notes
-            } else {
-                Vec::new()
-            }
+            (signing_failed || !response_delivered)
+                .then_some(PendingRelease::Transaction(reservation_builder))
         })
     }
 
@@ -1333,7 +1569,7 @@ where
     fn funding_proof(
         (ops, witness): (Ops, Option<OpWitness>),
         tip: HeaderId,
-        funded_notes: Vec<NoteNullifier>,
+        reservation_builder: MantleTxBuilder,
         signer: &TxSigner<Kms, RuntimeServiceId>,
         resp_tx: Sender<Result<TipResponse<ProvenFunding>, WalletServiceError>>,
     ) -> PendingSigning {
@@ -1360,11 +1596,8 @@ where
                 debug!(target: LOG_TARGET, "Failed to respond to ProveFunding");
             }
 
-            if proving_failed || !response_delivered {
-                funded_notes
-            } else {
-                Vec::new()
-            }
+            (proving_failed || !response_delivered)
+                .then_some(PendingRelease::Transaction(reservation_builder))
         })
     }
 
@@ -1509,27 +1742,30 @@ where
 
     async fn owned_note_at(
         tip: Option<HeaderId>,
+        note_set: NoteSetIndex,
         commitment: &NoteCommitment,
         wallet: &Wallet,
         cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
     ) -> Result<TipResponse<Option<OwnedNote>>, WalletServiceError> {
         let tip = Self::msg_tip_or_latest(tip, cryptarchia).await?;
-        let owned_note = wallet.wallet_state_at(tip)?.owned_note(commitment)?;
+        let owned_note = wallet
+            .wallet_state_at(tip)?
+            .owned_note(note_set, commitment)?;
         Ok(TipResponse {
             tip,
             response: owned_note,
         })
     }
 
-    /// Resolves the wallet-owned UTXOs that are eligible to lead at `tip`
+    /// Resolves tracked UTXOs that are eligible to lead at `tip`
     /// (or at the current tip when `tip` is `None`), paired with the key ids
     /// needed to build a leadership proof for them.
     async fn leader_aged_notes_at(
         tip: Option<HeaderId>,
-        wallet: &Wallet,
+        state: &ServiceState<'_>,
         cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
     ) -> Result<TipResponse<Vec<AgedNote>>, WalletServiceError> {
-        Self::leader_notes_with(tip, wallet, cryptarchia, WalletState::aged_notes).await
+        Self::leader_notes_with(tip, state, cryptarchia, WalletState::aged_notes).await
     }
 
     // The leader's eligible notes for a slot of `epoch`, which can be past the
@@ -1537,38 +1773,30 @@ where
     async fn leader_aged_notes_for_epoch(
         tip: Option<HeaderId>,
         epoch: Epoch,
-        wallet: &Wallet,
+        state: &ServiceState<'_>,
         cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
     ) -> Result<TipResponse<Vec<AgedNote>>, WalletServiceError> {
-        Self::leader_notes_with(tip, wallet, cryptarchia, |state| state.aged_notes_at(epoch)).await
+        Self::leader_notes_with(tip, state, cryptarchia, |state| state.aged_notes_at(epoch)).await
     }
 
     async fn leader_notes_with(
         tip: Option<HeaderId>,
-        wallet: &Wallet,
+        state: &ServiceState<'_>,
         cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
         aged_notes: impl FnOnce(&WalletState) -> Result<Vec<(OwnedNote, MerklePath)>, WalletError>,
     ) -> Result<TipResponse<Vec<AgedNote>>, WalletServiceError> {
         let tip = Self::msg_tip_or_latest(tip, cryptarchia).await?;
 
-        let wallet_state = wallet.wallet_state_at(tip).map_err(|err| {
-            error!(target: LOG_TARGET, err = ?err, "Failed to fetch wallet state");
-            WalletServiceError::FailedToFetchWalletStateForBlock(tip)
-        })?;
+        let wallet_state = state
+            .leadership_wallet()
+            .wallet_state_at(tip)
+            .map_err(|err| {
+                error!(target: LOG_TARGET, err = ?err, "Failed to fetch wallet state");
+                WalletServiceError::FailedToFetchWalletStateForBlock(tip)
+            })?;
 
-        let eligible_notes = aged_notes(&wallet_state)?
-            .into_iter()
-            .filter_map(|(note, aged_path)| {
-                wallet
-                    .known_keys()
-                    .get(&note.note.public_key)
-                    .map(|key_id| AgedNote {
-                        note,
-                        aged_path,
-                        key_id: key_id.clone(),
-                    })
-            })
-            .collect();
+        let eligible_notes =
+            select_leader_notes(state.leadership_keys(), aged_notes(&wallet_state)?);
 
         Ok(TipResponse {
             tip,
@@ -1596,8 +1824,42 @@ where
                 .await
                 .map_err(|_| WalletServiceError::KmsApi(error))?;
         }
+        let public = LeadershipPublicKeys {
+            nullifier_public_key: pk,
+            staking_public_key: pk,
+        };
+        if !state.leadership_keys().contains_key(&public) {
+            let leadership_id = Self::register_default_leadership(kms, key_id.clone(), pk).await?;
+            state.add_leadership_key(leadership_id, public);
+        }
         state.add_known_key(pk, key_id);
         Ok(pk)
+    }
+
+    async fn register_default_leadership(
+        kms: &KmsServiceApi<Kms, RuntimeServiceId>,
+        spending_id: KeyId,
+        expected_pk: ZkPublicKey,
+    ) -> Result<KeyId, WalletServiceError> {
+        let destination = format!("leadership/default/{spending_id}");
+        let result =
+            Box::pin(kms.register_default_leadership(spending_id, destination.clone())).await;
+        let public = match result {
+            Ok((_, public)) => public,
+            Err(_) => Box::pin(kms.public_key(destination.clone()))
+                .await
+                .map_err(WalletServiceError::KmsApi)?,
+        };
+        let expected = LeadershipPublicKeys {
+            nullifier_public_key: expected_pk,
+            staking_public_key: expected_pk,
+        };
+        if public != PublicKeyEncoding::Leadership(expected) {
+            return Err(WalletServiceError::KmsApi(
+                "Default leadership credentials do not match configured spending key".into(),
+            ));
+        }
+        Ok(destination)
     }
 
     // The opening of `note` with the nullifier its key derives.
@@ -1626,6 +1888,31 @@ where
         })
     }
 
+    async fn leadership_known_note(
+        kms: &KmsServiceApi<Kms, RuntimeServiceId>,
+        key_id: KeyId,
+        note: Note,
+        note_set: NoteSetIndex,
+    ) -> Result<KnownNote, WalletServiceError> {
+        let (output_tx, output_rx) = oneshot::channel();
+        Box::pin(kms.execute(
+            key_id,
+            KeyOperators::Leadership(Box::new(DeriveLeadershipNullifier::new(note, output_tx))),
+        ))
+        .await
+        .map_err(|error| WalletServiceError::KmsApi(Box::new(error)))?;
+        let nullifier = output_rx.await.map_err(|_| {
+            WalletServiceError::KmsApi(
+                "KMS API did not respond with the leadership nullifier".into(),
+            )
+        })?;
+        Ok(KnownNote {
+            note,
+            note_set,
+            nullifier,
+        })
+    }
+
     // The note with the nullifier the key of the wallet it is under derives.
     async fn held_note(
         note: Note,
@@ -1633,6 +1920,9 @@ where
         state: &ServiceState<'_>,
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
     ) -> Result<KnownNote, WalletServiceError> {
+        if note.public_key == *PK0 {
+            return Err(WalletServiceError::UnknownKey(note.public_key));
+        }
         let key_id = state
             .wallet()
             .known_keys()
@@ -1649,9 +1939,183 @@ where
         storage: &StorageApi<Tx>,
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
     ) -> Result<KnownNote, WalletServiceError> {
-        let known_note = Self::held_note(note, note_set, state, kms).await?;
-        state.store_known_notes(storage, &[known_note]).await?;
-        Ok(known_note)
+        Self::import_note_record(note, note_set, state, storage, kms, false).await
+    }
+
+    async fn import_note_record(
+        note: Note,
+        note_set: NoteSetIndex,
+        state: &mut ServiceState<'_>,
+        storage: &StorageApi<Tx>,
+        kms: &KmsServiceApi<Kms, RuntimeServiceId>,
+        historical: bool,
+    ) -> Result<KnownNote, WalletServiceError> {
+        let public = LeadershipPublicKeys {
+            nullifier_public_key: note.public_key,
+            staking_public_key: note.stake_public_key,
+        };
+        let leadership_id = state.leadership_keys().get(&public).cloned();
+        let leadership = if let Some(key_id) = leadership_id {
+            let known = Self::leadership_known_note(kms, key_id, note, note_set).await?;
+            Some(known)
+        } else {
+            None
+        };
+        let spending = if note.public_key != *PK0
+            && state.wallet().known_keys().contains_key(&note.public_key)
+        {
+            Some(Self::held_note(note, note_set, state, kms).await?)
+        } else {
+            None
+        };
+        let known = spending
+            .or(leadership)
+            .ok_or(WalletServiceError::UnknownKey(note.public_key))?;
+        if historical {
+            storage
+                .store_wallet_historical_openings(spending.as_slice(), leadership.as_slice())
+                .await
+        } else {
+            storage
+                .store_wallet_openings(spending.as_slice(), leadership.as_slice())
+                .await
+        }
+        .map_err(WalletServiceError::PersistedState)?;
+        if let Some(spending) = spending {
+            state.add_known_notes([spending]);
+        }
+        if let Some(leadership) = leadership {
+            state.add_leadership_notes([leadership]);
+        }
+        Ok(known)
+    }
+
+    async fn register_notes(
+        notes: Vec<(Note, NoteSetIndex)>,
+        state: &mut ServiceState<'_>,
+        storage: &StorageApi<Tx>,
+        kms: &KmsServiceApi<Kms, RuntimeServiceId>,
+    ) -> Result<Vec<KnownNote>, WalletServiceError> {
+        let mut imported = Vec::with_capacity(notes.len());
+        for (note, note_set) in notes {
+            imported.push(Self::import_note(note, note_set, state, storage, kms).await?);
+        }
+        Ok(imported)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "recovery needs the chain and wallet services"
+    )]
+    #[cfg(test)]
+    async fn recover_note(
+        note: Note,
+        note_set: NoteSetIndex,
+        path: MerklePath,
+        state: &mut ServiceState<'_>,
+        storage: &StorageApi<Tx>,
+        cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
+        kms: &KmsServiceApi<Kms, RuntimeServiceId>,
+        era_schedule: &ServiceEraSchedule,
+    ) -> Result<KnownNote, WalletServiceError> {
+        // Bound chain queries as well as replay. Otherwise fabricated paths can
+        // keep the wallet busy when the chain service is unavailable.
+        if path.siblings().len() != 40 {
+            return Err(WalletServiceError::InvalidHistoricalPath);
+        }
+        state.admit_historical_replay()?;
+        let tip = cryptarchia.info().await?.cryptarchia_info.tip;
+        let ledger = Self::ledger_state_at(tip, cryptarchia).await?;
+        let mmr = ledger
+            .latest_note_sets()
+            .get(note_set)
+            .ok_or(WalletServiceError::InvalidHistoricalPath)?
+            .commitments();
+        if !valid_historical_path(mmr, note, &path) {
+            return Err(WalletServiceError::InvalidHistoricalPath);
+        }
+        Self::backfill_if_not_in_sync(Some(tip), state, storage, cryptarchia, kms, era_schedule)
+            .await?;
+        let public = LeadershipPublicKeys {
+            nullifier_public_key: note.public_key,
+            staking_public_key: note.stake_public_key,
+        };
+        let spending = if state.wallet().known_keys().contains_key(&note.public_key)
+            && note.public_key != *PK0
+        {
+            Some(Self::held_note(note, note_set, state, kms).await?)
+        } else {
+            None
+        };
+        let leadership = if let Some(key_id) = state.leadership_keys().get(&public) {
+            Some(Self::leadership_known_note(kms, key_id.clone(), note, note_set).await?)
+        } else {
+            None
+        };
+        let known = spending
+            .or(leadership)
+            .ok_or(WalletServiceError::UnknownKey(note.public_key))?;
+        let id = NoteId::new(note_set, note.commitment());
+        let tracked = |wallet: &Wallet, known: KnownNote| -> Result<bool, WalletServiceError> {
+            let snapshot = wallet.wallet_state_at(tip)?;
+            Ok(snapshot.notes.contains_key(&id)
+                || snapshot.spent.contains(&SpentNullifier {
+                    note_set,
+                    nullifier: known.nullifier,
+                }))
+        };
+        if spending
+            .map(|k| tracked(state.wallet(), k))
+            .transpose()?
+            .unwrap_or(true)
+            && leadership
+                .map(|k| tracked(state.leadership_wallet(), k))
+                .transpose()?
+                .unwrap_or(true)
+        {
+            return Ok(known);
+        }
+        // The MMR stores its frontier, so an opening imported after its
+        // commitment needs the same replay used for recovery to reconstruct
+        // its path. Stage the replay before changing the live state.
+        let mut staged = state.replay_copy();
+        let retained = state.wallet().retained_blocks().collect::<Vec<_>>();
+        let imported =
+            Self::import_note_record(note, note_set, &mut staged, storage, kms, true).await?;
+        staged.restore_replay_openings(storage).await?;
+        let old_lib = state.lib();
+        let genesis = cryptarchia.get_genesis_block().await?;
+        let genesis_tx = genesis.genesis_tx();
+        let notes = genesis_tx.initial_notes();
+        let service_notes = genesis_tx
+            .sdp_declarations()
+            .map(|declaration| declaration.operation().service_note())
+            .collect::<Vec<_>>();
+        staged.rewind_to_genesis(genesis.header().id(), &notes, &service_notes)?;
+        Self::backfill_missing_blocks(tip, &mut staged, storage, cryptarchia, kms, era_schedule)
+            .await?;
+        for block in retained {
+            if !staged.wallet().has_processed_block(block) {
+                Self::backfill_missing_blocks(
+                    block,
+                    &mut staged,
+                    storage,
+                    cryptarchia,
+                    kms,
+                    era_schedule,
+                )
+                .await?;
+            }
+        }
+        if !staged.wallet().has_processed_block(old_lib) {
+            return Err(WalletServiceError::FailedToFetchWalletStateForBlock(
+                old_lib,
+            ));
+        }
+        staged.advance_lib(old_lib, 0);
+        staged.persist_after_replay();
+        *state = staged;
+        Ok(imported)
     }
 
     // A user step, or a program deposit, spending the channel notes of the
@@ -1663,7 +2127,7 @@ where
         state: &mut ServiceState<'_>,
         storage: &StorageApi<Tx>,
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
-    ) -> Result<(Step, Vec<Note>, OpWitness), WalletServiceError> {
+    ) -> Result<(Step, Vec<Note>, OpWitness, NoteSetIndex), WalletServiceError> {
         let (step, opening, witness, note_set) = channel::build_step(tip, request, state)?;
 
         let mut known_notes = Vec::new();
@@ -1674,7 +2138,7 @@ where
         }
         state.store_known_notes(storage, &known_notes).await?;
 
-        Ok((step, opening.outputs, witness))
+        Ok((step, opening.outputs, witness, note_set))
     }
 
     /// Proves `step` from its `witness` and answers the request, as
@@ -1683,7 +2147,9 @@ where
     fn channel_step_proof(
         (step, outputs, witness): (Step, Vec<Note>, OpWitness),
         tip: HeaderId,
+        note_set: NoteSetIndex,
         spent: Vec<NoteNullifier>,
+        owner: [u8; 32],
         signer: &TxSigner<Kms, RuntimeServiceId>,
         resp_tx: Sender<Result<TipResponse<ChannelStep>, WalletServiceError>>,
     ) -> PendingSigning {
@@ -1698,6 +2164,7 @@ where
                     step,
                     proof,
                     outputs,
+                    reservation_id: owner,
                 },
             });
 
@@ -1708,11 +2175,11 @@ where
                 debug!(target: LOG_TARGET, "Failed to respond to ProveChannelStep");
             }
 
-            if proving_failed || !response_delivered {
-                spent
-            } else {
-                Vec::new()
-            }
+            (proving_failed || !response_delivered).then_some(PendingRelease::Channel {
+                note_set,
+                nullifiers: spent,
+                owner,
+            })
         })
     }
 
@@ -1843,18 +2310,29 @@ where
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
     ) -> Result<(), WalletServiceError> {
         for (note_set, note) in &block.revealed {
-            let Some(key_id) = state.wallet().known_keys().get(&note.public_key).cloned() else {
-                continue;
-            };
-            if state
-                .wallet()
-                .known_notes()
-                .contains_key(&note.commitment())
+            if note.public_key != *PK0
+                && let Some(key_id) = state.wallet().known_keys().get(&note.public_key).cloned()
+                && !state
+                    .wallet()
+                    .known_notes()
+                    .contains_key(&NoteId::new(*note_set, note.commitment()))
             {
-                continue;
+                let known_note = Self::known_note(kms, key_id, *note, *note_set).await?;
+                state.store_known_notes(storage, &[known_note]).await?;
             }
-            let known_note = Self::known_note(kms, key_id, *note, *note_set).await?;
-            state.store_known_notes(storage, &[known_note]).await?;
+            let public = LeadershipPublicKeys {
+                nullifier_public_key: note.public_key,
+                staking_public_key: note.stake_public_key,
+            };
+            if let Some(key_id) = state.leadership_keys().get(&public).cloned()
+                && !state
+                    .leadership_wallet()
+                    .known_notes()
+                    .contains_key(&NoteId::new(*note_set, note.commitment()))
+            {
+                let known = Self::leadership_known_note(kms, key_id, *note, *note_set).await?;
+                state.store_leadership_notes(storage, &[known]).await?;
+            }
         }
         Ok(())
     }
@@ -1869,6 +2347,9 @@ where
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
         storage: &StorageApi<Tx>,
     ) -> Result<ServiceState<'u>, WalletServiceError> {
+        let (prepared, pending) =
+            Self::prepare_startup_recovery(initial_state, settings, storage, kms).await?;
+        initial_state = prepared;
         let known_notes = storage
             .load_wallet_known_notes()
             .await
@@ -1877,26 +2358,23 @@ where
             .load_wallet_reward_key_count()
             .await
             .map_err(WalletServiceError::PersistedState)?;
-        let mut state = match initial_state.take_lib_wallet_state() {
+        let leadership_notes = storage
+            .load_wallet_leadership_notes()
+            .await
+            .map_err(WalletServiceError::PersistedState)?;
+        initial_state.restore_spending_records(known_notes, reward_key_count);
+        initial_state.restore_leadership_records(&leadership_notes, pending);
+        let mut state = match initial_state.take_lib_wallet_state(settings) {
             Some((lib, wallet_state)) => ServiceState::from_lib_wallet_state(
-                known_notes,
-                reward_key_count,
+                initial_state,
                 lib,
                 wallet_state,
                 settings,
                 updater,
             ),
             None => {
-                Self::genesis_state(
-                    known_notes,
-                    reward_key_count,
-                    settings,
-                    updater,
-                    cryptarchia,
-                    kms,
-                    storage,
-                )
-                .await?
+                Self::genesis_state(initial_state, settings, updater, cryptarchia, kms, storage)
+                    .await?
             }
         };
 
@@ -1916,14 +2394,34 @@ where
     // A fresh wallet starts at the genesis block, knowing the genesis notes
     // of its keys.
     async fn genesis_state<'u>(
-        mut known_notes: KnownNotes,
-        reward_key_count: u64,
+        mut state: RecoveryState,
         settings: &WalletServiceSettings,
         updater: &'u StateUpdater<Option<RecoveryState>>,
         cryptarchia: &CryptarchiaServiceApi<Cryptarchia>,
         kms: &KmsServiceApi<Kms, RuntimeServiceId>,
         storage: &StorageApi<Tx>,
     ) -> Result<ServiceState<'u>, WalletServiceError> {
+        let remembered = state
+            .leadership_known_notes()
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for known in remembered {
+            let public = LeadershipPublicKeys {
+                nullifier_public_key: known.note.public_key,
+                staking_public_key: known.note.stake_public_key,
+            };
+            if let Some((key_id, _)) = settings
+                .leadership_keys
+                .iter()
+                .find(|(_, candidate)| **candidate == public)
+            {
+                let refreshed =
+                    Self::leadership_known_note(kms, key_id.clone(), known.note, known.note_set)
+                        .await?;
+                state.update_leadership_note(refreshed);
+            }
+        }
         let genesis = cryptarchia.get_genesis_block().await?;
         let genesis_tx = genesis.genesis_tx();
         let notes = genesis_tx.initial_notes();
@@ -1935,34 +2433,49 @@ where
         let key_ids = settings
             .known_keys
             .iter()
+            .filter(|(_, pk)| **pk != *PK0)
             .map(|(key_id, pk)| (*pk, key_id))
             .collect::<HashMap<_, _>>();
-        let mut genesis_known_notes = Vec::new();
+        let mut known_notes = Vec::new();
+        let mut leadership_notes = Vec::new();
         for (note_set, note) in notes
             .iter()
             .map(|note| (NoteSetIndex::Ledger, note))
             .chain(service_notes.iter().map(|note| (NoteSetIndex::Sdp, note)))
         {
             if let Some(key_id) = key_ids.get(&note.public_key) {
-                genesis_known_notes
-                    .push(Self::known_note(kms, (*key_id).clone(), *note, note_set).await?);
+                known_notes.push(Self::known_note(kms, (*key_id).clone(), *note, note_set).await?);
+            }
+            let public = LeadershipPublicKeys {
+                nullifier_public_key: note.public_key,
+                staking_public_key: note.stake_public_key,
+            };
+            if let Some((key_id, _)) = settings
+                .leadership_keys
+                .iter()
+                .find(|(_, candidate)| **candidate == public)
+            {
+                leadership_notes
+                    .push(Self::leadership_known_note(kms, key_id.clone(), *note, note_set).await?);
             }
         }
 
         storage
-            .store_wallet_known_notes(&genesis_known_notes)
+            .store_wallet_known_notes(&known_notes)
             .await
             .map_err(WalletServiceError::PersistedState)?;
-        for note in genesis_known_notes {
-            known_notes.insert_mut(note.note.commitment(), note);
-        }
+        storage
+            .store_wallet_leadership_notes(&leadership_notes)
+            .await
+            .map_err(WalletServiceError::PersistedState)?;
         Ok(ServiceState::from_genesis(
-            known_notes,
-            reward_key_count,
+            state,
             settings,
             genesis.header().id(),
             &notes,
             &service_notes,
+            known_notes,
+            leadership_notes,
             updater,
         )?)
     }
@@ -2204,20 +2717,28 @@ where
         );
 
         // Fetch block IDs in [state.lib, tip]
-        let missing_headers = cryptarchia_api
-            .get_headers(Some(tip), Some(state.lib()))
+        let mut stream = tokio::time::timeout(
+            HISTORY_QUERY_TIMEOUT,
+            cryptarchia_api.get_headers(Some(tip), Some(state.lib())),
+        )
+        .await
+        .map_err(|_| WalletServiceError::HistoryQueryTimeout)?
+        .map_err(WalletServiceError::CryptarchiaApi)
+        .inspect_err(|e| {
+            error!(
+                target: LOG_TARGET,
+                block_id = ?tip,
+                err = %e,
+                "Failed to fetch missing headers for backfill"
+            );
+        })?;
+        let mut missing_headers = Vec::new();
+        while let Some(header) = tokio::time::timeout(HISTORY_QUERY_TIMEOUT, stream.try_next())
             .await
-            .map_err(WalletServiceError::CryptarchiaApi)
-            .inspect_err(|e| {
-                error!(
-                    target: LOG_TARGET,
-                    block_id = ?tip,
-                    err = %e,
-                    "Failed to fetch missing headers for backfill"
-                );
-            })?
-            .try_collect::<Vec<_>>()
-            .await?;
+            .map_err(|_| WalletServiceError::HistoryQueryTimeout)??
+        {
+            missing_headers.push(header);
+        }
 
         if !missing_headers.is_empty() {
             debug!(
@@ -2237,8 +2758,16 @@ where
                 continue;
             }
 
-            let block = Self::load_block(header_id, storage).await?;
-            let events = Self::load_block_events(header_id, storage).await?;
+            let block =
+                tokio::time::timeout(HISTORY_QUERY_TIMEOUT, Self::load_block(header_id, storage))
+                    .await
+                    .map_err(|_| WalletServiceError::HistoryQueryTimeout)??;
+            let events = tokio::time::timeout(
+                HISTORY_QUERY_TIMEOUT,
+                Self::load_block_events(header_id, storage),
+            )
+            .await
+            .map_err(|_| WalletServiceError::HistoryQueryTimeout)??;
             let wallet_block = WalletBlock::from_block(
                 &block,
                 era_schedule.epoch_for_slot(block.header().slot()),

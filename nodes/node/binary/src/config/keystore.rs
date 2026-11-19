@@ -129,6 +129,17 @@ impl Keystore {
                 )?,
             ),
             (
+                "wallet.leadership_keys",
+                to_value(
+                    self.get_all()
+                        .filter_map(|(id, key)| match key {
+                            Key::Leadership(key) => Some((id, key.as_public_key())),
+                            Key::Ed25519(_) | Key::Zk(_) => None,
+                        })
+                        .collect::<HashMap<_, _>>(),
+                )?,
+            ),
+            (
                 "kms.backend.keys",
                 to_value(self.get_all().collect::<HashMap<_, _>>())?,
             ),
@@ -185,7 +196,7 @@ impl Keystore {
 
         match generic_key {
             Key::Ed25519(inner_key) => Ok((key_id, inner_key.clone().into_unsecured())),
-            Key::Zk(_) => Err(KeystoreError::Ed25519Expected(title)),
+            Key::Zk(_) | Key::Leadership(_) => Err(KeystoreError::Ed25519Expected(title)),
         }
     }
 
@@ -200,7 +211,7 @@ impl Keystore {
 
         match generic_key {
             Key::Zk(inner_key) => Ok((id, inner_key.clone().into_unsecured())),
-            Key::Ed25519(_) => Err(KeystoreError::ZkExpected(title)),
+            Key::Ed25519(_) | Key::Leadership(_) => Err(KeystoreError::ZkExpected(title)),
         }
     }
 
@@ -213,7 +224,7 @@ impl Keystore {
                     let unsecured = inner_key.clone().into_unsecured();
                     Some((id, unsecured))
                 }
-                Key::Ed25519(_) => None,
+                Key::Ed25519(_) | Key::Leadership(_) => None,
             })
     }
 
@@ -272,6 +283,14 @@ fn key_id(key: &Key) -> KeyId {
     let key_id_bytes = match key {
         Key::Ed25519(ed25519_secret_key) => ed25519_secret_key.as_public_key().to_bytes(),
         Key::Zk(zk_secret_key) => fr_to_bytes(zk_secret_key.as_public_key().as_fr()),
+        Key::Leadership(key) => {
+            let public = key.as_public_key();
+            return format!(
+                "leadership/{}/{}",
+                hex::encode(fr_to_bytes(public.nullifier_public_key.as_fr())),
+                hex::encode(fr_to_bytes(public.staking_public_key.as_fr()))
+            );
+        }
     };
     hex::encode(key_id_bytes)
 }

@@ -14,6 +14,7 @@ axum                          = { features = ["http1", "http2", "json", "tokio"]
 clap                          = { features = ["derive", "env", "std"], workspace = true }
 hex                           = { features = ["alloc"], workspace = true }
 lb-common-http-client         = { workspace = true }
+lb-core                       = { workspace = true }
 lb-groth16                    = { workspace = true }
 lb-http-api-common            = { workspace = true }
 lb-key-management-system-keys = { workspace = true }
@@ -21,6 +22,10 @@ lb-wallet                     = { workspace = true }
 reqwest                       = { workspace = true }
 serde_json                    = { workspace = true }
 tokio                         = { features = ["macros", "net", "rt-multi-thread", "sync", "time"], workspace = true }
+
+[dev-dependencies]
+lb-core  = { features = ["test-utils"], workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

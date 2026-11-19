@@ -5,44 +5,112 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use lb_binary_codec::bincode::SerializeOp as _;
-use lb_core::mantle::notes::NoteCommitment;
 use lb_groth16::fr_to_bytes;
-use lb_wallet::{KnownNote, KnownNotes};
+use lb_wallet::{KnownNote, KnownNotes, NoteId};
 use overwatch::DynError;
 
 use super::StorageApi;
 
 const OPENINGS: &[u8] = b"wallet/openings/";
+const LEADERSHIP_OPENINGS: &[u8] = b"wallet/leadership_openings/";
+const HISTORICAL_OPENINGS: &[u8] = b"wallet/historical_openings";
 const REWARD_KEY_COUNT: &[u8] = b"wallet/reward_key_count";
 
-fn opening_key(commitment: &NoteCommitment) -> Bytes {
-    let mut key = Vec::with_capacity(OPENINGS.len() + 32);
-    key.extend_from_slice(OPENINGS);
-    key.extend_from_slice(&fr_to_bytes(&commitment.0));
-    key.into()
+fn opening_key(prefix: &[u8], id: NoteId) -> Result<Bytes, DynError> {
+    let mut key = prefix.to_vec();
+    key.extend_from_slice(&id.note_set.to_bytes()?);
+    key.extend_from_slice(&fr_to_bytes(&id.commitment.0));
+    Ok(key.into())
 }
 
 impl<Tx> StorageApi<Tx> {
+    /// Atomically stores spending and leadership openings in separate
+    /// namespaces.
+    pub async fn store_wallet_openings(
+        &self,
+        spending: &[KnownNote],
+        leadership: &[KnownNote],
+    ) -> Result<(), DynError> {
+        self.store_wallet_openings_inner(spending, leadership, false)
+            .await
+    }
+
+    /// Save both authority namespaces and their recovery request atomically.
+    pub async fn store_wallet_recovery_openings<Metadata: serde::Serialize + Sync>(
+        &self,
+        spending: &[KnownNote],
+        leadership: &[KnownNote],
+        key: Bytes,
+        metadata: &Metadata,
+    ) -> Result<(), DynError> {
+        let mut items = spending
+            .iter()
+            .map(|note| (OPENINGS, note))
+            .chain(leadership.iter().map(|note| (LEADERSHIP_OPENINGS, note)))
+            .map(|(prefix, note)| Ok((opening_key(prefix, note.id())?, note.to_bytes()?)))
+            .collect::<Result<HashMap<_, _>, DynError>>()?;
+        items.insert(key, metadata.to_bytes()?);
+        self.bulk_store_confirmed(items).await
+    }
+
+    /// Save a historical opening and the recovery marker in the same batch.
+    pub async fn store_wallet_historical_openings(
+        &self,
+        spending: &[KnownNote],
+        leadership: &[KnownNote],
+    ) -> Result<(), DynError> {
+        self.store_wallet_openings_inner(spending, leadership, true)
+            .await
+    }
+
+    async fn store_wallet_openings_inner(
+        &self,
+        spending: &[KnownNote],
+        leadership: &[KnownNote],
+        historical: bool,
+    ) -> Result<(), DynError> {
+        let mut items = spending
+            .iter()
+            .map(|note| (OPENINGS, note))
+            .chain(leadership.iter().map(|note| (LEADERSHIP_OPENINGS, note)))
+            .map(|(prefix, note)| Ok((opening_key(prefix, note.id())?, note.to_bytes()?)))
+            .collect::<Result<HashMap<_, _>, DynError>>()?;
+        if historical {
+            items.insert(Bytes::from_static(HISTORICAL_OPENINGS), true.to_bytes()?);
+        }
+        if !items.is_empty() {
+            self.bulk_store_confirmed(items).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn wallet_requires_historical_replay(&self) -> Result<bool, DynError> {
+        self.load(Bytes::from_static(HISTORICAL_OPENINGS))
+            .await
+            .map(Option::unwrap_or_default)
+    }
+
+    /// Saves leadership openings separately from spendable wallet openings.
+    pub async fn store_wallet_leadership_notes(&self, notes: &[KnownNote]) -> Result<(), DynError> {
+        self.store_wallet_openings(&[], notes).await
+    }
+
+    pub async fn load_wallet_leadership_notes(&self) -> Result<KnownNotes, DynError> {
+        let notes = self
+            .load_prefix::<KnownNote>(Bytes::from_static(LEADERSHIP_OPENINGS))
+            .await?;
+        Ok(notes.into_iter().map(|note| (note.id(), note)).collect())
+    }
     /// Saves every opening in one atomic write, returning the database result.
     pub async fn store_wallet_known_notes(&self, notes: &[KnownNote]) -> Result<(), DynError> {
-        if notes.is_empty() {
-            return Ok(());
-        }
-        let items = notes
-            .iter()
-            .map(|note| Ok((opening_key(&note.note.commitment()), note.to_bytes()?)))
-            .collect::<Result<HashMap<_, _>, DynError>>()?;
-        self.bulk_store_confirmed(items).await
+        self.store_wallet_openings(notes, &[]).await
     }
 
     pub async fn load_wallet_known_notes(&self) -> Result<KnownNotes, DynError> {
         let notes = self
             .load_prefix::<KnownNote>(Bytes::from_static(OPENINGS))
             .await?;
-        Ok(notes
-            .into_iter()
-            .map(|note| (note.note.commitment(), note))
-            .collect())
+        Ok(notes.into_iter().map(|note| (note.id(), note)).collect())
     }
 
     pub async fn store_wallet_reward_key_count(&self, count: u64) -> Result<(), DynError> {
@@ -84,11 +152,67 @@ mod tests {
         worker.await.unwrap();
 
         let (restored, worker) = connect(RocksBackend::new(settings).unwrap());
-        let expected: KnownNotes = notes
-            .into_iter()
-            .map(|note| (note.note.commitment(), note))
-            .collect();
+        let expected: KnownNotes = notes.into_iter().map(|note| (note.id(), note)).collect();
         assert_eq!(restored.load_wallet_known_notes().await.unwrap(), expected);
+        drop(restored);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn identical_openings_keep_independent_sets_and_authorities_after_reopen() {
+        let directory = TempDir::new().unwrap();
+        let settings = settings(&directory);
+        let (storage, worker) = connect(RocksBackend::new(settings.clone()).unwrap());
+        let ledger = known_note(1);
+        let sdp = KnownNote {
+            note_set: NoteSetIndex::Sdp,
+            ..ledger
+        };
+        storage
+            .store_wallet_known_notes(&[ledger, sdp])
+            .await
+            .unwrap();
+        storage.store_wallet_leadership_notes(&[sdp]).await.unwrap();
+        drop(storage);
+        worker.await.unwrap();
+
+        let (restored, worker) = connect(RocksBackend::new(settings).unwrap());
+        assert_eq!(
+            restored.load_wallet_known_notes().await.unwrap(),
+            KnownNotes::from_iter([(ledger.id(), ledger), (sdp.id(), sdp)])
+        );
+        assert_eq!(
+            restored.load_wallet_leadership_notes().await.unwrap(),
+            KnownNotes::from_iter([(sdp.id(), sdp)])
+        );
+        drop(restored);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn historical_marker_is_durable_and_regular_openings_do_not_set_it() {
+        let directory = TempDir::new().unwrap();
+        let settings = settings(&directory);
+        let (storage, worker) = connect(RocksBackend::new(settings.clone()).unwrap());
+        let note = known_note(1);
+        storage.store_wallet_openings(&[note], &[]).await.unwrap();
+        assert!(!storage.wallet_requires_historical_replay().await.unwrap());
+        storage
+            .store_wallet_historical_openings(&[note], &[])
+            .await
+            .unwrap();
+        drop(storage);
+        worker.await.unwrap();
+        let (restored, worker) = connect(RocksBackend::new(settings).unwrap());
+        assert!(restored.wallet_requires_historical_replay().await.unwrap());
+        assert_eq!(
+            restored
+                .load_wallet_known_notes()
+                .await
+                .unwrap()
+                .get(&note.id()),
+            Some(&note)
+        );
         drop(restored);
         worker.await.unwrap();
     }
@@ -108,6 +232,53 @@ mod tests {
 
         assert!(storage.store_wallet_known_notes(&notes).await.is_err());
         assert_eq!(storage.load_wallet_known_notes().await.unwrap().size(), 0);
+        let key = Bytes::from_static(b"wallet/test_recovery_requests");
+        assert!(
+            storage
+                .store_wallet_recovery_openings(&notes, &notes, key.clone(), &1u64)
+                .await
+                .is_err()
+        );
+        assert!(storage.load::<u64>(key).await.unwrap().is_none());
+        assert_eq!(
+            storage.load_wallet_leadership_notes().await.unwrap().size(),
+            0
+        );
+        drop(storage);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_requests_and_both_authorities_are_atomic_and_survive_reopen() {
+        let directory = TempDir::new().unwrap();
+        let settings = settings(&directory);
+        let key = Bytes::from_static(b"wallet/test_recovery_requests");
+        let (storage, worker) = connect(RocksBackend::new(settings.clone()).unwrap());
+        let known = known_note(7);
+        storage
+            .store_wallet_recovery_openings(&[known], &[known], key.clone(), &1u64)
+            .await
+            .unwrap();
+        drop(storage);
+        worker.await.unwrap();
+        let (storage, worker) = connect(RocksBackend::new(settings).unwrap());
+        assert_eq!(storage.load::<u64>(key).await.unwrap(), Some(1));
+        assert_eq!(
+            storage
+                .load_wallet_known_notes()
+                .await
+                .unwrap()
+                .get(&known.id()),
+            Some(&known)
+        );
+        assert_eq!(
+            storage
+                .load_wallet_leadership_notes()
+                .await
+                .unwrap()
+                .get(&known.id()),
+            Some(&known)
+        );
         drop(storage);
         worker.await.unwrap();
     }
@@ -120,7 +291,7 @@ mod tests {
         storage
             .bulk_store_confirmed(HashMap::from([
                 (
-                    opening_key(&note.note.commitment()),
+                    opening_key(OPENINGS, note.id()).unwrap(),
                     Bytes::from_static(b"invalid opening"),
                 ),
                 (

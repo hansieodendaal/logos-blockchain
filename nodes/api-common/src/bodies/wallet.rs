@@ -226,6 +226,12 @@ pub mod import {
     pub struct WalletImportNoteRequestBody {
         pub note: Note,
         pub note_set: NoteSetIndex,
+        /// Online historical recovery is unavailable. Supplying this field
+        /// returns an explicit error directing the operator to startup
+        /// recovery. Without it, register the opening for future
+        /// inclusion only.
+        #[serde(default)]
+        pub historical_path: Option<lb_mmr::MerklePath>,
     }
 }
 
@@ -242,6 +248,7 @@ mod tests {
         let body = WalletImportNoteRequestBody {
             note: Note::new(5, Fr::from(3u64), ZkPublicKey::new(Fr::from(7u64))),
             note_set: NoteSetIndex::Ledger,
+            historical_path: None,
         };
         let decoded: WalletImportNoteRequestBody =
             serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();

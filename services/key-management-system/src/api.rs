@@ -95,6 +95,25 @@ where
             .map_err(|_| "Failed to register key.")?)
     }
 
+    pub async fn register_default_leadership(
+        &self,
+        source: <Kms::Backend as KMSBackend>::KeyId,
+        destination: <Kms::Backend as KMSBackend>::KeyId,
+    ) -> Result<KeyDescriptor<Kms::Backend>, DynError> {
+        let (reply_channel, rx) = oneshot::channel();
+        self.relay
+            .send(KMSMessage::RegisterDefaultLeadership {
+                source,
+                destination,
+                reply_channel,
+            })
+            .await
+            .map_err(|_| "Failed to send leadership key registration request")?;
+        rx.await
+            .map_err(|_| "Failed to receive leadership key registration response")?
+            .map_err(|e| format!("Failed to register leadership key: {e:?}").into())
+    }
+
     pub async fn public_key(
         &self,
         key_id: <Kms::Backend as KMSBackend>::KeyId,

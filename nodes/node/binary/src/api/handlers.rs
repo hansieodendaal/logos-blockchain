@@ -29,6 +29,7 @@ use lb_core::{
         Note, Op, TxHash,
         channel::{ChannelState, channel_note_set},
         ledger::verification_mode::StandardMode,
+        note_set::NoteSetIndex,
         notes::NoteNullifier,
         ops::channel::{ChannelId, deposit::DepositOp},
         traits::Hashable,
@@ -133,7 +134,7 @@ where
         .map_err(DynError::from)
         .and_then(|tx_fee| validate_max_tx_fee(tx_fee, max_tx_fee));
     if checked.is_err() {
-        wallet.release_pending_notes(reserved).await;
+        wallet.release_pending_notes(funded, reserved).await;
     }
     checked
 }
@@ -1144,6 +1145,7 @@ where
             tip,
             step: response.step,
             proof: response.proof,
+            reservation_id: response.reservation_id,
             outputs: response.outputs,
         })
     })
@@ -1237,8 +1239,12 @@ where
         let (holder_note, tx_builder) = match deposit {
             Ok(deposit) => deposit,
             Err(error) => {
-                let split_notes = split_builder.nullifiers_consumed().collect();
-                wallet.release_pending_notes(split_notes).await;
+                let split_notes = split_builder
+                    .nullifiers_consumed_in(NoteSetIndex::Ledger)
+                    .collect();
+                wallet
+                    .release_pending_notes(&split_builder, split_notes)
+                    .await;
                 return Err(error);
             }
         };
@@ -1261,7 +1267,7 @@ where
 
         let reserved = added_nullifiers(&tx_builder, &funded_tx_builder)
             .into_iter()
-            .chain(split_builder.nullifiers_consumed())
+            .chain(split_builder.nullifiers_consumed_in(NoteSetIndex::Ledger))
             .collect();
         check_funded_tx_fee(&wallet, &funded_tx_builder, req.max_tx_fee, reserved).await?;
 
@@ -1334,6 +1340,7 @@ where
             .await?;
         let outputs = withdrawal.opening.outputs.clone();
         let tx_builder = MantleTxBuilder::new()
+            .with_reservation_id(withdrawal.reservation_id)
             .push_op_with_opening(Op::ChannelWithdraw(withdrawal.op), withdrawal.opening)?;
         // The withdrawal names the channel root of this tip. A funding that
         // fails releases the notes of `tx_builder` in the wallet.
@@ -2464,6 +2471,9 @@ pub mod wallet {
         WalletService: WalletServiceData,
         RuntimeServiceId: Debug + Send + Sync + Display + 'static + AsServiceId<WalletService>,
     {
+        if req.historical_path.is_some() {
+            return (StatusCode::BAD_REQUEST, "Historical recovery requires wallet.historical_recovery in the node configuration and a restart").into_response();
+        }
         make_request_and_return_response!(async {
             let wallet = WalletApi::<WalletService, RuntimeServiceId>::new(
                 handle.relay::<WalletService>().await?,

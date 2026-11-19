@@ -25,6 +25,7 @@ services:
     image: ghcr.io/logos-blockchain/logos-blockchain:${TOOLS_IMAGE_LABEL}
     volumes:
       - node-data:/node-data
+      - faucet-data:/faucet-data
       - ./deployment:/etc/logos-blockchain
     environment:
       - FAUCET_PORT=18090
@@ -153,6 +154,7 @@ services:
 # Node data volume is marked as external and assumes
 # that configuration files were placed by compose.setup.yml
 volumes:
+  faucet-data:
   node-data:
     name: logos-node-data
     external: true

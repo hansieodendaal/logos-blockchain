@@ -33,6 +33,7 @@ pub trait KmsAdapter<RuntimeServiceId> {
     async fn build_private_inputs(
         &self,
         key_id: Self::KeyId,
+        note: Note,
         public_inputs: LeaderPublic,
         wallet: PolWalletInputsData,
         reward_value: Value,
@@ -60,7 +61,7 @@ where
         let public_inputs = *public_inputs;
         Box::pin(self.execute(
             key_id,
-            KeyOperators::Zk(Box::new(CheckLotteryWinning::new(
+            KeyOperators::Leadership(Box::new(CheckLotteryWinning::new(
                 output_tx,
                 note,
                 public_inputs,
@@ -76,14 +77,20 @@ where
     async fn build_private_inputs(
         &self,
         key_id: Self::KeyId,
+        note: Note,
         public_inputs: LeaderPublic,
         wallet: PolWalletInputsData,
         reward_value: Value,
     ) -> Result<LeaderPrivate, PrivateInputsError> {
         let (output_tx, output_rx) = oneshot::channel();
-        let operator =
-            BuildPrivateInputsWithLeaderKey::new(output_tx, public_inputs, wallet, reward_value);
-        Box::pin(self.execute(key_id, KeyOperators::Zk(Box::new(operator))))
+        let operator = BuildPrivateInputsWithLeaderKey::new(
+            output_tx,
+            public_inputs,
+            wallet,
+            reward_value,
+            note,
+        );
+        Box::pin(self.execute(key_id, KeyOperators::Leadership(Box::new(operator))))
             .await
             .map_err(|error| PrivateInputsError::KmsApi(Box::new(error)))?;
 

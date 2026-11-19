@@ -132,6 +132,19 @@ where
                 // Signatures in flight keep the keys they started with.
                 Self::handle_register(&key_id, key_type, reply_channel, Arc::make_mut(backend));
             }
+            KMSMessage::RegisterDefaultLeadership {
+                source,
+                destination,
+                reply_channel,
+            } => {
+                let backend = Arc::make_mut(backend);
+                let result = backend
+                    .register_default_leadership(&source, &destination)
+                    .and_then(|()| backend.public_key(&destination).map(|pk| (destination, pk)));
+                if reply_channel.send(result).is_err() {
+                    debug!(target: LOG_TARGET, "Could not reply to leadership key registration");
+                }
+            }
             KMSMessage::PublicKey {
                 key_id,
                 reply_channel,
@@ -307,6 +320,14 @@ mod tests {
 
         fn register(&mut self, key_id: &KeyId, key: Key) -> Result<(), Self::Error> {
             self.keys.register(key_id, key)
+        }
+
+        fn register_default_leadership(
+            &mut self,
+            source: &KeyId,
+            destination: &KeyId,
+        ) -> Result<(), Self::Error> {
+            self.keys.register_default_leadership(source, destination)
         }
 
         fn public_key(&self, key_id: &KeyId) -> Result<PublicKeyEncoding, Self::Error> {

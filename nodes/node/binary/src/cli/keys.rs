@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use color_eyre::eyre::Result;
 use lb_key_management_system_service::{
     backend::preload::KeyId,
-    keys::{Ed25519Key, Key, UnsecuredEd25519Key, UnsecuredZkKey, ZkKey},
+    keys::{Ed25519Key, Key, LeadershipKey, UnsecuredEd25519Key, UnsecuredZkKey, ZkKey},
 };
 use thiserror::Error;
 
@@ -89,6 +89,8 @@ pub struct AddKeyArgs {
         value_parser = parse_hex_ed25519_key
     )]
     ed25519_key: Option<UnsecuredEd25519Key>,
+    #[clap(skip)]
+    leadership_key: Option<LeadershipKey>,
 }
 
 impl AddKeyArgs {
@@ -101,9 +103,10 @@ impl AddKeyArgs {
         key: &Key,
         auto_approve: bool,
     ) -> Self {
-        let (ed25519_key, zk_key) = match key {
-            Key::Ed25519(key) => (Some(key.clone().into_unsecured()), None),
-            Key::Zk(key) => (None, Some(key.clone().into_unsecured())),
+        let (ed25519_key, zk_key, leadership_key) = match key {
+            Key::Ed25519(key) => (Some(key.clone().into_unsecured()), None, None),
+            Key::Zk(key) => (None, Some(key.clone().into_unsecured()), None),
+            Key::Leadership(key) => (None, None, Some(key.clone())),
         };
 
         Self {
@@ -112,21 +115,21 @@ impl AddKeyArgs {
             key_title,
             zk_key,
             ed25519_key,
+            leadership_key,
         }
     }
 
     /// Returns the key provided via the `--ed25519`/`--zk` flags as a [`Key`],
     /// validating that exactly one was given.
     pub fn key(&self) -> Result<Key> {
-        match (&self.ed25519_key, &self.zk_key) {
-            (Some(ed_secret), None) => Ok(Ed25519Key::from(ed_secret.clone()).into()),
-            (None, Some(zk_secret)) => Ok(ZkKey::from(zk_secret.clone()).into()),
-            (Some(_), Some(_)) => Err(color_eyre::eyre::eyre!(
-                "Please provide either --ed25519 or --zk, not both."
-            )),
-            (None, None) => Err(color_eyre::eyre::eyre!(
+        match (&self.ed25519_key, &self.zk_key, &self.leadership_key) {
+            (Some(ed_secret), None, None) => Ok(Ed25519Key::from(ed_secret.clone()).into()),
+            (None, Some(zk_secret), None) => Ok(ZkKey::from(zk_secret.clone()).into()),
+            (None, None, Some(key)) => Ok(Key::Leadership(key.clone())),
+            (None, None, None) => Err(color_eyre::eyre::eyre!(
                 "You must provide a key via --ed25519 or --zk."
             )),
+            _ => Err(color_eyre::eyre::eyre!("Please provide exactly one key.")),
         }
     }
 }

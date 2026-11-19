@@ -184,6 +184,7 @@ impl FaucetTask {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let resp = client
             .post(post_url)
+            .header("Idempotency-Key", hex::encode(rand::random::<[u8; 32]>()))
             .send()
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;

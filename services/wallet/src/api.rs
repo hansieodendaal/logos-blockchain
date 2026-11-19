@@ -94,9 +94,11 @@ where
 /// not: the inputs a split or a funding added.
 #[must_use]
 pub fn added_nullifiers(before: &MantleTxBuilder, after: &MantleTxBuilder) -> Vec<NoteNullifier> {
-    let before = before.nullifiers_consumed().collect::<HashSet<_>>();
+    let before = before
+        .nullifiers_consumed_in(NoteSetIndex::Ledger)
+        .collect::<HashSet<_>>();
     after
-        .nullifiers_consumed()
+        .nullifiers_consumed_in(NoteSetIndex::Ledger)
         .filter(|nullifier| !before.contains(nullifier))
         .collect()
 }
@@ -224,6 +226,7 @@ where
     pub async fn owned_note(
         &self,
         tip: Option<HeaderId>,
+        note_set: NoteSetIndex,
         commitment: NoteCommitment,
     ) -> Result<TipResponse<Option<OwnedNote>>, WalletApiError> {
         let (resp_tx, rx) = oneshot::channel();
@@ -231,6 +234,7 @@ where
         self.relay
             .send(WalletMsg::OwnedNote {
                 tip,
+                note_set,
                 commitment,
                 resp_tx,
             })
@@ -292,6 +296,38 @@ where
         Ok(rx.await??)
     }
 
+    /// Recover an opening already committed on chain using a current
+    /// membership path as admission evidence.
+    pub async fn recover_note(
+        &self,
+        note: Note,
+        note_set: NoteSetIndex,
+        path: lb_mmr::MerklePath,
+    ) -> Result<KnownNote, WalletApiError> {
+        let (resp_tx, rx) = oneshot::channel();
+        self.relay
+            .send(WalletMsg::RecoverNote {
+                note,
+                note_set,
+                path,
+                resp_tx,
+            })
+            .await?;
+        Ok(rx.await??)
+    }
+
+    /// Register a batch of openings for commitments included in future blocks.
+    pub async fn import_notes(
+        &self,
+        notes: Vec<(Note, NoteSetIndex)>,
+    ) -> Result<Vec<KnownNote>, WalletApiError> {
+        let (resp_tx, rx) = oneshot::channel();
+        self.relay
+            .send(WalletMsg::ImportNotes { notes, resp_tx })
+            .await?;
+        Ok(rx.await??)
+    }
+
     /// A user step, or a program deposit, spending the channel notes of the
     /// wallet, with its proof.
     pub async fn prove_channel_step(
@@ -343,16 +379,21 @@ where
         Ok(rx.await??)
     }
 
-    /// Releases the notes of `nullifiers`, which the wallet reserved for a
-    /// split or a funding of a transaction that will not be submitted, so
-    /// that they fund the next request. A caller only releases the notes
-    /// its own request reserved, since a reservation is keyed by the note
-    /// alone. If the release does not reach the wallet, the notes stay
-    /// reserved until their reservation expires.
-    pub async fn release_pending_notes(&self, nullifiers: Vec<NoteNullifier>) {
+    /// Releases the selected Ledger notes and the builder's consumed notes
+    /// that carry its reservation identifiers. If the release does not reach
+    /// the wallet, the notes stay reserved until their reservation expires.
+    pub async fn release_pending_notes(
+        &self,
+        builder: &MantleTxBuilder,
+        nullifiers: Vec<NoteNullifier>,
+    ) {
         if let Err(err) = self
             .relay
-            .send(WalletMsg::ReleasePendingNotes { nullifiers })
+            .send(WalletMsg::ReleasePendingNotes {
+                nullifiers,
+                owner: builder.reservation_id(),
+                builder: builder.clone(),
+            })
             .await
         {
             tracing::warn!(

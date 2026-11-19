@@ -382,7 +382,7 @@ where
     TimeBackend::Settings: Clone + Send + Sync + 'static,
     CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item> + 'static,
     ChainNetwork: ChainNetworkServiceData<Tx = Mempool::Item>,
-    Wallet: lb_wallet_service::api::WalletServiceData + 'static,
+    Wallet: lb_wallet_service::api::WalletServiceData + Send + Sync + 'static,
     RuntimeServiceId: Debug
         + Clone
         + Send
@@ -658,7 +658,7 @@ where
     TimeBackend::Settings: Clone + Send + Sync,
     CryptarchiaService: CryptarchiaServiceData<Tx = Mempool::Item> + 'static,
     ChainNetwork: ChainNetworkServiceData<Tx = Mempool::Item>,
-    Wallet: lb_wallet_service::api::WalletServiceData + 'static,
+    Wallet: lb_wallet_service::api::WalletServiceData + Send + Sync + 'static,
     RuntimeServiceId: Debug
         + Display
         + Sync
@@ -894,6 +894,7 @@ where
         let private = kms
             .build_private_inputs(
                 winning.note.key_id.clone(),
+                winning.note.note.note,
                 winning.public_inputs,
                 wallet_inputs,
                 reward.value,

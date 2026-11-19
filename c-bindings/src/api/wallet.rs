@@ -10,6 +10,7 @@ use lb_core::{
         channel::channel_note_set,
         gas::GasCost,
         ledger::verification_mode::StandardMode,
+        note_set::NoteSetIndex,
         notes::NoteCommitment as CoreNoteCommitment,
         ops::channel::{
             ChannelId,
@@ -1012,8 +1013,13 @@ pub(crate) fn channel_deposit_sync(
         let tx_builder = match deposit {
             Ok(tx_builder) => tx_builder,
             Err(error) => {
-                api.release_pending_notes(split_builder.nullifiers_consumed().collect())
-                    .await;
+                api.release_pending_notes(
+                    &split_builder,
+                    split_builder
+                        .nullifiers_consumed_in(NoteSetIndex::Ledger)
+                        .collect(),
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -1237,8 +1243,11 @@ pub(crate) fn wallet_fund_tx_sync(
             // The wallet reserved the notes of the funding, which no
             // transaction will spend. The inputs of the caller's own ops may be
             // reserved by another request, so they are kept.
-            api.release_pending_notes(added_nullifiers(&request.tx_builder, &funded_tx_builder))
-                .await;
+            api.release_pending_notes(
+                &funded_tx_builder,
+                added_nullifiers(&request.tx_builder, &funded_tx_builder),
+            )
+            .await;
             return Err(error);
         }
 

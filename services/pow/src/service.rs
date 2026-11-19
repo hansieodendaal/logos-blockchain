@@ -1902,13 +1902,17 @@ where
     WalletService: WalletServiceData,
     RuntimeServiceId: AsServiceId<WalletService> + Debug + Display + Sync,
 {
-    let mut nullifiers = Vec::with_capacity(claims.len());
-    for claim in claims {
-        let known = wallet_api
-            .import_note(reward_note(claim, reward_value), NoteSetIndex::Ledger)
-            .await?;
-        nullifiers.push(known.nullifier);
-    }
+    let nullifiers = wallet_api
+        .import_notes(
+            claims
+                .iter()
+                .map(|claim| (reward_note(claim, reward_value), NoteSetIndex::Ledger))
+                .collect(),
+        )
+        .await?
+        .into_iter()
+        .map(|known| known.nullifier)
+        .collect::<Vec<_>>();
     // One fresh nonce for the change note of each transfer group.
     let change_nonces: Vec<Fr> =
         std::iter::repeat_with(|| fr_from_mod_bytes(&rand::random::<[u8; 32]>()))
@@ -1928,9 +1932,14 @@ where
     let signed_tx = wallet_api.sign_tx(Some(tip), tx_builder).await?.response;
     // The wallet adopts the change once its commitment is appended; a signing
     // failure leaves no opening of a note that never lands.
-    for change in change_notes {
-        wallet_api.import_note(change, NoteSetIndex::Ledger).await?;
-    }
+    wallet_api
+        .import_notes(
+            change_notes
+                .into_iter()
+                .map(|note| (note, NoteSetIndex::Ledger))
+                .collect(),
+        )
+        .await?;
     Ok(signed_tx)
 }
 
@@ -2348,7 +2357,10 @@ mod tests {
         let known: KnownNotes = openings
             .values()
             .flat_map(|opening| opening.inputs.iter())
-            .map(|note| (note.commitment(), known_note(*note)))
+            .map(|note| {
+                let known = known_note(*note);
+                (known.id(), known)
+            })
             .collect();
         let state = WalletState::from_genesis(&known, genesis, &[], Epoch::new(0))?;
         let context = WitnessContext {
@@ -2811,6 +2823,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Exercise claim signing across a fork"
+    )]
     async fn a_claim_survives_a_fork_of_its_tip_block() {
         // A chain of 40 blocks, each appending one commitment.
         let mut wallet = Wallet::<u8>::from_genesis(
@@ -2846,6 +2862,14 @@ mod tests {
                 match msg {
                     WalletMsg::ImportNote { note, resp_tx, .. } => {
                         drop(resp_tx.send(Ok(known_note(note))));
+                    }
+                    WalletMsg::ImportNotes { notes, resp_tx } => {
+                        drop(
+                            resp_tx.send(Ok(notes
+                                .into_iter()
+                                .map(|(note, _)| known_note(note))
+                                .collect())),
+                        );
                     }
                     WalletMsg::SpendRoot { tip, resp_tx } => {
                         drop(resp_tx.send(Ok(TipResponse {
@@ -2884,7 +2908,10 @@ mod tests {
         let known: KnownNotes = openings
             .values()
             .flat_map(|opening| opening.inputs.iter())
-            .map(|note| (note.commitment(), known_note(*note)))
+            .map(|note| {
+                let known = known_note(*note);
+                (known.id(), known)
+            })
             .collect();
         let witnesses = op_witnesses(
             &wallet.spend_state(tip).unwrap(),
@@ -2909,6 +2936,73 @@ mod tests {
             witnesses[0].witness.tx_commitment_root(),
             extended.frontier_root()
         );
+    }
+
+    #[tokio::test]
+    async fn reward_and_change_preparation_registers_without_requesting_history() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let service = tokio::spawn(async move {
+            let mut batches = 0;
+            while let Some(mut msg) = receiver.recv().await {
+                match &mut msg {
+                    WalletMsg::ImportNotes { .. } => assert!(msg.wallet_state_tip().is_none()),
+                    WalletMsg::SpendRoot { .. } | WalletMsg::SignTx { .. } => (),
+                    other => panic!("claim preparation must not request recovery: {other:?}"),
+                }
+                match msg {
+                    WalletMsg::ImportNotes { notes, resp_tx } => {
+                        batches += 1;
+                        assert_ne!(notes.len(), 0);
+                        let notes = notes
+                            .into_iter()
+                            .map(|(note, set)| {
+                                assert_eq!(set, NoteSetIndex::Ledger);
+                                known_note(note)
+                            })
+                            .collect();
+                        drop(resp_tx.send(Ok(notes)));
+                        if batches == 2 {
+                            return batches;
+                        }
+                    }
+                    WalletMsg::SpendRoot { resp_tx, .. } => {
+                        drop(resp_tx.send(Ok(TipResponse {
+                            tip: HeaderId::from([0; 32]),
+                            response: Fr::from(1u64),
+                        })));
+                    }
+                    WalletMsg::SignTx {
+                        tx_builder,
+                        resp_tx,
+                        ..
+                    } => {
+                        let tx = SignedOps::from_ops_with_sample_proofs(
+                            tx_builder.build(FORK_DIGEST).unwrap(),
+                        )
+                        .into_preverified_trusted();
+                        drop(resp_tx.send(Ok(TipResponse {
+                            tip: HeaderId::from([0; 32]),
+                            response: tx,
+                        })));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            panic!("both reward and change registrations must complete");
+        });
+        let api = WalletApi::<DummyWallet, TestRuntimeServiceId>::new(OutboundRelay::new(sender));
+        let signed = sign_reward_claims(
+            &api,
+            reward_key(0).to_public_key(),
+            HeaderId::from([0; 32]),
+            REWARD,
+            GasPrices::new(1, 1),
+            GAS_PROFILE,
+            &[ticket()],
+        )
+        .await;
+        assert!(signed.is_ok());
+        assert_eq!(service.await.unwrap(), 2);
     }
 
     #[test]

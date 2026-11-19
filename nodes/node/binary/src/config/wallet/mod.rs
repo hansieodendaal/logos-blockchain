@@ -22,7 +22,10 @@ impl ServiceConfig {
         eras: &EraSchedule<EraDefinition>,
     ) -> WalletServiceSettings {
         WalletServiceSettings {
+            historical_recovery: self.user.historical_recovery,
+            historical_recovery_withdrawals: self.user.historical_recovery_withdrawals,
             known_keys: self.user.known_keys,
+            leadership_keys: self.user.leadership_keys,
             voucher_master_key_id: self.user.voucher_master_key_id,
             recovery_data,
             pending_note_expiry_blocks: self.user.pending_note_expiry_blocks,

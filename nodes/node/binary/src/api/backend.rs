@@ -57,6 +57,44 @@ use crate::{
     },
 };
 
+async fn wallet_readiness<RuntimeServiceId>(
+    axum::extract::State(handle): axum::extract::State<OverwatchHandle<RuntimeServiceId>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response
+where
+    RuntimeServiceId: AsServiceId<WalletService> + Debug + Display + Send + Sync + 'static,
+{
+    use axum::response::IntoResponse as _;
+    use lb_http_api_common::paths;
+    use overwatch::services::status::ServiceStatus;
+
+    let path = request.uri().path();
+    if path.starts_with("/wallet/")
+        || [
+            paths::LEADER_AGED_NOTES,
+            paths::CHANNEL_STEP,
+            paths::CHANNEL_WITHDRAW,
+            paths::CHANNEL_PREPARE_DEPOSIT,
+        ]
+        .contains(&path)
+    {
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handle.status_watcher::<WalletService>(),
+        )
+        .await;
+        if !matches!(ready, Ok(Ok(status)) if status.current() == ServiceStatus::Ready) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "wallet unavailable during startup or recovery",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Builds the axum router from the shared route table.
 ///
 /// Only the `$handler` half of each row is used; the `OpenAPI` half is matched
@@ -189,6 +227,10 @@ where
 
         let app = app
             .with_state(handle.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                handle.clone(),
+                wallet_readiness::<RuntimeServiceId>,
+            ))
             // The chain ID is a constant of the deployment, so it rides along
             // as a request extension instead of a service round trip.
             .layer(axum::Extension(self.settings.chain_id.clone()))
@@ -238,5 +280,77 @@ where
 
         let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
         axum::serve(listener, app).await
+    }
+}
+
+#[cfg(test)]
+mod recovery_admission_tests {
+    use axum::{
+        body::Body,
+        extract::State,
+        http::Request,
+        routing::{get, post},
+    };
+    use lb_core::mantle::{
+        Note,
+        note_set::{CommitmentMmr, NoteSetIndex},
+    };
+    use lb_http_api_common::bodies::wallet::import::WalletImportNoteRequestBody;
+    use lb_key_management_system_service::keys::ZkPublicKey;
+    use tower::Service as _;
+
+    use super::*;
+
+    fn unavailable_handle() -> OverwatchHandle<crate::RuntimeServiceId> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        OverwatchHandle::new(tokio::runtime::Handle::current(), sender)
+    }
+
+    #[tokio::test]
+    async fn wallet_http_is_unavailable_until_the_wallet_is_ready() {
+        let mut app = Router::new()
+            .route("/wallet/notes/import", post(async || StatusCode::OK))
+            .route("/version", get(async || StatusCode::OK))
+            .layer(axum::middleware::from_fn_with_state(
+                unavailable_handle(),
+                wallet_readiness,
+            ));
+        let wallet = app
+            .call(
+                Request::post("/wallet/notes/import")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wallet.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ordinary = app
+            .call(Request::get("/version").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ordinary.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn historical_http_import_is_rejected_without_querying_any_service() {
+        let note = Note::new(1, 7u64.into(), ZkPublicKey::zero());
+        let (_, path) = CommitmentMmr::new()
+            .push_with_paths(note.commitment(), &mut [])
+            .unwrap();
+        for _ in 0..3 {
+            // A disconnected handle would fail if the handler queried a
+            // service before checking the recovery request shape.
+            let response = wallet::import_note::<WalletService, crate::RuntimeServiceId>(
+                State(unavailable_handle()),
+                axum::Json(WalletImportNoteRequestBody {
+                    note,
+                    note_set: NoteSetIndex::Ledger,
+                    historical_path: Some(path.clone()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

@@ -51,6 +51,7 @@ lb-testing-framework             = { workspace = true }
 lb-tx-service                    = { workspace = true }
 lb-utils                         = { workspace = true }
 lb-wallet                        = { workspace = true }
+lb-wallet-service                = { workspace = true }
 lb-zktransfer                    = { workspace = true }
 libp2p                           = { workspace = true }
 rand                             = { workspace = true }

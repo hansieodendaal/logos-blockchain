@@ -2,6 +2,7 @@ pub mod errors;
 pub mod secured_key;
 
 mod ed25519;
+mod leadership;
 mod zk;
 
 use lb_key_management_system_macros::KmsEnumKey;
@@ -15,6 +16,7 @@ pub use crate::keys::{
         UnsecuredEd25519Key, UnverifiedPublicKey as UnverifiedEd25519PublicKey,
         UnverifiedX25519PublicKey, X25519PrivateKey,
     },
+    leadership::{LeadershipKey, LeadershipPublicKeys},
     zk::{PK0, PublicKey as ZkPublicKey, UnsecuredZkKey, ZkKey, ZkTransferPayload, kdf_public_key},
 };
 
@@ -27,6 +29,7 @@ pub use crate::keys::{
 pub enum Key {
     Ed25519(Ed25519Key),
     Zk(ZkKey),
+    Leadership(LeadershipKey),
 }
 
 impl From<Ed25519Key> for Key {

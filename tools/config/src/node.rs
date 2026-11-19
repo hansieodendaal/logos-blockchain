@@ -98,7 +98,7 @@ fn create_wallet_config(
             key_id_for_preload_backend(&Key::Zk(sk.clone())),
             sk.as_public_key(),
         )),
-        Key::Ed25519(_) => None,
+        Key::Ed25519(_) | Key::Leadership(_) => None,
     }))
     .collect();
 
@@ -106,5 +106,12 @@ fn create_wallet_config(
         voucher_master_key_id: key_id_for_preload_backend(&Key::Zk(consensus.known_key.clone())),
     });
     config.known_keys = known_keys;
+    config.leadership_keys = kms_keys
+        .iter()
+        .filter_map(|(id, key)| match key {
+            Key::Leadership(key) => Some((id.clone(), key.as_public_key())),
+            Key::Ed25519(_) | Key::Zk(_) => None,
+        })
+        .collect();
     config
 }

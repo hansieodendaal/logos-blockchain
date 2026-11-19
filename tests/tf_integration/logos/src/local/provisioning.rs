@@ -764,13 +764,23 @@ fn build_run_config(config: Config, deployment_settings: &DeploymentSettings) ->
                             key_id_for_preload_backend(&Key::Zk(sk.clone())),
                             sk.as_public_key(),
                         )),
-                        Key::Ed25519(_) => None,
+                        Key::Ed25519(_) | Key::Leadership(_) => None,
                     }),
             )
             .collect();
 
             wallet::serde::Config {
                 known_keys,
+                leadership_keys: config
+                    .kms_config
+                    .backend
+                    .keys
+                    .iter()
+                    .filter_map(|(id, key)| match key {
+                        Key::Leadership(key) => Some((id.clone(), key.as_public_key())),
+                        Key::Ed25519(_) | Key::Zk(_) => None,
+                    })
+                    .collect(),
                 ..wallet::serde::Config::with_required_values(wallet::serde::RequiredValues {
                     voucher_master_key_id: key_id_for_preload_backend(&Key::Zk(
                         config.consensus_config.known_key.clone(),

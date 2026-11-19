@@ -113,6 +113,8 @@ pub struct ChannelStepResponseBody {
     pub tip: HeaderId,
     pub step: Step,
     pub proof: ZkTransferProof,
+    /// Attach this id to the transaction builder containing the step.
+    pub reservation_id: [u8; 32],
     /// The openings of the notes the step creates, the change last. A payee
     /// whose wallet is not this node's imports its note to spend it.
     pub outputs: Vec<Note>,

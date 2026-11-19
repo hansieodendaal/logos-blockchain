@@ -176,7 +176,7 @@ fn rederive_note_public_keys(config: &mut Value, keystore: Option<&Keystore>) ->
         .chain(keystore.into_iter().flat_map(Keystore::secret_keys))
         .filter_map(|key| match key {
             Key::Zk(key) => Some((kdf_public_key(key.as_fr()), key.to_public_key())),
-            Key::Ed25519(_) => None,
+            Key::Ed25519(_) | Key::Leadership(_) => None,
         })
         .map(|(old, new)| Ok((to_value(old)?, to_value(new)?)))
         .collect::<Result<HashMap<_, _>>>()?;
@@ -290,6 +290,21 @@ mod tests {
 
     fn yaml(yaml: &str) -> Value {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn migration_preserves_independent_leadership_keys() {
+        use lb_key_management_system_service::keys::{LeadershipKey, secured_key::SecuredKey as _};
+
+        let key = LeadershipKey::new(7u64.into(), 19u64.into());
+        let public = key.as_public_key();
+        let mut keystore = Keystore::default();
+        keystore.set("delegated", Key::Leadership(key));
+        let mut config = yaml("wallet: {leadership_keys: {delegated: null}}");
+        config["wallet"]["leadership_keys"]["delegated"] = to_value(public).unwrap();
+        let original = config.clone();
+        migrate(&mut config, Some(&keystore)).unwrap();
+        assert_eq!(config, original);
     }
 
     #[test]

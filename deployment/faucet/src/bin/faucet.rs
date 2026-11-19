@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use clap::Parser;
 use lb_groth16::fr_from_bytes;
@@ -24,6 +24,9 @@ struct Args {
     faucet_pk: String,
     #[arg(long)]
     drip_amount: u64,
+    /// Private durable storage for pending and completed payment openings.
+    #[arg(long)]
+    state_dir: PathBuf,
     /// Minimum number of seconds between drips for the same recipient key.
     #[arg(long, default_value_t = 300)]
     cooldown_secs: u64,
@@ -38,8 +41,13 @@ async fn main() {
     println!("Faucet PK: {faucet_pk:?}");
 
     let faucet = Arc::new(
-        Faucet::new(args.node_base_url, faucet_pk, args.drip_amount)
-            .expect("faucet should be created"),
+        Faucet::new(
+            args.node_base_url,
+            faucet_pk,
+            args.drip_amount,
+            &args.state_dir,
+        )
+        .expect("faucet should be created"),
     );
 
     let (queue, requests) = mpsc::channel(DRIP_QUEUE_CAPACITY);
@@ -48,6 +56,7 @@ async fn main() {
     let state = Arc::new(FaucetServerState::new(
         queue,
         Duration::from_secs(args.cooldown_secs),
+        faucet.status(),
     ));
     let app = faucet_app(state);
 

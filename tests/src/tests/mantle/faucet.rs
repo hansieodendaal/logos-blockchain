@@ -17,12 +17,11 @@ use reqwest::StatusCode;
 use serial_test::serial;
 use tokio::{net::TcpListener, sync::mpsc, time::sleep};
 
-const FAUCET_FUNDS: u64 = 10_000 * UNITS_PER_LGO;
+const FAUCET_FUNDS: u64 = 100_000 * UNITS_PER_LGO;
 const DRIP_AMOUNT: u64 = 50 * UNITS_PER_LGO;
-/// Upper bound on the combined gas fees of the two drip transfers. Each drip
-/// costs 244 at genesis gas prices; the generous margin keeps the test stable
-/// if gas constants or prices change.
-const MAX_TOTAL_FEES: u64 = 2000 * UNITS_PER_LGO;
+/// Upper bound on the combined gas fees of two transfers, including the
+/// current proof and note-set charges and headroom for changing gas prices.
+const MAX_TOTAL_FEES: u64 = 20_000 * UNITS_PER_LGO;
 const DRIP_QUEUE_CAPACITY: usize = 16;
 const COOLDOWN: Duration = Duration::from_hours(1);
 /// Leaves room for the faucet to resubmit a dropped drip after its two minute
@@ -68,12 +67,14 @@ async fn faucet_drips_concurrent_requests_in_order() {
                 "{faucet_url}/faucet/{}",
                 recipient_a.public_key_hex()
             ))
+            .header("Idempotency-Key", "01".repeat(32))
             .send(),
         client
             .post(format!(
                 "{faucet_url}/faucet/{}",
                 recipient_b.public_key_hex()
             ))
+            .header("Idempotency-Key", "02".repeat(32))
             .send(),
     );
 
@@ -87,6 +88,7 @@ async fn faucet_drips_concurrent_requests_in_order() {
             "{faucet_url}/faucet/{}",
             recipient_a.public_key_hex()
         ))
+        .header("Idempotency-Key", "01".repeat(32))
         .send()
         .await
         .expect("repeat drip request should not fail");
@@ -124,14 +126,25 @@ async fn faucet_drips_concurrent_requests_in_order() {
 /// Runs the faucet worker and HTTP server in-process against the given node,
 /// returning the faucet base URL.
 async fn spawn_faucet(node: &NodeHttpClient, faucet_pk: ZkPublicKey) -> String {
+    let directory = tempfile::tempdir().expect("temporary faucet state directory");
     let faucet = Arc::new(
-        Faucet::new(api_url(node, ""), faucet_pk, DRIP_AMOUNT).expect("faucet should be created"),
+        Faucet::new(
+            api_url(node, ""),
+            faucet_pk,
+            DRIP_AMOUNT,
+            &directory.path().join("state"),
+        )
+        .expect("faucet should be created"),
     );
 
     let (queue, requests) = mpsc::channel(DRIP_QUEUE_CAPACITY);
-    tokio::spawn(run_worker(Arc::clone(&faucet), requests));
+    let status = faucet.status();
+    tokio::spawn(async move {
+        let _directory = directory;
+        run_worker(faucet, requests).await;
+    });
 
-    let state = Arc::new(FaucetServerState::new(queue, COOLDOWN));
+    let state = Arc::new(FaucetServerState::new(queue, COOLDOWN, status));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("faucet listener should bind");

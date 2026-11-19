@@ -14,6 +14,12 @@ pub trait KMSBackend {
 
     fn register(&mut self, key_id: &Self::KeyId, key: Self::Key) -> Result<(), Self::Error>;
 
+    fn register_default_leadership(
+        &mut self,
+        source: &Self::KeyId,
+        destination: &Self::KeyId,
+    ) -> Result<(), Self::Error>;
+
     fn public_key(
         &self,
         key_id: &Self::KeyId,

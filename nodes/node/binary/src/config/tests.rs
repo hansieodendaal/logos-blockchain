@@ -239,6 +239,23 @@ fn build_run_config_from_env_applies_environment_overrides() {
 }
 
 #[test]
+fn wallet_recovery_withdrawals_round_trip_into_service_settings() {
+    let config: WalletConfig = serde_yaml::from_str(
+        "voucher_master_key_id: voucher\nhistorical_recovery_withdrawals: [2, 5]\n",
+    )
+    .unwrap();
+    assert_eq!(config.historical_recovery_withdrawals, vec![2, 5]);
+    let config: WalletConfig =
+        serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+    let settings = WalletServiceConfig { user: config }.into_wallet_service_settings(
+        RecoveryData::default(),
+        DeploymentSettings::default().era_schedule(),
+    );
+    assert_eq!(settings.historical_recovery_withdrawals, vec![2, 5]);
+    assert_eq!(settings.historical_recovery.len(), 0);
+}
+
+#[test]
 fn service_settings_receive_recovery_data() {
     const STATE_PATH: &str = "./state";
     let recovery_data = recovery_data_fixture();
@@ -567,4 +584,24 @@ fn partial_blend_backend_keeps_the_peering_degree_check_default() {
         backend.peering_degree_check_interval,
         Some(std::time::Duration::from_mins(1))
     );
+}
+
+#[test]
+fn keystore_wires_leadership_credentials_without_adding_a_spending_key() {
+    use lb_key_management_system_service::keys::{
+        Key, LeadershipKey, secured_key::SecuredKey as _,
+    };
+
+    let key = LeadershipKey::new(7u64.into(), 19u64.into());
+    let public = key.as_public_key();
+    let mut keystore = Keystore::default();
+    keystore.set("delegated", Key::Leadership(key));
+    let (id, _) = keystore.get("delegated").unwrap();
+    let config = keystore.config_values().unwrap();
+    assert_eq!(
+        config["wallet"]["leadership_keys"][&id],
+        serde_yaml::to_value(public).unwrap()
+    );
+    assert!(config["wallet"]["known_keys"].get(&id).is_none());
+    assert!(config["kms"]["backend"]["keys"].get(&id).is_some());
 }

@@ -199,12 +199,12 @@ pub enum PrivateInputsError {
 /// The per-epoch chain state needed to check winning slots, shared by the
 /// per-slot block-proposal path and the per-epoch winning-slot scan.
 ///
-/// These inputs are all fixed for the whole epoch: `epoch_state` (including the
-/// aged UTXO tree) and the wallet's leader-eligible notes (aged at the end of
-/// the previous epoch). The block-proposal path additionally needs the *latest*
-/// ledger state (to prove a note is still unspent), which it fetches separately
-/// per won slot; the Blend winning-slot scan does not, since the leadership
-/// quota proof only attests that a note was aged, not that it is unspent.
+/// The `epoch_state` (including the aged UTXO tree) is fixed for the epoch.
+/// The wallet's notes are refreshed as the scan is driven. The block-proposal
+/// path additionally needs the *latest*
+/// ledger state to prove a note is still unspent. The Blend winning-slot scan
+/// also checks the current state before emitting a candidate, although its
+/// quota proof itself only attests the aged state.
 pub struct SlotContext {
     /// Tip explicitly passed to `get_leader_aged_notes` for the wallet query.
     pub wallet_tip: HeaderId,
@@ -229,6 +229,10 @@ pub struct SlotContext {
     clippy::cognitive_complexity,
     reason = "TODO: address this in a dedicated refactor"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The epoch handoff includes validation of current note eligibility"
+)]
 pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeServiceId>(
     cryptarchia_api: CryptarchiaServiceApi<CryptarchiaService>,
     wallet_api: WalletApi<Wallet, RuntimeServiceId>,
@@ -237,8 +241,8 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
     era_schedule: Arc<EraScheduledConfig>,
     epoch_handoff_sender: mpsc::Sender<WinningPolEpochSlots>,
 ) where
-    CryptarchiaService: CryptarchiaServiceData<Tx: Send>,
-    Wallet: WalletServiceData,
+    CryptarchiaService: CryptarchiaServiceData<Tx: Send> + 'static,
+    Wallet: WalletServiceData + Send + Sync + 'static,
     RuntimeServiceId: AsServiceId<Wallet>
         + AsServiceId<PreloadKmsService<RuntimeServiceId>>
         + Debug
@@ -324,12 +328,55 @@ pub async fn search_for_winning_slots<CryptarchiaService, Wallet, RuntimeService
         // never materialized here. A scan made stale by an epoch
         // rollover is implicitly abandoned: the subscriber just stops
         // polling it once it moves to the next epoch.
+        let scan_wallet = wallet_api.clone();
+        let refresh_wallet = wallet_api.clone();
+        let refresh: LeadershipNotesSource = Arc::new(move || {
+            let wallet = refresh_wallet.clone();
+            Box::pin(async move {
+                wallet
+                    .get_leader_aged_notes(None, epoch)
+                    .await
+                    .map_or_else(|_| Vec::new(), |response| response.response)
+            })
+        });
+        let scan_chain = cryptarchia_api.clone();
+        let aged_sets = Arc::new(epoch_state.note_sets.clone());
+        let is_current: CurrentLeadershipNote = Arc::new(move |candidate| {
+            let wallet = scan_wallet.clone();
+            let chain = scan_chain.clone();
+            let aged_sets = Arc::clone(&aged_sets);
+            Box::pin(async move {
+                let Ok(info) = chain.info().await else {
+                    return false;
+                };
+                let tip = info.cryptarchia_info.tip;
+                let Ok(result) = wallet.get_leader_aged_notes(Some(tip), epoch).await else {
+                    return false;
+                };
+                if !result.response.iter().any(|aged| {
+                    aged.note.note == candidate.note.note
+                        && aged.note.note_set == candidate.note.note_set
+                        && aged.aged_path == candidate.aged_path
+                        && aged.key_id == candidate.key_id
+                }) {
+                    return false;
+                }
+                let Ok(Some(latest)) = chain.get_ledger_state(tip).await else {
+                    return false;
+                };
+                pol_wallet_inputs_off_loop(&candidate, &aged_sets, latest.latest_note_sets())
+                    .await
+                    .is_ok()
+            })
+        });
         let winning_slots_stream = epoch_winning_slots_stream(
             &era_schedule,
             epoch_state,
             &eligible_aged,
             kms.clone(),
             slot,
+            is_current,
+            Some(refresh),
         );
         if epoch_handoff_sender
             .send(WinningPolEpochSlots {
@@ -428,12 +475,19 @@ where
 /// leadership quota proof only attests that a note was aged at the end of the
 /// previous epoch, not that it is unspent. Slots earlier than `start_slot` are
 /// skipped so a mid-epoch subscriber wastes no work.
+type CurrentLeadershipNote =
+    Arc<dyn Fn(AgedNote) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+type LeadershipNotesSource =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Vec<AgedNote>> + Send + Sync>;
+
 fn epoch_winning_slots_stream<RuntimeServiceId>(
     era_schedule: &EraScheduledConfig,
     epoch_state: EpochState,
     eligible_aged: &[AgedNote],
     kms: impl KmsAdapter<RuntimeServiceId, KeyId = KeyId> + Send + Sync + 'static,
     start_slot: Slot,
+    is_current: CurrentLeadershipNote,
+    refresh: Option<LeadershipNotesSource>,
 ) -> WinningPolSlotStream {
     let slots_per_epoch = config_for_epoch(era_schedule, epoch_state.epoch).epoch_length();
     let epoch_first_slot: u64 = era_schedule
@@ -466,12 +520,18 @@ fn epoch_winning_slots_stream<RuntimeServiceId>(
         let epoch_state = Arc::clone(&epoch_state);
         let eligible_aged = Arc::clone(&eligible_aged);
         let kms = Arc::clone(&kms);
+        let is_current = Arc::clone(&is_current);
+        let refresh = refresh.clone();
         let is_slot_winning_task: WinningSlotFuture = Box::pin(async move {
             // Only the aged half of the witness reaches the PoQ, so the latest
             // note sets are the aged ones and the msg is 0.
             let latest = &epoch_state.note_sets;
             let public_inputs = public_inputs_for_slot(&epoch_state, slot.into(), latest);
-            for note in eligible_aged.iter() {
+            let current = match refresh {
+                Some(refresh) => refresh().await,
+                None => eligible_aged.iter().map(|note| AgedNote { note: note.note.clone(), aged_path: note.aged_path.clone(), key_id: note.key_id.clone() }).collect(),
+            };
+            for note in &current {
                 let winning = match kms
                     .check_winning_with_key(note.key_id.clone(), &note.note.note, &public_inputs)
                     .await
@@ -504,10 +564,14 @@ fn epoch_winning_slots_stream<RuntimeServiceId>(
                     }
                 };
                 match kms
-                    .build_private_inputs(note.key_id.clone(), public_inputs, wallet, 0)
+                    .build_private_inputs(note.key_id.clone(), note.note.note, public_inputs, wallet, 0)
                     .await
                 {
-                    Ok(leader_private) => return Some(leader_private),
+                    Ok(leader_private) => {
+                        if is_current(AgedNote { note: note.note.clone(), aged_path: note.aged_path.clone(), key_id: note.key_id.clone() }).await {
+                            return Some(leader_private);
+                        }
+                    },
                     Err(e) => tracing::error!(
                         target: LOG_TARGET,
                         "Failed to build private inputs for winning note {:?} at slot {slot}: {e:?}",
@@ -642,11 +706,18 @@ mod pol_tests {
         let start_slot = epoch_starting_slot + config.epoch_length() / 2;
 
         // Drive every per-slot future and keep the winning ones.
-        let winners: Vec<_> =
-            epoch_winning_slots_stream(&eras, epoch_state, &eligible, kms, start_slot.into())
-                .filter_map(|winning_slot| winning_slot)
-                .collect()
-                .await;
+        let winners: Vec<_> = epoch_winning_slots_stream(
+            &eras,
+            epoch_state,
+            &eligible,
+            kms,
+            start_slot.into(),
+            Arc::new(|_| Box::pin(async { true })),
+            None,
+        )
+        .filter_map(|winning_slot| winning_slot)
+        .collect()
+        .await;
 
         for leader_private in &winners {
             let slot = leader_private.input().chain.slot_number;
@@ -672,16 +743,191 @@ mod pol_tests {
         let epoch_starting_slot: u64 = eras.starting_slot_for_epoch(epoch_state.epoch).into();
         let epoch_end = epoch_starting_slot + config.epoch_length();
 
-        let winners: Vec<_> =
-            epoch_winning_slots_stream(&eras, epoch_state, &eligible, kms, epoch_end.into())
-                .filter_map(|winning_slot| winning_slot)
-                .collect()
-                .await;
+        let winners: Vec<_> = epoch_winning_slots_stream(
+            &eras,
+            epoch_state,
+            &eligible,
+            kms,
+            epoch_end.into(),
+            Arc::new(|_| Box::pin(async { true })),
+            None,
+        )
+        .filter_map(|winning_slot| winning_slot)
+        .collect()
+        .await;
 
         assert!(
             winners.is_empty(),
             "no winning slots should be emitted when starting past the epoch end",
         );
+    }
+
+    #[tokio::test]
+    async fn scan_does_not_emit_notes_that_are_no_longer_eligible() {
+        let (config, kms, eligible, _, epoch_state) = scan_test_fixtures();
+        let eras = single_era(config);
+        let start = eras.starting_slot_for_epoch(epoch_state.epoch);
+        let winners: Vec<_> = epoch_winning_slots_stream(
+            &eras,
+            epoch_state,
+            &eligible,
+            kms,
+            start,
+            Arc::new(|_| Box::pin(async { false })),
+            None,
+        )
+        .filter_map(|winner| winner)
+        .collect()
+        .await;
+        assert!(winners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_does_not_emit_notes_from_an_unavailable_note_set() {
+        let (config, kms, eligible, _, epoch_state) = scan_test_fixtures();
+        let eras = single_era(config);
+        let start = eras.starting_slot_for_epoch(epoch_state.epoch);
+        let unknown = [in_unknown_set(&eligible[0])];
+        let winners: Vec<_> = epoch_winning_slots_stream(
+            &eras,
+            epoch_state,
+            &unknown,
+            kms,
+            start,
+            Arc::new(|_| Box::pin(async { true })),
+            None,
+        )
+        .filter_map(|winner| winner)
+        .collect()
+        .await;
+        assert!(winners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_can_pick_up_a_note_imported_after_the_epoch_handoff() {
+        let (config, kms, eligible, _, epoch_state) = scan_test_fixtures();
+        let eras = single_era(config);
+        let start = eras.starting_slot_for_epoch(epoch_state.epoch);
+        let notes = Arc::new(eligible);
+        let refresh: LeadershipNotesSource = Arc::new(move || {
+            let notes = Arc::clone(&notes);
+            Box::pin(async move { notes.iter().map(clone_aged).collect() })
+        });
+        let winners: Vec<_> = epoch_winning_slots_stream(
+            &eras,
+            epoch_state,
+            &[],
+            kms,
+            start,
+            Arc::new(|_| Box::pin(async { true })),
+            Some(refresh),
+        )
+        .filter_map(|winner| winner)
+        .collect()
+        .await;
+        assert!(!winners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn both_leadership_consumers_use_the_same_distinct_kms_credentials() {
+        use lb_core::proofs::leader_proof::Groth16LeaderProof;
+        use lb_key_management_system_service::{
+            backend::{KMSBackend as _, preload::PreloadKMSBackendSettings},
+            keys::{Key, LeadershipKey, kdf_public_key},
+            message::KMSMessage,
+        };
+
+        let (config, _, _, _, mut epoch_state) = scan_test_fixtures();
+        let nf_sk = Fr::from(7u64);
+        let staking_sk = Fr::from(19u64);
+        let note = Note {
+            stake_public_key: kdf_public_key(&staking_sk),
+            ..Note::new(1000, Fr::from(11u64), kdf_public_key(&nf_sk))
+        };
+        let (_, aged_path) = CommitmentMmr::new()
+            .push_with_paths(note.commitment(), &mut [])
+            .unwrap();
+        let latest = LedgerState::from_notes([note], &config, &genesis_parameters())
+            .latest_note_sets()
+            .clone();
+        epoch_state.note_sets = latest.clone();
+        let key_id = "leader".to_owned();
+        let aged = vec![AgedNote {
+            note: OwnedNote {
+                note,
+                note_set: NoteSetIndex::Ledger,
+                nullifier: derive_note_nullifier(&note.commitment(), &nf_sk),
+                path: aged_path.clone(),
+            },
+            aged_path,
+            key_id: key_id.clone(),
+        }];
+        let backend = lb_key_management_system_service::backend::preload::PreloadKMSBackend::new(
+            PreloadKMSBackendSettings {
+                keys: [(
+                    key_id,
+                    Key::Leadership(LeadershipKey::new(nf_sk, staking_sk)),
+                )]
+                .into(),
+            },
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if let KMSMessage::Execute {
+                    key_id,
+                    operator,
+                    reply_channel,
+                } = message
+                {
+                    drop(reply_channel.send(backend.execute(&key_id, operator).await));
+                }
+            }
+        });
+        let kms =
+            KmsServiceApi::<PreloadKmsService<TestRuntimeServiceId>, TestRuntimeServiceId>::new(
+                OutboundRelay::new(sender),
+            );
+        let eras = single_era(config);
+        let start = eras.starting_slot_for_epoch(epoch_state.epoch);
+        let mut scan = epoch_winning_slots_stream(
+            &eras,
+            epoch_state.clone(),
+            &aged,
+            kms.clone(),
+            start,
+            Arc::new(|_| Box::pin(async { true })),
+            None,
+        );
+        let scanned = loop {
+            let future = scan
+                .next()
+                .await
+                .expect("the easy lottery has a winning slot");
+            if let Some(private) = future.await {
+                break private;
+            }
+        };
+        let slot = Slot::from(scanned.input().chain.slot_number);
+        let scanned_public = public_inputs_for_slot(&epoch_state, slot, &latest);
+        let scan_proof = Groth16LeaderProof::prove(scanned).unwrap();
+        assert!(scan_proof.verify(&scanned_public, Fr::from(0u64)));
+
+        let winning = find_winning_note(&aged, &epoch_state, &latest, slot, &kms)
+            .await
+            .unwrap();
+        let private = kms
+            .build_private_inputs(
+                winning.note.key_id,
+                note,
+                winning.public_inputs,
+                winning.wallet_inputs,
+                0,
+            )
+            .await
+            .unwrap();
+        let proposal_proof = Groth16LeaderProof::prove(private).unwrap();
+        assert!(proposal_proof.verify(&winning.public_inputs, Fr::from(0u64)));
     }
 
     /// A winning note whose witness fails leaves the slot to the next winning
@@ -915,6 +1161,7 @@ mod pol_tests {
         async fn build_private_inputs(
             &self,
             _: Self::KeyId,
+            _: Note,
             public_inputs: LeaderPublic,
             wallet: PolWalletInputsData,
             reward_value: Value,
@@ -936,6 +1183,10 @@ mod pol_tests {
 
     #[derive(Debug)]
     struct TestRuntimeServiceId;
+
+    impl AsServiceId<PreloadKmsService<Self>> for TestRuntimeServiceId {
+        const SERVICE_ID: Self = Self;
+    }
 
     impl Display for TestRuntimeServiceId {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

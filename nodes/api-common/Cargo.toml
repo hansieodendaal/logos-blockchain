@@ -18,6 +18,7 @@ lb-core                       = { features = ["openapi"], workspace = true }
 lb-groth16                    = { workspace = true }
 lb-key-management-system-keys = { workspace = true }
 lb-log-targets                = { workspace = true }
+lb-mmr                        = { workspace = true }
 lb-tracing                    = { workspace = true }
 serde                         = { features = ["alloc", "derive"], workspace = true }
 serde_json                    = { workspace = true }

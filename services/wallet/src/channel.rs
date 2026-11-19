@@ -59,6 +59,7 @@ pub struct ChannelStep {
     pub step: Step,
     pub proof: ZkTransferProof,
     pub outputs: Vec<Note>,
+    pub reservation_id: [u8; 32],
 }
 
 /// A withdrawal of channel notes of the wallet, each released as a ledger
@@ -67,6 +68,7 @@ pub struct ChannelStep {
 pub struct ChannelWithdrawal {
     pub op: ChannelWithdrawOp,
     pub opening: ZkTransferOpening,
+    pub reservation_id: [u8; 32],
 }
 
 // A user step, or a program deposit, spending the channel notes of the
@@ -165,11 +167,10 @@ pub fn build_withdrawal(
         .map(|commitment| {
             let owned = spend_state
                 .notes
-                .get(commitment)
-                .filter(|owned| owned.note_set == note_set)
+                .get(&lb_wallet::NoteId::new(note_set, *commitment))
                 .ok_or(WalletServiceError::NoChannelNote(*commitment, channel_id))?;
-            if spend_state.is_withdrawing(&owned.nullifier)
-                || state.is_pending_note(&owned.nullifier)
+            if spend_state.is_withdrawing(note_set, &owned.nullifier)
+                || state.is_pending_note(note_set, &owned.nullifier)
             {
                 return Err(WalletServiceError::ChannelNoteInFlight(
                     *commitment,
@@ -193,6 +194,7 @@ pub fn build_withdrawal(
     };
     Ok(ChannelWithdrawal {
         op,
+        reservation_id: rand::random(),
         opening: ZkTransferOpening {
             inputs: inputs.iter().map(|owned| owned.note).collect(),
             outputs,

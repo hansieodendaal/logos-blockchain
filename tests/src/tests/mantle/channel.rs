@@ -510,7 +510,11 @@ async fn channel_note_round_trip() {
         .send()
         .await
         .expect("request should not fail");
-    assert!(response.status().is_success(), "deposit should succeed");
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        panic!("deposit should succeed: {status}: {body}");
+    }
     let ChannelPrepareDepositResponseBody {
         hash: deposit_tx_hash,
         transaction,
@@ -533,6 +537,7 @@ async fn channel_note_round_trip() {
         step: first_step,
         proof: first_proof,
         outputs: first_outputs,
+        reservation_id: first_reservation,
         ..
     } = channel_user_step(
         &validator.client,
@@ -558,6 +563,7 @@ async fn channel_note_round_trip() {
         step,
         proof,
         outputs,
+        reservation_id: second_reservation,
         ..
     } = channel_user_step(
         &validator.client,
@@ -579,6 +585,8 @@ async fn channel_note_round_trip() {
 
     let signing_key = Ed25519Key::from_bytes(&[7u8; 32]);
     let tx_builder = MantleTxBuilder::new()
+        .with_additional_reservation_id(first_reservation)
+        .with_additional_reservation_id(second_reservation)
         .push_op(Op::ChannelInscribe(InscriptionOp {
             channel_id,
             inscription: Inscription::new_unchecked(b"zone block".to_vec()),

@@ -471,6 +471,18 @@ impl CommonHttpClient {
         self.get::<(), ChainServiceInfo>(request_url, None).await
     }
 
+    /// A bounded page of the node's current canonical ancestry.
+    pub async fn canonical_headers(
+        &self,
+        base_url: Url,
+        ancestor: HeaderId,
+    ) -> Result<Vec<HeaderId>, Error> {
+        let mut url = base_url.join("cryptarchia/headers").map_err(Error::Url)?;
+        url.query_pairs_mut()
+            .append_pair("to", &ancestor.to_string());
+        self.get::<(), Vec<HeaderId>>(url, None).await
+    }
+
     /// Get the gas prices from the ledger state at `tip`, or at the current
     /// tip when `tip` is `None`.
     pub async fn gas_prices(

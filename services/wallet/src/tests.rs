@@ -1,6 +1,5 @@
 use core::num::NonZeroU32;
 use std::{
-    collections::HashSet,
     fmt::{self, Display, Formatter},
     time::Duration,
 };
@@ -18,7 +17,7 @@ use lb_core::{
     mantle::{
         GenesisParameters, GenesisTime,
         gas::Gas,
-        note_set::{CommitmentMmr, NoteSetUpdate},
+        note_set::NoteSetUpdate,
         notes::derive_note_nullifier,
         ops::{
             channel::{
@@ -47,7 +46,7 @@ use lb_time::era::{Era, EraEntriesAfterGenesis, EraTiming};
 use lb_utils::math::{NonNegativeRatio, PositiveRatio, ProperFraction};
 use overwatch::services::{
     relay::{InboundRelay, OutboundRelay, Relay},
-    state::{NoOperator, NoState},
+    state::{NoOperator, NoState, ServiceState as _},
 };
 use time::OffsetDateTime;
 use tokio::{
@@ -56,6 +55,8 @@ use tokio::{
 };
 
 use super::*;
+#[path = "tests/recovery.rs"]
+mod recovery;
 
 #[test]
 fn op_proof_pairs_each_operation_with_its_proof_type() {
@@ -77,6 +78,1210 @@ fn op_proof_pairs_each_operation_with_its_proof_type() {
         OpProof::Ed25519Sig(signature)
     );
     assert!(op_proof(&OpRef::Transfer(&transfer), None, None).is_err());
+}
+
+#[test]
+fn historical_recovery_requires_a_current_membership_proof() {
+    let owner = ZkPublicKey::new(Fr::from(2u64));
+    let committed = Note::new(25, Fr::from(1u64), owner);
+    let fabricated = Note::new(25, Fr::from(2u64), owner);
+    let (mmr, path) = CommitmentMmr::new()
+        .push_with_paths(committed.commitment(), &mut [])
+        .unwrap();
+    assert!(valid_historical_path(&mmr, committed, &path));
+    assert!(!valid_historical_path(&mmr, fabricated, &path));
+    let (later, _) = mmr
+        .push_with_paths(fabricated.commitment(), &mut [])
+        .unwrap();
+    assert!(!valid_historical_path(&later, committed, &path));
+}
+
+#[tokio::test]
+async fn fabricated_historical_imports_do_not_start_replay() {
+    let key = ZkKey::new(Fr::from(7u64));
+    let committed = known_note(&key, 100, 1).note;
+    let fabricated = Note {
+        nonce: Fr::from(2u64),
+        ..committed
+    };
+    let (mmr, path) = CommitmentMmr::new()
+        .push_with_paths(committed.commitment(), &mut [])
+        .unwrap();
+    let ledger = LedgerState::from_notes([committed], &ledger_config(), &genesis_parameters());
+    assert!(valid_historical_path(&mmr, committed, &path));
+    let (sender, mut requests) = mpsc::channel(8);
+    let chain = CryptarchiaServiceApi::<DummyCryptarchia>::new(OutboundRelay::new(sender));
+    let unexpected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&unexpected);
+    tokio::spawn(async move {
+        while let Some(message) = requests.recv().await {
+            match message {
+                ConsensusMsg::Query(Query::Info { reply_channel }) => {
+                    let genesis = HeaderId::from([0; 32]);
+                    drop(reply_channel.send(ChainServiceInfo {
+                        cryptarchia_info: CryptarchiaInfo {
+                            lib: genesis,
+                            lib_slot: Slot::from(0),
+                            tip: genesis,
+                            slot: Slot::from(0),
+                            height: 0,
+                            state: State::Online,
+                        },
+                        phase: PhaseTag::Following,
+                    }));
+                }
+                ConsensusMsg::Query(Query::GetLedgerState { reply_channel, .. }) => {
+                    drop(reply_channel.send(Some(ledger.clone())));
+                }
+                _ => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    let settings = wallet_settings(committed.public_key);
+    let (updates, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let mut state = wallet_state(&settings, &[], &updater);
+    let (storage, mut writes) = storage_api();
+    let kms = kms_api(key);
+    for attempt in 0..3 {
+        let result = TestWallet::recover_note(
+            fabricated,
+            NoteSetIndex::Ledger,
+            path.clone(),
+            &mut state,
+            &storage,
+            &chain,
+            &kms,
+            &era_schedule(),
+        )
+        .await;
+        if attempt == 0 {
+            assert!(matches!(
+                result,
+                Err(WalletServiceError::InvalidHistoricalPath)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(WalletServiceError::HistoricalReplayRateLimited)
+            ));
+        }
+    }
+    assert!(writes.try_recv().is_err());
+    assert_eq!(unexpected.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(state.wallet().known_notes().is_empty());
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises replay, failure and deduplication"
+)]
+async fn confirmed_genesis_note_is_recovered_with_a_verified_path() {
+    use lb_core::{
+        block::genesis::GenesisBlockBuilder,
+        mantle::{ops::channel::NULL_CHANNEL_ID, transactions::GenesisAllocation},
+    };
+
+    let key = ZkKey::new(Fr::from(7u64));
+    let genesis = GenesisBlockBuilder::new()
+        .add_note(GenesisAllocation {
+            value: 100,
+            public_key: key.to_public_key(),
+        })
+        .set_inscription(InscriptionOp {
+            channel_id: NULL_CHANNEL_ID,
+            inscription: Inscription::new_unchecked(genesis_parameters().encode_to_vec()),
+            parent: MsgId::root(),
+            signer: UnverifiedEd25519PublicKey::from_bytes(&[0; 32]).unwrap(),
+            mini_blocks: MiniBlocks::default(),
+        })
+        .build()
+        .unwrap();
+    let notes = genesis.genesis_tx().initial_notes();
+    let note = notes[0];
+    let id = genesis.header().id();
+    let (mmr, path) = CommitmentMmr::new()
+        .push_with_paths(note.commitment(), &mut [])
+        .unwrap();
+    let ledger = LedgerState::from_notes(
+        notes.iter().copied(),
+        &ledger_config(),
+        &genesis_parameters(),
+    );
+    assert!(valid_historical_path(&mmr, note, &path));
+    let (sender, mut requests) = mpsc::channel(8);
+    let chain = CryptarchiaServiceApi::<DummyCryptarchia>::new(OutboundRelay::new(sender));
+    let replay_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&replay_count);
+    let fail_genesis = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fail_query = Arc::clone(&fail_genesis);
+    tokio::spawn(async move {
+        while let Some(message) = requests.recv().await {
+            match message {
+                ConsensusMsg::Query(Query::Info { reply_channel }) => {
+                    drop(reply_channel.send(ChainServiceInfo {
+                        cryptarchia_info: CryptarchiaInfo {
+                            lib: id,
+                            lib_slot: 0.into(),
+                            tip: id,
+                            slot: 0.into(),
+                            height: 0,
+                            state: State::Online,
+                        },
+                        phase: PhaseTag::Following,
+                    }));
+                }
+                ConsensusMsg::Query(Query::GetLedgerState { reply_channel, .. }) => {
+                    drop(reply_channel.send(Some(ledger.clone())));
+                }
+                ConsensusMsg::Query(Query::GetGenesisBlock { reply_channel }) => {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if !fail_query.load(std::sync::atomic::Ordering::SeqCst) {
+                        drop(reply_channel.send(genesis.clone()));
+                    }
+                }
+                ConsensusMsg::Query(Query::GetHeaders { reply_channel, .. }) => {
+                    drop(reply_channel.send(Box::pin(futures::stream::iter([Ok(id)]))));
+                }
+                _ => panic!("unexpected chain request"),
+            }
+        }
+    });
+    let (sender, mut requests) = mpsc::channel(8);
+    let storage = StorageApi::<TestTx>::new(OutboundRelay::new(sender));
+    tokio::spawn(async move {
+        let mut records = HashMap::new();
+        while let Some(request) = requests.recv().await {
+            match request {
+                StorageMsg::BulkStoreConfirmed {
+                    items,
+                    reply_channel,
+                } => {
+                    records.extend(items);
+                    drop(reply_channel.send(Ok(())));
+                }
+                StorageMsg::LoadPrefix {
+                    prefix,
+                    reply_channel,
+                    ..
+                } => {
+                    drop(
+                        reply_channel.send(
+                            records
+                                .iter()
+                                .filter(|(key, _)| key.starts_with(&prefix))
+                                .map(|(_, value)| value.clone())
+                                .collect(),
+                        ),
+                    );
+                }
+                StorageMsg::Load { key, reply_channel } => {
+                    drop(reply_channel.send(records.get(&key).cloned()));
+                }
+                _ => panic!("unexpected storage request"),
+            }
+        }
+    });
+    let settings = wallet_settings(note.public_key);
+    let (updates, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        id,
+        &notes,
+        &[],
+        [],
+        [],
+        &updater,
+    )
+    .unwrap();
+    let kms = kms_api(key);
+    assert!(
+        state
+            .wallet()
+            .wallet_state_at(id)
+            .unwrap()
+            .owned_note(NoteSetIndex::Ledger, &note.commitment())
+            .unwrap()
+            .is_none()
+    );
+    let mut failed = state.replay_copy();
+    assert!(
+        TestWallet::recover_note(
+            note,
+            NoteSetIndex::Ledger,
+            path.clone(),
+            &mut failed,
+            &storage,
+            &chain,
+            &kms,
+            &era_schedule()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        failed
+            .wallet()
+            .wallet_state_at(id)
+            .unwrap()
+            .owned_note(NoteSetIndex::Ledger, &note.commitment())
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.wallet_requires_historical_replay().await.unwrap());
+    assert!(
+        storage
+            .load_wallet_known_notes()
+            .await
+            .unwrap()
+            .contains_key(&NoteId::new(NoteSetIndex::Ledger, note.commitment()))
+    );
+    assert!(matches!(
+        TestWallet::recover_note(
+            note,
+            NoteSetIndex::Ledger,
+            path.clone(),
+            &mut failed,
+            &storage,
+            &chain,
+            &kms,
+            &era_schedule()
+        )
+        .await,
+        Err(WalletServiceError::HistoricalReplayRateLimited)
+    ));
+    fail_genesis.store(false, std::sync::atomic::Ordering::SeqCst);
+    TestWallet::recover_note(
+        note,
+        NoteSetIndex::Ledger,
+        path.clone(),
+        &mut state,
+        &storage,
+        &chain,
+        &kms,
+        &era_schedule(),
+    )
+    .await
+    .unwrap();
+    let wallet = state.wallet().wallet_state_at(id).unwrap();
+    assert!(
+        wallet
+            .owned_note(NoteSetIndex::Ledger, &note.commitment())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(replay_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(storage.wallet_requires_historical_replay().await.unwrap());
+    assert!(matches!(
+        TestWallet::recover_note(
+            note,
+            NoteSetIndex::Ledger,
+            path,
+            &mut state,
+            &storage,
+            &chain,
+            &kms,
+            &era_schedule(),
+        )
+        .await,
+        Err(WalletServiceError::HistoricalReplayRateLimited)
+    ));
+    assert_eq!(replay_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "exercises late recovery across forks, LIB and restart"
+)]
+async fn late_replay_preserves_forks_spending_and_reservations_after_restart() {
+    use lb_core::{
+        block::genesis::GenesisBlockBuilder,
+        mantle::{ops::channel::NULL_CHANNEL_ID, transactions::GenesisAllocation},
+    };
+
+    let key = ZkKey::new(Fr::from(7u64));
+    let genesis = GenesisBlockBuilder::new()
+        .add_note(GenesisAllocation {
+            value: 100,
+            public_key: key.to_public_key(),
+        })
+        .set_inscription(InscriptionOp {
+            channel_id: NULL_CHANNEL_ID,
+            inscription: Inscription::new_unchecked(genesis_parameters().encode_to_vec()),
+            parent: MsgId::root(),
+            signer: UnverifiedEd25519PublicKey::from_bytes(&[0; 32]).unwrap(),
+            mini_blocks: MiniBlocks::default(),
+        })
+        .build()
+        .unwrap();
+    let notes = genesis.genesis_tx().initial_notes();
+    let note = notes[0];
+    let nullifier = derive_note_nullifier(&note.commitment(), &key.nullifier_key());
+    let genesis_id = genesis.header().id();
+    let common = create_block(genesis_id, 1);
+    let common_id = common.header().id();
+    let spent = create_block(common_id, 2);
+    let spent_id = spent.header().id();
+    let fork = create_block(common_id, 3);
+    let fork_id = fork.header().id();
+    let spend_events = Events::from(Event::Block(BlockEvent::NoteSetUpdated(NoteSetUpdate {
+        note_set: NoteSetIndex::Ledger,
+        nullifiers: vec![nullifier],
+        commitments: vec![],
+    })));
+    let events = HashMap::from([
+        (common_id, Bytes::try_from(Events::new()).unwrap()),
+        (spent_id, Bytes::try_from(spend_events).unwrap()),
+        (fork_id, Bytes::try_from(Events::new()).unwrap()),
+    ]);
+    let blocks = [common, spent, fork]
+        .into_iter()
+        .map(|block| (block.header().id(), Bytes::from(block.encode_to_vec())))
+        .collect::<HashMap<_, _>>();
+    let (sender, mut requests) = mpsc::channel(8);
+    let storage = StorageApi::<TestTx>::new(OutboundRelay::new(sender));
+    tokio::spawn(async move {
+        let mut records = HashMap::new();
+        while let Some(request) = requests.recv().await {
+            match request {
+                StorageMsg::BulkStoreConfirmed {
+                    items,
+                    reply_channel,
+                } => {
+                    records.extend(items);
+                    drop(reply_channel.send(Ok(())));
+                }
+                StorageMsg::LoadPrefix {
+                    prefix,
+                    reply_channel,
+                    ..
+                } => {
+                    drop(
+                        reply_channel.send(
+                            records
+                                .iter()
+                                .filter(|(key, _)| key.starts_with(&prefix))
+                                .map(|(_, value)| value.clone())
+                                .collect(),
+                        ),
+                    );
+                }
+                StorageMsg::Load { key, reply_channel } => {
+                    drop(reply_channel.send(records.get(&key).cloned()));
+                }
+                StorageMsg::GetBlock {
+                    header_id,
+                    response_tx,
+                } => {
+                    drop(response_tx.send(blocks.get(&header_id).cloned()));
+                }
+                StorageMsg::GetBlockEvents {
+                    header_id,
+                    response_tx,
+                } => {
+                    drop(response_tx.send(events.get(&header_id).cloned()));
+                }
+                _ => panic!("unexpected storage request"),
+            }
+        }
+    });
+    let ledger = LedgerState::from_notes(
+        notes.iter().copied(),
+        &ledger_config(),
+        &genesis_parameters(),
+    );
+    let (sender, mut requests) = mpsc::channel(8);
+    let chain = CryptarchiaServiceApi::<DummyCryptarchia>::new(OutboundRelay::new(sender));
+    tokio::spawn(async move {
+        while let Some(message) = requests.recv().await {
+            match message {
+                ConsensusMsg::Query(Query::Info { reply_channel }) => {
+                    drop(reply_channel.send(ChainServiceInfo {
+                        cryptarchia_info: CryptarchiaInfo {
+                            lib: common_id,
+                            lib_slot: 1.into(),
+                            tip: spent_id,
+                            slot: 2.into(),
+                            height: 2,
+                            state: State::Online,
+                        },
+                        phase: PhaseTag::Following,
+                    }));
+                }
+                ConsensusMsg::Query(Query::GetLedgerState { reply_channel, .. }) => {
+                    drop(reply_channel.send(Some(ledger.clone())));
+                }
+                ConsensusMsg::Query(Query::GetGenesisBlock { reply_channel }) => {
+                    drop(reply_channel.send(genesis.clone()));
+                }
+                ConsensusMsg::Query(Query::GetHeaders {
+                    from_descendant,
+                    to_ancestor,
+                    reply_channel,
+                }) => {
+                    let descendant = from_descendant.unwrap();
+                    let mut headers = vec![descendant];
+                    if descendant != common_id && descendant != genesis_id {
+                        headers.push(common_id);
+                    }
+                    if descendant != genesis_id {
+                        headers.push(genesis_id);
+                    }
+                    if let Some(index) = headers.iter().position(|id| Some(*id) == to_ancestor) {
+                        headers.truncate(index + 1);
+                    }
+                    drop(
+                        reply_channel
+                            .send(Box::pin(futures::stream::iter(headers.into_iter().map(Ok)))),
+                    );
+                }
+                _ => panic!("unexpected chain request"),
+            }
+        }
+    });
+    let settings = wallet_settings(note.public_key);
+    let (updates, checkpoints) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        genesis_id,
+        &notes,
+        &[],
+        [],
+        [],
+        &updater,
+    )
+    .unwrap();
+    for (id, parent, nullifiers) in [
+        (common_id, genesis_id, vec![]),
+        (spent_id, common_id, vec![nullifier]),
+        (fork_id, common_id, vec![]),
+    ] {
+        state
+            .apply_block(&WalletBlock {
+                id,
+                parent,
+                epoch: 0.into(),
+                updates: vec![NoteSetUpdate {
+                    note_set: NoteSetIndex::Ledger,
+                    nullifiers,
+                    commitments: vec![],
+                }],
+                revealed: vec![],
+                withdrawals: vec![],
+            })
+            .unwrap();
+    }
+    state.advance_lib(common_id, 1);
+    state.reserve_pending_notes_in(NoteSetIndex::Ledger, [nullifier], [3; 32]);
+    let (_, path) = CommitmentMmr::new()
+        .push_with_paths(note.commitment(), &mut [])
+        .unwrap();
+    let kms = kms_api(key);
+    TestWallet::recover_note(
+        note,
+        NoteSetIndex::Ledger,
+        path,
+        &mut state,
+        &storage,
+        &chain,
+        &kms,
+        &settings.era_schedule,
+    )
+    .await
+    .unwrap();
+    assert!(state.is_pending_note(NoteSetIndex::Ledger, &nullifier));
+    let check_forks = |state: &ServiceState<'_>| {
+        let spent = state.wallet().wallet_state_at(spent_id).unwrap();
+        assert!(
+            spent
+                .owned_note(NoteSetIndex::Ledger, &note.commitment())
+                .unwrap()
+                .is_none()
+        );
+        let fork = state.wallet().wallet_state_at(fork_id).unwrap();
+        let owned = fork
+            .owned_note(NoteSetIndex::Ledger, &note.commitment())
+            .unwrap()
+            .unwrap();
+        assert_eq!(owned.nullifier, nullifier);
+        assert!(
+            owned
+                .path
+                .verify::<ZkHasher>(note.commitment().0, fork.root_of(NoteSetIndex::Ledger))
+        );
+    };
+    check_forks(&state);
+    let checkpoint = checkpoints.borrow().clone().unwrap().to_bytes().unwrap();
+    let mut restored = TestWallet::start_state(
+        RecoveryState::from_bytes(&checkpoint).unwrap(),
+        &settings,
+        &updater,
+        &chain,
+        &kms,
+        &storage,
+    )
+    .await
+    .unwrap();
+    TestWallet::backfill_missing_blocks(
+        spent_id,
+        &mut restored,
+        &storage,
+        &chain,
+        &kms,
+        &settings.era_schedule,
+    )
+    .await
+    .unwrap();
+    TestWallet::backfill_missing_blocks(
+        fork_id,
+        &mut restored,
+        &storage,
+        &chain,
+        &kms,
+        &settings.era_schedule,
+    )
+    .await
+    .unwrap();
+    restored.advance_lib(common_id, 1);
+    check_forks(&restored);
+}
+
+#[test]
+fn leader_selection_excludes_notes_without_a_staking_key() {
+    let owner = ZkPublicKey::new(Fr::from(2u64));
+    let staked = Note::new(25, Fr::from(1u64), owner);
+    let unstaked = Note {
+        nonce: Fr::from(2u64),
+        stake_public_key: ZkPublicKey::zero(),
+        ..staked
+    };
+    let known_notes = [staked, unstaked]
+        .into_iter()
+        .zip([1u64, 2])
+        .map(|(note, nullifier)| {
+            (
+                NoteId::new(NoteSetIndex::Ledger, note.commitment()),
+                KnownNote {
+                    note,
+                    note_set: NoteSetIndex::Ledger,
+                    nullifier: NoteNullifier(Fr::from(nullifier)),
+                },
+            )
+        })
+        .collect();
+    let genesis = HeaderId::from([0; 32]);
+    let wallet = Wallet::from_genesis(
+        [(owner, "owner".into())],
+        known_notes,
+        genesis,
+        &[staked, unstaked],
+        &[],
+    )
+    .unwrap();
+    let aged = wallet
+        .wallet_state_at(genesis)
+        .unwrap()
+        .aged_notes()
+        .unwrap();
+    let keys = HashMap::from([(
+        LeadershipPublicKeys {
+            nullifier_public_key: owner,
+            staking_public_key: owner,
+        },
+        "owner".into(),
+    )]);
+    let selected = select_leader_notes(&keys, aged);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].note.note, staked);
+    assert_eq!(wallet.balance(genesis, owner).unwrap().unwrap().balance, 50);
+}
+
+#[tokio::test]
+async fn leadership_only_wallet_and_kms_build_a_verifiable_proof_with_distinct_keys() {
+    assert_leadership_proof(Fr::from(7u64), Fr::from(0u64), NoteSetIndex::Ledger, false).await;
+}
+
+#[test]
+fn sdp_reservation_does_not_exclude_or_release_the_matching_ledger_note() {
+    use lb_core::mantle::ops::sdp::SDPWithdrawOp;
+
+    let key = ZkKey::new(Fr::from(7u64));
+    let ledger = known_note(&key, 100, 1);
+    let sdp = KnownNote {
+        note_set: NoteSetIndex::Sdp,
+        ..ledger
+    };
+    let settings = wallet_settings(ledger.note.public_key);
+    let (updates, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let genesis = HeaderId::from([0; 32]);
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        genesis,
+        &[ledger.note],
+        &[sdp.note],
+        [ledger, sdp],
+        [],
+        &updater,
+    )
+    .unwrap();
+    let owner = [1; 32];
+    state.reserve_pending_notes_in(NoteSetIndex::Sdp, [sdp.nullifier], owner);
+    assert!(!state.is_pending_note(NoteSetIndex::Ledger, &ledger.nullifier));
+    let builder = MantleTxBuilder::new()
+        .with_reservation_id(owner)
+        .push_op(Op::SDPWithdraw(SDPWithdrawOp {
+            service_note_nullifier: sdp.nullifier,
+            ..SDPWithdrawOp::sample()
+        }))
+        .unwrap()
+        .add_ledger_output(Note::new(50, Fr::from(3u64), ledger.note.public_key))
+        .unwrap();
+    let funded = state
+        .fund_tx(
+            genesis,
+            &builder,
+            ledger.note.public_key,
+            Fr::from(4u64),
+            [ledger.note.public_key],
+            &free_context(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(funded.funding_inputs()[0].nullifier, ledger.nullifier);
+    state.reserve_transaction_notes(&funded, owner);
+    state.release_pending_notes_in(NoteSetIndex::Sdp, [sdp.nullifier], owner);
+    assert!(state.is_pending_note(NoteSetIndex::Ledger, &ledger.nullifier));
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Covers imports, discovery and spending separation"
+)]
+async fn importing_a_leadership_only_opening_does_not_add_spending_authority() {
+    use lb_key_management_system_service::{
+        backend::preload::PreloadKMSBackendSettings,
+        keys::{LeadershipKey, kdf_public_key},
+    };
+    let nf_sk = Fr::from(7u64);
+    let staking_sk = Fr::from(19u64);
+    let public = LeadershipPublicKeys {
+        nullifier_public_key: kdf_public_key(&nf_sk),
+        staking_public_key: kdf_public_key(&staking_sk),
+    };
+    let note = Note {
+        stake_public_key: public.staking_public_key,
+        ..Note::new(12, Fr::from(11u64), public.nullifier_public_key)
+    };
+    let id = "leader".to_owned();
+    let backend = KmsBackend::new(PreloadKMSBackendSettings {
+        keys: HashMap::from([(
+            id.clone(),
+            Key::Leadership(LeadershipKey::new(nf_sk, staking_sk)),
+        )]),
+    });
+    let (sender, mut receiver) = mpsc::channel(2);
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            if let KMSMessage::Execute {
+                key_id,
+                operator,
+                reply_channel,
+            } = message
+            {
+                drop(reply_channel.send(backend.execute(&key_id, operator).await));
+            }
+        }
+    });
+    let kms = KmsServiceApi::<TestKms, TestRuntimeServiceId>::new(OutboundRelay::new(sender));
+    let mut settings = wallet_settings(public.nullifier_public_key);
+    settings.known_keys.clear();
+    settings.leadership_keys.insert(id, public);
+    let genesis = HeaderId::from([0; 32]);
+    let (updates, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        genesis,
+        &[],
+        &[],
+        [],
+        [],
+        &updater,
+    )
+    .unwrap();
+    let (storage, mut writes) = storage_api();
+    let (failed, _) = complete_opening_write(
+        TestWallet::import_note(note, NoteSetIndex::Ledger, &mut state, &storage, &kms),
+        &mut writes,
+        Err("write failed".into()),
+    )
+    .await;
+    assert!(matches!(failed, Err(WalletServiceError::PersistedState(_))));
+    assert!(state.leadership_wallet().known_notes().is_empty());
+    tokio::spawn(async move {
+        while let Some(request) = writes.recv().await {
+            if let StorageMsg::BulkStoreConfirmed { reply_channel, .. } = request {
+                drop(reply_channel.send(Ok(())));
+            } else {
+                panic!("unexpected storage request");
+            }
+        }
+    });
+    TestWallet::import_note(note, NoteSetIndex::Ledger, &mut state, &storage, &kms)
+        .await
+        .unwrap();
+    TestWallet::import_note(note, NoteSetIndex::Sdp, &mut state, &storage, &kms)
+        .await
+        .unwrap();
+    let channel = NoteSetIndex::Channel(ChannelId::from([8; 32]));
+    TestWallet::import_note(note, channel, &mut state, &storage, &kms)
+        .await
+        .unwrap();
+    // Registration has no chain-service dependency, including for repeat
+    // requests. The next block discovers all three memberships normally.
+    TestWallet::import_note(note, channel, &mut state, &storage, &kms)
+        .await
+        .unwrap();
+    assert!(
+        !state
+            .wallet()
+            .known_notes()
+            .contains_key(&NoteId::new(NoteSetIndex::Ledger, note.commitment()))
+    );
+    assert!(
+        state
+            .leadership_wallet()
+            .known_notes()
+            .contains_key(&NoteId::new(NoteSetIndex::Ledger, note.commitment()))
+    );
+    let child = WalletBlock {
+        id: HeaderId::from([1; 32]),
+        parent: genesis,
+        epoch: Epoch::new(0),
+        updates: [NoteSetIndex::Ledger, NoteSetIndex::Sdp, channel]
+            .into_iter()
+            .map(|note_set| NoteSetUpdate {
+                note_set,
+                nullifiers: vec![],
+                commitments: vec![note.commitment()],
+            })
+            .collect(),
+        revealed: vec![(NoteSetIndex::Channel(ChannelId::from([8; 32])), note)],
+        withdrawals: vec![],
+    };
+    TestWallet::add_revealed_notes(&child, &mut state, &storage, &kms)
+        .await
+        .unwrap();
+    state.apply_block(&child).unwrap();
+    assert!(
+        state
+            .wallet()
+            .balance(child.id, note.public_key)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        state
+            .leadership_wallet()
+            .wallet_state_at(child.id)
+            .unwrap()
+            .aged_notes_at(Epoch::new(2))
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn delegated_sdp_service_note_builds_a_verifiable_leadership_proof() {
+    assert_leadership_proof(Fr::from(7u64), Fr::from(0u64), NoteSetIndex::Sdp, false).await;
+}
+
+#[tokio::test]
+async fn program_leadership_uses_nf_sk0_without_spending_authority() {
+    let nf_sk0 = ZkKey::zero().nullifier_key();
+    assert_eq!(
+        lb_key_management_system_service::keys::kdf_public_key(&nf_sk0),
+        *PK0
+    );
+    assert_leadership_proof(
+        nf_sk0,
+        Fr::from(42u64),
+        NoteSetIndex::Channel(ChannelId::from([8; 32])),
+        false,
+    )
+    .await;
+}
+
+async fn assert_leadership_proof(nf_sk: Fr, program: Fr, note_set: NoteSetIndex, collision: bool) {
+    assert_leadership_proof_with_recovery(nf_sk, program, note_set, collision, false).await;
+}
+
+#[expect(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::option_if_let_else,
+    reason = "proof verification includes wallet, KMS and recovery"
+)]
+async fn assert_leadership_proof_with_recovery(
+    nf_sk: Fr,
+    program: Fr,
+    note_set: NoteSetIndex,
+    collision: bool,
+    recovered: bool,
+) {
+    use lb_core::{
+        mantle::note_set::NoteSets,
+        proofs::leader_proof::{LeaderPublic, pol_wallet_inputs},
+    };
+    use lb_key_management_system_service::{
+        backend::preload::PreloadKMSBackendSettings,
+        keys::{LeadershipKey, kdf_public_key},
+        operators::zk::leader::{BuildPrivateInputsWithLeaderKey, CheckLotteryWinning},
+    };
+
+    let staking_sk = Fr::from(19u64);
+    let public = LeadershipPublicKeys {
+        nullifier_public_key: kdf_public_key(&nf_sk),
+        staking_public_key: kdf_public_key(&staking_sk),
+    };
+    let note = if note_set == NoteSetIndex::Sdp {
+        let mut declaration = SDPDeclareOp::sample();
+        declaration.note_pk = public.nullifier_public_key;
+        declaration.note_stake_pk = public.staking_public_key;
+        declaration.amount = 1000;
+        declaration.service_note()
+    } else {
+        Note {
+            stake_public_key: public.staking_public_key,
+            program,
+            ..Note::new(1000, Fr::from(11u64), public.nullifier_public_key)
+        }
+    };
+    let key_id = "leadership".to_owned();
+    let backend = KmsBackend::new(PreloadKMSBackendSettings {
+        keys: HashMap::from([(
+            key_id.clone(),
+            Key::Leadership(LeadershipKey::new(nf_sk, staking_sk)),
+        )]),
+    });
+    let (sender, mut receiver) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Some(message) = receiver.recv().await {
+            if let KMSMessage::Execute {
+                key_id,
+                operator,
+                reply_channel,
+            } = message
+            {
+                let result = backend.execute(&key_id, operator).await;
+                drop(reply_channel.send(result));
+            }
+        }
+    });
+    let kms = KmsServiceApi::<TestKms, TestRuntimeServiceId>::new(OutboundRelay::new(sender));
+    let known = TestWallet::leadership_known_note(&kms, key_id.clone(), note, note_set)
+        .await
+        .unwrap();
+    let mut known_notes = vec![known];
+    if collision {
+        known_notes.push(
+            TestWallet::leadership_known_note(&kms, key_id.clone(), note, NoteSetIndex::Ledger)
+                .await
+                .unwrap(),
+        );
+    }
+    let genesis = HeaderId::from([0; 32]);
+    let (updates, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(updates));
+    let mut settings = wallet_settings(public.nullifier_public_key);
+    settings.known_keys.clear();
+    settings.leadership_keys.insert(key_id.clone(), public);
+    let ledger_notes = if note_set == NoteSetIndex::Ledger || collision {
+        vec![note]
+    } else {
+        vec![]
+    };
+    let filler = Note::new(5, Fr::from(99u64), public.nullifier_public_key);
+    let service_notes = if note_set == NoteSetIndex::Sdp && collision {
+        vec![filler, note]
+    } else if note_set == NoteSetIndex::Sdp {
+        vec![note]
+    } else {
+        vec![]
+    };
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        genesis,
+        &ledger_notes,
+        &service_notes,
+        [],
+        known_notes,
+        &updater,
+    )
+    .unwrap();
+    let mut ledger_prefix = Vec::new();
+    let recovered_tip = if recovered {
+        settings
+            .historical_recovery
+            .push(RecoveryOpening { note, note_set });
+        let fixture = recovery::Fixture::new(note, note_set, Duration::ZERO);
+        ledger_prefix = fixture.genesis_notes.clone();
+        state = fixture
+            .reconstruct(
+                &settings,
+                RecoveryState::from_settings(&settings).unwrap(),
+                &kms,
+                &updater,
+            )
+            .await;
+        TestWallet::complete_startup_recovery(&mut state, fixture.tip, &fixture.storage)
+            .await
+            .unwrap();
+        Some(fixture.tip)
+    } else {
+        None
+    };
+    let tip = if let Some(tip) = recovered_tip {
+        tip
+    } else if collision {
+        assert_eq!(
+            select_leader_notes(
+                state.leadership_keys(),
+                state
+                    .leadership_wallet()
+                    .wallet_state_at(genesis)
+                    .unwrap()
+                    .aged_notes()
+                    .unwrap()
+            )
+            .len(),
+            2
+        );
+        let block = WalletBlock {
+            id: HeaderId::from([1; 32]),
+            parent: genesis,
+            epoch: Epoch::new(0),
+            updates: vec![NoteSetUpdate {
+                note_set: NoteSetIndex::Ledger,
+                nullifiers: vec![known.nullifier],
+                commitments: vec![],
+            }],
+            revealed: vec![],
+            withdrawals: vec![],
+        };
+        state.apply_block(&block).unwrap();
+        block.id
+    } else if let NoteSetIndex::Channel(_) = note_set {
+        let block = WalletBlock {
+            id: HeaderId::from([1; 32]),
+            parent: genesis,
+            epoch: Epoch::new(0),
+            updates: vec![NoteSetUpdate {
+                note_set,
+                nullifiers: vec![],
+                commitments: vec![note.commitment()],
+            }],
+            revealed: vec![],
+            withdrawals: vec![],
+        };
+        state.apply_block(&block).unwrap();
+        block.id
+    } else {
+        genesis
+    };
+    assert!(
+        state
+            .wallet()
+            .balance(tip, note.public_key)
+            .unwrap()
+            .is_none()
+    );
+    let aged = state
+        .leadership_wallet()
+        .wallet_state_at(tip)
+        .unwrap()
+        .aged_notes_at(
+            if recovered || matches!(note_set, NoteSetIndex::Channel(_)) {
+                Epoch::new(2)
+            } else {
+                Epoch::new(0)
+            },
+        )
+        .unwrap();
+    let selected = select_leader_notes(state.leadership_keys(), aged);
+    assert_eq!(selected.len(), 1);
+
+    let mut sets = NoteSets::new();
+    if !ledger_prefix.is_empty() {
+        let ledger = sets
+            .ledger()
+            .clone()
+            .execute_adding(
+                &ledger_prefix
+                    .iter()
+                    .map(Note::commitment)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        sets = sets.update_ledger(ledger);
+    }
+    let sets = match note_set {
+        NoteSetIndex::Ledger => {
+            let ledger = sets
+                .ledger()
+                .clone()
+                .execute_adding(&[note.commitment()])
+                .unwrap();
+            sets.update_ledger(ledger)
+        }
+        NoteSetIndex::Sdp => {
+            let sdp = sets
+                .sdp()
+                .clone()
+                .execute_adding(
+                    &service_notes
+                        .iter()
+                        .map(Note::commitment)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let sets = sets.update_sdp(sdp);
+            if collision {
+                let ledger = sets
+                    .ledger()
+                    .clone()
+                    .execute_adding(&[note.commitment()])
+                    .unwrap();
+                sets.update_ledger(ledger)
+            } else {
+                sets
+            }
+        }
+        NoteSetIndex::Channel(channel_id) => {
+            let sets = sets.with_channel(channel_id);
+            let channel = sets
+                .channel(&channel_id)
+                .unwrap()
+                .clone()
+                .execute_adding(&[note.commitment()])
+                .unwrap();
+            sets.update_channel(channel)
+        }
+    }
+    .end_block(1, 1024)
+    .unwrap();
+    if collision {
+        let candidates = select_leader_notes(
+            state.leadership_keys(),
+            state
+                .leadership_wallet()
+                .wallet_state_at(genesis)
+                .unwrap()
+                .aged_notes()
+                .unwrap(),
+        );
+        for candidate in &candidates {
+            assert!(
+                pol_wallet_inputs(
+                    &note,
+                    candidate.note.note_set,
+                    &candidate.note.nullifier,
+                    &candidate.aged_path,
+                    &sets,
+                    &sets
+                )
+                .is_ok()
+            );
+        }
+        assert!(
+            pol_wallet_inputs(
+                &note,
+                NoteSetIndex::Ledger,
+                &known.nullifier,
+                &candidates
+                    .iter()
+                    .find(|candidate| candidate.note.note_set == NoteSetIndex::Sdp)
+                    .unwrap()
+                    .aged_path,
+                &sets,
+                &sets
+            )
+            .is_err()
+        );
+    }
+    let latest = if collision {
+        let ledger = sets
+            .ledger()
+            .clone()
+            .execute_spending(&[known.nullifier])
+            .unwrap();
+        sets.clone()
+            .update_ledger(ledger)
+            .end_block(2, 1024)
+            .unwrap()
+    } else {
+        sets.clone()
+    };
+    let inputs = LeaderPublic::new(
+        sets.eligible_root(),
+        latest.eligible_root(),
+        Fr::from(3u64),
+        5,
+        -Fr::from(1u64),
+        Fr::from(0u64),
+    );
+    let (tx, rx) = oneshot::channel();
+    Box::pin(kms.execute(
+        key_id.clone(),
+        KeyOperators::Leadership(Box::new(CheckLotteryWinning::new(tx, note, inputs))),
+    ))
+    .await
+    .unwrap();
+    assert!(rx.await.unwrap());
+    let mut wallet = pol_wallet_inputs(
+        &note,
+        note_set,
+        &known.nullifier,
+        &selected[0].aged_path,
+        &sets,
+        &latest,
+    )
+    .unwrap();
+    wallet.reward_public_key = *public.nullifier_public_key.as_fr();
+    wallet.reward_nonce = Fr::from(23u64);
+    let (tx, rx) = oneshot::channel();
+    Box::pin(kms.execute(
+        key_id,
+        KeyOperators::Leadership(Box::new(BuildPrivateInputsWithLeaderKey::new(
+            tx, inputs, wallet, 0, note,
+        ))),
+    ))
+    .await
+    .unwrap();
+    let private = rx.await.unwrap();
+    assert_eq!(private.input().wallet.nullifier_key, nf_sk);
+    assert_eq!(private.input().wallet.staking_secret_key, staking_sk);
+    let proof = Groth16LeaderProof::prove(private).unwrap();
+    assert!(proof.verify(&inputs, Fr::from(0u64)));
+}
+
+#[tokio::test]
+async fn identical_memberships_survive_one_set_spending_and_prove_leadership() {
+    assert_leadership_proof(Fr::from(7u64), Fr::from(0u64), NoteSetIndex::Sdp, true).await;
 }
 
 #[tokio::test]
@@ -245,12 +1450,10 @@ async fn change_waits_for_storage_and_is_spendable_after_restore() {
     .await;
     assert!(matches!(failed, Err(WalletServiceError::PersistedState(_))));
     assert_eq!(failed_records.len(), 0);
-    assert!(
-        !state
-            .wallet()
-            .known_notes()
-            .contains_key(&expected_change.commitment())
-    );
+    assert!(!state.wallet().known_notes().contains_key(&NoteId::new(
+        NoteSetIndex::Ledger,
+        expected_change.commitment()
+    )));
 
     // Retry the save, then rebuild the wallet and spend the change.
     let (saved, records) = complete_opening_write(
@@ -261,7 +1464,9 @@ async fn change_waits_for_storage_and_is_spendable_after_restore() {
     .await;
     saved.unwrap();
     assert_eq!(
-        state.wallet().known_notes()[&expected_change.commitment()].note,
+        state.wallet().known_notes()
+            [&NoteId::new(NoteSetIndex::Ledger, expected_change.commitment())]
+            .note,
         expected_change
     );
     assert!(checkpoint_updates.borrow().is_none());
@@ -328,10 +1533,16 @@ async fn leader_reward_waits_for_storage_before_becoming_known() {
         .load_wallet_known_notes()
         .await
         .unwrap();
-    assert_eq!(stored[&reward.commitment()].note, reward);
     assert_eq!(
-        state.wallet().known_notes().get(&reward.commitment()),
-        stored.get(&reward.commitment())
+        stored[&NoteId::new(NoteSetIndex::Ledger, reward.commitment())].note,
+        reward
+    );
+    assert_eq!(
+        state
+            .wallet()
+            .known_notes()
+            .get(&NoteId::new(NoteSetIndex::Ledger, reward.commitment())),
+        stored.get(&NoteId::new(NoteSetIndex::Ledger, reward.commitment()))
     );
 }
 
@@ -361,11 +1572,179 @@ async fn imported_note_waits_for_storage_before_becoming_known() {
         .load_wallet_known_notes()
         .await
         .unwrap();
-    assert_eq!(stored.get(&note.commitment()), Some(&imported));
+    assert_eq!(stored.get(&imported.id()), Some(&imported));
     assert_eq!(
-        state.wallet().known_notes().get(&note.commitment()),
+        state.wallet().known_notes().get(&imported.id()),
         Some(&imported)
     );
+}
+
+#[tokio::test]
+async fn replay_restores_finalized_spending_openings_before_rewinding() {
+    let key = ZkKey::new(Fr::from(7u64));
+    let input = known_note(&key, 100, 1);
+    let settings = wallet_settings(input.note.public_key);
+    let (checkpoint_sender, _checkpoint_updates) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(checkpoint_sender));
+    let mut state = wallet_state(&settings, &[input], &updater);
+    let (storage, mut writes) = storage_api();
+    let (saved, records) = complete_opening_write(
+        state.store_known_notes(&storage, &[input]),
+        &mut writes,
+        Ok(()),
+    )
+    .await;
+    saved.unwrap();
+
+    let genesis = HeaderId::from([0; 32]);
+    state.advance_lib(genesis, 0);
+    assert!(!state.wallet().known_notes().contains_key(&input.id()));
+
+    let mut staged = state.replay_copy();
+    staged
+        .restore_replay_openings(&storage_with_records(records))
+        .await
+        .unwrap();
+    staged
+        .rewind_to_genesis(genesis, &[input.note], &[])
+        .unwrap();
+    assert_eq!(
+        staged
+            .wallet()
+            .balance(genesis, input.note.public_key)
+            .unwrap()
+            .unwrap()
+            .balance,
+        input.note.value
+    );
+}
+
+#[tokio::test]
+async fn replay_restores_finalized_leadership_openings_without_spending_authority() {
+    use lb_key_management_system_service::keys::LeadershipKey;
+
+    let public = LeadershipKey::new(7u64.into(), 9u64.into()).as_public_key();
+    let note = Note {
+        stake_public_key: public.staking_public_key,
+        ..Note::new(10, Fr::ONE, public.nullifier_public_key)
+    };
+    let known = KnownNote {
+        note,
+        note_set: NoteSetIndex::Ledger,
+        nullifier: NoteNullifier(Fr::from(3u64)),
+    };
+    let mut settings = wallet_settings(public.nullifier_public_key);
+    settings.known_keys.clear();
+    settings.leadership_keys.insert("leader".into(), public);
+    let genesis = HeaderId::from([0; 32]);
+    let (sender, _receiver) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(sender));
+    let mut state = ServiceState::from_genesis(
+        RecoveryState::from_settings(&settings).unwrap(),
+        &settings,
+        genesis,
+        &[note],
+        &[],
+        [],
+        [],
+        &updater,
+    )
+    .unwrap();
+    let (storage, mut writes) = storage_api();
+    let (saved, records) = complete_opening_write(
+        async {
+            storage
+                .store_wallet_leadership_notes(&[known])
+                .await
+                .map_err(WalletServiceError::PersistedState)
+        },
+        &mut writes,
+        Ok(()),
+    )
+    .await;
+    saved.unwrap();
+    state.advance_lib(genesis, 0);
+    assert!(
+        !state
+            .leadership_wallet()
+            .known_notes()
+            .contains_key(&known.id())
+    );
+    let mut staged = state.replay_copy();
+    staged
+        .restore_replay_openings(&storage_with_records(records))
+        .await
+        .unwrap();
+    staged.rewind_to_genesis(genesis, &[note], &[]).unwrap();
+    assert_eq!(
+        staged
+            .leadership_wallet()
+            .wallet_state_at(genesis)
+            .unwrap()
+            .aged_notes()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        staged
+            .wallet()
+            .balance(genesis, note.public_key)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn imported_note_batch_waits_for_each_durable_opening() {
+    let key = ZkKey::new(Fr::from(7u64));
+    let input = known_note(&key, 100, 1);
+    let settings = wallet_settings(input.note.public_key);
+    let (checkpoint_sender, _checkpoint_updates) = watch::channel(None);
+    let updater = StateUpdater::new(Arc::new(checkpoint_sender));
+    let mut state = wallet_state(&settings, &[input], &updater);
+    let (storage, mut writes) = storage_api();
+    let kms = kms_api(key);
+    let notes = [
+        Note::new(20, Fr::from(8u64), input.note.public_key),
+        Note::new(30, Fr::from(9u64), input.note.public_key),
+    ];
+    let mut operation = Box::pin(TestWallet::register_notes(
+        notes
+            .into_iter()
+            .map(|note| (note, NoteSetIndex::Ledger))
+            .collect(),
+        &mut state,
+        &storage,
+        &kms,
+    ));
+    let mut records = HashMap::new();
+    for _ in notes {
+        let message = tokio::select! {
+            _ = &mut operation => panic!("returned before all opening saves"),
+            message = writes.recv() => message.unwrap(),
+        };
+        let StorageMsg::BulkStoreConfirmed {
+            items,
+            reply_channel,
+        } = message
+        else {
+            panic!("expected an atomic opening save");
+        };
+        assert!(poll!(operation.as_mut()).is_pending());
+        records.extend(items);
+        reply_channel.send(Ok(())).unwrap();
+    }
+    let imported = operation.await.unwrap();
+    let restored = storage_with_records(records)
+        .load_wallet_known_notes()
+        .await
+        .unwrap();
+    assert_eq!(imported.len(), notes.len());
+    for known in imported {
+        assert_eq!(restored.get(&known.id()), Some(&known));
+        assert_eq!(state.wallet().known_notes().get(&known.id()), Some(&known));
+    }
 }
 
 #[tokio::test]
@@ -549,6 +1928,10 @@ async fn split_with_storage_result(
     (response.await.unwrap().map(|reply| reply.response), saved)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Checks both checkpoint and genesis recovery through spending"
+)]
 async fn assert_restored_notes_are_spendable(
     settings: &WalletServiceSettings,
     input: KnownNote,
@@ -598,13 +1981,16 @@ async fn assert_restored_notes_are_spendable(
     )
     .await
     .unwrap();
+    let mut recovery = RecoveryState::from_settings(settings).unwrap();
+    recovery.restore_spending_records(storage.load_wallet_known_notes().await.unwrap(), 0);
     let from_genesis = ServiceState::from_genesis(
-        storage.load_wallet_known_notes().await.unwrap(),
-        0,
+        recovery,
         settings,
         HeaderId::from([0; 32]),
         &[input.note],
         &[],
+        [],
+        [],
         &updater,
     )
     .unwrap();
@@ -636,11 +2022,16 @@ async fn assert_restored_notes_are_spendable(
             .collect::<Vec<_>>();
         assert_eq!(state.notes.size(), owned_outputs.len());
         for note in owned_outputs {
-            let owned = state.notes.get(&note.commitment()).unwrap();
+            let owned = state
+                .notes
+                .get(&NoteId::new(NoteSetIndex::Ledger, note.commitment()))
+                .unwrap();
             assert_eq!(owned.note, *note);
             assert_eq!(
                 owned.nullifier,
-                restored.wallet().known_notes()[&note.commitment()].nullifier
+                restored.wallet().known_notes()
+                    [&NoteId::new(NoteSetIndex::Ledger, note.commitment())]
+                    .nullifier
             );
         }
         let funded = state
@@ -748,12 +2139,17 @@ fn chain_api() -> CryptarchiaServiceApi<DummyCryptarchia> {
 }
 
 fn kms_api(key: ZkKey) -> KmsServiceApi<TestKms, TestRuntimeServiceId> {
+    kms_api_with_keys(HashMap::from([
+        ("owner".to_owned(), Key::Zk(key.clone())),
+        ("voucher-master".to_owned(), Key::Zk(key)),
+    ]))
+}
+
+fn kms_api_with_keys(
+    mut keys: HashMap<String, Key>,
+) -> KmsServiceApi<TestKms, TestRuntimeServiceId> {
     let (sender, mut receiver) = mpsc::channel::<KMSMessage<KmsBackend>>(1);
     tokio::spawn(async move {
-        let mut keys = HashMap::from([
-            ("owner".to_owned(), Key::Zk(key.clone())),
-            ("voucher-master".to_owned(), Key::Zk(key)),
-        ]);
         while let Some(message) = receiver.recv().await {
             match message {
                 KMSMessage::Execute {
@@ -774,7 +2170,31 @@ fn kms_api(key: ZkKey) -> KmsServiceApi<TestKms, TestRuntimeServiceId> {
                     keys.insert(key_id.clone(), key_type);
                     reply_channel.send(Ok((key_id, public_key))).unwrap();
                 }
-                _ => panic!("unexpected KMS request"),
+                KMSMessage::PublicKey {
+                    key_id,
+                    reply_channel,
+                } => {
+                    reply_channel
+                        .send(Ok(keys[&key_id].as_public_key()))
+                        .unwrap();
+                }
+                KMSMessage::RegisterDefaultLeadership {
+                    source,
+                    destination,
+                    reply_channel,
+                } => {
+                    let Key::Zk(key) = &keys[&source] else {
+                        panic!("expected spending key");
+                    };
+                    let nf = key.nullifier_key();
+                    let key = Key::Leadership(
+                        lb_key_management_system_service::keys::LeadershipKey::new(nf, nf),
+                    );
+                    let public = key.as_public_key();
+                    keys.insert(destination.clone(), key);
+                    reply_channel.send(Ok((destination, public))).unwrap();
+                }
+                KMSMessage::Sign { .. } => panic!("unexpected KMS request"),
             }
         }
     });
@@ -794,7 +2214,10 @@ pub fn known_note(key: &ZkKey, value: Value, nonce: u64) -> KnownNote {
 
 fn wallet_settings(owner: ZkPublicKey) -> WalletServiceSettings {
     WalletServiceSettings {
+        historical_recovery: Vec::new(),
+        historical_recovery_withdrawals: Vec::new(),
         known_keys: HashMap::from([("owner".into(), owner)]),
+        leadership_keys: HashMap::new(),
         voucher_master_key_id: "voucher-master".into(),
         recovery_data: RecoveryData::default(),
         pending_note_expiry_blocks: 10,
@@ -808,18 +2231,15 @@ fn wallet_state<'u>(
     notes: &[KnownNote],
     updater: &'u StateUpdater<Option<RecoveryState>>,
 ) -> ServiceState<'u> {
-    let known_notes = notes
-        .iter()
-        .map(|note| (note.note.commitment(), *note))
-        .collect();
     let genesis_notes = notes.iter().map(|note| note.note).collect::<Vec<_>>();
     ServiceState::from_genesis(
-        known_notes,
-        0,
+        RecoveryState::from_settings(settings).unwrap(),
         settings,
         HeaderId::from([0; 32]),
         &genesis_notes,
         &[],
+        notes.iter().copied(),
+        [],
         updater,
     )
     .unwrap()
@@ -884,12 +2304,13 @@ fn wallet_for_backfill<'u>(
     updater: &'u StateUpdater<Option<RecoveryState>>,
 ) -> ServiceState<'u> {
     ServiceState::from_genesis(
-        KnownNotes::from_iter([(known_note.note.commitment(), known_note)]),
-        0,
+        RecoveryState::from_settings(settings).unwrap(),
         settings,
         genesis,
         &[],
         &[],
+        [known_note],
+        [],
         updater,
     )
     .unwrap()
@@ -898,7 +2319,10 @@ fn wallet_for_backfill<'u>(
 fn assert_single_note_state(state: &WalletState, known_note: KnownNote) {
     let commitment = known_note.note.commitment();
     assert_eq!(state.notes.size(), 1);
-    let owned_note = state.notes.get(&commitment).unwrap();
+    let owned_note = state
+        .notes
+        .get(&NoteId::new(known_note.note_set, commitment))
+        .unwrap();
     assert_eq!(owned_note.note, known_note.note);
     assert_eq!(owned_note.nullifier, known_note.nullifier);
     assert_eq!(
@@ -1060,11 +2484,17 @@ async fn a_failed_signing_gives_its_reservations_back() {
     let (signer, _unserved_kms) = signer();
     let (resp_tx, response) = oneshot::channel();
 
-    let unused =
-        TestWallet::signing(unsignable_job(), tip(), funded_notes(), &signer, resp_tx).await;
+    let unused = TestWallet::signing(
+        unsignable_job(),
+        tip(),
+        reserved_builder(),
+        &signer,
+        resp_tx,
+    )
+    .await;
 
     assert!(response.await.unwrap().is_err());
-    assert_eq!(unused, funded_notes());
+    assert_returned_reservation(unused);
 }
 
 #[tokio::test]
@@ -1076,13 +2506,13 @@ async fn an_undelivered_transaction_gives_its_reservations_back() {
     let unused = TestWallet::signing(
         signing_job(MantleTxBuilder::new()),
         tip(),
-        funded_notes(),
+        reserved_builder(),
         &signer,
         resp_tx,
     )
     .await;
 
-    assert_eq!(unused, funded_notes());
+    assert_returned_reservation(unused);
 }
 
 #[tokio::test]
@@ -1093,14 +2523,14 @@ async fn a_delivered_transaction_keeps_its_reservations() {
     let unused = TestWallet::signing(
         signing_job(MantleTxBuilder::new()),
         tip(),
-        funded_notes(),
+        reserved_builder(),
         &signer,
         resp_tx,
     )
     .await;
 
     assert!(response.await.unwrap().is_ok());
-    assert_eq!(unused, vec![]);
+    assert!(unused.is_none());
 }
 
 /// The genesis parameters of a test chain: the supply cap and the genesis gas
@@ -1338,6 +2768,27 @@ fn unsignable_job() -> TxSigningRequest {
 }
 
 /// The note funding a signing's transaction.
-fn funded_notes() -> Vec<NoteNullifier> {
-    vec![NoteNullifier(Fr::ONE)]
+fn reserved_builder() -> MantleTxBuilder {
+    MantleTxBuilder::new()
+        .with_reservation_id([7; 32])
+        .push_op(Op::Transfer(TransferOp::new(
+            [NoteNullifier(Fr::ONE)].into(),
+            [NoteCommitment(Fr::ONE)].into(),
+            Fr::ONE,
+            0,
+        )))
+        .unwrap()
+}
+
+fn assert_returned_reservation(release: Option<PendingRelease>) {
+    let Some(PendingRelease::Transaction(builder)) = release else {
+        panic!("expected the transaction reservation");
+    };
+    assert_eq!(builder.reservation_id(), Some([7; 32]));
+    assert_eq!(
+        builder
+            .nullifiers_consumed_in(NoteSetIndex::Ledger)
+            .collect::<Vec<_>>(),
+        vec![NoteNullifier(Fr::ONE)]
+    );
 }
