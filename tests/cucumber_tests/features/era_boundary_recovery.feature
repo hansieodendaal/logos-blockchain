@@ -12,6 +12,7 @@ Feature: Era boundary recovery
   # does not establish successful F0 completion during grace.
   @era_boundary_recovery
   Scenario: IBD recovers after an in-flight old-era block request expires
+    # Bind the fault to the provider/requester pair and prevent unsolicited proposals.
     Given era-boundary recovery evidence is active
     And the era-transition participants are:
       | node   | role      | canonical_reference |
@@ -29,17 +30,21 @@ Feature: Era boundary recovery
     And I have user config override "network.backend.swarm.chain_sync.inbound_download_stream_timeout" as "seconds(300)"
     And I start the provider participant with its configured era-transition response hold
     Then the running nodes use the same effective deployment
+    # Build a real IBD backlog and retain a finalized anchor before applying the hold.
     And the provider participant produces at least 24 blocks before era activation within 120 seconds
     When I capture a non-genesis finalized block before the era boundary on the canonical reference participant
     And I start the requester participant connected to the provider participant with tip polling disabled
     Then the running nodes use the same effective deployment
     And all era-transition participants report proposal publishing disabled
     And the requester receives and applies its first F0 block while the provider holds the next response within 120 seconds
+    # Activation leaves the established stream alive during grace; expiry cancels it.
     When all nodes enter the target era within 260 seconds
     Then all nodes report the target-era fork digest within 30 seconds
     And transition expiry cancels the held F0 request and the requester detects the interruption within 30 seconds
+    # Recovery must originate in the node and preserve already applied progress.
     And the requester automatically replaces the interrupted request under F1 and the provider accepts it within 90 seconds
     And the requester retains the first downloaded block and completes IBD within 180 seconds
+    # Convergence, finalized ancestry, and health cover distinct outcomes.
     And all declared era-transition participants have at least 12 blocks and canonical histories converge to within 1 blocks within 180 seconds
     And all nodes preserve the captured finalized block on their LIB ancestry after the era boundary within 120 seconds
     And all era-transition participants remain healthy after IBD recovery
@@ -55,6 +60,7 @@ Feature: Era boundary recovery
   # or same-context collision pattern.
   @era_boundary_recovery @era_boundary_concurrent_requests
   Scenario: An unselected F0 request completes while a selected concurrent request expires
+    # Select only one requester for the hold and keep proposal publication controlled.
     Given era-boundary recovery evidence is active
     And the era-transition participants are:
       | node   | role                 | canonical_reference |
@@ -75,6 +81,7 @@ Feature: Era boundary recovery
     And I have user config override "network.backend.swarm.kademlia.kbucket_inserts" as "manual"
     And I start the provider participant with its configured era-transition response hold
     Then the running nodes use the same effective deployment
+    # Create overlapping F0 downloads with real progress on the selected request.
     And the provider participant produces at least 24 blocks before era activation within 120 seconds
     When I capture a non-genesis finalized block before the era boundary on the canonical reference participant
     And I start the requester participant connected to the provider participant with tip polling disabled
@@ -83,13 +90,16 @@ Feature: Era boundary recovery
     Then the selected F0 request overlaps with an unselected F0 request that completes normally within 120 seconds
     And the running nodes use the same effective deployment
     And all era-transition participants report proposal publishing disabled
+    # Rotation preserves established work through grace; only expiry cancels the hold.
     When all nodes enter the target era within 260 seconds
     Then all nodes report the target-era fork digest within 30 seconds
     And transition expiry cancels the held F0 request and the requester detects the interruption within 30 seconds
+    # The selected requester must recover on its own; the control already completed.
     And the requester automatically replaces the interrupted request under F1 and the provider accepts it within 90 seconds
     And the requester retains the first downloaded block and completes IBD within 180 seconds
     When I enable proposal publishing on participant "NODE_1"
     Then participant "NODE_1" reports proposal publishing enabled
+    # Check shared history, finality, and health independently across participants.
     And all declared era-transition participants have at least 12 blocks and canonical histories converge to within 1 blocks within 180 seconds
     And all nodes preserve the captured finalized block on their LIB ancestry after the era boundary within 120 seconds
     And all era-transition participants remain healthy after IBD recovery
@@ -105,6 +115,7 @@ Feature: Era boundary recovery
   # possible peer/request collisions.
   @era_boundary_recovery @era_boundary_flexible_participants
   Scenario: Explicit interactions isolate the selected request across multiple providers and requesters
+    # Bind separate selected and control interactions so the fault cannot apply globally.
     Given era-boundary recovery evidence is active
     And the era-transition participants are:
       | node   | role      | canonical_reference |
@@ -130,6 +141,7 @@ Feature: Era boundary recovery
     And I have user config override "network.backend.swarm.kademlia.kbucket_inserts" as "manual"
     And I start the provider participant with its configured era-transition response hold
     Then the running nodes use the same effective deployment
+    # Establish selected F0 progress and an independent control download.
     And the provider participant produces at least 12 blocks before era activation within 120 seconds
     When I capture a non-genesis finalized block before the era boundary on the canonical reference participant
     And I start the requester participant connected to the provider participant with tip polling disabled
@@ -139,15 +151,18 @@ Feature: Era boundary recovery
     Then the selected F0 request overlaps with an unselected F0 request that completes normally within 120 seconds
     And the running nodes use the same effective deployment
     And all era-transition participants report proposal publishing disabled
+    # F1 activation starts grace; the established selected stream expires later.
     When all nodes enter the target era within 260 seconds
     Then all nodes report the target-era fork digest within 30 seconds
     And transition expiry cancels the held F0 request and the requester detects the interruption within 30 seconds
+    # Require autonomous replacement without disturbing the completed control interaction.
     And the requester automatically replaces the interrupted request under F1 and the provider accepts it within 90 seconds
     And the requester retains the first downloaded block and completes IBD within 180 seconds
     When I enable proposal publishing on participant "NODE_1"
     Then participant "NODE_1" reports proposal publishing enabled
     When I enable proposal publishing on all era-transition participants
     Then all era-transition participants report proposal publishing enabled
+    # All participants must converge, retain the finalized anchor, and stay healthy.
     And all declared era-transition participants have at least 12 blocks and canonical histories converge to within 1 blocks within 180 seconds
     And all nodes preserve the captured finalized block on their LIB ancestry after the era boundary within 120 seconds
     And all era-transition participants remain healthy after IBD recovery
@@ -161,6 +176,7 @@ Feature: Era boundary recovery
   # the orphan path from IBD and checks retained progress and chain continuity.
   @era_boundary_recovery @era_boundary_orphan_download
   Scenario: A runtime orphan download recovers after its F0 request expires
+    # Bind the hold to this interaction while excluding initial IBD and unsolicited proposals.
     Given era-boundary orphan-download recovery evidence is active
     And the era-transition participants are:
       | node   | role      | canonical_reference |
@@ -180,6 +196,7 @@ Feature: Era boundary recovery
     And I have user config override "network.backend.swarm.chain_sync.inbound_download_stream_timeout" as "seconds(300)"
     And I start the provider participant with its configured era-transition response hold
     Then the running nodes use the same effective deployment
+    # Complete IBD first, then create missing ancestry for the normal runtime downloader.
     And the provider participant produces at least 18 blocks before era activation within 120 seconds
     When I capture a non-genesis finalized block before the era boundary on the canonical reference participant
     And I start the requester participant connected to the provider participant with tip polling disabled
@@ -189,13 +206,16 @@ Feature: Era boundary recovery
     When the provider publishes one descendant that starts a held F0 orphan request within 90 seconds
     Then participant "NODE_1" reports proposal publishing disabled
     And all era-transition participants report proposal publishing disabled
+    # Activation preserves the established F0 stream through grace until expiry.
     When all nodes enter the target era within 260 seconds
     Then all nodes report the target-era fork digest within 30 seconds
     And expiry cancels the held F0 orphan request and schedules autonomous recovery within 60 seconds
+    # The orphan downloader must continue without a test-side recovery trigger.
     And the requester completes its exact F1 orphan replacement within 90 seconds
     And the requester retains partial orphan progress and resolves the original ancestry within 90 seconds
     When I enable proposal publishing on participant "NODE_1"
     Then participant "NODE_1" reports proposal publishing enabled
+    # Separately verify canonical convergence, finalized ancestry, and node health.
     And all declared era-transition participants have at least 12 blocks and canonical histories converge to within 1 blocks within 180 seconds
     And all nodes preserve the captured finalized block on their LIB ancestry after the era boundary within 120 seconds
     And all era-transition participants remain healthy after orphan recovery

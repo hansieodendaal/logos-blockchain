@@ -1555,6 +1555,42 @@ mod tests {
         ));
     }
 
+    // Characterizes the existing request-start failure path; this is not a
+    // real-node era-transition regression or proof of a protocol refusal.
+    #[tokio::test]
+    async fn runtime_orphan_request_start_failure_after_rotation_leaves_downloader_idle() {
+        let chain = create_chain(4);
+        let parent = chain[2];
+        let orphan = chain[3];
+        let network = MockNetworkAdapter::new();
+        let requests = Arc::clone(&network.requests);
+        let mut downloader = OrphanBlocksDownloader::<_, usize>::new_for_runtime_orphans(
+            network,
+            ORPHAN_CACHE_SIZE,
+            REJECTED_CACHE_SIZE,
+        );
+        downloader
+            .enqueue_orphan(orphan, Some(parent), TEST_TIP.into(), TEST_LIB.into())
+            .unwrap();
+        let mut downloader = pin::pin!(downloader);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(downloader.as_mut().poll_next(&mut cx).is_pending());
+        assert!(matches!(downloader.state, DownloaderState::Requesting(_)));
+        assert!(requests.lock().unwrap().is_empty());
+        downloader.as_mut().get_mut().rotate_era(Era::new(1)).await;
+        assert!(downloader.as_mut().poll_next(&mut cx).is_pending());
+        assert!(matches!(downloader.state, DownloaderState::Idle));
+        assert!(!downloader.should_poll());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, orphan);
+        assert_eq!(requests[0].local_tip, TEST_TIP.into());
+        assert_eq!(requests[0].lib, TEST_LIB.into());
+        assert!(requests[0].additional_blocks.is_empty());
+        drop(requests);
+    }
+
     #[tokio::test]
     async fn runtime_orphan_download_resumes_after_expiry_from_last_valid_block() {
         let chain = create_chain(4);

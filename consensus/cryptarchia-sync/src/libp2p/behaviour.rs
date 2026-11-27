@@ -1020,6 +1020,58 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn queued_old_era_request_loses_reply_after_both_swarms_rotate() {
+        let config = Config {
+            peer_response_timeout: Duration::from_secs(1),
+            max_inbound_requests: 4.try_into().unwrap(),
+            inbound_download_stream_timeout: Duration::from_secs(120),
+            #[cfg(feature = "testing-era-boundaries")]
+            testing_era_boundaries: None,
+        };
+        let (mut provider, provider_peer, mut requester) =
+            connect_provider_and_downloader(config).await;
+        let f0 = requester
+            .behaviour()
+            .sync_protocol_state
+            .protocol_name
+            .clone();
+        let mut replies = request_blocks(
+            &mut requester,
+            1,
+            HeaderId::from([1; 32]),
+            HeaderId::from([2; 32]),
+            HeaderId::from([3; 32]),
+            &HashSet::new(),
+            provider_peer,
+        );
+        assert_eq!(
+            requester
+                .behaviour()
+                .sync_protocol_state
+                .ongoing_requests
+                .sending_blocks_requests
+                .len(),
+            1
+        );
+
+        let f1 = StreamProtocol::new("/tests/chain-sync-f1");
+        requester.behaviour_mut().start_new_era(f1.clone());
+        provider.behaviour_mut().start_new_era(f1);
+        assert!(requester.behaviour().old_era.is_some());
+        assert_ne!(requester.behaviour().sync_protocol_state.protocol_name, f0);
+
+        tokio::spawn(async move { requester.loop_on_next().await });
+        tokio::spawn(run_provider(provider, StandardProvider { blocks_count: 1 }));
+        let reply = replies.pop().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), reply)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn test_block_sync_between_two_swarms() {
         let config = Config {
             peer_response_timeout: Duration::from_secs(1),
